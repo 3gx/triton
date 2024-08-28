@@ -312,6 +312,12 @@ public:
       // convert operands
       int minBitwidth =
           std::min(computeOrigBitWidth(a), computeOrigBitWidth(b));
+      if (minBitwidth == 8) {
+        // workaround for i8x* matmul, issue #2853
+        // minBithwdith == 8 segfault in ttgpu -> llvm
+        // if it is equal to 8 with pick the other bitwidth
+        minBitwidth = std::max(computeOrigBitWidth(a), computeOrigBitWidth(b));
+      }
       Type minType = rewriter.getIntegerType(minBitwidth);
       // convert A operand
       auto newAEncoding = DotOperandEncodingAttr::get(
