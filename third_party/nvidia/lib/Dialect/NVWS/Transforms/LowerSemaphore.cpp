@@ -317,8 +317,21 @@ PhaseMap assignInBlock(Block *block, PhaseMap phaseMap) {
       OpBuilder builder(opT);
       builder.setInsertionPointAfter(opT);
 
-#ifndef MULTIPHASE
-      opT.getPhaseMutable().assign(index.phase);
+#ifdef MULTIPHASE
+      opT.getPhaseMutable().assign(phase);
+      SmallVector<Operation *> users;
+      for (auto user : opT.getStage().getUsers())
+        users.push_back(user);
+      assert(!users.empty());
+      auto user = users.back();
+      auto phaseBit = builder.create<arith::ShLIOp>(
+          opT.getLoc(),
+          builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32),
+          opT.getStage());
+      phaseMap[opT.getOperand(0)] =
+          builder.create<arith::XOrIOp>(opT.getLoc(), phase, phaseBit);
+#else
+      opT.getPhaseMutable().assign(phase);
 
       Operation *addi = {};
       for (auto user : opT.getStage().getUsers()) {
@@ -354,19 +367,6 @@ PhaseMap assignInBlock(Block *block, PhaseMap phaseMap) {
             opT.getLoc(), cnd->getResult(0), nextPhase, phase);
       }
 
-#else
-      opT.getPhaseMutable().assign(phase);
-      SmallVector<Operation *> users;
-      for (auto user : opT.getStage().getUsers())
-        users.push_back(user);
-      assert(!users.empty());
-      auto user = users.back();
-      auto phaseBit = builder.create<arith::ShLIOp>(
-          opT.getLoc(),
-          builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32),
-          opT.getStage());
-      phaseMap[opT.getOperand(0)] =
-          builder.create<arith::XOrIOp>(opT.getLoc(), phase, phaseBit);
 #endif
 
     } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
