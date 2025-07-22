@@ -42,6 +42,8 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/ErrorHandling.h"
 
+#include "Utility.hpp"
+
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 using namespace mlir::triton::nvidia_gpu;
@@ -244,6 +246,7 @@ public:
 };
 
 // ----------------------------------------------------------------------------
+#if 0
 template <class T> struct ArefStage {
   using StageMap = llvm::MapVector<Value /*aref*/, Value /*stage*/>;
   using UseSet = llvm::SetVector<Value /*aref*/>;
@@ -408,6 +411,7 @@ template <class T> struct ArefStage {
     }
   }
 };
+#endif
 
 // ----------------------------------------------------------------------------
 
@@ -422,10 +426,32 @@ public:
     SmallVector<WarpGroupOp> wgOps;
     m.walk([&](WarpGroupOp wgOp) { wgOps.push_back(wgOp); });
     for (auto wgOp : wgOps) {
-      ArefStage<ArefPutEnterOp>::run(wgOp);
-      ArefStage<ArefPutExitOp>::run(wgOp);
-      ArefStage<ArefGetEnterOp>::run(wgOp);
-      ArefStage<ArefGetExitOp>::run(wgOp);
+      auto updateStage = [](ImplicitLocOpBuilder &b, Value stage,
+                            Operation *op) -> Value {
+        // set curent stage
+        op->setOperand(1, stage);
+
+        // compute next stage
+        auto nextStage = b.create<arith::AddIOp>(
+            stage, b.create<arith::ConstantIntOp>(1, 32));
+        auto arefBuf = op->getOperand(0)
+                           .template getDefiningOp<nvws::ArefCreateOp>()
+                           .getOperand(0);
+        auto depth = cast<MemDescType>(arefBuf.getType()).getShape().front();
+
+        auto cnd =
+            b.create<arith::CmpIOp>(arith::CmpIPredicate::eq, nextStage,
+                                    b.create<arith::ConstantIntOp>(depth, 32));
+        auto zero = b.create<arith::ConstantIntOp>(0, 32);
+        return b.create<arith::SelectOp>(cnd, zero, nextStage);
+      };
+      auto initStage = [](ImplicitLocOpBuilder &b, Operation *op) -> Value {
+        return b.create<arith::ConstantIntOp>(0, 32);
+      };
+      ArefStage<ArefPutEnterOp>::run(wgOp, initStage, updateStage);
+      ArefStage<ArefPutExitOp>::run(wgOp, initStage, updateStage);
+      ArefStage<ArefGetEnterOp>::run(wgOp, initStage, updateStage);
+      ArefStage<ArefGetExitOp>::run(wgOp, initStage, updateStage);
     }
     LLVM_DEBUG(llvm::dbgs() << "After ArefStageAssignment\n" << m << "\n");
 
