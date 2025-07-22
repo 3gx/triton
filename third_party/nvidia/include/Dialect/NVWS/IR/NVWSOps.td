@@ -93,11 +93,12 @@ def NVWS_ArefGetEnterOp : NVWS_Op<"aref.get.enter"> {
 
   let arguments = (ins NVWS_ArefType:$aref,
                        I32:$stage,
+                       I32:$stageB,
                        I32:$phase);
   let results = (outs Variadic<AnyType>:$results);
   let hasVerifier=1;
   let assemblyFormat = [{
-    $aref `[` $stage `,` $phase `]` attr-dict
+    $aref `[` $stage `,` $stageB `,` $phase `]` attr-dict
     `:` type($aref) `->` type($results)
   }];
 }
@@ -123,11 +124,12 @@ def NVWS_ArefPutEnterOp : NVWS_Op<"aref.put.enter"> {
 
   let arguments = (ins NVWS_ArefType:$aref,
                        I32:$stage,
+                       I32:$stageB,
                        I32:$phase);
   let results = (outs Variadic<AnyType>:$results);
   let hasVerifier=1;
   let assemblyFormat = [{
-    $aref `[` $stage `,` $phase `]` attr-dict
+    $aref `[` $stage `,` $stageB `,` $phase `]` attr-dict
     `:` type($aref) `->` type($results)
   }];
 }

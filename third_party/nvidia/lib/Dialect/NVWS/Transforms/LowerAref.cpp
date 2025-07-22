@@ -268,7 +268,7 @@ LogicalResult rewritePutEnterOp(ArefCreateOp arefOp, ArefPutEnterOp op,
   rewriter.setInsertionPointAfter(op);
 
   // get empty barrier at a given stage
-  Value emptyBarrier = getEmptyBarrier(rewriter, loc, arefVal, op.getStage());
+  Value emptyBarrier = getEmptyBarrier(rewriter, loc, arefVal, op.getStageB());
 
   rewriter.create<WaitBarrierOp>(loc, emptyBarrier, op.getPhase());
   auto views = getSubViews(arefVal, op.getStage(), loc, rewriter);
@@ -290,7 +290,7 @@ LogicalResult rewriteGetEnterOp(ArefCreateOp arefOp, ArefGetEnterOp op,
   auto loc = op.getLoc();
   rewriter.setInsertionPointAfter(op);
 
-  Value fullBarrier = getFullBarrier(rewriter, loc, arefVal, op.getStage());
+  Value fullBarrier = getFullBarrier(rewriter, loc, arefVal, op.getStageB());
   rewriter.create<WaitBarrierOp>(loc, fullBarrier, op.getPhase());
   auto views = getSubViews(arefVal, op.getStage(), loc, rewriter);
   assert(views.size() == op.getResults().size());
@@ -390,6 +390,7 @@ template <class T> struct ArefIndex<T> {
     // into a single index, results in better performance. Same approach is used
     // in CUTLASS and CUTEDSL, and this may allow PTXAS to better optimize code.
     Value stage;
+    Value stageB;
     Value phase;
   };
   using ArefIndexMap = llvm::MapVector<Value /*aref*/, Index>;
@@ -426,6 +427,8 @@ template <class T> struct ArefIndex<T> {
       extraIterArgs.push_back(index.stage);
       arefIndexRefs.push_back(&arefIndexMap[aref].stage);
       if (index.phase) {
+        extraIterArgs.push_back(index.stageB);
+        arefIndexRefs.push_back(&arefIndexMap[aref].stageB);
         extraIterArgs.push_back(index.phase);
         arefIndexRefs.push_back(&arefIndexMap[aref].phase);
       }
@@ -449,8 +452,10 @@ template <class T> struct ArefIndex<T> {
     for (auto aref : arefUseInBlock) {
       auto &index = arefIndexMapInBlock[aref];
       extraYieldArgs.push_back(index.stage);
-      if (index.phase)
+      if (index.phase) {
+        extraYieldArgs.push_back(index.stageB);
         extraYieldArgs.push_back(index.phase);
+      }
     }
     appendToForOpYield(forOp, extraYieldArgs);
 
@@ -480,6 +485,8 @@ template <class T> struct ArefIndex<T> {
       extraIfResults.push_back(index.stage.getType());
       arefIndexRefs.push_back(&arefIndexMap[aref].stage);
       if (index.phase) {
+        extraIfResults.push_back(index.stageB.getType());
+        arefIndexRefs.push_back(&arefIndexMap[aref].stageB);
         extraIfResults.push_back(index.phase.getType());
         arefIndexRefs.push_back(&arefIndexMap[aref].phase);
       }
@@ -512,6 +519,10 @@ template <class T> struct ArefIndex<T> {
       elseYieldOp->insertOperands(elseYieldOp.getNumOperands(),
                                   elseIndex.stage);
       if (thenIndex.phase) {
+        thenYieldOp->insertOperands(thenYieldOp.getNumOperands(),
+                                    thenIndex.stageB);
+        elseYieldOp->insertOperands(elseYieldOp.getNumOperands(),
+                                    elseIndex.stageB);
         thenYieldOp->insertOperands(thenYieldOp.getNumOperands(),
                                     thenIndex.phase);
         elseYieldOp->insertOperands(elseYieldOp.getNumOperands(),
@@ -552,8 +563,24 @@ template <class T> struct ArefIndex<T> {
             builder.create<arith::SelectOp>(opT.getLoc(), cnd, zero, nextStage);
 
         if (index.phase) {
+          opT->setOperand(2, index.stageB);
+          auto nextStage = builder.create<arith::AddIOp>(
+              opT.getLoc(), index.stageB,
+              builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
+          auto arefBuf = opT.getAref()
+                             .template getDefiningOp<nvws::ArefCreateOp>()
+                             .getOperand(0);
+          auto depth = cast<MemDescType>(arefBuf.getType()).getShape().front();
+
+          auto cnd = builder.create<arith::CmpIOp>(
+              opT.getLoc(), arith::CmpIPredicate::eq, nextStage,
+              builder.create<arith::ConstantIntOp>(opT.getLoc(), depth, 32));
+          auto zero = builder.create<arith::ConstantIntOp>(opT.getLoc(), 0, 32);
+          arefIndexMap[opT.getAref()].stageB = builder.create<arith::SelectOp>(
+              opT.getLoc(), cnd, zero, nextStage);
+
           // if this is an enterOp, compute next phase
-          opT->setOperand(2, index.phase);
+          opT->setOperand(3, index.phase);
           auto nextPhase = builder.create<arith::XOrIOp>(
               opT.getLoc(), index.phase,
               builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
@@ -607,12 +634,17 @@ template <class T> struct ArefIndex<T> {
       arefIndexMap[aref].stage =
           builder.create<arith::ConstantIntOp>(aref.getLoc(), 0, 32);
       if (std::is_same_v<T, ArefPutEnterOp>) {
+        arefIndexMap[aref].stageB =
+            builder.create<arith::ConstantIntOp>(aref.getLoc(), 0, 32);
         arefIndexMap[aref].phase =
             builder.create<arith::ConstantIntOp>(aref.getLoc(), 1, 32);
       } else if (std::is_same_v<T, ArefGetEnterOp>) {
+        arefIndexMap[aref].stageB =
+            builder.create<arith::ConstantIntOp>(aref.getLoc(), 0, 32);
         arefIndexMap[aref].phase =
             builder.create<arith::ConstantIntOp>(aref.getLoc(), 0, 32);
       } else {
+        arefIndexMap[aref].stageB = {};
         arefIndexMap[aref].phase = {};
       }
     }
