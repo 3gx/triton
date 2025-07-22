@@ -297,10 +297,8 @@ LogicalResult rewritePutEnterOp(ArefCreateOp arefOp, ArefPutEnterOp op,
 
   rewriter.create<WaitBarrierOp>(loc, emptyBarrier, op.getPhase());
 #else
-  rewriter.create<SemaphoreAcquireOp>(
-      loc, arefVal.emptySemaphore,
-      rewriter.create<arith::ConstantOp>(loc, rewriter.getI32IntegerAttr(0)),
-      Value());
+  rewriter.create<SemaphoreAcquireOp>(loc, arefVal.emptySemaphore,
+                                      op.getStage(), Value());
 #endif
   auto views = getSubViews(arefVal, op.getStage(), loc, rewriter);
   assert(views.size() == op.getResults().size());
@@ -325,10 +323,8 @@ LogicalResult rewriteGetEnterOp(ArefCreateOp arefOp, ArefGetEnterOp op,
   Value fullBarrier = getFullBarrier(rewriter, loc, arefVal, op.getStage());
   rewriter.create<WaitBarrierOp>(loc, fullBarrier, op.getPhase());
 #else
-  rewriter.create<SemaphoreAcquireOp>(
-      loc, arefVal.fullSemaphore,
-      rewriter.create<arith::ConstantOp>(loc, rewriter.getI32IntegerAttr(0)),
-      Value());
+  rewriter.create<SemaphoreAcquireOp>(loc, arefVal.fullSemaphore, op.getStage(),
+                                      Value());
 #endif
   auto views = getSubViews(arefVal, op.getStage(), loc, rewriter);
   assert(views.size() == op.getResults().size());
@@ -677,12 +673,12 @@ template <> struct ArefIndex<> {
   static LogicalResult run(WarpGroupOp wgOp) {
     if (failed(ArefIndex<ArefPutEnterOp>::run(wgOp, "ArefPutEnterOp")))
       return failure();
-    // if (failed(ArefIndex<ArefPutExitOp>::run(wgOp, "ArefPutExitOp")))
-    //   return failure();
+    if (failed(ArefIndex<ArefPutExitOp>::run(wgOp, "ArefPutExitOp")))
+      return failure();
     if (failed(ArefIndex<ArefGetEnterOp>::run(wgOp, "ArefGetEnterOp")))
       return failure();
-    // if (failed(ArefIndex<ArefGetExitOp>::run(wgOp, "ArefGetExitOp")))
-    //   return failure();
+    if (failed(ArefIndex<ArefGetExitOp>::run(wgOp, "ArefGetExitOp")))
+      return failure();
     return success();
   }
 };

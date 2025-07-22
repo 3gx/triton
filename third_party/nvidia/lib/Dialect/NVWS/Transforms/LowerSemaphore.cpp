@@ -204,7 +204,7 @@ template <class T> struct AssignIndex<T> {
     // Having stage and phase as separate values, rather than encoding them
     // into a single index, results in better performance. Same approach is used
     // in CUTLASS and CUTEDSL, and this may allow PTXAS to better optimize code.
-    Value stage;
+    // Value stage;
     Value phase;
   };
   using IndexMap = llvm::MapVector<Value, Index>;
@@ -237,8 +237,8 @@ template <class T> struct AssignIndex<T> {
     SmallVector<Value *> indexRefs;
     for (auto sema : useInBlock) {
       auto index = indexMap.lookup(sema);
-      extraIterArgs.push_back(index.stage);
-      indexRefs.push_back(&indexMap[sema].stage);
+      // extraIterArgs.push_back(index.stage);
+      // indexRefs.push_back(&indexMap[sema].stage);
       if (index.phase) {
         extraIterArgs.push_back(index.phase);
         indexRefs.push_back(&indexMap[sema].phase);
@@ -261,7 +261,7 @@ template <class T> struct AssignIndex<T> {
     SmallVector<Value> extraYieldArgs;
     for (auto sema : useInBlock) {
       auto &index = indexMapInBlock[sema];
-      extraYieldArgs.push_back(index.stage);
+      // extraYieldArgs.push_back(index.stage);
       if (index.phase)
         extraYieldArgs.push_back(index.phase);
     }
@@ -289,8 +289,8 @@ template <class T> struct AssignIndex<T> {
     SmallVector<Value *> indexRefs;
     for (auto sema : useInIfOp) {
       auto index = indexMap.lookup(sema);
-      extraIfResults.push_back(index.stage.getType());
-      indexRefs.push_back(&indexMap[sema].stage);
+      // extraIfResults.push_back(index.stage.getType());
+      // indexRefs.push_back(&indexMap[sema].stage);
       if (index.phase) {
         extraIfResults.push_back(index.phase.getType());
         indexRefs.push_back(&indexMap[sema].phase);
@@ -317,10 +317,10 @@ template <class T> struct AssignIndex<T> {
     for (auto sema : useInIfOp) {
       auto &thenIndex = indexInThenBlock[sema];
       auto &elseIndex = indexInElseBlock[sema];
-      thenYieldOp->insertOperands(thenYieldOp.getNumOperands(),
-                                  thenIndex.stage);
-      elseYieldOp->insertOperands(elseYieldOp.getNumOperands(),
-                                  elseIndex.stage);
+      // thenYieldOp->insertOperands(thenYieldOp.getNumOperands(),
+      //                             thenIndex.stage);
+      // elseYieldOp->insertOperands(elseYieldOp.getNumOperands(),
+      //                             elseIndex.stage);
       if (thenIndex.phase) {
         thenYieldOp->insertOperands(thenYieldOp.getNumOperands(),
                                     thenIndex.phase);
@@ -343,34 +343,41 @@ template <class T> struct AssignIndex<T> {
         OpBuilder builder(opT);
         builder.setInsertionPointAfter(opT);
 
-        // compute next stage
-        opT.getStageMutable().assign(index.stage);
-        auto nextStage = builder.create<arith::AddIOp>(
-            opT.getLoc(), index.stage,
-            builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
-        // auto arefBuf = opT.getAref()
-        //                    .template getDefiningOp<nvws::ArefCreateOp>()
-        //                    .getOperand(0);
-        auto depth = *opT.getSemaphore().getType().getNumStages();
-        //            depth 2; //
-        //            cast<MemDescType>(arefBuf.getType()).getShape().front();
+        // compute next stageG
+        // opT.getStageMutable().assign(index.stage);
+        // auto nextStage = builder.create<arith::AddIOp>(
+        //     opT.getLoc(), index.stage,
+        //     builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
+        // // auto arefBuf = opT.getAref()
+        // //                    .template getDefiningOp<nvws::ArefCreateOp>()
+        // //                    .getOperand(0);
+        // auto depth = *opT.getSemaphore().getType().getNumStages();
+        // //            depth 2; //
+        // // cast<MemDescType>(arefBuf.getType()).getShape().front();
 
-        auto cnd = builder.create<arith::CmpIOp>(
-            opT.getLoc(), arith::CmpIPredicate::eq, nextStage,
-            builder.create<arith::ConstantIntOp>(opT.getLoc(), depth, 32));
-        auto zero = builder.create<arith::ConstantIntOp>(opT.getLoc(), 0, 32);
-        indexMap[opT.getOperand(0)].stage =
-            builder.create<arith::SelectOp>(opT.getLoc(), cnd, zero, nextStage);
+        // auto cnd = builder.create<arith::CmpIOp>(
+        //     opT.getLoc(), arith::CmpIPredicate::eq, nextStage,
+        //     builder.create<arith::ConstantIntOp>(opT.getLoc(), depth, 32));
+        // auto zero = builder.create<arith::ConstantIntOp>(opT.getLoc(), 0,
+        // 32); indexMap[opT.getOperand(0)].stage =
+        //     builder.create<arith::SelectOp>(opT.getLoc(), cnd, zero,
+        //     nextStage);
 
-        if constexpr (std::is_same_v<T, SemaphoreAcquireOp>) {
+//        if constexpr (std::is_same_v<T, SemaphoreAcquireOp>) {
+          auto depth = *opT.getSemaphore().getType().getNumStages();
+
           // if this is an enterOp, compute next phase
           opT.getPhaseMutable().assign(index.phase);
           auto nextPhase = builder.create<arith::XOrIOp>(
               opT.getLoc(), index.phase,
               builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
+          auto cnd = builder.create<arith::CmpIOp>(
+              opT.getLoc(), arith::CmpIPredicate::eq, opT.getStage(),
+              builder.create<arith::ConstantIntOp>(opT.getLoc(), depth - 1,
+                                                   32));
           indexMap[opT.getOperand(0)].phase = builder.create<arith::SelectOp>(
               opT.getLoc(), cnd, nextPhase, index.phase);
-        }
+ //       }
 
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
         assignInForOp(forOp, indexMap);
@@ -416,8 +423,8 @@ template <class T> struct AssignIndex<T> {
     for (auto anchor : use) {
       OpBuilder builder(anchor.getDefiningOp());
       builder.setInsertionPointAfter(anchor.getDefiningOp());
-      indexMap[anchor].stage =
-          builder.create<arith::ConstantIntOp>(anchor.getLoc(), 0, 32);
+      // indexMap[anchor].stage =
+      //     builder.create<arith::ConstantIntOp>(anchor.getLoc(), 0, 32);
       if (std::is_same_v<T, SemaphoreAcquireOp>) {
         auto semaOp = anchor.getDefiningOp<SemaphoreCreateOp>();
         assert(semaOp);
@@ -425,6 +432,7 @@ template <class T> struct AssignIndex<T> {
         indexMap[anchor].phase = builder.create<arith::ConstantIntOp>(
             anchor.getLoc(), isReleased, 32);
       } else {
+        assert(0);
         indexMap[anchor].phase = {};
       }
     }
@@ -444,11 +452,12 @@ template <> struct AssignIndex<> {
       assert(0);
       return failure();
     }
-    if (failed(
-            AssignIndex<SemaphoreReleaseOp>::run(wgOp, "SemaphoreReleaseOp"))) {
-      assert(0);
-      return failure();
-    }
+    // if (failed(
+    //         AssignIndex<SemaphoreReleaseOp>::run(wgOp,
+    //         "SemaphoreReleaseOp"))) {
+    //   assert(0);
+    //   return failure();
+    // }
     return success();
   }
 };
