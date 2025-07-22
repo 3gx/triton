@@ -62,12 +62,13 @@ namespace {
 // ----------------------------------------------------------------------------
 
 struct ArefValue {
-  Value emptyMbars;
-  Value fullMbars;
+  Value emptySemaphore;
+  Value fullSemaphore;
   int depth;
   SmallVector<Value> buffers;
 };
 
+#if 0
 Value getEmptyBarrier(PatternRewriter &rewriter, Location loc, ArefValue aref,
                       Value stage) {
   return createSingleBufferView(rewriter, aref.emptyMbars, stage);
@@ -77,6 +78,7 @@ Value getFullBarrier(PatternRewriter &rewriter, Location loc, ArefValue aref,
                      Value stage) {
   return createSingleBufferView(rewriter, aref.fullMbars, stage);
 }
+#endif
 
 std::pair<WarpGroupOp, int> getWarpGroupIdx(Operation *op) {
   if (auto wgOp = dyn_cast<WarpGroupOp>(op->getParentOp())) {
@@ -158,6 +160,7 @@ std::pair<int, int> getArrivalCount(ArefCreateOp op) {
 }
 
 ArefValue createAndInitMbar(ArefCreateOp op, PatternRewriter &rewriter) {
+#if 0
   auto [producerArrivalCount, consumerArrivalCount] = getArrivalCount(op);
 
   MLIRContext *ctx = op.getContext();
@@ -188,6 +191,23 @@ ArefValue createAndInitMbar(ArefCreateOp op, PatternRewriter &rewriter) {
 
   return ArefValue{emptyMbars, fullMbars, static_cast<int>(depth),
                    op.getOperands()};
+#else
+  MLIRContext *ctx = op.getContext();
+  auto loc = op.getLoc();
+  auto arefTy = op.getType();
+  auto baseType = arefTy.getBaseType();
+  auto arefBufTypes = llvm::to_vector(llvm::map_range(
+      arefTy.getBaseType(), [](Type type) { return cast<MemDescType>(type); }));
+  auto shape = arefBufTypes[0].getShape();
+  auto depth = shape[0];
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  auto semaTy = triton::nvws::SemaphoreType::get(b.getContext(), depth);
+  auto emptySempahore = b.create<SemaphoreCreateOp>(loc, semaTy, true);
+  auto fullSempahore = b.create<SemaphoreCreateOp>(loc, semaTy, false);
+
+  return ArefValue{emptySempahore, fullSempahore, static_cast<int>(depth),
+                   op.getOperands()};
+#endif
 }
 
 SmallVector<Value> getSubViews(ArefValue arefVal, Value stage, Location loc,
@@ -254,11 +274,15 @@ void lowerAsyncLoads(ArefPutEnterOp op, PatternRewriter &rewriter,
   assert(arefPutExitOp.getAref() == op.getAref() &&
          "Expecting matching Aref on the ArefPutExitOp");
 
-  Value fullBarrier =
+#if 0 
+Value fullBarrier =
       getFullBarrier(rewriter, loc, arefVal, arefPutExitOp.getStage());
   Value pred = rewriter.create<arith::ConstantIntOp>(loc, 1, 1);
   rewriter.create<triton::nvidia_gpu::BarrierExpectOp>(loc, fullBarrier, 0,
                                                        pred);
+#else
+  llvm_unreachable("not implemented");
+#endif
   return;
 }
 
@@ -267,10 +291,17 @@ LogicalResult rewritePutEnterOp(ArefCreateOp arefOp, ArefPutEnterOp op,
   auto loc = op.getLoc();
   rewriter.setInsertionPointAfter(op);
 
+#if 0
   // get empty barrier at a given stage
   Value emptyBarrier = getEmptyBarrier(rewriter, loc, arefVal, op.getStage());
 
   rewriter.create<WaitBarrierOp>(loc, emptyBarrier, op.getPhase());
+#else
+  rewriter.create<SemaphoreAcquireOp>(
+      loc, arefVal.emptySemaphore,
+      rewriter.create<arith::ConstantOp>(loc, rewriter.getI32IntegerAttr(0)),
+      Value());
+#endif
   auto views = getSubViews(arefVal, op.getStage(), loc, rewriter);
   assert(views.size() == op.getResults().size());
 
@@ -290,8 +321,15 @@ LogicalResult rewriteGetEnterOp(ArefCreateOp arefOp, ArefGetEnterOp op,
   auto loc = op.getLoc();
   rewriter.setInsertionPointAfter(op);
 
+#if 0
   Value fullBarrier = getFullBarrier(rewriter, loc, arefVal, op.getStage());
   rewriter.create<WaitBarrierOp>(loc, fullBarrier, op.getPhase());
+#else
+  rewriter.create<SemaphoreAcquireOp>(
+      loc, arefVal.fullSemaphore,
+      rewriter.create<arith::ConstantOp>(loc, rewriter.getI32IntegerAttr(0)),
+      Value());
+#endif
   auto views = getSubViews(arefVal, op.getStage(), loc, rewriter);
   assert(views.size() == op.getResults().size());
 
@@ -331,16 +369,28 @@ LogicalResult rewritePutExitOp(ArefPutExitOp op, PatternRewriter &rewriter,
                                ArefValue arefVal) {
   auto loc = op->getLoc();
   rewriter.setInsertionPointAfter(op);
+#if 0
   Value fullBarrier = getFullBarrier(rewriter, loc, arefVal, op.getStage());
   return insertArriveBarrier(loc, op.getAsyncOps(), rewriter, fullBarrier);
+#else
+  rewriter.create<SemaphoreReleaseOp>(loc, arefVal.fullSemaphore, op.getStage(),
+                                      op.getAsyncOps());
+  return success();
+#endif
 }
 
 LogicalResult rewriteGetExitOp(ArefGetExitOp op, PatternRewriter &rewriter,
                                ArefValue arefVal) {
   auto loc = op->getLoc();
   rewriter.setInsertionPointAfter(op);
+#if 0
   Value emptyBarrier = getEmptyBarrier(rewriter, loc, arefVal, op.getStage());
   return insertArriveBarrier(loc, op.getAsyncOps(), rewriter, emptyBarrier);
+#else
+  rewriter.create<SemaphoreReleaseOp>(loc, arefVal.emptySemaphore,
+                                      op.getStage(), op.getAsyncOps());
+  return success();
+#endif
 }
 
 class LowerArefCreate : public OpRewritePattern<ArefCreateOp> {
@@ -551,9 +601,9 @@ template <class T> struct ArefIndex<T> {
         arefIndexMap[opT.getAref()].stage =
             builder.create<arith::SelectOp>(opT.getLoc(), cnd, zero, nextStage);
 
-        if (index.phase) {
+        if constexpr (std::is_same_v<T, SemaphoreAcquireOp>) {
           // if this is an enterOp, compute next phase
-          opT->setOperand(2, index.phase);
+          opT.getPhaseMutable().assign(index.phase);
           auto nextPhase = builder.create<arith::XOrIOp>(
               opT.getLoc(), index.phase,
               builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
@@ -606,12 +656,10 @@ template <class T> struct ArefIndex<T> {
       builder.setInsertionPointAfter(aref.getDefiningOp());
       arefIndexMap[aref].stage =
           builder.create<arith::ConstantIntOp>(aref.getLoc(), 0, 32);
-      if (std::is_same_v<T, ArefPutEnterOp>) {
+      if (std::is_same_v<T, SemaphoreAcquireOp>) {
+        bool isReleased = true;
         arefIndexMap[aref].phase =
-            builder.create<arith::ConstantIntOp>(aref.getLoc(), 1, 32);
-      } else if (std::is_same_v<T, ArefGetEnterOp>) {
-        arefIndexMap[aref].phase =
-            builder.create<arith::ConstantIntOp>(aref.getLoc(), 0, 32);
+            builder.create<arith::ConstantIntOp>(aref.getLoc(), isReleased, 32);
       } else {
         arefIndexMap[aref].phase = {};
       }
@@ -629,12 +677,12 @@ template <> struct ArefIndex<> {
   static LogicalResult run(WarpGroupOp wgOp) {
     if (failed(ArefIndex<ArefPutEnterOp>::run(wgOp, "ArefPutEnterOp")))
       return failure();
-    if (failed(ArefIndex<ArefPutExitOp>::run(wgOp, "ArefPutExitOp")))
-      return failure();
+    // if (failed(ArefIndex<ArefPutExitOp>::run(wgOp, "ArefPutExitOp")))
+    //   return failure();
     if (failed(ArefIndex<ArefGetEnterOp>::run(wgOp, "ArefGetEnterOp")))
       return failure();
-    if (failed(ArefIndex<ArefGetExitOp>::run(wgOp, "ArefGetExitOp")))
-      return failure();
+    // if (failed(ArefIndex<ArefGetExitOp>::run(wgOp, "ArefGetExitOp")))
+    //   return failure();
     return success();
   }
 };
