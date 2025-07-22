@@ -39,14 +39,14 @@ include "NVWSAttrDefs.td"
 class NVWS_Op<string mnemonic, list<Trait> traits = []> :
     Op<NVWS_Dialect, mnemonic, traits>;
 
-def NVWS_SemaphoreCreateOp : NVWS_Op<"sem.create"> {
+def NVWS_SemaphoreCreateOp : NVWS_Op<"semaphore.create"> {
   let summary = "create a semaphore";
   let arguments = (ins I1Attr:$is_released);
   let results = (outs NVWS_SemaphoreType:$result);
   let assemblyFormat = "$is_released attr-dict `:` type($result)";
 }
 
-def NVWS_SemaphoreAcquireOp : NVWS_Op<"sem.acquire"> {
+def NVWS_SemaphoreAcquireOp : NVWS_Op<"semaphore.acquire"> {
   let summary = "acquire a semaphore";
   let arguments = (ins NVWS_SemaphoreType:$semaphore,
                        I32:$stage,
@@ -56,7 +56,7 @@ def NVWS_SemaphoreAcquireOp : NVWS_Op<"sem.acquire"> {
   }];
 }
 
-def NVWS_SemaphoreReleaseOp : NVWS_Op<"sem.release"> {
+def NVWS_SemaphoreReleaseOp : NVWS_Op<"semaphore.release"> {
   let summary = "release a semaphore";
   let arguments = (ins NVWS_SemaphoreType:$semaphore,
                        I32:$stage,
