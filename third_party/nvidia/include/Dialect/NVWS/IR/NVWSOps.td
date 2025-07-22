@@ -39,6 +39,32 @@ include "NVWSAttrDefs.td"
 class NVWS_Op<string mnemonic, list<Trait> traits = []> :
     Op<NVWS_Dialect, mnemonic, traits>;
 
+def NVWS_SemaphoreCreateOp : NVWS_Op<"sem.create"> {
+  let summary = "create a semaphore";
+  let arguments = (ins);
+  let results = (outs NVWS_SemaphoreType:$result);
+  let assemblyFormat = "attr-dict `:` type($result)";
+}
+
+def NVWS_SemaphoreAcquireOp : NVWS_Op<"sem.acquire"> {
+  let summary = "acquire a semaphore";
+  let arguments = (ins NVWS_SemaphoreType:$semaphore,
+                       I32:$stage,
+                       Optional<I32>:$phase);
+  let assemblyFormat = [{
+    $semaphore `[` $stage (`,` $phase^)? `]` attr-dict `:` type($semaphore)
+  }];
+}
+
+def NVWS_SemaphoreReleaseOp : NVWS_Op<"sem.release"> {
+  let summary = "release a semaphore";
+  let arguments = (ins NVWS_SemaphoreType:$semaphore,
+                       I32:$stage);
+  let assemblyFormat = [{
+    $semaphore `[` $stage `]` attr-dict `:` type($semaphore)
+  }];
+}
+
 def NVWS_ArefCreateOp : NVWS_Op<"aref.create", [
     RangedTypesMatchWith<"input types match Aref output type",
                         "result", "operands", "::llvm::cast<ArefType>($_self).getBaseType()">, Pure]> {
