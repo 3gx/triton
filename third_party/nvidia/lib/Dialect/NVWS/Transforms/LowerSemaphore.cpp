@@ -419,7 +419,9 @@ template <class T> struct AssignIndex<T> {
       indexMap[anchor].stage =
           builder.create<arith::ConstantIntOp>(anchor.getLoc(), 0, 32);
       if (std::is_same_v<T, SemaphoreAcquireOp>) {
-        bool isReleased = true;
+        auto semaOp = anchor.getDefiningOp<SemaphoreCreateOp>();
+        assert(semaOp);
+        bool isReleased = semaOp.getIsReleased();
         indexMap[anchor].phase = builder.create<arith::ConstantIntOp>(
             anchor.getLoc(), isReleased, 32);
       } else {
