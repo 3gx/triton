@@ -383,7 +383,7 @@ template <class T> struct AssignIndex<T> {
   }
 
   static LogicalResult run(WarpGroupOp wgOp, std::string opName) {
-    llvm::errs() << " --- Xrun " << opName << "\n";
+    // llvm::errs() << " --- Xrun " << opName << "\n";
     // Verify that all puts and gets are in the same group; otherwise, the stage
     // would need to be communicated across groups, not currently supported.
     Region *opRegion = {};
@@ -463,15 +463,14 @@ public:
     mlir::ModuleOp m = getOperation();
     SmallVector<WarpGroupOp> wgOps;
     m.walk([&](WarpGroupOp wgOp) { wgOps.push_back(wgOp); });
-    llvm::errs() << " --- XwgOps.size() " << wgOps.size() << "\n";
+    // llvm::errs() << " --- XwgOps.size() " << wgOps.size() << "\n";
     for (auto wgOp : wgOps) {
-      llvm::errs() << " --- XwgOp " << wgOp << "\n";
+      // llvm::errs() << " --- XwgOp " << wgOp << "\n";
       if (failed(AssignIndex<>::run(wgOp)))
         signalPassFailure();
     }
-    // LLVM_DEBUG(llvm::dbgs() << "After semaphoreIndexAssignment\n" << m <<
-    // "\n");
-    llvm::errs() << "After semaphoreIndexAssignment\n" << m << "\n";
+    LLVM_DEBUG(llvm::dbgs() << "After semaphoreIndexAssignment\n" << m << "\n");
+    // llvm::errs() << "After semaphoreIndexAssignment\n" << m << "\n";
     //    assert(0);
 
     mlir::RewritePatternSet patterns(context);
