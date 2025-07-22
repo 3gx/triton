@@ -64,21 +64,8 @@ namespace {
 struct ArefValue {
   Value emptySemaphore;
   Value fullSemaphore;
-  int depth;
   SmallVector<Value> buffers;
 };
-
-#if 0
-Value getEmptyBarrier(PatternRewriter &rewriter, Location loc, ArefValue aref,
-                      Value stage) {
-  return createSingleBufferView(rewriter, aref.emptyMbars, stage);
-}
-
-Value getFullBarrier(PatternRewriter &rewriter, Location loc, ArefValue aref,
-                     Value stage) {
-  return createSingleBufferView(rewriter, aref.fullMbars, stage);
-}
-#endif
 
 std::pair<WarpGroupOp, int> getWarpGroupIdx(Operation *op) {
   if (auto wgOp = dyn_cast<WarpGroupOp>(op->getParentOp())) {
@@ -90,108 +77,7 @@ std::pair<WarpGroupOp, int> getWarpGroupIdx(Operation *op) {
   return getWarpGroupIdx(op->getParentOp());
 }
 
-std::pair<int, int> getArrivalCount(ArefCreateOp op) {
-  std::optional<int> producerArrivalCount, consumerArrivalCount;
-
-  for (auto user : op->getUsers()) {
-    auto [wgOp, idx] = getWarpGroupIdx(user);
-    auto numWarps = wgOp.getNumWarps()[idx];
-
-    if (auto putExitOp = dyn_cast<ArefPutExitOp>(user)) {
-      int count = 0;
-      for (auto prod : putExitOp.getAsyncOps()) {
-        auto kind = dyn_cast<AsyncOpAttr>(prod).getValue();
-        switch (kind) {
-        case AsyncOp::TC5MMA:
-        case AsyncOp::TMALoad:
-          count += 1;
-          break;
-        case AsyncOp::CpAsync:
-          count += numWarps * 32;
-          break;
-        case AsyncOp::NONE:
-          // TODO: this should be 'numWarps * 32' when we transition to
-          //       multi-threaded arrive
-          count += 1;
-          break;
-        default:
-          llvm_unreachable("unknown producer kind");
-        }
-      }
-
-      if (producerArrivalCount) {
-        assert(*producerArrivalCount == count &&
-               "inconsistent producer arrival count");
-      } else {
-        producerArrivalCount = count;
-      }
-    } else if (auto getExitOp = dyn_cast<ArefGetExitOp>(user)) {
-      int count = 0;
-      for (auto consumer : getExitOp.getAsyncOps()) {
-        auto kind = dyn_cast<AsyncOpAttr>(consumer).getValue();
-        switch (kind) {
-        case AsyncOp::TC5MMA:
-          count += 1;
-          break;
-        case AsyncOp::NONE:
-        case AsyncOp::WGMMA:
-          // TODO: this should be 'numWarps * 32' when we transition to
-          //       multi-threaded arrive
-          count += 1;
-          break;
-        default:
-          llvm_unreachable("unknown consumer kind");
-        }
-      }
-
-      if (consumerArrivalCount) {
-        assert(*consumerArrivalCount == count &&
-               "inconsistent consumer arrival count");
-      } else {
-        consumerArrivalCount = count;
-      }
-    }
-  }
-
-  assert(producerArrivalCount);
-  assert(consumerArrivalCount);
-
-  return {*producerArrivalCount, *consumerArrivalCount};
-}
-
 ArefValue createAndInitMbar(ArefCreateOp op, PatternRewriter &rewriter) {
-#if 0
-  auto [producerArrivalCount, consumerArrivalCount] = getArrivalCount(op);
-
-  MLIRContext *ctx = op.getContext();
-  auto loc = op.getLoc();
-  auto arefTy = op.getType();
-  auto baseType = arefTy.getBaseType();
-  auto arefBufTypes = llvm::to_vector(llvm::map_range(
-      arefTy.getBaseType(), [](Type type) { return cast<MemDescType>(type); }));
-  auto shape = arefBufTypes[0].getShape();
-  auto depth = shape[0];
-
-  ImplicitLocOpBuilder builder(op.getLoc(), rewriter);
-  auto emptyMbars = createScalarAlloc(builder, rewriter.getI64Type(), depth);
-  auto fullMbars = createScalarAlloc(builder, rewriter.getI64Type(), depth);
-  auto lb = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
-  auto ub = rewriter.create<arith::ConstantIntOp>(loc, depth, 32);
-  auto step = rewriter.create<arith::ConstantIntOp>(loc, 1, 32);
-  auto dLoop = rewriter.create<scf::ForOp>(loc, lb, ub, step);
-  rewriter.setInsertionPointToStart(dLoop.getBody());
-
-  for (int i = 0; i < 2; ++i) {
-    auto mbars = i == 0 ? emptyMbars : fullMbars;
-    auto singleBarrier =
-        createSingleBufferView(rewriter, mbars, dLoop.getInductionVar());
-    int arrivalCount = i == 0 ? consumerArrivalCount : producerArrivalCount;
-    rewriter.create<InitBarrierOp>(loc, singleBarrier, arrivalCount);
-  }
-
-  return ArefValue{emptyMbars, fullMbars, static_cast<int>(depth),
-                   op.getOperands()};
-#else
   MLIRContext *ctx = op.getContext();
   auto loc = op.getLoc();
   auto arefTy = op.getType();
@@ -205,9 +91,7 @@ ArefValue createAndInitMbar(ArefCreateOp op, PatternRewriter &rewriter) {
   auto emptySempahore = b.create<SemaphoreCreateOp>(loc, semaTy, true);
   auto fullSempahore = b.create<SemaphoreCreateOp>(loc, semaTy, false);
 
-  return ArefValue{emptySempahore, fullSempahore, static_cast<int>(depth),
-                   op.getOperands()};
-#endif
+  return ArefValue{emptySempahore, fullSempahore, op.getOperands()};
 }
 
 SmallVector<Value> getSubViews(ArefValue arefVal, Value stage, Location loc,
@@ -286,20 +170,13 @@ Value fullBarrier =
   return;
 }
 
-LogicalResult rewritePutEnterOp(ArefCreateOp arefOp, ArefPutEnterOp op,
-                                PatternRewriter &rewriter, ArefValue arefVal) {
+void rewritePutEnterOp(ArefCreateOp arefOp, ArefPutEnterOp op,
+                       PatternRewriter &rewriter, ArefValue arefVal) {
   auto loc = op.getLoc();
   rewriter.setInsertionPointAfter(op);
 
-#if 0
-  // get empty barrier at a given stage
-  Value emptyBarrier = getEmptyBarrier(rewriter, loc, arefVal, op.getStage());
-
-  rewriter.create<WaitBarrierOp>(loc, emptyBarrier, op.getPhase());
-#else
   rewriter.create<SemaphoreAcquireOp>(loc, arefVal.emptySemaphore,
                                       op.getStage(), Value());
-#endif
   auto views = getSubViews(arefVal, op.getStage(), loc, rewriter);
   assert(views.size() == op.getResults().size());
 
@@ -310,83 +187,36 @@ LogicalResult rewritePutEnterOp(ArefCreateOp arefOp, ArefPutEnterOp op,
   // replaces uses with views
   for (int i = 0; i < arefVal.buffers.size(); ++i)
     op.getResult(i).replaceAllUsesWith(views[i]);
-
-  return success();
 }
 
-LogicalResult rewriteGetEnterOp(ArefCreateOp arefOp, ArefGetEnterOp op,
-                                PatternRewriter &rewriter, ArefValue arefVal) {
+void rewriteGetEnterOp(ArefCreateOp arefOp, ArefGetEnterOp op,
+                       PatternRewriter &rewriter, ArefValue arefVal) {
   auto loc = op.getLoc();
   rewriter.setInsertionPointAfter(op);
 
-#if 0
-  Value fullBarrier = getFullBarrier(rewriter, loc, arefVal, op.getStage());
-  rewriter.create<WaitBarrierOp>(loc, fullBarrier, op.getPhase());
-#else
   rewriter.create<SemaphoreAcquireOp>(loc, arefVal.fullSemaphore, op.getStage(),
                                       Value());
-#endif
   auto views = getSubViews(arefVal, op.getStage(), loc, rewriter);
   assert(views.size() == op.getResults().size());
 
   for (int i = 0; i < arefVal.buffers.size(); ++i)
     op.getResult(i).replaceAllUsesWith(views[i]);
-
-  return success();
 }
 
-LogicalResult insertArriveBarrier(Location loc, ArrayAttr asyncOps,
-                                  PatternRewriter &rewriter, Value mbar) {
-  for (auto asyncOp : asyncOps) {
-    auto asyncOpEnum = cast<AsyncOpAttr>(asyncOp).getValue();
-    switch (asyncOpEnum) {
-    case AsyncOp::NONE:
-    case AsyncOp::WGMMA:
-      rewriter.create<nvidia_gpu::ArriveBarrierOp>(loc, mbar, 1);
-      break;
-    case AsyncOp::TC5MMA:
-    case AsyncOp::TMEMCopy:
-      rewriter.create<nvidia_gpu::TCGen5CommitOp>(loc, mbar);
-      break;
-
-    case AsyncOp::TMALoad:
-      // nothing to do, TMA load is handled by lowering putEnterOp
-      break;
-    case AsyncOp::CpAsync:
-    default:
-      llvm_unreachable("unknown async op");
-    }
-  }
-
-  return success();
-}
-
-LogicalResult rewritePutExitOp(ArefPutExitOp op, PatternRewriter &rewriter,
-                               ArefValue arefVal) {
+void rewritePutExitOp(ArefPutExitOp op, PatternRewriter &rewriter,
+                      ArefValue arefVal) {
   auto loc = op->getLoc();
   rewriter.setInsertionPointAfter(op);
-#if 0
-  Value fullBarrier = getFullBarrier(rewriter, loc, arefVal, op.getStage());
-  return insertArriveBarrier(loc, op.getAsyncOps(), rewriter, fullBarrier);
-#else
   rewriter.create<SemaphoreReleaseOp>(loc, arefVal.fullSemaphore, op.getStage(),
                                       op.getAsyncOps());
-  return success();
-#endif
 }
 
-LogicalResult rewriteGetExitOp(ArefGetExitOp op, PatternRewriter &rewriter,
-                               ArefValue arefVal) {
+void rewriteGetExitOp(ArefGetExitOp op, PatternRewriter &rewriter,
+                      ArefValue arefVal) {
   auto loc = op->getLoc();
   rewriter.setInsertionPointAfter(op);
-#if 0
-  Value emptyBarrier = getEmptyBarrier(rewriter, loc, arefVal, op.getStage());
-  return insertArriveBarrier(loc, op.getAsyncOps(), rewriter, emptyBarrier);
-#else
   rewriter.create<SemaphoreReleaseOp>(loc, arefVal.emptySemaphore,
                                       op.getStage(), op.getAsyncOps());
-  return success();
-#endif
 }
 
 class LowerArefCreate : public OpRewritePattern<ArefCreateOp> {
@@ -401,20 +231,16 @@ public:
     for (auto userOp : op->getUsers()) {
       if (auto user = dyn_cast<ArefPutEnterOp>(userOp)) {
         opToDelete.insert(user);
-        if (rewritePutEnterOp(op, user, rewriter, aref).failed())
-          return failure();
+        rewritePutEnterOp(op, user, rewriter, aref);
       } else if (auto user = dyn_cast<ArefGetEnterOp>(userOp)) {
         opToDelete.insert(user);
-        if (rewriteGetEnterOp(op, user, rewriter, aref).failed())
-          return failure();
+        rewriteGetEnterOp(op, user, rewriter, aref);
       } else if (auto user = dyn_cast<ArefPutExitOp>(userOp)) {
         opToDelete.insert(user);
-        if (rewritePutExitOp(user, rewriter, aref).failed())
-          return failure();
+        rewritePutExitOp(user, rewriter, aref);
       } else if (auto user = dyn_cast<ArefGetExitOp>(userOp)) {
         opToDelete.insert(user);
-        if (rewriteGetExitOp(user, rewriter, aref).failed())
-          return failure();
+        rewriteGetExitOp(user, rewriter, aref);
       } else {
         llvm_unreachable("users of aref can only be ArefPut or ArefGet");
       }
@@ -428,53 +254,38 @@ public:
 };
 
 // ----------------------------------------------------------------------------
+template <class T> struct ArefStage {
+  using StageMap = llvm::MapVector<Value /*aref*/, Value>;
+  using UseSet = llvm::SetVector<Value /*aref*/>;
 
-template <class... Ts> struct ArefIndex;
-template <class T> struct ArefIndex<T> {
-  struct Index {
-    // Having stage and phase as separate values, rather than encoding them
-    // into a single index, results in better performance. Same approach is used
-    // in CUTLASS and CUTEDSL, and this may allow PTXAS to better optimize code.
-    Value stage;
-    Value phase;
-  };
-  using ArefIndexMap = llvm::MapVector<Value /*aref*/, Index>;
-  using ArefUseSet = llvm::SetVector<Value /*aref*/>;
-
-  static ArefUseSet analyzeArefUseInBlock(Block *block, ArefUseSet arefUseSet) {
+  static UseSet analyzeUseInBlock(Block *block, UseSet useSet) {
     for (auto &op : *block) {
       if (auto opT = dyn_cast<T>(op)) {
-        arefUseSet.insert(opT.getAref());
+        useSet.insert(opT.getAref());
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-        arefUseSet = analyzeArefUseInBlock(forOp.getBody(), arefUseSet);
+        useSet = analyzeUseInBlock(forOp.getBody(), useSet);
       } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-        arefUseSet = analyzeArefUseInBlock(ifOp.thenBlock(), arefUseSet);
+        useSet = analyzeUseInBlock(ifOp.thenBlock(), useSet);
         if (ifOp.elseBlock())
-          arefUseSet = analyzeArefUseInBlock(ifOp.elseBlock(), arefUseSet);
+          useSet = analyzeUseInBlock(ifOp.elseBlock(), useSet);
       }
     }
-    return arefUseSet;
+    return useSet;
   }
 
-  static void assignArefIndexInForOp(scf::ForOp forOp,
-                                     ArefIndexMap &arefIndexMap) {
+  static void assignStageInForOp(scf::ForOp forOp, StageMap &stageMap) {
 
     // find uses of arefs in forOp body
-    auto arefUseInBlock = analyzeArefUseInBlock(forOp.getBody(), {});
-    if (arefUseInBlock.empty())
+    auto useInBlock = analyzeUseInBlock(forOp.getBody(), {});
+    if (useInBlock.empty())
       return;
 
     // add extra iterArgs to the forOp
     SmallVector<Value> extraIterArgs;
-    SmallVector<Value *> arefIndexRefs;
-    for (auto aref : arefUseInBlock) {
-      auto index = arefIndexMap.lookup(aref);
-      extraIterArgs.push_back(index.stage);
-      arefIndexRefs.push_back(&arefIndexMap[aref].stage);
-      if (index.phase) {
-        extraIterArgs.push_back(index.phase);
-        arefIndexRefs.push_back(&arefIndexMap[aref].phase);
-      }
+    SmallVector<Value *> stageRefs;
+    for (auto aref : useInBlock) {
+      extraIterArgs.push_back(stageMap.lookup(aref));
+      stageRefs.push_back(&stageMap[aref]);
     }
 
     // create new forOp with extra iterArgs
@@ -484,51 +295,40 @@ template <class T> struct ArefIndex<T> {
 
     // update arefIndex with iterArgs in the forOp body
     for (size_t idx = nArgs; idx < forOp.getRegionIterArgs().size(); ++idx)
-      *arefIndexRefs[idx - nArgs] = forOp.getRegionIterArgs()[idx];
+      *stageRefs[idx - nArgs] = forOp.getRegionIterArgs()[idx];
 
     // assign arefIndex in the forOp body
-    auto arefIndexMapInBlock =
-        assignArefIndexInBlock(forOp.getBody(), arefIndexMap);
+    auto stageMapInBlock = assignStageInBlock(forOp.getBody(), stageMap);
 
     // update yieldOp to return new indexes
     SmallVector<Value> extraYieldArgs;
-    for (auto aref : arefUseInBlock) {
-      auto &index = arefIndexMapInBlock[aref];
-      extraYieldArgs.push_back(index.stage);
-      if (index.phase)
-        extraYieldArgs.push_back(index.phase);
-    }
+    for (auto aref : useInBlock)
+      extraYieldArgs.push_back(stageMapInBlock[aref]);
     appendToForOpYield(forOp, extraYieldArgs);
 
-    // update arefIndex with results from newForOp
+    // update stage with results from newForOp
     for (size_t idx = nArgs; idx < forOp.getRegionIterArgs().size(); ++idx)
-      *arefIndexRefs[idx - nArgs] = forOp.getResult(idx);
+      *stageRefs[idx - nArgs] = forOp.getResult(idx);
   }
 
-  static void assignArefIndexInIfOp(scf::IfOp ifOp,
-                                    ArefIndexMap &arefIndexMap) {
+  static void assignStageInIfOp(scf::IfOp ifOp, StageMap &stageMap) {
 
     // find uses of aref in then-block
-    auto arefUseInIfOp = analyzeArefUseInBlock(ifOp.thenBlock(), {});
-    if (arefUseInIfOp.empty())
+    auto useInBlock = analyzeUseInBlock(ifOp.thenBlock(), {});
+    if (useInBlock.empty())
       return;
 
     // find uses of aref in else-block
-    arefUseInIfOp = ifOp.elseBlock()
-                        ? analyzeArefUseInBlock(ifOp.elseBlock(), arefUseInIfOp)
-                        : arefUseInIfOp;
+    useInBlock = ifOp.elseBlock()
+                     ? analyzeUseInBlock(ifOp.elseBlock(), useInBlock)
+                     : useInBlock;
 
     // add extra results to the ifOp
     SmallVector<Type> extraIfResults;
-    SmallVector<Value *> arefIndexRefs;
-    for (auto aref : arefUseInIfOp) {
-      auto index = arefIndexMap.lookup(aref);
-      extraIfResults.push_back(index.stage.getType());
-      arefIndexRefs.push_back(&arefIndexMap[aref].stage);
-      if (index.phase) {
-        extraIfResults.push_back(index.phase.getType());
-        arefIndexRefs.push_back(&arefIndexMap[aref].phase);
-      }
+    SmallVector<Value *> stageRefs;
+    for (auto aref : useInBlock) {
+      extraIfResults.push_back(stageMap.lookup(aref).getType());
+      stageRefs.push_back(&stageMap[aref]);
     }
 
     // create new ifOp with extra results
@@ -537,53 +337,43 @@ template <class T> struct ArefIndex<T> {
     auto newIfOp = replaceIfOpWithNewSignature(builder, ifOp, extraIfResults);
 
     // assign arefIndex in then-body
-    auto arefIndexInThenBlock =
-        assignArefIndexInBlock(newIfOp.thenBlock(), arefIndexMap);
+    auto stageMapInThenBlock =
+        assignStageInBlock(newIfOp.thenBlock(), stageMap);
 
     // assign arefIndex in else-body
-    auto arefIndexInElseBlock =
-        ifOp.elseBlock()
-            ? assignArefIndexInBlock(newIfOp.elseBlock(), arefIndexMap)
-            : arefIndexMap;
+    auto stageMapInElseBlock =
+        ifOp.elseBlock() ? assignStageInBlock(newIfOp.elseBlock(), stageMap)
+                         : stageMap;
 
     // update yieldOp to return new indexes
     auto thenYieldOp = newIfOp.thenYield();
     auto elseYieldOp = newIfOp.elseYield();
     // insert new indexes to the yieldOp
-    for (auto aref : arefUseInIfOp) {
-      auto &thenIndex = arefIndexInThenBlock[aref];
-      auto &elseIndex = arefIndexInElseBlock[aref];
+    for (auto aref : useInBlock) {
       thenYieldOp->insertOperands(thenYieldOp.getNumOperands(),
-                                  thenIndex.stage);
+                                  stageMapInThenBlock[aref]);
       elseYieldOp->insertOperands(elseYieldOp.getNumOperands(),
-                                  elseIndex.stage);
-      if (thenIndex.phase) {
-        thenYieldOp->insertOperands(thenYieldOp.getNumOperands(),
-                                    thenIndex.phase);
-        elseYieldOp->insertOperands(elseYieldOp.getNumOperands(),
-                                    elseIndex.phase);
-      }
+                                  stageMapInElseBlock[aref]);
     }
     ifOp.erase();
 
     // update arefIndex with results from newIfOp
     for (size_t idx = nArgs; idx < newIfOp.getResults().size(); ++idx)
-      *arefIndexRefs[idx - nArgs] = newIfOp.getResult(idx);
+      *stageRefs[idx - nArgs] = newIfOp.getResult(idx);
   }
 
-  static ArefIndexMap assignArefIndexInBlock(Block *block,
-                                             ArefIndexMap arefIndexMap) {
+  static StageMap assignStageInBlock(Block *block, StageMap stageMap) {
     for (auto &op : llvm::make_early_inc_range(*block)) {
       if (auto opT = dyn_cast<T>(op)) {
-        auto index = arefIndexMap.lookup(opT.getAref());
+        auto stage = stageMap.lookup(opT.getAref());
 
         OpBuilder builder(opT);
         builder.setInsertionPointAfter(opT);
 
         // compute next stage
-        opT.getStageMutable().assign(index.stage);
+        opT.getStageMutable().assign(stage);
         auto nextStage = builder.create<arith::AddIOp>(
-            opT.getLoc(), index.stage,
+            opT.getLoc(), stage,
             builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
         auto arefBuf = opT.getAref()
                            .template getDefiningOp<nvws::ArefCreateOp>()
@@ -594,92 +384,40 @@ template <class T> struct ArefIndex<T> {
             opT.getLoc(), arith::CmpIPredicate::eq, nextStage,
             builder.create<arith::ConstantIntOp>(opT.getLoc(), depth, 32));
         auto zero = builder.create<arith::ConstantIntOp>(opT.getLoc(), 0, 32);
-        arefIndexMap[opT.getAref()].stage =
+        stageMap[opT.getAref()] =
             builder.create<arith::SelectOp>(opT.getLoc(), cnd, zero, nextStage);
-
-        if constexpr (std::is_same_v<T, SemaphoreAcquireOp>) {
-          // if this is an enterOp, compute next phase
-          opT.getPhaseMutable().assign(index.phase);
-          auto nextPhase = builder.create<arith::XOrIOp>(
-              opT.getLoc(), index.phase,
-              builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
-          arefIndexMap[opT.getAref()].phase = builder.create<arith::SelectOp>(
-              opT.getLoc(), cnd, nextPhase, index.phase);
-        }
-
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-        assignArefIndexInForOp(forOp, arefIndexMap);
+        assignStageInForOp(forOp, stageMap);
       } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-        assignArefIndexInIfOp(ifOp, arefIndexMap);
+        assignStageInIfOp(ifOp, stageMap);
       }
     }
 
-    return arefIndexMap;
+    return stageMap;
   }
 
-  static LogicalResult run(WarpGroupOp wgOp, std::string opName) {
+  static void run(WarpGroupOp wgOp, std::string opName) {
     // Verify that all puts and gets are in the same group; otherwise, the stage
     // would need to be communicated across groups, not currently supported.
-    Region *opRegion = {};
-
-    SetVector<Value> arefs;
-    wgOp.walk([&](T op) { arefs.insert(op.getAref()); });
-    for (auto aref : arefs) {
-      for (auto user : aref.getUsers()) {
-        if (isa<T>(user)) {
-          auto [wg, idx] = getWarpGroupIdx(user);
-          auto region = &wg.getPartitionRegions()[idx];
-          if (opRegion && opRegion != region) {
-            return mlir::emitWarning(user->getLoc(),
-                                     "All " + opName +
-                                         " must be in the same warp-group");
-          }
-          opRegion = region;
-        }
-      }
-    }
-
-    ArefUseSet arefUse;
+    UseSet useSet;
     for (auto region : wgOp.getRegions()) {
       auto block = &region->getBlocks().front();
-      arefUse = analyzeArefUseInBlock(block, arefUse);
+      useSet = analyzeUseInBlock(block, useSet);
     }
 
     // initialize indexes
-    ArefIndexMap arefIndexMap;
-    for (auto aref : arefUse) {
+    StageMap stageMap;
+    for (auto aref : useSet) {
       OpBuilder builder(aref.getDefiningOp());
       builder.setInsertionPointAfter(aref.getDefiningOp());
-      arefIndexMap[aref].stage =
+      stageMap[aref] =
           builder.create<arith::ConstantIntOp>(aref.getLoc(), 0, 32);
-      if (std::is_same_v<T, SemaphoreAcquireOp>) {
-        bool isReleased = true;
-        arefIndexMap[aref].phase =
-            builder.create<arith::ConstantIntOp>(aref.getLoc(), isReleased, 32);
-      } else {
-        arefIndexMap[aref].phase = {};
-      }
     }
 
     for (auto region : wgOp.getRegions()) {
       auto block = &region->getBlocks().front();
-      assignArefIndexInBlock(block, arefIndexMap);
+      assignStageInBlock(block, stageMap);
     }
-    return success();
-  }
-};
-
-template <> struct ArefIndex<> {
-  static LogicalResult run(WarpGroupOp wgOp) {
-    if (failed(ArefIndex<ArefPutEnterOp>::run(wgOp, "ArefPutEnterOp")))
-      return failure();
-    if (failed(ArefIndex<ArefPutExitOp>::run(wgOp, "ArefPutExitOp")))
-      return failure();
-    if (failed(ArefIndex<ArefGetEnterOp>::run(wgOp, "ArefGetEnterOp")))
-      return failure();
-    if (failed(ArefIndex<ArefGetExitOp>::run(wgOp, "ArefGetExitOp")))
-      return failure();
-    return success();
   }
 };
 
@@ -696,10 +434,12 @@ public:
     SmallVector<WarpGroupOp> wgOps;
     m.walk([&](WarpGroupOp wgOp) { wgOps.push_back(wgOp); });
     for (auto wgOp : wgOps) {
-      if (failed(ArefIndex<>::run(wgOp)))
-        signalPassFailure();
+      ArefStage<ArefPutEnterOp>::run(wgOp, "ArefPutEnterOp");
+      ArefStage<ArefPutExitOp>::run(wgOp, "ArefPutExitOp");
+      ArefStage<ArefGetEnterOp>::run(wgOp, "ArefGetEnterOp");
+      ArefStage<ArefGetExitOp>::run(wgOp, "ArefGetExitOp");
     }
-    LLVM_DEBUG(llvm::dbgs() << "After arefIndexAssignment\n" << m << "\n");
+    LLVM_DEBUG(llvm::dbgs() << "After ArefStageAssignment\n" << m << "\n");
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<LowerArefCreate>(context);

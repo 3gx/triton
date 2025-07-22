@@ -51,7 +51,7 @@ using namespace mlir::triton::nvws;
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
-#if 1
+#if 0
 #define MULTIPHASE
 #endif
 
