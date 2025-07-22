@@ -148,7 +148,7 @@ void lowerAsyncLoads(ArefPutEnterOp op, PatternRewriter &rewriter,
   assert(arefPutExitOp.getAref() == op.getAref() &&
          "Expecting matching Aref on the ArefPutExitOp");
 
-#if 0 
+#if 0
 Value fullBarrier =
       getFullBarrier(rewriter, loc, arefVal, arefPutExitOp.getStage());
   Value pred = rewriter.create<arith::ConstantIntOp>(loc, 1, 1);
