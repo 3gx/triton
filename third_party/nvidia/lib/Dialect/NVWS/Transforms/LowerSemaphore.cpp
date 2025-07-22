@@ -137,6 +137,8 @@ void rewriteAcquireOp(SemaphoreCreateOp semaphoreOp, SemaphoreAcquireOp op,
   rewriter.setInsertionPointAfter(op);
   auto mbar = createSingleBufferView(rewriter, mbars, op.getStage());
 #ifdef MULTIPHASE
+  // extract phase for a given stage from the phase bit-vector
+  // phase = (phase >> stage) & 1
   Value phaseBit =
       rewriter.create<arith::ShRSIOp>(loc, op.getPhase(), op.getStage());
   phaseBit = rewriter.create<arith::AndIOp>(
@@ -324,6 +326,8 @@ PhaseMap assignInBlock(Block *block, PhaseMap phaseMap) {
         users.push_back(user);
       assert(!users.empty());
       auto user = users.back();
+      // the phase is a bit-vector, each bit for each stage
+      // next_phase = phase ^ (1 << stage)
       auto phaseBit = builder.create<arith::ShLIOp>(
           opT.getLoc(),
           builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32),
