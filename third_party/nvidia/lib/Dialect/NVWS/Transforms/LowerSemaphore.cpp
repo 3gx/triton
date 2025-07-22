@@ -140,7 +140,13 @@ void rewriteAcquireOp(SemaphoreCreateOp semaphoreOp, SemaphoreAcquireOp op,
   auto loc = op.getLoc();
   rewriter.setInsertionPointAfter(op);
   auto mbar = createSingleBufferView(rewriter, mbars, op.getStage());
-  rewriter.create<WaitBarrierOp>(loc, mbar, op.getPhase());
+  Value phaseBit =
+      rewriter.create<arith::ShRSIOp>(loc, op.getPhase(), op.getStage());
+#if 0
+  phaseBit = rewriter.create<arith::AndIOp>(
+      loc, phaseBit, rewriter.create<arith::ConstantIntOp>(loc, 1, 32));
+#endif
+  rewriter.create<WaitBarrierOp>(loc, mbar, phaseBit);
 }
 
 void rewriteReleaseOp(SemaphoreCreateOp semaphoreOp, SemaphoreReleaseOp op,
@@ -363,21 +369,30 @@ template <class T> struct AssignIndex<T> {
         //     builder.create<arith::SelectOp>(opT.getLoc(), cnd, zero,
         //     nextStage);
 
-//        if constexpr (std::is_same_v<T, SemaphoreAcquireOp>) {
-          auto depth = *opT.getSemaphore().getType().getNumStages();
+#if 0
+        //        if constexpr (std::is_same_v<T, SemaphoreAcquireOp>) {
+        auto depth = *opT.getSemaphore().getType().getNumStages();
 
-          // if this is an enterOp, compute next phase
-          opT.getPhaseMutable().assign(index.phase);
-          auto nextPhase = builder.create<arith::XOrIOp>(
-              opT.getLoc(), index.phase,
-              builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
-          auto cnd = builder.create<arith::CmpIOp>(
-              opT.getLoc(), arith::CmpIPredicate::eq, opT.getStage(),
-              builder.create<arith::ConstantIntOp>(opT.getLoc(), depth - 1,
-                                                   32));
-          indexMap[opT.getOperand(0)].phase = builder.create<arith::SelectOp>(
-              opT.getLoc(), cnd, nextPhase, index.phase);
- //       }
+        // if this is an enterOp, compute next phase
+        opT.getPhaseMutable().assign(index.phase);
+        auto nextPhase = builder.create<arith::XOrIOp>(
+            opT.getLoc(), index.phase,
+            builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
+        auto cnd = builder.create<arith::CmpIOp>(
+            opT.getLoc(), arith::CmpIPredicate::eq, opT.getStage(),
+            builder.create<arith::ConstantIntOp>(opT.getLoc(), depth - 1, 32));
+        indexMap[opT.getOperand(0)].phase = builder.create<arith::SelectOp>(
+            opT.getLoc(), cnd, nextPhase, index.phase);
+        //       }
+#else
+        opT.getPhaseMutable().assign(index.phase);
+        auto phaseBit = builder.create<arith::ShLIOp>(
+            opT.getLoc(),
+            builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32),
+            opT.getStage());
+        indexMap[opT.getOperand(0)].phase =
+            builder.create<arith::XOrIOp>(opT.getLoc(), index.phase, phaseBit);
+#endif
 
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
         assignInForOp(forOp, indexMap);
@@ -430,7 +445,7 @@ template <class T> struct AssignIndex<T> {
         assert(semaOp);
         bool isReleased = semaOp.getIsReleased();
         indexMap[anchor].phase = builder.create<arith::ConstantIntOp>(
-            anchor.getLoc(), isReleased, 32);
+            anchor.getLoc(), isReleased ? 0xFFFFFFFF : 0x00000000, 32);
       } else {
         assert(0);
         indexMap[anchor].phase = {};
