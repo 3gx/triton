@@ -131,11 +131,9 @@ Value createAndInitMbar(SemaphoreCreateOp op, PatternRewriter &rewriter) {
   auto dLoop = rewriter.create<scf::ForOp>(loc, lb, ub, step);
   rewriter.setInsertionPointToStart(dLoop.getBody());
 
-  for (int i = 0; i < 2; ++i) {
-    auto singleBarrier =
-        createSingleBufferView(rewriter, mbars, dLoop.getInductionVar());
-    rewriter.create<InitBarrierOp>(loc, singleBarrier, pendingCount);
-  }
+  auto singleBarrier =
+      createSingleBufferView(rewriter, mbars, dLoop.getInductionVar());
+  rewriter.create<InitBarrierOp>(loc, singleBarrier, pendingCount);
   return mbars;
 }
 
