@@ -59,9 +59,10 @@ def NVWS_SemaphoreAcquireOp : NVWS_Op<"sem.acquire"> {
 def NVWS_SemaphoreReleaseOp : NVWS_Op<"sem.release"> {
   let summary = "release a semaphore";
   let arguments = (ins NVWS_SemaphoreType:$semaphore,
-                       I32:$stage);
+                       I32:$stage,
+                       NVWS_AsyncOpArrayAttr:$async_ops);
   let assemblyFormat = [{
-    $semaphore `[` $stage `]` attr-dict `:` type($semaphore)
+    $semaphore `[` $stage `]` $async_ops attr-dict `:` type($semaphore)
   }];
 }
 
