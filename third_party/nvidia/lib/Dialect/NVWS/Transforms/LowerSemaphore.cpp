@@ -386,12 +386,21 @@ template <class T> struct AssignIndex<T> {
         //       }
 #else
         opT.getPhaseMutable().assign(index.phase);
-        auto phaseBit = builder.create<arith::ShLIOp>(
-            opT.getLoc(),
-            builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32),
-            opT.getStage());
-        indexMap[opT.getOperand(0)].phase =
-            builder.create<arith::XOrIOp>(opT.getLoc(), index.phase, phaseBit);
+        SmallVector<Operation *> users;
+        for (auto user : opT.getStage().getUsers())
+          users.push_back(user);
+        assert(!users.empty());
+        auto user = users.back();
+        for (auto user : users) {
+          // OpBuilder::InsertionGuard guard(builder);
+          // builder.setInsertionPoint(user);
+          auto phaseBit = builder.create<arith::ShLIOp>(
+              opT.getLoc(),
+              builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32),
+              opT.getStage());
+          indexMap[opT.getOperand(0)].phase = builder.create<arith::XOrIOp>(
+              opT.getLoc(), index.phase, phaseBit);
+        }
 #endif
 
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
