@@ -245,7 +245,7 @@ public:
 
 // ----------------------------------------------------------------------------
 template <class T> struct ArefStage {
-  using StageMap = llvm::MapVector<Value /*aref*/, Value>;
+  using StageMap = llvm::MapVector<Value /*aref*/, Value /*stage*/>;
   using UseSet = llvm::SetVector<Value /*aref*/>;
 
   static UseSet analyzeUseInBlock(Block *block, UseSet useSet) {

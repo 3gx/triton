@@ -203,11 +203,11 @@ public:
 };
 
 namespace AssignPhase {
-using PhaseMap = llvm::MapVector<Value, Value>;
-using UseSet = llvm::SetVector<Value>;
+using PhaseMap = llvm::MapVector<Value /*semaphore*/, Value /*phase*/>;
+using UseSet = llvm::SetVector<Value /*semaphore*/>;
 static PhaseMap assignInBlock(Block *block, PhaseMap phaseMap);
 
-static UseSet analyzeUseInBlock(Block *block, UseSet useSet) {
+UseSet analyzeUseInBlock(Block *block, UseSet useSet) {
   for (auto &op : *block) {
     if (auto opT = dyn_cast<SemaphoreAcquireOp>(op)) {
       useSet.insert(opT.getOperand(0));
@@ -222,7 +222,7 @@ static UseSet analyzeUseInBlock(Block *block, UseSet useSet) {
   return useSet;
 }
 
-static void assignInForOp(scf::ForOp forOp, PhaseMap &phaseMap) {
+void assignInForOp(scf::ForOp forOp, PhaseMap &phaseMap) {
 
   // find uses of xops in forOp body
   auto useInBlock = analyzeUseInBlock(forOp.getBody(), {});
@@ -260,7 +260,7 @@ static void assignInForOp(scf::ForOp forOp, PhaseMap &phaseMap) {
     *indexRefs[idx - nArgs] = forOp.getResult(idx);
 }
 
-static void assignInIfOp(scf::IfOp ifOp, PhaseMap &phaseMap) {
+void assignInIfOp(scf::IfOp ifOp, PhaseMap &phaseMap) {
 
   // find uses of xops in then-block
   auto useInIfOp = analyzeUseInBlock(ifOp.thenBlock(), {});
@@ -309,7 +309,7 @@ static void assignInIfOp(scf::IfOp ifOp, PhaseMap &phaseMap) {
     *phaseRefs[idx - nArgs] = newIfOp.getResult(idx);
 }
 
-static PhaseMap assignInBlock(Block *block, PhaseMap phaseMap) {
+PhaseMap assignInBlock(Block *block, PhaseMap phaseMap) {
   for (auto &op : llvm::make_early_inc_range(*block)) {
     if (auto opT = dyn_cast<SemaphoreAcquireOp>(op)) {
       auto phase = phaseMap.lookup(opT.getOperand(0));
@@ -379,7 +379,7 @@ static PhaseMap assignInBlock(Block *block, PhaseMap phaseMap) {
   return phaseMap;
 }
 
-static void run(WarpGroupOp wgOp) {
+void run(WarpGroupOp wgOp) {
   UseSet useSet;
   for (auto region : wgOp.getRegions()) {
     auto block = &region->getBlocks().front();
