@@ -62,7 +62,7 @@ def NVWS_SemaphoreReleaseOp : NVWS_Op<"sem.release"> {
                        I32:$stage,
                        NVWS_AsyncOpArrayAttr:$async_ops);
   let assemblyFormat = [{
-    $semaphore `[` $stage `]` $async_ops attr-dict `:` type($semaphore)
+    $semaphore `[` $stage `]` attr-dict `:` type($semaphore)
   }];
 }
 

@@ -236,7 +236,8 @@ void lowerAsyncLoads(ArefPutEnterOp op, PatternRewriter &rewriter,
   //   %bufs:n = aref_put.enter %aref[%enter_idx] {aref_tag = tag}
   //   tma_load %bufs[0]
   //   ..
-  //   tma_load %bufs[n-1]
+  //   tma_load %bufs[n-1p
+
   //   aref_put.exit %aref[%exit_idx] {aref_tag = tag}
 
   // locate the matching aref_put.exit with the same tag, to get full barrier
@@ -262,6 +263,15 @@ void lowerAsyncLoads(ArefPutEnterOp op, PatternRewriter &rewriter,
   return;
 }
 
+Value getPhase(OpBuilder &rewriter, Value phase, Value stage) {
+  Value phaseBit =
+      rewriter.create<arith::ShRSIOp>(phase.getLoc(), phase, stage);
+      return phaseBit;
+  return rewriter.create<arith::AndIOp>(
+      phase.getLoc(), phaseBit,
+      rewriter.create<arith::ConstantIntOp>(phase.getLoc(), 1, 32));
+}
+
 LogicalResult rewritePutEnterOp(ArefCreateOp arefOp, ArefPutEnterOp op,
                                 PatternRewriter &rewriter, ArefValue arefVal) {
   auto loc = op.getLoc();
@@ -270,7 +280,8 @@ LogicalResult rewritePutEnterOp(ArefCreateOp arefOp, ArefPutEnterOp op,
   // get empty barrier at a given stage
   Value emptyBarrier = getEmptyBarrier(rewriter, loc, arefVal, op.getStage());
 
-  rewriter.create<WaitBarrierOp>(loc, emptyBarrier, op.getPhase());
+  rewriter.create<WaitBarrierOp>(
+      loc, emptyBarrier, getPhase(rewriter, op.getPhase(), op.getStage()));
   auto views = getSubViews(arefVal, op.getStage(), loc, rewriter);
   assert(views.size() == op.getResults().size());
 
@@ -291,7 +302,8 @@ LogicalResult rewriteGetEnterOp(ArefCreateOp arefOp, ArefGetEnterOp op,
   rewriter.setInsertionPointAfter(op);
 
   Value fullBarrier = getFullBarrier(rewriter, loc, arefVal, op.getStage());
-  rewriter.create<WaitBarrierOp>(loc, fullBarrier, op.getPhase());
+  rewriter.create<WaitBarrierOp>(
+      loc, fullBarrier, getPhase(rewriter, op.getPhase(), op.getStage()));
   auto views = getSubViews(arefVal, op.getStage(), loc, rewriter);
   assert(views.size() == op.getResults().size());
 
@@ -554,11 +566,13 @@ template <class T> struct ArefIndex<T> {
         if (index.phase) {
           // if this is an enterOp, compute next phase
           opT->setOperand(2, index.phase);
-          auto nextPhase = builder.create<arith::XOrIOp>(
-              opT.getLoc(), index.phase,
-              builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
-          arefIndexMap[opT.getAref()].phase = builder.create<arith::SelectOp>(
-              opT.getLoc(), cnd, nextPhase, index.phase);
+          auto phaseBit = builder.create<arith::ShLIOp>(
+              opT.getLoc(),
+              builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32),
+              index.stage);
+          auto nextPhase = builder.create<arith::XOrIOp>(opT.getLoc(),
+                                                         index.phase, phaseBit);
+          arefIndexMap[opT.getAref()].phase = nextPhase;
         }
 
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
@@ -608,10 +622,10 @@ template <class T> struct ArefIndex<T> {
           builder.create<arith::ConstantIntOp>(aref.getLoc(), 0, 32);
       if (std::is_same_v<T, ArefPutEnterOp>) {
         arefIndexMap[aref].phase =
-            builder.create<arith::ConstantIntOp>(aref.getLoc(), 1, 32);
+            builder.create<arith::ConstantIntOp>(aref.getLoc(), 0xFFFFFFFF, 32);
       } else if (std::is_same_v<T, ArefGetEnterOp>) {
         arefIndexMap[aref].phase =
-            builder.create<arith::ConstantIntOp>(aref.getLoc(), 0, 32);
+            builder.create<arith::ConstantIntOp>(aref.getLoc(), 0x00000000, 32);
       } else {
         arefIndexMap[aref].phase = {};
       }
