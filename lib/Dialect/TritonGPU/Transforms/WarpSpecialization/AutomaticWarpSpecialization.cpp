@@ -45,7 +45,6 @@ void AutomaticWarpSpecialization::runOnOperation() {
   pm.addPass(createTritonGPUPartitionLoops());
   pm.addPass(createNVWSLowerAref());
   pm.addPass(createNVWSLowerSemaphore());
-  pm.addPass(createCSEPass());
   pm.addPass(createNVWSLowerWarpGroup());
   if (failed(runPipeline(pm, getOperation())))
     return signalPassFailure();

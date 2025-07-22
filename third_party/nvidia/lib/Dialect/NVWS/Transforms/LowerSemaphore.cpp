@@ -51,6 +51,10 @@ using namespace mlir::triton::nvws;
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+#if 1
+#define MULTIPHASE
+#endif
+
 namespace mlir {
 namespace triton {
 
@@ -140,11 +144,15 @@ void rewriteAcquireOp(SemaphoreCreateOp semaphoreOp, SemaphoreAcquireOp op,
   auto loc = op.getLoc();
   rewriter.setInsertionPointAfter(op);
   auto mbar = createSingleBufferView(rewriter, mbars, op.getStage());
+#ifdef MULTIPHASE
   Value phaseBit =
       rewriter.create<arith::ShRSIOp>(loc, op.getPhase(), op.getStage());
 #if 0
   phaseBit = rewriter.create<arith::AndIOp>(
       loc, phaseBit, rewriter.create<arith::ConstantIntOp>(loc, 1, 32));
+#endif
+#else
+  Value phaseBit = op.getPhase();
 #endif
   rewriter.create<WaitBarrierOp>(loc, mbar, phaseBit);
 }
@@ -369,22 +377,23 @@ template <class T> struct AssignIndex<T> {
         //     builder.create<arith::SelectOp>(opT.getLoc(), cnd, zero,
         //     nextStage);
 
-#if 0
-        //        if constexpr (std::is_same_v<T, SemaphoreAcquireOp>) {
-        auto depth = *opT.getSemaphore().getType().getNumStages();
+// #if 0
+//         //        if constexpr (std::is_same_v<T, SemaphoreAcquireOp>) {
+//         auto depth = *opT.getSemaphore().getType().getNumStages();
 
-        // if this is an enterOp, compute next phase
-        opT.getPhaseMutable().assign(index.phase);
-        auto nextPhase = builder.create<arith::XOrIOp>(
-            opT.getLoc(), index.phase,
-            builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
-        auto cnd = builder.create<arith::CmpIOp>(
-            opT.getLoc(), arith::CmpIPredicate::eq, opT.getStage(),
-            builder.create<arith::ConstantIntOp>(opT.getLoc(), depth - 1, 32));
-        indexMap[opT.getOperand(0)].phase = builder.create<arith::SelectOp>(
-            opT.getLoc(), cnd, nextPhase, index.phase);
-        //       }
-#elif 0
+//         // if this is an enterOp, compute next phase
+//         opT.getPhaseMutable().assign(index.phase);
+//         auto nextPhase = builder.create<arith::XOrIOp>(
+//             opT.getLoc(), index.phase,
+//             builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
+//         auto cnd = builder.create<arith::CmpIOp>(
+//             opT.getLoc(), arith::CmpIPredicate::eq, opT.getStage(),
+//             builder.create<arith::ConstantIntOp>(opT.getLoc(), depth - 1,
+//             32));
+//         indexMap[opT.getOperand(0)].phase = builder.create<arith::SelectOp>(
+//             opT.getLoc(), cnd, nextPhase, index.phase);
+//         //       }
+#ifndef MULTIPHASE
         opT.getPhaseMutable().assign(index.phase);
 
         Operation *addi = {};
@@ -395,21 +404,33 @@ template <class T> struct AssignIndex<T> {
           }
         }
         assert(addi);
-        Operation *cmp = {};
+        Operation *cnd = {};
         for (auto user : addi->getUsers()) {
           if (isa<arith::CmpIOp>(user)) {
-            assert(!cmp);
-            cmp = user;
+            assert(!cnd);
+            cnd = user;
           }
         }
-        assert(cmp);
+        assert(cnd);
+        Operation *select = {};
+        for (auto user : cnd->getUsers()) {
+          if (isa<arith::SelectOp>(user)) {
+            assert(!select);
+            select = user;
+          }
+        }
+        assert(select);
         {
           OpBuilder::InsertionGuard guard(builder);
-          builder.setInsertionPointAfter(cmp);
+          builder.setInsertionPointAfter(select);
+          auto nextPhase = builder.create<arith::XOrIOp>(
+              opT.getLoc(), index.phase,
+              builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
+          indexMap[opT.getOperand(0)].phase = builder.create<arith::SelectOp>(
+              opT.getLoc(), cnd->getResult(0), nextPhase, index.phase);
         }
 
 #else
-#define MULTIPHASE
         opT.getPhaseMutable().assign(index.phase);
         SmallVector<Operation *> users;
         for (auto user : opT.getStage().getUsers())
