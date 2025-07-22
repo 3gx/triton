@@ -384,23 +384,44 @@ template <class T> struct AssignIndex<T> {
         indexMap[opT.getOperand(0)].phase = builder.create<arith::SelectOp>(
             opT.getLoc(), cnd, nextPhase, index.phase);
         //       }
+#elif 0
+        opT.getPhaseMutable().assign(index.phase);
+
+        Operation *addi = {};
+        for (auto user : opT.getStage().getUsers()) {
+          if (isa<arith::AddIOp>(user)) {
+            assert(!addi);
+            addi = user;
+          }
+        }
+        assert(addi);
+        Operation *cmp = {};
+        for (auto user : addi->getUsers()) {
+          if (isa<arith::CmpIOp>(user)) {
+            assert(!cmp);
+            cmp = user;
+          }
+        }
+        assert(cmp);
+        {
+          OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointAfter(cmp);
+        }
+
 #else
+#define MULTIPHASE
         opT.getPhaseMutable().assign(index.phase);
         SmallVector<Operation *> users;
         for (auto user : opT.getStage().getUsers())
           users.push_back(user);
         assert(!users.empty());
         auto user = users.back();
-        for (auto user : users) {
-          // OpBuilder::InsertionGuard guard(builder);
-          // builder.setInsertionPoint(user);
-          auto phaseBit = builder.create<arith::ShLIOp>(
-              opT.getLoc(),
-              builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32),
-              opT.getStage());
-          indexMap[opT.getOperand(0)].phase = builder.create<arith::XOrIOp>(
-              opT.getLoc(), index.phase, phaseBit);
-        }
+        auto phaseBit = builder.create<arith::ShLIOp>(
+            opT.getLoc(),
+            builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32),
+            opT.getStage());
+        indexMap[opT.getOperand(0)].phase =
+            builder.create<arith::XOrIOp>(opT.getLoc(), index.phase, phaseBit);
 #endif
 
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
@@ -453,8 +474,13 @@ template <class T> struct AssignIndex<T> {
         auto semaOp = anchor.getDefiningOp<SemaphoreCreateOp>();
         assert(semaOp);
         bool isReleased = semaOp.getIsReleased();
+#ifdef MULTIPHASE
         indexMap[anchor].phase = builder.create<arith::ConstantIntOp>(
             anchor.getLoc(), isReleased ? 0xFFFFFFFF : 0x00000000, 32);
+#else
+        indexMap[anchor].phase = builder.create<arith::ConstantIntOp>(
+            anchor.getLoc(), isReleased ? 1 : 0, 32);
+#endif
       } else {
         assert(0);
         indexMap[anchor].phase = {};
