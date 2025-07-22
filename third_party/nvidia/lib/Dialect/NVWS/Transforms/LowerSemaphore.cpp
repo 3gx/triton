@@ -139,10 +139,8 @@ void rewriteAcquireOp(SemaphoreCreateOp semaphoreOp, SemaphoreAcquireOp op,
 #ifdef MULTIPHASE
   Value phaseBit =
       rewriter.create<arith::ShRSIOp>(loc, op.getPhase(), op.getStage());
-#if 1
   phaseBit = rewriter.create<arith::AndIOp>(
       loc, phaseBit, rewriter.create<arith::ConstantIntOp>(loc, 1, 32));
-#endif
 #else
   Value phaseBit = op.getPhase();
 #endif
@@ -204,326 +202,213 @@ public:
   }
 };
 
-template <class... Ts> struct AssignIndex;
-template <class T> struct AssignIndex<T> {
-  struct Index {
-    // Having stage and phase as separate values, rather than encoding them
-    // into a single index, results in better performance. Same approach is used
-    // in CUTLASS and CUTEDSL, and this may allow PTXAS to better optimize code.
-    // Value stage;
-    Value phase;
-  };
-  using IndexMap = llvm::MapVector<Value, Index>;
-  using UseSet = llvm::SetVector<Value>;
+namespace AssignPhase {
+using PhaseMap = llvm::MapVector<Value, Value>;
+using UseSet = llvm::SetVector<Value>;
+static PhaseMap assignInBlock(Block *block, PhaseMap phaseMap);
 
-  static UseSet analyzeUseInBlock(Block *block, UseSet useSet) {
-    for (auto &op : *block) {
-      if (auto opT = dyn_cast<T>(op)) {
-        useSet.insert(opT.getOperand(0));
-      } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-        useSet = analyzeUseInBlock(forOp.getBody(), useSet);
-      } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-        useSet = analyzeUseInBlock(ifOp.thenBlock(), useSet);
-        if (ifOp.elseBlock())
-          useSet = analyzeUseInBlock(ifOp.elseBlock(), useSet);
-      }
+static UseSet analyzeUseInBlock(Block *block, UseSet useSet) {
+  for (auto &op : *block) {
+    if (auto opT = dyn_cast<SemaphoreAcquireOp>(op)) {
+      useSet.insert(opT.getOperand(0));
+    } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      useSet = analyzeUseInBlock(forOp.getBody(), useSet);
+    } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      useSet = analyzeUseInBlock(ifOp.thenBlock(), useSet);
+      if (ifOp.elseBlock())
+        useSet = analyzeUseInBlock(ifOp.elseBlock(), useSet);
     }
-    return useSet;
+  }
+  return useSet;
+}
+
+static void assignInForOp(scf::ForOp forOp, PhaseMap &phaseMap) {
+
+  // find uses of xops in forOp body
+  auto useInBlock = analyzeUseInBlock(forOp.getBody(), {});
+  if (useInBlock.empty())
+    return;
+
+  // add extra iterArgs to the forOp
+  SmallVector<Value> extraIterArgs;
+  SmallVector<Value *> indexRefs;
+  for (auto sema : useInBlock) {
+    extraIterArgs.push_back(phaseMap.lookup(sema));
+    indexRefs.push_back(&phaseMap[sema]);
   }
 
-  static void assignInForOp(scf::ForOp forOp, IndexMap &indexMap) {
+  // create new forOp with extra iterArgs
+  OpBuilder builder(forOp);
+  size_t nArgs = forOp.getRegionIterArgs().size();
+  forOp = addIterArgsToLoop(builder, forOp, extraIterArgs);
 
-    // find uses of xops in forOp body
-    auto useInBlock = analyzeUseInBlock(forOp.getBody(), {});
-    if (useInBlock.empty())
-      return;
+  // update index with iterArgs in the forOp body
+  for (size_t idx = nArgs; idx < forOp.getRegionIterArgs().size(); ++idx)
+    *indexRefs[idx - nArgs] = forOp.getRegionIterArgs()[idx];
 
-    // add extra iterArgs to the forOp
-    SmallVector<Value> extraIterArgs;
-    SmallVector<Value *> indexRefs;
-    for (auto sema : useInBlock) {
-      auto index = indexMap.lookup(sema);
-      // extraIterArgs.push_back(index.stage);
-      // indexRefs.push_back(&indexMap[sema].stage);
-      if (index.phase) {
-        extraIterArgs.push_back(index.phase);
-        indexRefs.push_back(&indexMap[sema].phase);
-      }
-    }
+  // assign index in the forOp body
+  auto phaseMapInBlock = assignInBlock(forOp.getBody(), phaseMap);
 
-    // create new forOp with extra iterArgs
-    OpBuilder builder(forOp);
-    size_t nArgs = forOp.getRegionIterArgs().size();
-    forOp = addIterArgsToLoop(builder, forOp, extraIterArgs);
+  // update yieldOp to return new indexes
+  SmallVector<Value> extraYieldArgs;
+  for (auto sema : useInBlock)
+    extraYieldArgs.push_back(phaseMapInBlock[sema]);
+  appendToForOpYield(forOp, extraYieldArgs);
 
-    // update index with iterArgs in the forOp body
-    for (size_t idx = nArgs; idx < forOp.getRegionIterArgs().size(); ++idx)
-      *indexRefs[idx - nArgs] = forOp.getRegionIterArgs()[idx];
+  // update index with results from newForOp
+  for (size_t idx = nArgs; idx < forOp.getRegionIterArgs().size(); ++idx)
+    *indexRefs[idx - nArgs] = forOp.getResult(idx);
+}
 
-    // assign index in the forOp body
-    auto indexMapInBlock = assignInBlock(forOp.getBody(), indexMap);
+static void assignInIfOp(scf::IfOp ifOp, PhaseMap &phaseMap) {
 
-    // update yieldOp to return new indexes
-    SmallVector<Value> extraYieldArgs;
-    for (auto sema : useInBlock) {
-      auto &index = indexMapInBlock[sema];
-      // extraYieldArgs.push_back(index.stage);
-      if (index.phase)
-        extraYieldArgs.push_back(index.phase);
-    }
-    appendToForOpYield(forOp, extraYieldArgs);
+  // find uses of xops in then-block
+  auto useInIfOp = analyzeUseInBlock(ifOp.thenBlock(), {});
+  if (useInIfOp.empty())
+    return;
 
-    // update index with results from newForOp
-    for (size_t idx = nArgs; idx < forOp.getRegionIterArgs().size(); ++idx)
-      *indexRefs[idx - nArgs] = forOp.getResult(idx);
+  // find uses of xops in else-block
+  useInIfOp = ifOp.elseBlock() ? analyzeUseInBlock(ifOp.elseBlock(), useInIfOp)
+                               : useInIfOp;
+
+  // add extra results to the ifOp
+  SmallVector<Type> extraIfResults;
+  SmallVector<Value *> phaseRefs;
+  for (auto sema : useInIfOp) {
+    extraIfResults.push_back(phaseMap.lookup(sema).getType());
+    phaseRefs.push_back(&phaseMap[sema]);
   }
 
-  static void assignInIfOp(scf::IfOp ifOp, IndexMap &indexMap) {
+  // create new ifOp with extra results
+  OpBuilder builder(ifOp);
+  size_t nArgs = ifOp.getResults().size();
+  auto newIfOp = replaceIfOpWithNewSignature(builder, ifOp, extraIfResults);
 
-    // find uses of xops in then-block
-    auto useInIfOp = analyzeUseInBlock(ifOp.thenBlock(), {});
-    if (useInIfOp.empty())
-      return;
+  // assign index in then-body
+  auto phaseInThenBlock = assignInBlock(newIfOp.thenBlock(), phaseMap);
 
-    // find uses of xops in else-block
-    useInIfOp = ifOp.elseBlock()
-                    ? analyzeUseInBlock(ifOp.elseBlock(), useInIfOp)
-                    : useInIfOp;
+  // assign index in else-body
+  auto phaseInElseBlock = ifOp.elseBlock()
+                              ? assignInBlock(newIfOp.elseBlock(), phaseMap)
+                              : phaseMap;
 
-    // add extra results to the ifOp
-    SmallVector<Type> extraIfResults;
-    SmallVector<Value *> indexRefs;
-    for (auto sema : useInIfOp) {
-      auto index = indexMap.lookup(sema);
-      // extraIfResults.push_back(index.stage.getType());
-      // indexRefs.push_back(&indexMap[sema].stage);
-      if (index.phase) {
-        extraIfResults.push_back(index.phase.getType());
-        indexRefs.push_back(&indexMap[sema].phase);
-      }
-    }
-
-    // create new ifOp with extra results
-    OpBuilder builder(ifOp);
-    size_t nArgs = ifOp.getResults().size();
-    auto newIfOp = replaceIfOpWithNewSignature(builder, ifOp, extraIfResults);
-
-    // assign index in then-body
-    auto indexInThenBlock = assignInBlock(newIfOp.thenBlock(), indexMap);
-
-    // assign index in else-body
-    auto indexInElseBlock = ifOp.elseBlock()
-                                ? assignInBlock(newIfOp.elseBlock(), indexMap)
-                                : indexMap;
-
-    // update yieldOp to return new indexes
-    auto thenYieldOp = newIfOp.thenYield();
-    auto elseYieldOp = newIfOp.elseYield();
-    // insert new indexes to the yieldOp
-    for (auto sema : useInIfOp) {
-      auto &thenIndex = indexInThenBlock[sema];
-      auto &elseIndex = indexInElseBlock[sema];
-      // thenYieldOp->insertOperands(thenYieldOp.getNumOperands(),
-      //                             thenIndex.stage);
-      // elseYieldOp->insertOperands(elseYieldOp.getNumOperands(),
-      //                             elseIndex.stage);
-      if (thenIndex.phase) {
-        thenYieldOp->insertOperands(thenYieldOp.getNumOperands(),
-                                    thenIndex.phase);
-        elseYieldOp->insertOperands(elseYieldOp.getNumOperands(),
-                                    elseIndex.phase);
-      }
-    }
-    ifOp.erase();
-
-    // update index with results from newIfOp
-    for (size_t idx = nArgs; idx < newIfOp.getResults().size(); ++idx)
-      *indexRefs[idx - nArgs] = newIfOp.getResult(idx);
+  // update yieldOp to return new indexes
+  auto thenYieldOp = newIfOp.thenYield();
+  auto elseYieldOp = newIfOp.elseYield();
+  // insert new indexes to the yieldOp
+  for (auto sema : useInIfOp) {
+    thenYieldOp->insertOperands(thenYieldOp.getNumOperands(),
+                                phaseInThenBlock[sema]);
+    elseYieldOp->insertOperands(elseYieldOp.getNumOperands(),
+                                phaseInElseBlock[sema]);
   }
+  ifOp.erase();
 
-  static IndexMap assignInBlock(Block *block, IndexMap indexMap) {
-    for (auto &op : llvm::make_early_inc_range(*block)) {
-      if (auto opT = dyn_cast<T>(op)) {
-        auto index = indexMap.lookup(opT.getOperand(0));
+  // update index with results from newIfOp
+  for (size_t idx = nArgs; idx < newIfOp.getResults().size(); ++idx)
+    *phaseRefs[idx - nArgs] = newIfOp.getResult(idx);
+}
 
-        OpBuilder builder(opT);
-        builder.setInsertionPointAfter(opT);
+static PhaseMap assignInBlock(Block *block, PhaseMap phaseMap) {
+  for (auto &op : llvm::make_early_inc_range(*block)) {
+    if (auto opT = dyn_cast<SemaphoreAcquireOp>(op)) {
+      auto phase = phaseMap.lookup(opT.getOperand(0));
 
-        // compute next stageG
-        // opT.getStageMutable().assign(index.stage);
-        // auto nextStage = builder.create<arith::AddIOp>(
-        //     opT.getLoc(), index.stage,
-        //     builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
-        // // auto arefBuf = opT.getAref()
-        // //                    .template getDefiningOp<nvws::ArefCreateOp>()
-        // //                    .getOperand(0);
-        // auto depth = *opT.getSemaphore().getType().getNumStages();
-        // //            depth 2; //
-        // // cast<MemDescType>(arefBuf.getType()).getShape().front();
+      OpBuilder builder(opT);
+      builder.setInsertionPointAfter(opT);
 
-        // auto cnd = builder.create<arith::CmpIOp>(
-        //     opT.getLoc(), arith::CmpIPredicate::eq, nextStage,
-        //     builder.create<arith::ConstantIntOp>(opT.getLoc(), depth, 32));
-        // auto zero = builder.create<arith::ConstantIntOp>(opT.getLoc(), 0,
-        // 32); indexMap[opT.getOperand(0)].stage =
-        //     builder.create<arith::SelectOp>(opT.getLoc(), cnd, zero,
-        //     nextStage);
-
-// #if 0
-//         //        if constexpr (std::is_same_v<T, SemaphoreAcquireOp>) {
-//         auto depth = *opT.getSemaphore().getType().getNumStages();
-
-//         // if this is an enterOp, compute next phase
-//         opT.getPhaseMutable().assign(index.phase);
-//         auto nextPhase = builder.create<arith::XOrIOp>(
-//             opT.getLoc(), index.phase,
-//             builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
-//         auto cnd = builder.create<arith::CmpIOp>(
-//             opT.getLoc(), arith::CmpIPredicate::eq, opT.getStage(),
-//             builder.create<arith::ConstantIntOp>(opT.getLoc(), depth - 1,
-//             32));
-//         indexMap[opT.getOperand(0)].phase = builder.create<arith::SelectOp>(
-//             opT.getLoc(), cnd, nextPhase, index.phase);
-//         //       }
 #ifndef MULTIPHASE
-        opT.getPhaseMutable().assign(index.phase);
+      opT.getPhaseMutable().assign(index.phase);
 
-        Operation *addi = {};
-        for (auto user : opT.getStage().getUsers()) {
-          if (isa<arith::AddIOp>(user)) {
-            assert(!addi);
-            addi = user;
-          }
+      Operation *addi = {};
+      for (auto user : opT.getStage().getUsers()) {
+        if (isa<arith::AddIOp>(user)) {
+          assert(!addi);
+          addi = user;
         }
-        assert(addi);
-        Operation *cnd = {};
-        for (auto user : addi->getUsers()) {
-          if (isa<arith::CmpIOp>(user)) {
-            assert(!cnd);
-            cnd = user;
-          }
+      }
+      assert(addi);
+      Operation *cnd = {};
+      for (auto user : addi->getUsers()) {
+        if (isa<arith::CmpIOp>(user)) {
+          assert(!cnd);
+          cnd = user;
         }
-        assert(cnd);
-        Operation *select = {};
-        for (auto user : cnd->getUsers()) {
-          if (isa<arith::SelectOp>(user)) {
-            assert(!select);
-            select = user;
-          }
+      }
+      assert(cnd);
+      Operation *select = {};
+      for (auto user : cnd->getUsers()) {
+        if (isa<arith::SelectOp>(user)) {
+          assert(!select);
+          select = user;
         }
-        assert(select);
-        {
-          OpBuilder::InsertionGuard guard(builder);
-          builder.setInsertionPointAfter(select);
-          auto nextPhase = builder.create<arith::XOrIOp>(
-              opT.getLoc(), index.phase,
-              builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
-          indexMap[opT.getOperand(0)].phase = builder.create<arith::SelectOp>(
-              opT.getLoc(), cnd->getResult(0), nextPhase, index.phase);
-        }
+      }
+      assert(select);
+      {
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointAfter(select);
+        auto nextPhase = builder.create<arith::XOrIOp>(
+            opT.getLoc(), phase,
+            builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
+        phaseMap[opT.getOperand(0)] = builder.create<arith::SelectOp>(
+            opT.getLoc(), cnd->getResult(0), nextPhase, phase);
+      }
 
 #else
-        opT.getPhaseMutable().assign(index.phase);
-        SmallVector<Operation *> users;
-        for (auto user : opT.getStage().getUsers())
-          users.push_back(user);
-        assert(!users.empty());
-        auto user = users.back();
-        auto phaseBit = builder.create<arith::ShLIOp>(
-            opT.getLoc(),
-            builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32),
-            opT.getStage());
-        indexMap[opT.getOperand(0)].phase =
-            builder.create<arith::XOrIOp>(opT.getLoc(), index.phase, phaseBit);
+      opT.getPhaseMutable().assign(phase);
+      SmallVector<Operation *> users;
+      for (auto user : opT.getStage().getUsers())
+        users.push_back(user);
+      assert(!users.empty());
+      auto user = users.back();
+      auto phaseBit = builder.create<arith::ShLIOp>(
+          opT.getLoc(),
+          builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32),
+          opT.getStage());
+      phaseMap[opT.getOperand(0)] =
+          builder.create<arith::XOrIOp>(opT.getLoc(), phase, phaseBit);
 #endif
 
-      } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-        assignInForOp(forOp, indexMap);
-      } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-        assignInIfOp(ifOp, indexMap);
-      }
+    } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      assignInForOp(forOp, phaseMap);
+    } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      assignInIfOp(ifOp, phaseMap);
     }
-
-    return indexMap;
   }
 
-  static LogicalResult run(WarpGroupOp wgOp, std::string opName) {
-    // llvm::errs() << " --- Xrun " << opName << "\n";
-    // Verify that all puts and gets are in the same group; otherwise, the stage
-    // would need to be communicated across groups, not currently supported.
-    Region *opRegion = {};
+  return phaseMap;
+}
 
-    // SetVector<Value> anchors;
-    // wgOp.walk([&](T op) { anchors.insert(op.getOperand(0)); });
-    // for (auto anchor : anchors) {
-    //   for (auto user : anchor.getUsers()) {
-    //     if (isa<T>(user)) {
-    //       auto [wg, idx] = getWarpGroupIdx(user);
-    //       auto region = &wg.getPartitionRegions()[idx];
-    //       if (opRegion && opRegion != region) {
-    //         return mlir::emitWarning(user->getLoc(),
-    //                                  "All " + opName +
-    //                                      " must be in the same warp-group");
-    //       }
-    //       opRegion = region;
-    //     }
-    //   }
-    // }
+static void run(WarpGroupOp wgOp) {
+  UseSet useSet;
+  for (auto region : wgOp.getRegions()) {
+    auto block = &region->getBlocks().front();
+    useSet = analyzeUseInBlock(block, useSet);
+  }
 
-    UseSet use;
-    for (auto region : wgOp.getRegions()) {
-      auto block = &region->getBlocks().front();
-      use = analyzeUseInBlock(block, use);
-    }
-
-    // initialize indexes
-    IndexMap indexMap;
-    for (auto anchor : use) {
-      OpBuilder builder(anchor.getDefiningOp());
-      builder.setInsertionPointAfter(anchor.getDefiningOp());
-      // indexMap[anchor].stage =
-      //     builder.create<arith::ConstantIntOp>(anchor.getLoc(), 0, 32);
-      if (std::is_same_v<T, SemaphoreAcquireOp>) {
-        auto semaOp = anchor.getDefiningOp<SemaphoreCreateOp>();
-        assert(semaOp);
-        bool isReleased = semaOp.getIsReleased();
+  // initialize indexes
+  PhaseMap phaseMap;
+  for (auto sema : useSet) {
+    OpBuilder builder(sema.getDefiningOp());
+    builder.setInsertionPointAfter(sema.getDefiningOp());
+    auto semaOp = sema.getDefiningOp<SemaphoreCreateOp>();
+    assert(semaOp);
+    bool isReleased = semaOp.getIsReleased();
 #ifdef MULTIPHASE
-        indexMap[anchor].phase = builder.create<arith::ConstantIntOp>(
-            anchor.getLoc(), isReleased ? 0xFFFFFFFF : 0x00000000, 32);
+    phaseMap[sema] = builder.create<arith::ConstantIntOp>(
+        sema.getLoc(), isReleased ? 0xFFFFFFFF : 0x00000000, 32);
 #else
-        indexMap[anchor].phase = builder.create<arith::ConstantIntOp>(
-            anchor.getLoc(), isReleased ? 1 : 0, 32);
+    phaseMap[sema] = builder.create<arith::ConstantIntOp>(
+        sema.getLoc(), isReleased ? 1 : 0, 32);
 #endif
-      } else {
-        assert(0);
-        indexMap[anchor].phase = {};
-      }
-    }
-
-    for (auto region : wgOp.getRegions()) {
-      auto block = &region->getBlocks().front();
-      assignInBlock(block, indexMap);
-    }
-    return success();
   }
-};
 
-template <> struct AssignIndex<> {
-  static LogicalResult run(WarpGroupOp wgOp) {
-    if (failed(
-            AssignIndex<SemaphoreAcquireOp>::run(wgOp, "SemaphoreAcquireOp"))) {
-      assert(0);
-      return failure();
-    }
-    // if (failed(
-    //         AssignIndex<SemaphoreReleaseOp>::run(wgOp,
-    //         "SemaphoreReleaseOp"))) {
-    //   assert(0);
-    //   return failure();
-    // }
-    return success();
+  for (auto region : wgOp.getRegions()) {
+    auto block = &region->getBlocks().front();
+    assignInBlock(block, phaseMap);
   }
-};
+}
+} // namespace AssignPhase
 
 } // anonymous namespace
 
@@ -535,15 +420,9 @@ public:
     mlir::ModuleOp m = getOperation();
     SmallVector<WarpGroupOp> wgOps;
     m.walk([&](WarpGroupOp wgOp) { wgOps.push_back(wgOp); });
-    // llvm::errs() << " --- XwgOps.size() " << wgOps.size() << "\n";
-    for (auto wgOp : wgOps) {
-      // llvm::errs() << " --- XwgOp " << wgOp << "\n";
-      if (failed(AssignIndex<>::run(wgOp)))
-        signalPassFailure();
-    }
+    for (auto wgOp : wgOps)
+      AssignPhase::run(wgOp);
     LLVM_DEBUG(llvm::dbgs() << "After semaphoreIndexAssignment\n" << m << "\n");
-    // llvm::errs() << "After semaphoreIndexAssignment\n" << m << "\n";
-    //    assert(0);
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<LowerSemaphoreCreate>(context);

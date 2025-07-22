@@ -386,9 +386,7 @@ template <class T> struct ArefStage {
     return stageMap;
   }
 
-  static void run(WarpGroupOp wgOp, std::string opName) {
-    // Verify that all puts and gets are in the same group; otherwise, the stage
-    // would need to be communicated across groups, not currently supported.
+  static void run(WarpGroupOp wgOp) {
     UseSet useSet;
     for (auto region : wgOp.getRegions()) {
       auto block = &region->getBlocks().front();
@@ -424,10 +422,10 @@ public:
     SmallVector<WarpGroupOp> wgOps;
     m.walk([&](WarpGroupOp wgOp) { wgOps.push_back(wgOp); });
     for (auto wgOp : wgOps) {
-      ArefStage<ArefPutEnterOp>::run(wgOp, "ArefPutEnterOp");
-      ArefStage<ArefPutExitOp>::run(wgOp, "ArefPutExitOp");
-      ArefStage<ArefGetEnterOp>::run(wgOp, "ArefGetEnterOp");
-      ArefStage<ArefGetExitOp>::run(wgOp, "ArefGetExitOp");
+      ArefStage<ArefPutEnterOp>::run(wgOp);
+      ArefStage<ArefPutExitOp>::run(wgOp);
+      ArefStage<ArefGetEnterOp>::run(wgOp);
+      ArefStage<ArefGetExitOp>::run(wgOp);
     }
     LLVM_DEBUG(llvm::dbgs() << "After ArefStageAssignment\n" << m << "\n");
 
