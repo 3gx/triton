@@ -41,9 +41,9 @@ class NVWS_Op<string mnemonic, list<Trait> traits = []> :
 
 def NVWS_SemaphoreCreateOp : NVWS_Op<"sem.create"> {
   let summary = "create a semaphore";
-  let arguments = (ins);
+  let arguments = (ins I1:$is_released);
   let results = (outs NVWS_SemaphoreType:$result);
-  let assemblyFormat = "attr-dict `:` type($result)";
+  let assemblyFormat = "$is_released attr-dict `:` type($result)";
 }
 
 def NVWS_SemaphoreAcquireOp : NVWS_Op<"sem.acquire"> {
