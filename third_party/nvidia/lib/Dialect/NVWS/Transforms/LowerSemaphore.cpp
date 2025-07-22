@@ -51,7 +51,7 @@ using namespace mlir::triton::nvws;
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
-#if 0
+#if 1
 #define MULTIPHASE
 #endif
 
@@ -120,20 +120,14 @@ Value createAndInitMbar(SemaphoreCreateOp op, PatternRewriter &rewriter) {
 
   MLIRContext *ctx = op.getContext();
   auto loc = op.getLoc();
-  auto semaType = op.getType();
-  auto depth = *semaType.getNumStages();
+  auto numStages = *op.getType().getNumStages();
 
   ImplicitLocOpBuilder builder(op.getLoc(), rewriter);
-  auto mbars = createScalarAlloc(builder, rewriter.getI64Type(), depth);
-  auto lb = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
-  auto ub = rewriter.create<arith::ConstantIntOp>(loc, depth, 32);
-  auto step = rewriter.create<arith::ConstantIntOp>(loc, 1, 32);
-  auto dLoop = rewriter.create<scf::ForOp>(loc, lb, ub, step);
-  rewriter.setInsertionPointToStart(dLoop.getBody());
-
-  auto singleBarrier =
-      createSingleBufferView(rewriter, mbars, dLoop.getInductionVar());
-  rewriter.create<InitBarrierOp>(loc, singleBarrier, pendingCount);
+  auto mbars = createScalarAlloc(builder, rewriter.getI64Type(), numStages);
+  for (int i = 0; i < numStages; i++) {
+    auto singleBarrier = createSingleBufferView(rewriter, mbars, i);
+    rewriter.create<InitBarrierOp>(loc, singleBarrier, pendingCount);
+  }
   return mbars;
 }
 
@@ -145,7 +139,7 @@ void rewriteAcquireOp(SemaphoreCreateOp semaphoreOp, SemaphoreAcquireOp op,
 #ifdef MULTIPHASE
   Value phaseBit =
       rewriter.create<arith::ShRSIOp>(loc, op.getPhase(), op.getStage());
-#if 0
+#if 1
   phaseBit = rewriter.create<arith::AndIOp>(
       loc, phaseBit, rewriter.create<arith::ConstantIntOp>(loc, 1, 32));
 #endif

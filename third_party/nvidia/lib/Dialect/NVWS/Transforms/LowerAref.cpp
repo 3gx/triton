@@ -67,16 +67,6 @@ struct ArefValue {
   SmallVector<Value> buffers;
 };
 
-std::pair<WarpGroupOp, int> getWarpGroupIdx(Operation *op) {
-  if (auto wgOp = dyn_cast<WarpGroupOp>(op->getParentOp())) {
-    auto region = op->getParentRegion();
-    return {wgOp, region->getRegionNumber()};
-  }
-  if (isa<triton::FuncOp>(op))
-    return {nullptr, -1};
-  return getWarpGroupIdx(op->getParentOp());
-}
-
 ArefValue createAndInitMbar(ArefCreateOp op, PatternRewriter &rewriter) {
   MLIRContext *ctx = op.getContext();
   auto loc = op.getLoc();
