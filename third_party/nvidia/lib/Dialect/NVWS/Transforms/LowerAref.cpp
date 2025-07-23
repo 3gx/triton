@@ -447,10 +447,10 @@ public:
       auto initStage = [](ImplicitLocOpBuilder &b, Operation *op) -> Value {
         return b.create<arith::ConstantIntOp>(0, 32);
       };
-      ArefStage<ArefPutEnterOp>::run(wgOp, initStage, updateStage);
-      ArefStage<ArefPutExitOp>::run(wgOp, initStage, updateStage);
-      ArefStage<ArefGetEnterOp>::run(wgOp, initStage, updateStage);
-      ArefStage<ArefGetExitOp>::run(wgOp, initStage, updateStage);
+      ThreadValue<ArefPutEnterOp>::run(wgOp, initStage, updateStage);
+      ThreadValue<ArefPutExitOp>::run(wgOp, initStage, updateStage);
+      ThreadValue<ArefGetEnterOp>::run(wgOp, initStage, updateStage);
+      ThreadValue<ArefGetExitOp>::run(wgOp, initStage, updateStage);
     }
     LLVM_DEBUG(llvm::dbgs() << "After ArefStageAssignment\n" << m << "\n");
 

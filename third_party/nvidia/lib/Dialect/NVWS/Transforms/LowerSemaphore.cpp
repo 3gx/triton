@@ -487,7 +487,7 @@ public:
         return b.create<arith::ConstantIntOp>(isReleased ? 1 : 0, 32);
 #endif
       };
-      ArefStage<SemaphoreAcquireOp>::run(wgOp, initStage, updateStage);
+      ThreadValue<SemaphoreAcquireOp>::run(wgOp, initStage, updateStage);
 #endif
     }
     LLVM_DEBUG(llvm::dbgs() << "After semaphoreIndexAssignment\n" << m << "\n");

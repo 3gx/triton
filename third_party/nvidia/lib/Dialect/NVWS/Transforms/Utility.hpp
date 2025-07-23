@@ -14,10 +14,10 @@
 
 namespace mlir {
 
-template <class T> struct ArefStage {
+template <class T> struct ThreadValue {
   std::function<Value(ImplicitLocOpBuilder &, Value, Operation *)> updateValue;
-  using StageMap = llvm::MapVector<Value /*aref*/, Value /*stage*/>;
-  using UseSet = llvm::SetVector<Value /*aref*/>;
+  using ValueMap = llvm::MapVector<Value /*key*/, Value /*value*/>;
+  using UseSet = llvm::SetVector<Value /*key*/>;
 
   UseSet analyzeUseInBlock(Block *block, UseSet useSet) {
     for (auto &op : *block) {
@@ -34,9 +34,9 @@ template <class T> struct ArefStage {
     return useSet;
   }
 
-  void assignStageInForOp(scf::ForOp forOp, StageMap &stageMap) {
+  void assignStageInForOp(scf::ForOp forOp, ValueMap &valueMap) {
 
-    // find uses of arefs in forOp body
+    // find uses of key in forOp body
     auto useInBlock = analyzeUseInBlock(forOp.getBody(), {});
     if (useInBlock.empty())
       return;
@@ -44,9 +44,9 @@ template <class T> struct ArefStage {
     // add extra iterArgs to the forOp
     SmallVector<Value> extraIterArgs;
     SmallVector<Value *> stageRefs;
-    for (auto aref : useInBlock) {
-      extraIterArgs.push_back(stageMap.lookup(aref));
-      stageRefs.push_back(&stageMap[aref]);
+    for (auto key : useInBlock) {
+      extraIterArgs.push_back(valueMap.lookup(key));
+      stageRefs.push_back(&valueMap[key]);
     }
 
     // create new forOp with extra iterArgs
@@ -54,32 +54,32 @@ template <class T> struct ArefStage {
     size_t nArgs = forOp.getRegionIterArgs().size();
     forOp = addIterArgsToLoop(builder, forOp, extraIterArgs);
 
-    // update arefIndex with iterArgs in the forOp body
+    // update value with iterArgs in the forOp body
     for (size_t idx = nArgs; idx < forOp.getRegionIterArgs().size(); ++idx)
       *stageRefs[idx - nArgs] = forOp.getRegionIterArgs()[idx];
 
-    // assign arefIndex in the forOp body
-    auto stageMapInBlock = assignStageInBlock(forOp.getBody(), stageMap);
+    // assign value in the forOp body
+    auto valueMapInBlock = assignStageInBlock(forOp.getBody(), valueMap);
 
     // update yieldOp to return new indexes
     SmallVector<Value> extraYieldArgs;
-    for (auto aref : useInBlock)
-      extraYieldArgs.push_back(stageMapInBlock[aref]);
+    for (auto key : useInBlock)
+      extraYieldArgs.push_back(valueMapInBlock[key]);
     appendToForOpYield(forOp, extraYieldArgs);
 
-    // update stage with results from newForOp
+    // update value with results from newForOp
     for (size_t idx = nArgs; idx < forOp.getRegionIterArgs().size(); ++idx)
       *stageRefs[idx - nArgs] = forOp.getResult(idx);
   }
 
-  void assignStageInIfOp(scf::IfOp ifOp, StageMap &stageMap) {
+  void assignStageInIfOp(scf::IfOp ifOp, ValueMap &valueMap) {
 
-    // find uses of aref in then-block
+    // find uses of key in then-block
     auto useInBlock = analyzeUseInBlock(ifOp.thenBlock(), {});
     if (useInBlock.empty())
       return;
 
-    // find uses of aref in else-block
+    // find uses of key in else-block
     useInBlock = ifOp.elseBlock()
                      ? analyzeUseInBlock(ifOp.elseBlock(), useInBlock)
                      : useInBlock;
@@ -87,9 +87,9 @@ template <class T> struct ArefStage {
     // add extra results to the ifOp
     SmallVector<Type> extraIfResults;
     SmallVector<Value *> stageRefs;
-    for (auto aref : useInBlock) {
-      extraIfResults.push_back(stageMap.lookup(aref).getType());
-      stageRefs.push_back(&stageMap[aref]);
+    for (auto key : useInBlock) {
+      extraIfResults.push_back(valueMap.lookup(key).getType());
+      stageRefs.push_back(&valueMap[key]);
     }
 
     // create new ifOp with extra results
@@ -97,47 +97,47 @@ template <class T> struct ArefStage {
     size_t nArgs = ifOp.getResults().size();
     auto newIfOp = replaceIfOpWithNewSignature(builder, ifOp, extraIfResults);
 
-    // assign arefIndex in then-body
-    auto stageMapInThenBlock =
-        assignStageInBlock(newIfOp.thenBlock(), stageMap);
+    // assign value in then-body
+    auto valueMapInThenBlock =
+        assignStageInBlock(newIfOp.thenBlock(), valueMap);
 
-    // assign arefIndex in else-body
-    auto stageMapInElseBlock =
-        ifOp.elseBlock() ? assignStageInBlock(newIfOp.elseBlock(), stageMap)
-                         : stageMap;
+    // assign value in else-body
+    auto valueMapInElseBlock =
+        ifOp.elseBlock() ? assignStageInBlock(newIfOp.elseBlock(), valueMap)
+                         : valueMap;
 
     // update yieldOp to return new indexes
     auto thenYieldOp = newIfOp.thenYield();
     auto elseYieldOp = newIfOp.elseYield();
     // insert new indexes to the yieldOp
-    for (auto aref : useInBlock) {
+    for (auto key : useInBlock) {
       thenYieldOp->insertOperands(thenYieldOp.getNumOperands(),
-                                  stageMapInThenBlock[aref]);
+                                  valueMapInThenBlock[key]);
       elseYieldOp->insertOperands(elseYieldOp.getNumOperands(),
-                                  stageMapInElseBlock[aref]);
+                                  valueMapInElseBlock[key]);
     }
     ifOp.erase();
 
-    // update arefIndex with results from newIfOp
+    // update value with results from newIfOp
     for (size_t idx = nArgs; idx < newIfOp.getResults().size(); ++idx)
       *stageRefs[idx - nArgs] = newIfOp.getResult(idx);
   }
 
-  StageMap assignStageInBlock(Block *block, StageMap stageMap) {
+  ValueMap assignStageInBlock(Block *block, ValueMap valueMap) {
     for (auto &op : llvm::make_early_inc_range(*block)) {
       if (auto opT = dyn_cast<T>(op)) {
         ImplicitLocOpBuilder b(op.getLoc(), &op);
         b.setInsertionPointAfter(&op);
-        auto value = stageMap.lookup(op.getOperand(0));
-        stageMap[op.getOperand(0)] = updateValue(b, value, &op);
+        auto value = valueMap.lookup(op.getOperand(0));
+        valueMap[op.getOperand(0)] = updateValue(b, value, &op);
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-        assignStageInForOp(forOp, stageMap);
+        assignStageInForOp(forOp, valueMap);
       } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-        assignStageInIfOp(ifOp, stageMap);
+        assignStageInIfOp(ifOp, valueMap);
       }
     }
 
-    return stageMap;
+    return valueMap;
   }
 
   static void
@@ -145,24 +145,24 @@ template <class T> struct ArefStage {
       std::function<Value(ImplicitLocOpBuilder &, Operation *)> initValue,
       std::function<Value(ImplicitLocOpBuilder &, Value, Operation *)>
           updateValue) {
-    ArefStage<T> stage{updateValue};
+    ThreadValue<T> value{updateValue};
     UseSet useSet;
     for (auto region : wgOp.getRegions()) {
       auto block = &region->getBlocks().front();
-      useSet = stage.analyzeUseInBlock(block, useSet);
+      useSet = value.analyzeUseInBlock(block, useSet);
     }
 
     // initialize indexes
-    StageMap stageMap;
-    for (auto aref : useSet) {
-      ImplicitLocOpBuilder b(aref.getLoc(), aref.getDefiningOp());
-      b.setInsertionPointAfter(aref.getDefiningOp());
-      stageMap[aref] = initValue(b, aref.getDefiningOp());
+    ValueMap valueMap;
+    for (auto key : useSet) {
+      ImplicitLocOpBuilder b(key.getLoc(), key.getDefiningOp());
+      b.setInsertionPointAfter(key.getDefiningOp());
+      valueMap[key] = initValue(b, key.getDefiningOp());
     }
 
     for (auto region : wgOp.getRegions()) {
       auto block = &region->getBlocks().front();
-      stage.assignStageInBlock(block, stageMap);
+      value.assignStageInBlock(block, valueMap);
     }
   }
 };
