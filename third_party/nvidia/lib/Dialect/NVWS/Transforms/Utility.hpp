@@ -129,7 +129,6 @@ template <class T> struct ArefStage {
         ImplicitLocOpBuilder b(op.getLoc(), &op);
         b.setInsertionPointAfter(&op);
         auto value = stageMap.lookup(op.getOperand(0));
-        op.setOperand(1, value);
         stageMap[op.getOperand(0)] = updateValue(b, value, &op);
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
         assignStageInForOp(forOp, stageMap);

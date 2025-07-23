@@ -21,6 +21,7 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include "Utility.hpp"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AttrTypeSubElements.h"
@@ -424,8 +425,71 @@ public:
     mlir::ModuleOp m = getOperation();
     SmallVector<WarpGroupOp> wgOps;
     m.walk([&](WarpGroupOp wgOp) { wgOps.push_back(wgOp); });
-    for (auto wgOp : wgOps)
+    for (auto wgOp : wgOps) {
+#if 0
       AssignPhase::run(wgOp);
+#else
+      auto updateStage = [](ImplicitLocOpBuilder &b, Value phase,
+                            Operation *op) -> Value {
+        cast<SemaphoreAcquireOp>(op).getPhaseMutable().assign(phase);
+#ifdef MULTIPHASE
+        // the phase is a bit-vector, each bit for each stage
+        // next_phase = phase ^ (1 << stage)
+        auto phaseBit = b.create<arith::ShLIOp>(
+            b.create<arith::ConstantIntOp>(1, 32), op->getOperand(1));
+        return b.create<arith::XOrIOp>(phase, phaseBit);
+#else
+        opT.getPhaseMutable().assign(phase);
+
+        Operation *addi = {};
+        for (auto user : opT.getStage().getUsers()) {
+          if (isa<arith::AddIOp>(user)) {
+            assert(!addi);
+            addi = user;
+          }
+        }
+        assert(addi);
+        Operation *cnd = {};
+        for (auto user : addi->getUsers()) {
+          if (isa<arith::CmpIOp>(user)) {
+            assert(!cnd);
+            cnd = user;
+          }
+        }
+        assert(cnd);
+        Operation *select = {};
+        for (auto user : cnd->getUsers()) {
+          if (isa<arith::SelectOp>(user)) {
+            assert(!select);
+            select = user;
+          }
+        }
+        assert(select);
+        {
+          OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointAfter(select);
+          auto nextPhase = builder.create<arith::XOrIOp>(
+              opT.getLoc(), phase,
+              builder.create<arith::ConstantIntOp>(opT.getLoc(), 1, 32));
+          phaseMap[opT.getOperand(0)] = builder.create<arith::SelectOp>(
+              opT.getLoc(), cnd->getResult(0), nextPhase, phase);
+        }
+
+#endif
+      };
+      auto initStage = [](ImplicitLocOpBuilder &b, Operation *op) -> Value {
+        auto semaOp = cast<SemaphoreCreateOp>(op);
+        bool isReleased = semaOp.getIsReleased();
+#ifdef MULTIPHASE
+        return b.create<arith::ConstantIntOp>(
+            isReleased ? 0xFFFFFFFF : 0x00000000, 32);
+#else
+        return b.create<arith::ConstantIntOp>(isReleased ? 1 : 0, 32);
+#endif
+      };
+      ArefStage<SemaphoreAcquireOp>::run(wgOp, initStage, updateStage);
+#endif
+    }
     LLVM_DEBUG(llvm::dbgs() << "After semaphoreIndexAssignment\n" << m << "\n");
 
     mlir::RewritePatternSet patterns(context);
