@@ -46,13 +46,14 @@ def NVWS_SemaphoreCreateOp : NVWS_Op<"semaphore.create"> {
   let assemblyFormat = "$is_released attr-dict `:` type($result)";
 }
 
-def NVWS_SemaphoreAcquireOp : NVWS_Op<"semaphore.acquire"> {
+def NVWS_SemaphoreAcquireOp : NVWS_Op<"semaphore.acquire", [AttrSizedOperandSegments]> {
   let summary = "acquire a semaphore";
   let arguments = (ins NVWS_SemaphoreType:$semaphore,
                        I32:$stage,
-                       Optional<I32>:$phase);
+                       Optional<I32>:$phase,
+                       Optional<I1>:$pred);
   let assemblyFormat = [{
-    $semaphore `[` $stage (`,` $phase^)? `]` attr-dict `:` type($semaphore)
+    $semaphore `[` $stage (`,` $phase^)? `]` (`,` $pred^)? attr-dict `:` type($semaphore)
   }];
 }
 

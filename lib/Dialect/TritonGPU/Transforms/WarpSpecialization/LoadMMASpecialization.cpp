@@ -111,6 +111,20 @@ static std::pair<Value, Value> postIncrementModulo(ImplicitLocOpBuilder &b,
   return {nextIndex, nextPhase};
 }
 
+static Value updateIndex(ImplicitLocOpBuilder &b, Value index,
+                         unsigned numStages) {
+  auto intCst = [&](int value) {
+    return b.create<arith::ConstantIntOp>(value, 32);
+  };
+  Value nextIndex = b.create<arith::AddIOp>(index, intCst(1));
+
+  Value rollover = b.create<arith::CmpIOp>(arith::CmpIPredicate::eq, nextIndex,
+                                           intCst(numStages));
+  nextIndex = b.create<arith::SelectOp>(rollover, intCst(0), nextIndex);
+
+  return nextIndex;
+}
+
 static std::pair<BlockArgument, BlockArgument>
 addIndexAndPhase(PartitionBuilder &b, scf::ForOp &loop, unsigned numStages,
                  Value epilogue = {}) {
@@ -500,19 +514,29 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
   ttng::TMEMAllocOp allocOp =
       createTMemAlloc(b, oldAllocOp, /*multiBuffered=*/true, numMmaStages);
 
-  // Use placeholder values for the indices in the loop.
+// Use placeholder values for the indices in the loop.
+#if 0
   loop = addIterArgsToLoop(b, loop, {b.intCst(0), b.intCst(0)});
   auto indexPhase = loop.getRegionIterArgs().take_back(2);
   BlockArgument index = indexPhase[0];
   BlockArgument phase = indexPhase[1];
+#else
+  loop = addIterArgsToLoop(b, loop, {b.intCst(0)});
+  BlockArgument index = loop.getRegionIterArgs().back();
+#endif
 
   // Replace uses of the accumulator before the loop with buffer 0, and replace
   // those after the loop with the last buffer.
   Value firstView = createSingleBufferView(b, allocOp, b.intCst(0));
   b.setInsertionPointAfter(loop);
+#if 0
   Value lastIndex = loop.getResult(index.getArgNumber() - 1);
   Value lastPhase = loop.getResult(phase.getArgNumber() - 1);
   Value lastView = createSingleBufferView(b, allocOp, lastIndex);
+#else
+  Value lastIndex = loop.getResult(index.getArgNumber() - 1);
+  Value lastView = createSingleBufferView(b, allocOp, lastIndex);
+#endif
 
   // Find users of the accumulator in the loop and sort them by program order.
   SmallVector<Operation *> usersInLoop;
@@ -556,10 +580,16 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
 
   struct Node {
     Operation *op;
+#if 0
     Value barPrev;
     Value barNext;
     Value index;
     Value phase;
+#else
+    Value semaPrev;
+    Value semaNext;
+    Value index;
+#endif
   };
 
   SmallVector<Node, 3> nodes{Node{overwriteOp}, Node{mmaOp}, Node{readOp}};
@@ -572,12 +602,21 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
     Node &next = nodes[(i + 1) % nodes.size()];
     if (schedule.getPartition(inBody(cur.op)) !=
         schedule.getPartition(inBody(next.op))) {
+#if 0
       cur.barNext = createBarrierAlloc(loop, numMmaStages);
       next.barPrev = cur.barNext;
+#else
+      auto semaTy =
+          triton::nvws::SemaphoreType::get(b.getContext(), numMmaStages);
+      cur.semaNext = b.create<nvws::SemaphoreCreateOp>(
+          b.getType<triton::nvws::SemaphoreType>(), /*isReleased=*/false);
+      next.semaPrev = cur.semaNext;
+#endif
     }
   }
 
-  // If the first node has a barrier, fully initialize it to let it run.
+// If the first node has a barrier, fully initialize it to let it run.
+#if 0
   if (nodes.front().barPrev) {
     for (auto i : llvm::seq(numMmaStages)) {
       b.setInsertionPoint(loop);
@@ -585,6 +624,15 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
       b.create<ttng::ArriveBarrierOp>(bar, /*arriveCount=*/1);
     }
   }
+#else
+  if (nodes.front().semaPrev) {
+    for (auto i : llvm::seq(numMmaStages)) {
+      b.setInsertionPoint(loop);
+      Value sema = nodes.front().semaPrev;
+      b.create<nvws::SemaphoreReleaseOp>(sema, b.intCst(i));
+    }
+  }
+#endif
 
   Value userPred = b.boolCst(true);
   if (readOp == mmaOp) {
@@ -596,10 +644,19 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
     }();
     userPred = b.create<arith::CmpIOp>(
         arith::CmpIPredicate::eq, loop.getInductionVar(), lastInductionValue);
+#if 0
     nodes.back().barNext = createBarrierAlloc(loop, /*numBarriers=*/1);
+#else
+    auto semaTy = triton::nvws::SemaphoreType::get(b.getContext(), 1);
+    nodes.back().semaNext =
+        b.create<nvws::SemaphoreCreateOp>(semaTy, /*isReleased=*/false);
+#endif
   }
 
-  Value curIndex = index, curPhase = phase;
+  Value curIndex = index;
+#if 0
+  Value curPhase = phase;
+#endif
   b.setInsertionPoint(loop);
   Value replTok = b.create<ub::PoisonOp>(b.getType<AsyncTokenType>());
   DenseSet<Operation *> seen;
@@ -607,9 +664,16 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
   Node *firstAfterInc = nullptr;
   for (Node &node : nodes) {
     node.index = curIndex;
+#if 0
     node.phase = curPhase;
+#endif
+#if 0
     if (incrementPt && node.barPrev && !firstAfterInc)
       firstAfterInc = &node;
+#else
+    if (incrementPt && node.semaPrev && !firstAfterInc)
+      firstAfterInc = &node;
+#endif
     if (!seen.insert(node.op).second)
       continue;
     b.setInsertionPoint(node.op);
@@ -632,31 +696,51 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
       ImplicitLocOpBuilder b(readOp->getLoc(), loop);
       userPred = getUserPrecondition(b, loop, node.op);
       b.setInsertionPointAfter(inBody(readOp));
+#if 0
       auto [nextIndex, nextPhase] =
           postIncrementModulo(b, index, phase, numMmaStages);
       curIndex = b.create<arith::SelectOp>(userPred, nextIndex, index);
       curPhase = b.create<arith::SelectOp>(userPred, nextPhase, phase);
+#else
+      auto nextIndex = updateIndex(b, index, numMmaStages);
+      curIndex = b.create<arith::SelectOp>(userPred, nextIndex, index);
+#endif
       incrementPt = b.saveInsertionPoint();
     }
   }
   if (firstAfterInc) {
     b.setInsertionPoint(loop);
     if (firstAfterInc->op == mmaOp) {
+#if 0
       Value firstBar = createSingleBufferView(b, firstAfterInc->barPrev, 0);
       b.create<ttng::ArriveBarrierOp>(firstBar, /*arriveCount=*/1);
+#else
+      b.create<nvws::SemaphoreReleaseOp>(firstAfterInc->semaPrev, b.intCst(0));
+#endif
     } else {
       assert(firstAfterInc->op == dyn_cast<ttng::TMEMStoreOp>(overwriteOp));
       for (auto i : llvm::seq(numMmaStages)) {
+#if 0
         Value firstBar = createSingleBufferView(b, firstAfterInc->barPrev, i);
         b.create<ttng::ArriveBarrierOp>(firstBar, /*arriveCount=*/1);
+#else
+        b.create<nvws::SemaphoreReleaseOp>(firstAfterInc->semaPrev,
+                                           b.intCst(i));
+#endif
       }
     }
   }
   oldAllocOp.getToken().replaceAllUsesWith(allocOp.getToken());
   oldAllocOp.erase();
+#if 0
   cast<scf::YieldOp>(loop.getBody()->getTerminator())
       .getResultsMutable()
       .append({curIndex, curPhase});
+#else
+  cast<scf::YieldOp>(loop.getBody()->getTerminator())
+      .getResultsMutable()
+      .append(curIndex);
+#endif
 
   // Find operands that need to be pipelined through shmem.
   SmallVector<Value> incomingOperands;
@@ -735,32 +819,49 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
     Operation *lastOp = findNearestCommonPostDominator(defs, postDomInfo);
 
     StageCluster nodeStageCluster = getStageCluster(node.op);
-    if (node.barPrev) {
+    if (node.semaPrev) {
       if (!isa<ttng::TMEMLoadOp>(node.op)) {
         // If the user precondition is defined after the MMA, we need to peel
         // the wait for the user.
         if (incrementPt && domOp->isBeforeInBlock(&*incrementPt->getPoint()) &&
             domInfo.properlyDominates(mmaOp, userPred.getDefiningOp())) {
           b.restoreInsertionPoint(*incrementPt);
+#if 0
           Value bar = createSingleBufferView(b, node.barPrev, curIndex);
           b.createInto<ttng::WaitBarrierOp>(*partition, nodeStageCluster, bar,
                                             curPhase, userPred);
+#else
+          b.createInto<nvws::SemaphoreAcquireOp>(
+              *partition, nodeStageCluster, node.semaPrev, curIndex, userPred);
+#endif
         } else {
           b.setInsertionPoint(domOp);
+#if 0
           Value bar = createSingleBufferView(b, node.barPrev, node.index);
           b.createInto<ttng::WaitBarrierOp>(*partition, nodeStageCluster, bar,
                                             node.phase, userPred);
+#else
+          b.createInto<nvws::SemaphoreAcquireOp>(*partition, nodeStageCluster,
+                                                 node.semaPrev, node.index,
+                                                 userPred);
+#endif
         }
       } else {
         b.setInsertionPoint(domOp);
         if (isa<scf::IfOp>(domOp->getParentOp()) && accIsMultiBuffered)
           b.setInsertionPointToStart(domOp->getBlock());
+#if 0
         Value bar = createSingleBufferView(b, node.barPrev, node.index);
         b.createInto<ttng::WaitBarrierOp>(*partition, nodeStageCluster, bar,
                                           node.phase);
+#else
+        b.createInto<nvws::SemaphoreAcquireOp>(*partition, nodeStageCluster,
+                                               node.semaPrev, node.index,
+                                               userPred);
+#endif
       }
     }
-    if (node.barNext) {
+    if (node.semaNext) {
       if (mmaOp == node.op) {
         b.setInsertionPoint(mmaOp);
         Value bar = createSingleBufferView(b, node.barNext, node.index);
