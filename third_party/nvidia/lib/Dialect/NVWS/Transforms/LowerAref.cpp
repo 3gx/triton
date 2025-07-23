@@ -428,9 +428,6 @@ public:
     for (auto wgOp : wgOps) {
       auto updateStage = [](ImplicitLocOpBuilder &b, Value stage,
                             Operation *op) -> Value {
-        // set curent stage
-        op->setOperand(1, stage);
-
         // compute next stage
         auto nextStage = b.create<arith::AddIOp>(
             stage, b.create<arith::ConstantIntOp>(1, 32));
