@@ -608,8 +608,8 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
 #else
       auto semaTy =
           triton::nvws::SemaphoreType::get(b.getContext(), numMmaStages);
-      cur.semaNext = b.create<nvws::SemaphoreCreateOp>(
-          b.getType<triton::nvws::SemaphoreType>(), /*isReleased=*/false);
+      cur.semaNext =
+          b.create<nvws::SemaphoreCreateOp>(semaTy, /*isReleased=*/false);
       next.semaPrev = cur.semaNext;
 #endif
     }
@@ -629,7 +629,11 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
     for (auto i : llvm::seq(numMmaStages)) {
       b.setInsertionPoint(loop);
       Value sema = nodes.front().semaPrev;
-      b.create<nvws::SemaphoreReleaseOp>(sema, b.intCst(i));
+      b.create<nvws::SemaphoreReleaseOp>(
+          sema, b.intCst(i),
+          b.getArrayAttr(SmallVector<Attribute>{triton::nvws::AsyncOpAttr::get(
+              b.getContext(), triton::nvws::AsyncOp::NONE)}),
+          Value());
     }
   }
 #endif
@@ -715,7 +719,11 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
       Value firstBar = createSingleBufferView(b, firstAfterInc->barPrev, 0);
       b.create<ttng::ArriveBarrierOp>(firstBar, /*arriveCount=*/1);
 #else
-      b.create<nvws::SemaphoreReleaseOp>(firstAfterInc->semaPrev, b.intCst(0));
+      b.create<nvws::SemaphoreReleaseOp>(
+          firstAfterInc->semaPrev, b.intCst(0),
+          b.getArrayAttr(SmallVector<Attribute>{triton::nvws::AsyncOpAttr::get(
+              b.getContext(), triton::nvws::AsyncOp::NONE)}),
+          Value());
 #endif
     } else {
       assert(firstAfterInc->op == dyn_cast<ttng::TMEMStoreOp>(overwriteOp));
@@ -724,8 +732,12 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
         Value firstBar = createSingleBufferView(b, firstAfterInc->barPrev, i);
         b.create<ttng::ArriveBarrierOp>(firstBar, /*arriveCount=*/1);
 #else
-        b.create<nvws::SemaphoreReleaseOp>(firstAfterInc->semaPrev,
-                                           b.intCst(i));
+        b.create<nvws::SemaphoreReleaseOp>(
+            firstAfterInc->semaPrev, b.intCst(i),
+            b.getArrayAttr(
+                SmallVector<Attribute>{triton::nvws::AsyncOpAttr::get(
+                    b.getContext(), triton::nvws::AsyncOp::NONE)}),
+            Value());
 #endif
       }
     }
@@ -831,8 +843,9 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
           b.createInto<ttng::WaitBarrierOp>(*partition, nodeStageCluster, bar,
                                             curPhase, userPred);
 #else
-          b.createInto<nvws::SemaphoreAcquireOp>(
-              *partition, nodeStageCluster, node.semaPrev, curIndex, userPred);
+          b.createInto<nvws::SemaphoreAcquireOp>(*partition, nodeStageCluster,
+                                                 node.semaPrev, curIndex,
+                                                 Value(), userPred);
 #endif
         } else {
           b.setInsertionPoint(domOp);
@@ -843,7 +856,7 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
 #else
           b.createInto<nvws::SemaphoreAcquireOp>(*partition, nodeStageCluster,
                                                  node.semaPrev, node.index,
-                                                 userPred);
+                                                 Value(), userPred);
 #endif
         }
       } else {
@@ -855,8 +868,9 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
         b.createInto<ttng::WaitBarrierOp>(*partition, nodeStageCluster, bar,
                                           node.phase);
 #else
-        b.createInto<nvws::SemaphoreAcquireOp>(
-            *partition, nodeStageCluster, node.semaPrev, node.index, userPred);
+        b.createInto<nvws::SemaphoreAcquireOp>(*partition, nodeStageCluster,
+                                               node.semaPrev, node.index,
+                                               Value(), userPred);
 #endif
       }
     }
@@ -889,7 +903,8 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
             *partition, nodeStageCluster, node.semaNext, node.index,
             b.getArrayAttr(
                 SmallVector<Attribute>{triton::nvws::AsyncOpAttr::get(
-                    b.getContext(), triton::nvws::AsyncOp::TC5MMA)}));
+                    b.getContext(), triton::nvws::AsyncOp::TC5MMA)}),
+            Value());
 #endif
       }
     }
@@ -934,7 +949,8 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
     Value lastBar = createSingleBufferView(b, nodes.back().arNext, lastIndex);
     b.create<ttng::WaitBarrierOp>(lastBar, lastPhase);
 #else
-    b.create<nvws::SemaphoreAcquireOp>(nodes.back().semaNext, lastIndex);
+    b.create<nvws::SemaphoreAcquireOp>(nodes.back().semaNext, lastIndex,
+                                       Value(), Value());
 #endif
   }
 

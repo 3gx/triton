@@ -168,7 +168,7 @@ void rewritePutEnterOp(ArefCreateOp arefOp, ArefPutEnterOp op,
   rewriter.setInsertionPointAfter(op);
 
   rewriter.create<SemaphoreAcquireOp>(loc, arefVal.emptySemaphore,
-                                      op.getStage(), Value());
+                                      op.getStage(), Value(), Value());
   auto views = getSubViews(arefVal, op.getStage(), loc, rewriter);
   assert(views.size() == op.getResults().size());
 
@@ -187,7 +187,7 @@ void rewriteGetEnterOp(ArefCreateOp arefOp, ArefGetEnterOp op,
   rewriter.setInsertionPointAfter(op);
 
   rewriter.create<SemaphoreAcquireOp>(loc, arefVal.fullSemaphore, op.getStage(),
-                                      Value());
+                                      Value(), Value());
   auto views = getSubViews(arefVal, op.getStage(), loc, rewriter);
   assert(views.size() == op.getResults().size());
 
@@ -200,7 +200,7 @@ void rewritePutExitOp(ArefPutExitOp op, PatternRewriter &rewriter,
   auto loc = op->getLoc();
   rewriter.setInsertionPointAfter(op);
   rewriter.create<SemaphoreReleaseOp>(loc, arefVal.fullSemaphore, op.getStage(),
-                                      op.getAsyncOps());
+                                      op.getAsyncOps(), Value());
 }
 
 void rewriteGetExitOp(ArefGetExitOp op, PatternRewriter &rewriter,
@@ -208,7 +208,7 @@ void rewriteGetExitOp(ArefGetExitOp op, PatternRewriter &rewriter,
   auto loc = op->getLoc();
   rewriter.setInsertionPointAfter(op);
   rewriter.create<SemaphoreReleaseOp>(loc, arefVal.emptySemaphore,
-                                      op.getStage(), op.getAsyncOps());
+                                      op.getStage(), op.getAsyncOps(), Value());
 }
 
 class LowerArefCreate : public OpRewritePattern<ArefCreateOp> {
