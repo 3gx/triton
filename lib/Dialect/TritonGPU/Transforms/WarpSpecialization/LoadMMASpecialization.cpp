@@ -881,7 +881,6 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
         Value bar = createSingleBufferView(b, node.barNext, node.index);
         mmaOp.addCompletionBarrier(bar, userPred);
 #else
-        Value bar = createSingleBufferView(b, node.semaNext, node.index);
         b.createInto<nvws::SemaphoreReleaseOp>(
             *partition, nodeStageCluster, node.semaNext, node.index,
             b.getArrayAttr(
