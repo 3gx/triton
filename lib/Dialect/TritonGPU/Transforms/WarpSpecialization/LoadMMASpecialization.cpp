@@ -855,25 +855,42 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
         b.createInto<ttng::WaitBarrierOp>(*partition, nodeStageCluster, bar,
                                           node.phase);
 #else
-        b.createInto<nvws::SemaphoreAcquireOp>(*partition, nodeStageCluster,
-                                               node.semaPrev, node.index,
-                                               userPred);
+        b.createInto<nvws::SemaphoreAcquireOp>(
+            *partition, nodeStageCluster, node.semaPrev, node.index, userPred);
 #endif
       }
     }
     if (node.semaNext) {
       if (mmaOp == node.op) {
         b.setInsertionPoint(mmaOp);
+#if 0
         Value bar = createSingleBufferView(b, node.barNext, node.index);
         mmaOp.addCompletionBarrier(bar, userPred);
+#else
+        Value bar = createSingleBufferView(b, node.semaNext, node.index);
+        b.createInto<nvws::SemaphoreReleaseOp>(
+            *partition, nodeStageCluster, node.semaNext, node.index,
+            b.getArrayAttr(
+                SmallVector<Attribute>{triton::nvws::AsyncOpAttr::get(
+                    b.getContext(), triton::nvws::AsyncOp::TC5MMA)}),
+            userPred);
+#endif
         mmaOp.setIsAsync(true);
       } else {
         b.setInsertionPointAfter(lastOp);
         if (isa<scf::IfOp>(lastOp->getParentOp()) && accIsMultiBuffered)
           b.setInsertionPoint(lastOp->getBlock()->getTerminator());
+#if 0
         Value bar = createSingleBufferView(b, node.barNext, node.index);
         b.createInto<ttng::ArriveBarrierOp>(*partition, nodeStageCluster, bar,
                                             1);
+#else
+        b.createInto<nvws::SemaphoreReleaseOp>(
+            *partition, nodeStageCluster, node.semaNext, node.index,
+            b.getArrayAttr(
+                SmallVector<Attribute>{triton::nvws::AsyncOpAttr::get(
+                    b.getContext(), triton::nvws::AsyncOp::TC5MMA)}));
+#endif
       }
     }
   }
@@ -908,13 +925,17 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
     mmaOp.setIsAsync(true);
   }
 
-  if (nodes.back().barNext) {
+  if (nodes.back().semaNext) {
     b.setInsertionPointAfter(loop);
     // Re-acquire loop results as they may have been invalidated.
     Value lastIndex = loop.getResult(index.getArgNumber() - 1);
+#if 0
     Value lastPhase = loop.getResult(phase.getArgNumber() - 1);
-    Value lastBar = createSingleBufferView(b, nodes.back().barNext, lastIndex);
+    Value lastBar = createSingleBufferView(b, nodes.back().arNext, lastIndex);
     b.create<ttng::WaitBarrierOp>(lastBar, lastPhase);
+#else
+    b.create<nvws::SemaphoreAcquireOp>(nodes.back().semaNext, lastIndex);
+#endif
   }
 
   llvm::SetVector<Operation *> predOps;
