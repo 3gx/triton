@@ -181,7 +181,8 @@ def TritonGPULoadMMASpecialization : Pass<"tritongpu-load-mma-specialization", "
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
-                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
 
   let options = [
     Option<"numStages", "num-stages", "int32_t", /*default*/"3",
