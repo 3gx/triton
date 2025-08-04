@@ -171,7 +171,8 @@ LogicalResult DependencyRewriter::run() {
     };
     for (Operation *op : partition.getOps()) {
       for (OpOperand &use : op->getUses()) {
-        collectUses(use);
+        if (!isa<AsyncTokenType>(use.get().getType()))
+          collectUses(use);
       }
     }
 

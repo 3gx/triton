@@ -237,6 +237,13 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     tmemStoreOp.getPredMutable().assign(mask);
     return op;
   }
+  if (auto commitOp = dyn_cast<ttng::TCGen5CommitOp>(op)) {
+    rewriter.setInsertionPoint(commitOp);
+    Value mask = getPredMask(rewriter, commitOp.getPred().getType(),
+                             commitOp.getPred(), pred);
+    commitOp.getPredMutable().assign(mask);
+    return op;
+  }
   if (auto waitBarrier = dyn_cast<ttng::WaitBarrierOp>(op)) {
     rewriter.setInsertionPoint(waitBarrier);
     Value mask = pred;

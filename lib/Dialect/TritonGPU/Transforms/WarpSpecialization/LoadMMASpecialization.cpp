@@ -812,6 +812,7 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
     Value lastPhase = loop.getResult(phase.getArgNumber() - 1);
     Value lastBar = createSingleBufferView(b, nodes.back().barNext, lastIndex);
     auto waitBarrierOp = b.create<ttng::WaitBarrierOp>(lastBar, lastPhase);
+#if 0
     auto node_front = nodes.front();
     auto partition = schedule.getPartition(inBody(node_front.op));
     PartitionBuilder b(waitBarrierOp->getLoc(), waitBarrierOp);
@@ -821,6 +822,7 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
                            b.getI32IntegerAttr(schedule.getTag()));
     b.assignPartition(lastBar.getDefiningOp(), *partition);
     b.assignPartition(waitBarrierOp, *partition);
+#endif
   }
 
   llvm::SetVector<Operation *> predOps;
@@ -868,11 +870,13 @@ LogicalResult lowerLoops(scf::ForOp &loop, MutableArrayRef<PipelinedLoad> loads,
       return failure();
   }
 
-  // Multi-buffer and lower the MMAs.
+// Multi-buffer and lower the MMAs.
+#if 0
   for (PipelinedMMA &mma : mmas) {
     if (failed(pipelineMMA(loop, mma, schedule, domInfo, postDomInfo)))
       return failure();
   }
+#endif
 
   return success();
 }
