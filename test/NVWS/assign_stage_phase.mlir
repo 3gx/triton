@@ -59,6 +59,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
       "op_d"(%4) {ttg.partition = 2 : i32} : (tensor<1xi32, #blocked>) -> ()
       // CHECK: op_c
       // CHECK-NEXT: op_d
+      // CHECK-NEXT: yield [[S0b]], [[P0b]], [[S1b]], [[P1b]], [[S2b]], [[P2b]]
 
     } {ttg.partition.stages = [0 : i32, 2 : i32, 2 : i32], ttg.warp_specialize.tag = 0 : i32}
     ttg.local_dealloc %0 : !ttg.memdesc<3x1xi32, #shared, #smem, mutable>
