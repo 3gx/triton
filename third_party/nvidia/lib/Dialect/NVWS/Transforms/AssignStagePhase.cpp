@@ -77,10 +77,9 @@ template <class T> struct ThreadIndex {
 
   T isValidOp(Operation *op) {
     if (isa<T>(op) && op->getOperand(0) == aref) {
-      if (auto opPartitionId = getPartitionId(op)) {
-        if (opPartitionId == partitionId)
-          return cast<T>(op);
-      }
+      auto opPartitionId = getPartitionId(op);
+      if (!opPartitionId || *opPartitionId == partitionId)
+        return cast<T>(op);
     }
     return {};
   }
