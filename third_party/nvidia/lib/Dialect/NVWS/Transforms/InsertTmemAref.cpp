@@ -425,7 +425,7 @@ struct TMEMAref {
 TmemAccessDag::Node *
 insertTmemArefImpl(TmemAccessDag::Node *node,
                    std::optional<PartitionId> curPartitionId, TMEMAref &state) {
-  if (node->partitionId != curPartitionId) {
+  if (curPartitionId && node->partitionId != curPartitionId) {
     OpBuilder b(node->op);
     Operation *prevOp = nullptr;
     std::optional<PartitionId> prevPartitionId;
@@ -580,7 +580,7 @@ LogicalResult insertTmemAref(TmemAccessDag &accessDag) {
                             src, boolCst(b, allocOp.getLoc(), true));
   } else {
     // allocOp w/o src, assume the ownership of tmem belongs to first user
-    partitionId = accessDag.getRootNode()->user->partitionId;
+    // partitionId = accessDag.getRootNode()->user->partitionId;
   }
 
   auto node = insertTmemArefImpl(rootNode->user.get(), partitionId, state);
