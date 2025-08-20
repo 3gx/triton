@@ -170,4 +170,3 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
     tt.return
   }
 }
-
