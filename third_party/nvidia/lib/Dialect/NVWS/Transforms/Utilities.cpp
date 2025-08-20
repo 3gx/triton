@@ -1,5 +1,6 @@
 #include "Utilities.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
@@ -22,6 +23,19 @@ ArefCreateOp createArefCreateOp(OpBuilder &builder, ArrayRef<Type> arefTypes,
   auto ctx = builder.getContext();
   auto arefTy = ArefType::get(ctx, TypeArrayAttr::get(ctx, arefTypes));
   return builder.create<ArefCreateOp>(loc, arefTy, allocOps);
+}
+
+std::optional<PartitionId> getPartitionId(Operation *op) {
+  if (auto partitionAttr = op->getAttrOfType<IntegerAttr>(kPartitionAttrName)) {
+    IntegerAttr tagAttr;
+    while (op && !tagAttr) {
+      tagAttr = op->getAttrOfType<IntegerAttr>(kWarpSpecializeTagAttrName);
+      op = op->getParentOp();
+    }
+    if (tagAttr)
+      return PartitionId(partitionAttr.getInt(), tagAttr.getInt());
+  }
+  return {};
 }
 
 } // namespace mlir::triton::nvws
