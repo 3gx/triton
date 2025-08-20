@@ -220,20 +220,9 @@ template <class T> struct ThreadIndex {
         auto zero = b.create<arith::ConstantIntOp>(0, 32);
         index.stage = b.create<arith::SelectOp>(cnd, zero, nextStage);
 
-#if 1
-        /* change matching #if in LowerAref.cpp to enable MULTIPHASE */
-#define MULTIPHASE
-        // the phase is a bit-vector, each bit for each stage
-        // next_phase = phase_vector ^ (1 << stage)
-        // TODO: check for perf regression when enabling multiphase
-        Value phaseBit = b.create<arith::ShLIOp>(
-            b.create<arith::ConstantIntOp>(1, 32), index.stage);
-        index.phase = b.create<arith::XOrIOp>(index.phase, phaseBit);
-#else
         auto nextPhase = b.create<arith::XOrIOp>(
             index.phase, b.create<arith::ConstantIntOp>(1, 32));
         index.phase = b.create<arith::SelectOp>(cnd, nextPhase, index.phase);
-#endif
 
         index.token = opT.getToken();
         opT.getStageMutable().assign(index.stage);
@@ -285,11 +274,7 @@ template <class T> struct ThreadIndex {
     static_assert(std::is_same_v<T, ArefPutEnterOp> ||
                       std::is_same_v<T, ArefGetEnterOp>,
                   "ArefPutEnterOp or ArefGetEnterOp expected");
-#ifdef MULTIPHASE
-    auto initPhase = std::is_same_v<T, ArefPutEnterOp> ? 0 : -1;
-#else
     auto initPhase = std::is_same_v<T, ArefPutEnterOp> ? 0 : 1;
-#endif
     index.phase = b.create<arith::ConstantIntOp>(initPhase, 32);
 
     arefIndex.assignArefIndexInBlock(arefOp->getBlock(), index);
