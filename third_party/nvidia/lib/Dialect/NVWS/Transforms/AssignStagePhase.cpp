@@ -24,6 +24,7 @@
 #include "Utilities.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 
+#include "Utilities.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AttrTypeSubElements.h"
@@ -45,7 +46,6 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/ErrorHandling.h"
-#include "Utilities.h"
 
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
@@ -69,13 +69,25 @@ template <class T> struct ThreadIndex {
     Value token;
   };
   Value aref;
+  PartitionId partitionId;
   DenseMap<Value, int> tokToStagePosMap;
 
-  ThreadIndex(Value aref) : aref(aref) {}
+  ThreadIndex(Value aref, PartitionId partitionId)
+      : aref(aref), partitionId(partitionId) {}
+
+  T isValidOp(Operation *op) {
+    if (isa<T>(op) && op->getOperand(0) == aref) {
+      if (auto opPartitionId = getPartitionId(op)) {
+        if (opPartitionId == partitionId)
+          return cast<T>(op);
+      }
+    }
+    return {};
+  }
 
   bool analyzeArefUseInBlock(Block *block) {
     for (auto &op : *block) {
-      if (isa<T>(op) && op.getOperand(0) == aref) {
+      if (isValidOp(&op)) {
         return true;
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
         if (analyzeArefUseInBlock(forOp.getBody()))
@@ -203,9 +215,7 @@ template <class T> struct ThreadIndex {
 
   Index assignArefIndexInBlock(Block *block, Index index) {
     for (auto &op : llvm::make_early_inc_range(*block)) {
-      if (isa<T>(op) && op.getOperand(0) == aref) {
-        auto opT = cast<T>(op);
-
+      if (auto opT = isValidOp(&op)) {
         ImplicitLocOpBuilder b(opT.getLoc(), opT);
 
         auto nextStage = b.create<arith::AddIOp>(
@@ -262,7 +272,14 @@ template <class T> struct ThreadIndex {
   }
 
   static LogicalResult run(ArefCreateOp arefOp) {
-    ThreadIndex arefIndex(arefOp.getResult());
+
+    std::set<PartitionId> partitionIds;
+    for (auto user : arefOp->getUsers()) {
+      if (isa<T>(user)) {
+        if (auto partitionId = getPartitionId(user))
+          partitionIds.insert(*partitionId);
+      }
+    }
 
     // initialize indexes
     Index index;
@@ -278,14 +295,17 @@ template <class T> struct ThreadIndex {
     auto initPhase = std::is_same_v<T, ArefPutEnterOp> ? 0 : 1;
     index.phase = b.create<arith::ConstantIntOp>(initPhase, 32);
 
-    arefIndex.assignArefIndexInBlock(arefOp->getBlock(), index);
+    for (auto partitionId : partitionIds) {
+      ThreadIndex arefIndex(arefOp.getResult(), partitionId);
+      arefIndex.assignArefIndexInBlock(arefOp->getBlock(), index);
 
-    for (auto user : arefOp->getUsers())
-      if (auto enterOp = dyn_cast<T>(user)) {
-        DenseSet<Operation *> visited;
-        arefIndex.propagateStage(enterOp.getToken(), enterOp.getStage(),
-                                 visited);
-      }
+      for (auto user : arefOp->getUsers())
+        if (auto enterOp = dyn_cast<T>(user)) {
+          DenseSet<Operation *> visited;
+          arefIndex.propagateStage(enterOp.getToken(), enterOp.getStage(),
+                                   visited);
+        }
+    }
 
     return success();
   }

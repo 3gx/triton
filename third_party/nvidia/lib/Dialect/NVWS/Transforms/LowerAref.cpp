@@ -101,18 +101,6 @@ struct BarrierCount {
   int producerPendingCount;
   int consumerPendingCount;
 };
-std::optional<PartitionId> getPartitionId(Operation *op) {
-  if (auto partitionAttr = op->getAttrOfType<IntegerAttr>(kPartitionAttrName)) {
-    IntegerAttr tagAttr;
-    while (op && !tagAttr) {
-      tagAttr = op->getAttrOfType<IntegerAttr>(kWarpSpecializeTagAttrName);
-      op = op->getParentOp();
-    }
-    if (tagAttr)
-      return PartitionId(partitionAttr.getInt(), tagAttr.getInt());
-  }
-  return {};
-}
 
 BarrierCount getArrivalCount(ArefCreateOp op) {
   std::optional<int> producerPendingCount, consumerPendingCount;

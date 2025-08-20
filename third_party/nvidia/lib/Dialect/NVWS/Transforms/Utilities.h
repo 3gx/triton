@@ -28,6 +28,7 @@ struct PartitionId : std::pair<int, int> {
   int &tag() { return second; }
 };
 
+std::optional<PartitionId> getPartitionId(Operation *op);
 
 } // namespace mlir::triton::nvws
 
