@@ -45,6 +45,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "Utilities.h"
 
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
@@ -65,17 +66,11 @@ namespace {
 
 // ----------------------------------------------------------------------------
 
-struct PartitionId : std::pair<int, int> {
-  PartitionId(int index, int tag) : std::pair<int, int>(index, tag) {}
-  int &index() { return first; }
-  int &tag() { return second; }
-};
-
 void assignStageCluster(Operation *op, std::optional<PartitionId> partitionId,
                         StageCluster stageCluster, OpBuilder &builder) {
   if (partitionId) {
     op->setAttr(kPartitionAttrName,
-                builder.getI32IntegerAttr(partitionId->first));
+                builder.getI32IntegerAttr(partitionId->index()));
     if (stageCluster) {
       op->setAttr(triton::kLoopStageAttrName,
                   builder.getI32IntegerAttr(stageCluster->first));

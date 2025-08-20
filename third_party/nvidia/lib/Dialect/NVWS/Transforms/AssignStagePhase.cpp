@@ -45,6 +45,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "Utilities.h"
 
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;

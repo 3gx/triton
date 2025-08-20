@@ -22,6 +22,13 @@ inline std::optional<int> findValuePosInRange(const Range &range,
   return {};
 }
 
+struct PartitionId : std::pair<int, int> {
+  PartitionId(int index, int tag) : std::pair<int, int>(index, tag) {}
+  int &index() { return first; }
+  int &tag() { return second; }
+};
+
+
 } // namespace mlir::triton::nvws
 
 #endif // NVIDIA_NVWS_TRANSFORMS_UTILITY_H_
