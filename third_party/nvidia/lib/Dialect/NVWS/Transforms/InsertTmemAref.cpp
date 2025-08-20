@@ -449,14 +449,13 @@ insertTmemArefImpl(TmemAccessDag::Node *node,
 
     // acquire right before op that acquires ownership of tmem
     auto curOp = node->op;
+    auto partitionId = node->partitionId;
     b.setInsertionPoint(curOp);
 
-    auto partitionId = node->partitionId;
     if (isa<scf::YieldOp>(curOp)) {
       // in yieldOp we overload parentDag as the first op in the current subDag
-      // so we use its partition and stageCluster to insert acquire
+      // so we use its stageCluster to insert acquire
       curOp = node->parentDag->op;
-      partitionId = node->parentDag->partitionId;
     }
     auto stageCluster = getStageCluster(curOp);
     state.acquire(b, curOp->getLoc(), {partitionId, stageCluster});
