@@ -575,9 +575,20 @@ mlir::triton::getMultiBufferedType(ttg::MemDescType memDescType,
   auto shape = memDescType.getShape();
   SmallVector<int64_t> bufferShape(shape.begin(), shape.end());
   bufferShape.insert(bufferShape.begin(), depth);
+  auto v1 = memDescType.getElementType();
+  auto v2 = memDescType.getEncoding();
+  auto v3 = memDescType.getMemorySpace();
+  llvm::errs() << "===> 1:memDescType: " << memDescType << "\n";
+  llvm::errs() << "===> 2:v1: " << v1 << "\n";
+  llvm::errs() << "===> 3:v2: " << v2 << "\n";
+  llvm::errs() << "===> 4:v3: " << v3 << "\n";
+#if 0
   return ttg::MemDescType::get(
       bufferShape, memDescType.getElementType(), memDescType.getEncoding(),
       memDescType.getMemorySpace(), /*mutableMemory*/ true);
+#else
+  return ttg::MemDescType::get(bufferShape, v1, v2, v3, true);
+#endif
 }
 
 ttg::SharedEncodingTrait mlir::triton::getSharedEncoding(RankedTensorType ty) {

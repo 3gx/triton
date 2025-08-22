@@ -525,6 +525,12 @@ insertTmemArefImpl(TmemAccessDag::Node *node,
 LogicalResult insertTmemAref(TmemAccessDag &accessDag) {
   auto rootNode = accessDag.getRootNode();
   auto allocOp = cast<TMEMAllocOp>(rootNode->op);
+  auto allocTy = allocOp.getResult().getType();
+  if (isa<TensorMemoryScalesEncodingAttr>(allocTy.getEncoding())) {
+    // don't warp-specialize tmem-scales
+    assert(0 && "not implemented");
+    return success();
+  }
 
   std::optional<bool> isMultiStaged;
   for (auto user : allocOp.getResult().getUsers()) {
@@ -545,9 +551,7 @@ LogicalResult insertTmemAref(TmemAccessDag &accessDag) {
     }
   }
   auto numStages = isMultiStaged ? (1 + *isMultiStaged) : 1;
-
-  MemDescType arefBufType =
-      getMultiBufferedType(allocOp.getResult().getType(), numStages);
+  MemDescType arefBufType = getMultiBufferedType(allocTy, numStages);
   OpBuilder b(allocOp);
 
   // alloc can be inside ws-loop, we need to find the entry point for ws-loop
@@ -609,11 +613,12 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
     tmemDags.push_back(TmemAccessDag::build(allocOp));
   });
 
-  llvm::errs() << "===> FuncOp: " << funcOp.getSymName() << "\n";
+  llvm::errs() << "===> 1:FuncOp: " << funcOp.getSymName() << "\n";
   for (auto &accessDag : tmemDags) {
     accessDag.printDag(llvm::errs());
   }
 
+  llvm::errs() << "===> 2:FuncOp: " << funcOp.getSymName() << "\n";
   for (auto &accessDag : tmemDags) {
     // LLVM_DEBUG({ accessDag.printDag(llvm::dbgs()); });
     accessDag.printDag(llvm::errs());
