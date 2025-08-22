@@ -610,6 +610,9 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
   });
 
   llvm::errs() << "===> FuncOp: " << funcOp.getSymName() << "\n";
+  for (auto &accessDag : tmemDags) {
+    accessDag.printDag(llvm::errs());
+  }
 
   for (auto &accessDag : tmemDags) {
     // LLVM_DEBUG({ accessDag.printDag(llvm::dbgs()); });
