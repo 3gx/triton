@@ -5,6 +5,7 @@
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVectorExtras.h"
@@ -46,8 +47,13 @@ template <typename T>
 static std::optional<Twine> verifySlice(T &origType, T &newType) {
   if (!origType || !newType)
     return "MLIR Types don't match";
-  if (origType.getElementType() != newType.getElementType() ||
-      origType.getRank() - 1 != newType.getRank()) {
+  if (isa<mlir::triton::nvidia_gpu::TensorMemoryScalesEncodingAttr>(
+          origType.getEncoding()) &&
+      (origType.getElementType() != newType.getElementType() ||
+       origType.getRank() != newType.getRank())) {
+    return "Ranks don't match for TensorMemoryScalesEncodingAttr";
+  } else if (origType.getElementType() != newType.getElementType() ||
+             origType.getRank() - 1 != newType.getRank()) {
     return "Ranks don't match";
   }
   for (size_t i = 0, e = newType.getShape().size(); i < e; i++) {

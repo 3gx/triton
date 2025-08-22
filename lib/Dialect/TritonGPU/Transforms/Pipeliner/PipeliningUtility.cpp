@@ -563,9 +563,12 @@ void mlir::triton::combineRedundantWaitOps(
 
 ttg::MemDescType mlir::triton::getBufferViewType(ttg::MemDescType allocTy,
                                                  bool mutableMemory) {
-  return ttg::MemDescType::get(allocTy.getShape().drop_front(),
-                               allocTy.getElementType(), allocTy.getEncoding(),
-                               allocTy.getMemorySpace(), mutableMemory,
+  auto shape = allocTy.getShape();
+  if (!isa<nvidia_gpu::TensorMemoryScalesEncodingAttr>(allocTy.getEncoding()))
+    shape = shape.drop_front();
+  return ttg::MemDescType::get(shape, allocTy.getElementType(),
+                               allocTy.getEncoding(), allocTy.getMemorySpace(),
+                               mutableMemory,
                                /*allocShape=*/allocTy.getAllocShape());
 }
 
@@ -574,21 +577,15 @@ mlir::triton::getMultiBufferedType(ttg::MemDescType memDescType,
                                    int32_t depth) {
   auto shape = memDescType.getShape();
   SmallVector<int64_t> bufferShape(shape.begin(), shape.end());
-  bufferShape.insert(bufferShape.begin(), depth);
-  auto v1 = memDescType.getElementType();
-  auto v2 = memDescType.getEncoding();
-  auto v3 = memDescType.getMemorySpace();
-  llvm::errs() << "===> 1:memDescType: " << memDescType << "\n";
-  llvm::errs() << "===> 2:v1: " << v1 << "\n";
-  llvm::errs() << "===> 3:v2: " << v2 << "\n";
-  llvm::errs() << "===> 4:v3: " << v3 << "\n";
-#if 0
+  if (!isa<nvidia_gpu::TensorMemoryScalesEncodingAttr>(
+          memDescType.getEncoding())) {
+    bufferShape.insert(bufferShape.begin(), depth);
+  } else {
+    assert(depth == 1 && "Scales don't currently support multibuffering");
+  }
   return ttg::MemDescType::get(
       bufferShape, memDescType.getElementType(), memDescType.getEncoding(),
       memDescType.getMemorySpace(), /*mutableMemory*/ true);
-#else
-  return ttg::MemDescType::get(bufferShape, v1, v2, v3, true);
-#endif
 }
 
 ttg::SharedEncodingTrait mlir::triton::getSharedEncoding(RankedTensorType ty) {
