@@ -623,7 +623,6 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
       if (failed(insertTmemAref(accessDag)))
         return failure();
     // llvm::errs() << " -->:FUNC:\n" << funcOp << "\n";
-    break;
   }
   return success();
 }
