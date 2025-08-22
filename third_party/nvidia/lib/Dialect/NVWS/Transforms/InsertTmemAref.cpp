@@ -496,12 +496,12 @@ insertTmemArefImpl(TmemAccessDag::Node *node,
     tmemStoreOp.getToken().replaceAllUsesWith(state.replToken);
   } else if (auto mmaOp = dyn_cast<MMAv5OpInterface>(node->op)) {
     if (mmaOp.getAccumulator() == state.origBuffer) {
-      mmaOp.setAccumulator(state.getBuffer(b, node->partitionId, node->op));
       mmaOp.getAccDepMutable().clear();
       mmaOp.getToken().replaceAllUsesWith(state.replToken);
-    } else {
-      mmaOp.getAMutable().assign(
-          state.getBuffer(b, node->partitionId, node->op));
+    }
+    for (auto &opnd : mmaOp->getOpOperands()) {
+      if (opnd.get() == state.origBuffer)
+        opnd.set(state.getBuffer(b, node->partitionId, node->op));
     }
   } else if (auto yieldOp = dyn_cast<scf::YieldOp>(node->op)) {
     yieldOp.setOperand(node->tokOperand->getOperandNumber(), state.token);
@@ -608,10 +608,10 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
     tmemDags.push_back(TmemAccessDag::build(allocOp));
   });
 
-  llvm::errs() << "===> 1:FuncOp: " << funcOp.getSymName() << "\n";
-  for (auto &accessDag : tmemDags) {
-    accessDag.printDag(llvm::errs());
-  }
+  // llvm::errs() << "===> 1:FuncOp: " << funcOp.getSymName() << "\n";
+  // for (auto &accessDag : tmemDags) {
+  //   accessDag.printDag(llvm::errs());
+  // }
 
   llvm::errs() << "===> 2:FuncOp: " << funcOp.getSymName() << "\n";
   for (auto &accessDag : tmemDags) {
@@ -622,7 +622,7 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
     if (!partitions.empty())
       if (failed(insertTmemAref(accessDag)))
         return failure();
-    llvm::errs() << " -->:FUNC:\n" << funcOp << "\n";
+    // llvm::errs() << " -->:FUNC:\n" << funcOp << "\n";
     break;
   }
   return success();

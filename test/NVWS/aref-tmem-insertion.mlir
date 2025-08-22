@@ -366,28 +366,28 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     "use"(%result_0) : (tensor<128x128xf32, #blocked>) -> ()
     tt.return
   }
-  // tt.func @load_scale_mma_user(%arg0: !ttg.memdesc<128x64xf16, #shared, #smem>, %arg1: !ttg.memdesc<64x128xf16, #shared, #smem>, %arg2: !tt.tensordesc<tensor<8x128xi8, #shared>>, %arg3: !ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>, %arg4: i32) {
-  //   %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
-  //   %true = arith.constant true
-  //   %c1_i32 = arith.constant 1 : i32
-  //   %c0_i32 = arith.constant 0 : i32
-  //   %result, %token = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
-  //   %0 = ttng.tmem_store %cst, %result[%token], %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-  //   %1 = scf.for %arg5 = %c0_i32 to %arg4 step %c1_i32 iter_args(%arg6 = %0) -> (!ttg.async.token)  : i32 {
-  //     %2 = tt.descriptor_load %arg2[%arg5, %arg5] {ttg.partition = 2 : i32} : !tt.tensordesc<tensor<8x128xi8, #shared>> -> tensor<8x128xi8, #blocked1>
-  //     %3 = ttg.local_alloc %2 {ttg.partition = 2 : i32} : (tensor<8x128xi8, #blocked1>) -> !ttg.memdesc<8x128xi8, #shared, #smem>
-  //     %4 = ttg.local_load %3 {ttg.partition = 0 : i32} : !ttg.memdesc<8x128xi8, #shared, #smem> -> tensor<8x128xi8, #linear1>
-  //     %5 = tt.trans %4 {order = array<i32: 1, 0>, ttg.partition = 0 : i32} : tensor<8x128xi8, #linear1> -> tensor<128x8xi8, #linear>
-  //     %result_2 = ttng.tmem_alloc %5 {ttg.partition = 0 : i32} : (tensor<128x8xi8, #linear>) -> !ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>
-  //     %6 = ttng.tc_gen5_mma_scaled %arg0, %arg1, %result[%arg6], %result_2, %arg3, %true, %true lhs = e4m3 rhs = e4m3 {ttg.partition = 1 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>, !ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>
-  //     %result_3, %token_4 = ttng.tmem_load %result[%6] {ttg.partition = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
-  //     "user"(%result_3) {ttg.partition = 0 : i32} : (tensor<128x128xf32, #blocked>) -> ()
-  //     scf.yield %token_4 : !ttg.async.token
-  //   } {tt.num_stages = 3 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 16 : i32}
-  //   %result_0, %token_1 = ttng.tmem_load %result[%1] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
-  //   "use"(%result_0) : (tensor<128x128xf32, #blocked>) -> ()
-  //   tt.return
-  // }
+  tt.func @load_scale_mma_user(%arg0: !ttg.memdesc<128x64xf16, #shared, #smem>, %arg1: !ttg.memdesc<64x128xf16, #shared, #smem>, %arg2: !tt.tensordesc<tensor<8x128xi8, #shared>>, %arg3: !ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>, %arg4: i32) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    %true = arith.constant true
+    %c1_i32 = arith.constant 1 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %result, %token = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %0 = ttng.tmem_store %cst, %result[%token], %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %1 = scf.for %arg5 = %c0_i32 to %arg4 step %c1_i32 iter_args(%arg6 = %0) -> (!ttg.async.token)  : i32 {
+      %2 = tt.descriptor_load %arg2[%arg5, %arg5] {ttg.partition = 2 : i32} : !tt.tensordesc<tensor<8x128xi8, #shared>> -> tensor<8x128xi8, #blocked1>
+      %3 = ttg.local_alloc %2 {ttg.partition = 2 : i32} : (tensor<8x128xi8, #blocked1>) -> !ttg.memdesc<8x128xi8, #shared, #smem>
+      %4 = ttg.local_load %3 {ttg.partition = 0 : i32} : !ttg.memdesc<8x128xi8, #shared, #smem> -> tensor<8x128xi8, #linear1>
+      %5 = tt.trans %4 {order = array<i32: 1, 0>, ttg.partition = 0 : i32} : tensor<8x128xi8, #linear1> -> tensor<128x8xi8, #linear>
+      %result_2 = ttng.tmem_alloc %5 {ttg.partition = 0 : i32} : (tensor<128x8xi8, #linear>) -> !ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>
+      %6 = ttng.tc_gen5_mma_scaled %arg0, %arg1, %result[%arg6], %result_2, %arg3, %true, %true lhs = e4m3 rhs = e4m3 {ttg.partition = 1 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>, !ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>
+      %result_3, %token_4 = ttng.tmem_load %result[%6] {ttg.partition = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+      "user"(%result_3) {ttg.partition = 0 : i32} : (tensor<128x128xf32, #blocked>) -> ()
+      scf.yield %token_4 : !ttg.async.token
+    } {tt.num_stages = 3 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 16 : i32}
+    %result_0, %token_1 = ttng.tmem_load %result[%1] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    "use"(%result_0) : (tensor<128x128xf32, #blocked>) -> ()
+    tt.return
+  }
   tt.func @store_mma_load(%arg0: i32, %arg1: !tt.tensordesc<tensor<128x64xf16, #shared>>, %arg2: !ttg.memdesc<64x128xf16, #shared, #smem>) {
     %true = arith.constant true
     %c1_i32 = arith.constant 1 : i32
