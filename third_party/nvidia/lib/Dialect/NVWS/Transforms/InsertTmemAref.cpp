@@ -253,8 +253,8 @@ struct TmemAccessDag {
     return accessDag;
   }
 
-  DenseSet<PartitionId> collectPartitions(Node *node) {
-    DenseSet<PartitionId> partitions;
+  std::set<PartitionId> collectPartitions(Node *node) {
+    std::set<PartitionId> partitions;
     if (node->partitionId)
       partitions.insert(*node->partitionId);
 
@@ -278,7 +278,7 @@ struct TmemAccessDag {
     for (int i = 0; i < indent; i++) {
       os << " ";
     }
-    DenseSet<PartitionId> partitions;
+    std::set<PartitionId> partitions;
     os << "|- [" << node->op << "]";
     if (node->partitionId)
       partitions.insert(*node->partitionId);
@@ -295,8 +295,7 @@ struct TmemAccessDag {
     }
     os << "[";
     for (auto partition : partitions) {
-      os << " @" << getPartitionTag(partition) << "."
-         << getPartitionIndex(partition) << " ";
+      os << " @" << partition.tag() << "." << partition.index() << " ";
     }
     os << "]";
     os << " prev[" << (node->parent ? node->parent->op : nullptr) << "]";
@@ -341,8 +340,8 @@ OpT createInto(OpBuilder &b, Location loc,
                Args &&...args) {
   auto op = b.create<OpT>(loc, std::forward<Args>(args)...);
   if (parititionIdStageCluster.first) {
-    op->setAttr(kPartitionAttrName, b.getI32IntegerAttr(getPartitionIndex(
-                                        *parititionIdStageCluster.first)));
+    op->setAttr(kPartitionAttrName,
+                b.getI32IntegerAttr(parititionIdStageCluster.first->index()));
     assignStage(b, op, parititionIdStageCluster.second);
   }
   return op;
