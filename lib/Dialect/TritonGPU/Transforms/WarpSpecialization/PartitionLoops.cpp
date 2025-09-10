@@ -21,6 +21,8 @@ using namespace triton::gpu;
 
 namespace {
 
+constexpr int kAllPartitionsDefIdx = 255;
+
 struct WarpGroupBuilder : public OpBuilder {
   WarpGroupBuilder(Block *block, Block::iterator insertPoint,
                    size_t partitionId)
@@ -201,19 +203,26 @@ void cloneIfOp(scf::IfOp ifOp, SmallVector<WarpGroupBuilder> &builders,
   for (size_t idx : partitionIndices) {
     auto &b = builders[idx];
     auto cond = b.mapping.lookupOrDefault(ifOp.getCondition());
-    auto newIfOp = b.create<scf::IfOp>(ifOp.getLoc(), ifOp.getResultTypes(),
-                                       cond, ifOp.elseBlock() ? true : false);
+    SmallVector<Type> newIfResultTypes;
+    auto attrArray = ifOp->getAttrOfType<ArrayAttr>(kPartitionOutputsAttrName);
+    assert(attrArray.size() == ifOp.getResultTypes().size());
+    SmallVector<int> newIfResultIndices;
+    for (auto pos = 0; pos < ifOp.getResultTypes().size(); ++pos) {
+      auto partitionIds = cast<DenseI32ArrayAttr>(attrArray[pos]).asArrayRef();
+      if (llvm::is_contained(partitionIds, idx)) {
+        newIfResultTypes.push_back(ifOp.getResult(pos).getType());
+        newIfResultIndices.push_back(pos);
+      }
+    }
+    auto newIfOp = b.create<scf::IfOp>(ifOp.getLoc(), newIfResultTypes, cond,
+                                       ifOp.elseBlock() ? true : false);
     newIfOp->setAttrs(ifOp->getAttrs());
     newIfOps.push_back(newIfOp);
 
-    mapRange(ifOp.getResults(), newIfOp.getResults(), b.mapping);
-    mapRange(ifOp.thenBlock()->getArguments(),
-             newIfOp.thenBlock()->getArguments(), b.mapping);
-
-    if (ifOp.elseBlock()) {
-      mapRange(ifOp.elseBlock()->getArguments(),
-               newIfOp.elseBlock()->getArguments(), b.mapping);
+    for (auto [newIdx, oldIdx] : llvm::enumerate(newIfResultIndices)) {
+      b.mapping.map(ifOp.getResult(oldIdx), newIfOp.getResult(newIdx));
     }
+    assert(ifOp.thenBlock()->getNumArguments() == 0);
 
     b.setInsertionPointToStart(newIfOp.thenBlock());
   }
@@ -289,7 +298,6 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
                      const PartitionSet &partitions) {
   for (auto &op_ : *block) {
     auto op = &op_;
-    auto partitionIndices = getPartitionIds(op, partitions.getNumPartitions());
 
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       cloneForOp(forOp, builders, partitions);
@@ -302,17 +310,37 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
         continue;
       }
 
+      SmallVector<size_t> partitionIndices;
+      if (auto ifOp = dyn_cast<scf::IfOp>(yieldOp->getParentOp())) {
+        auto partitions =
+            ifOp->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName)
+                .asArrayRef();
+        for (auto idx : partitions) {
+          partitionIndices.push_back(idx);
+        }
+      } else {
+        partitionIndices = getPartitionIds(op, partitions.getNumPartitions());
+      }
+
       for (size_t idx : partitionIndices) {
         auto &builder = builders[idx];
         SmallVector<size_t> newOperandIndices;
         if (auto forOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp())) {
           newOperandIndices =
               getLoopVarIndicesToKeep(
-                  forOp, partitions.getPartition(builder.partitionId), partitions)
+                  forOp, partitions.getPartition(builder.partitionId),
+                  partitions)
                   .first;
         } else {
+          auto ifOp = cast<scf::IfOp>(yieldOp->getParentOp());
+          auto attrArray =
+              ifOp->getAttrOfType<ArrayAttr>(kPartitionOutputsAttrName);
+          assert(attrArray.size() == yieldOp.getOperands().size());
           for (size_t i = 0; i < yieldOp.getOperands().size(); ++i) {
-            newOperandIndices.push_back(i);
+            auto ids = cast<DenseI32ArrayAttr>(attrArray[i]).asArrayRef();
+            if (llvm::is_contained(ids, idx)) {
+              newOperandIndices.push_back(i);
+            }
           }
         }
 
@@ -327,9 +355,60 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
         }
       }
     } else {
+      auto partitionIndices =
+          getPartitionIds(op, partitions.getNumPartitions());
       cloneOp(op, builders, partitionIndices);
     }
   }
+}
+void inferIfStmtPartitions(scf::IfOp ifOp) {
+  using PartitionSet = SetVector<int>;
+  PartitionSet zeroPartition, allPartitions;
+  zeroPartition.insert(0);
+  allPartitions.insert(kAllPartitionsDefIdx);
+  SmallVector<std::optional<PartitionSet>> partitionIndices;
+  auto partitionIndex = [&](OpOperand &opnd) -> std::optional<PartitionSet> {
+    if (auto defOp = opnd.get().getDefiningOp()) {
+      return triton::gpu::getPartitionIds(defOp);
+    }
+    return std::nullopt;
+  };
+  for (auto &opnd : ifOp.thenYield()->getOpOperands()) {
+    partitionIndices.push_back(partitionIndex(opnd));
+  }
+
+  if (ifOp.elseBlock()) {
+    for (auto [idx, opnd] :
+         llvm::enumerate(ifOp.elseYield()->getOpOperands())) {
+      auto index = partitionIndex(opnd);
+      if (index) {
+        if (partitionIndices[idx]) {
+          assert(
+              partitionIndices[idx] == index &&
+              "inconsistent partitions for then/else branches yield operand");
+        } else {
+          partitionIndices[idx] = index;
+        }
+      } else if (!partitionIndices[idx]) {
+        partitionIndices[idx] = isa<AsyncTokenType>(opnd.get().getType())
+                                    ? zeroPartition
+                                    : allPartitions;
+      }
+    }
+  }
+
+  llvm::SmallVector<Attribute> partitionAttrs;
+  SetVector<int> ifPartitions;
+  for (auto partition : partitionIndices) {
+    assert(partition);
+    OpBuilder b(ifOp);
+    ArrayRef<int> ids(partition->begin(), partition->end());
+    partitionAttrs.push_back(b.getDenseI32ArrayAttr(ids));
+    ifPartitions.insert(partition->begin(), partition->end());
+  }
+  ifOp->setAttr(kPartitionOutputsAttrName,
+                ArrayAttr::get(ifOp.getContext(), partitionAttrs));
+  setPartition(ifOp, ifPartitions);
 }
 
 void assignRootPartition(scf::ForOp loop, int numPartitions) {
@@ -367,12 +446,16 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     return failure();
   PartitionSet partitions = std::move(*partitionsOr);
 
+  static int counter = 0;
+
   assignRootPartition(loop, partitions.getNumPartitions());
   assignRegionBodyPartition(loop);
+  loop.walk([&](scf::IfOp ifOp) { inferIfStmtPartitions(ifOp); });
 
-  //  loop->getParentOfType<ModuleOp>().dump();
+//  loop->getParentOfType<ModuleOp>().dump();
 
-  // Only the root node should have consumers at this point.
+// Only the root node should have consumers at this point.
+#if 0
   for (const Partition &partition : partitions.getPartitions()) {
     bool failed = false;
     auto callback = [&](OpResult output, OpOperand &use, unsigned distance) {
@@ -401,6 +484,7 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     if (failed)
       return failure();
   }
+#endif
 
   // There is nothing to do if the loop has 1 or fewer partitions.
   if (llvm::size(partitions.getPartitions()) <= 1)
@@ -507,7 +591,6 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     }
   }
 
-  //  loop->getParentOfType<ModuleOp>().dump();
   for (auto op : llvm::reverse(opsToErase))
     op->erase();
 
