@@ -573,7 +573,8 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
   for (int i = 0; i < nodes.size(); ++i) {
     Node &cur = nodes[i];
     Node &next = nodes[(i + 1) % nodes.size()];
-    if (!samePartition(inBody(cur.op), inBody(next.op))) {
+//    if (!samePartition(inBody(cur.op), inBody(next.op))) {
+    if (!samePartition(cur.op, next.op)) {
       cur.barNext = createBarrierAlloc(loop, numMmaStages);
       next.barPrev = cur.barNext;
     }
@@ -671,7 +672,7 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
     Operation *defOp = operand.getDefiningOp();
     if (!defOp || loop.isDefinedOutsideOfLoop(operand))
       continue;
-    defOp = inBody(defOp);
+//    defOp = inBody(defOp);
 
     if (partitions.isInRootPartition(defOp)) {
       // If the MMA operand is coming from outside the loop, move the alloc out.
@@ -717,7 +718,7 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
   }
 
   for (Node &node : nodes) {
-    Partition *partition = partitions.getPartition(inBody(node.op));
+    Partition *partition = partitions.getPartition(node.op);
     PartitionBuilder b(node.op->getLoc(), loop);
 
     SmallVector<Operation *> defs;

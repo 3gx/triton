@@ -55,12 +55,44 @@ bool isTensorResultComputedBy(scf::ForOp loop, size_t resultIdx,
                               const Partition *partition,
                               const PartitionSet &partitions) {
   bool ret = false;
+#if 1
   partition->iterateOutputs(loop, [&](Operation *op, OpOperand &use) {
     if (isa<scf::YieldOp>(op) && use.getOperandNumber() == resultIdx &&
         isa<RankedTensorType>(loop.getResult(resultIdx).getType())) {
       ret = true;
     }
   });
+#else
+  if (loop.getResult(resultIdx).use_empty())
+    return false;
+  auto value = loop.getYieldedValues()[resultIdx];
+  if (!isa<RankedTensorType>(value.getType()))
+    return false;
+  if (auto defOp = value.getDefiningOp()) {
+    SetVector<int> partitionIds;
+    if (auto attr =
+            defOp->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName)) {
+      partitionIds = SetVector<int>(attr.asArrayRef());
+      if (auto ifOp = dyn_cast<scf::IfOp>(defOp)) {
+        int pos = -1;
+        for (auto result : ifOp.getResults()) {
+          if (result == value) {
+            pos = result.getResultNumber();
+            break;
+          }
+        }
+        assert(pos != -1);
+        auto arrayAttr = ifOp->getAttrOfType<ArrayAttr>(kPartitionAttrName);
+        assert(arrayAttr.size() == ifOp.getResultTypes().size());
+        defIdx = cast<IntegerAttr>(arrayAttr[pos]).getInt();
+      } else if (auto attr =
+                     defOp->getAttrOfType<IntegerAttr>(kPartitionAttrName)) {
+        defIdx = attr.getInt();
+      }
+
+      return defIdx == partition->getIndex() || defIdx == kAllPartitionsDefIdx;
+    }
+#endif
   return ret;
 }
 
@@ -364,8 +396,10 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     return failure();
   PartitionSet partitions = std::move(*partitionsOr);
 
+#if 0
   assignRootPartition(loop, partitions);
   assignRegionBodyPartition(loop, partitions);
+#endif
 
   // Only the root node should have consumers at this point.
   for (const Partition &partition : partitions.getPartitions()) {
@@ -516,6 +550,99 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
   return success();
 }
 
+LogicalResult inferIfStmtPartitions(scf::IfOp ifOp) {
+  using PartitionSet = SetVector<int>;
+  PartitionSet ifOpPartitions;
+  SmallVector<std::optional<PartitionSet>> partitionIndices(
+      ifOp.getResultTypes().size());
+
+  auto processBlock = [&](Block *block) -> LogicalResult {
+    if (!block)
+      return success();
+
+    for (auto &op : *block) {
+      if (auto yieldOp = dyn_cast<scf::YieldOp>(op)) {
+        // for yield op, get partition of each result of if-stmt
+        for (auto [idx, value] : llvm::enumerate(yieldOp->getOperands())) {
+          if (auto partitionIds = getPartitionIds(value.getDefiningOp())) {
+            if (partitionIndices[idx]) {
+              if (partitionIndices[idx] != partitionIds) {
+                return emitError(yieldOp.getLoc(),
+                                 "inconsistent partitions for then/else "
+                                 "branches yield operand");
+              }
+            } else {
+              partitionIndices[idx] = partitionIds;
+            }
+          }
+        }
+      } else {
+        // for all other ops, compute a set of partition where if-op has to
+        // be executed
+        auto opPartitions = getPartitionIds(&op);
+        llvm::errs() << "YYY: op:" << op << "\n";
+        assert(opPartitions);
+        for (auto p : *opPartitions) {
+          ifOpPartitions.insert(p);
+        }
+      }
+    }
+    return success();
+  };
+
+  if (failed(processBlock(ifOp.thenBlock())))
+    return failure();
+  if (failed(processBlock(ifOp.elseBlock())))
+    return failure();
+
+  llvm::errs() << "ifOp:" << ifOp << "\n";
+  for (auto [idx, partition] : llvm::enumerate(partitionIndices)) {
+    llvm::errs() << "idx: " << idx << " partition: [";
+    if (partition) {
+      llvm::errs() << " [ ";
+      for (auto p : *partition) {
+        llvm::errs() << p << " ";
+      }
+      llvm::errs() << "]";
+    }
+    llvm::errs() << " ]\n";
+  }
+
+  llvm::SmallVector<Attribute> partitionAttrs;
+  for (auto [idx, partition] : llvm::enumerate(partitionIndices)) {
+    if (!partition) {
+      if (!isa<AsyncTokenType>(ifOp.getResult(idx).getType())) {
+        return emitError(ifOp.getLoc(),
+                         "partition not found for if-stmt result");
+      }
+      partition = SetVector<int>();
+      partition->insert(0);
+    }
+    ArrayRef<int> ids(partition->begin(), partition->end());
+    OpBuilder b(ifOp);
+    llvm::errs() << "idx:" << idx << " ids: [";
+    for (auto p : ids) {
+      llvm::errs() << p << " ";
+    }
+    llvm::errs() << "]\n";
+    partitionAttrs.push_back(b.getDenseI32ArrayAttr(ids));
+  }
+  ifOp->setAttr(kPartitionOutputsAttrName,
+                ArrayAttr::get(ifOp.getContext(), partitionAttrs));
+  setPartition(ifOp, ifOpPartitions);
+  llvm::errs() << "ifOp:" << ifOp << "\n";
+  return success();
+} // namespace
+
+LogicalResult inferReduceOpPartitions(triton::ReduceOp reduceOp) {
+  auto terminator = reduceOp.getRegion().getBlocks().front().getTerminator();
+  auto partitionIds = getPartitionIds(terminator);
+  if (!partitionIds)
+    return emitError(reduceOp.getLoc(), "reduce op has no partition ids");
+  setPartition(reduceOp, *partitionIds);
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // Pass Definition
 //===----------------------------------------------------------------------===//
@@ -535,8 +662,8 @@ struct PartitionLoops
 } // namespace
 
 void PartitionLoops::runOnOperation() {
-  // Collect for loops to warp specialize. This pass expects the loop to already
-  // be annotated with partitions.
+  // Collect for loops to warp specialize. This pass expects the loop to
+  // already be annotated with partitions.
   SmallVector<scf::ForOp> loops;
   getOperation().walk([&](scf::ForOp loop) {
     if (loop->hasAttrOfType<ArrayAttr>(kPartitionStagesAttrName))
@@ -544,6 +671,15 @@ void PartitionLoops::runOnOperation() {
   });
 
   for (scf::ForOp loop : loops) {
+    loop.walk([&](scf::IfOp ifOp) {
+      if (failed(inferIfStmtPartitions(ifOp)))
+        signalPassFailure();
+    });
+    loop.walk([&](triton::ReduceOp reduceOp) {
+      if (failed(inferReduceOpPartitions(reduceOp)))
+        signalPassFailure();
+    });
+    llvm::errs() << "MODUX: " << getOperation() << "\n";
     if (failed(partitionLoop(loop)))
       return signalPassFailure();
   }
