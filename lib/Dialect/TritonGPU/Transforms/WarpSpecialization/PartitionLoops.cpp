@@ -54,6 +54,7 @@ enum class LoopVarCategory {
 bool isTensorResultComputedBy(scf::ForOp loop, size_t resultIdx,
                               const Partition *partition,
                               const PartitionSet &partitions) {
+#if 0
   bool ret = false;
   partition->iterateOutputs(loop, [&](Operation *op, OpOperand &use) {
     if (isa<scf::YieldOp>(op) && use.getOperandNumber() == resultIdx &&
@@ -62,6 +63,26 @@ bool isTensorResultComputedBy(scf::ForOp loop, size_t resultIdx,
     }
   });
   return ret;
+#else
+  auto value = loop.getYieldedValues()[resultIdx];
+  auto defOp = value.getDefiningOp();
+  auto partitionIds = getPartitionIds(defOp);
+  ArrayRef<int> partitionIdsRef{partitionIds->begin(), partitionIds->end()};
+  if (auto ifOp = dyn_cast<scf::IfOp>(defOp)) {
+    int pos = -1;
+    for (auto result : ifOp.getResults()) {
+      if (result == value) {
+        pos = result.getResultNumber();
+        break;
+      }
+    }
+    assert(pos != -1);
+    auto arrayAttr = ifOp->getAttrOfType<ArrayAttr>(kPartitionOutputsAttrName);
+    assert(arrayAttr.size() == ifOp.getResultTypes().size());
+    partitionIdsRef = cast<DenseI32ArrayAttr>(arrayAttr[pos]).asArrayRef();
+  }
+  return llvm::is_contained(partitionIdsRef, partition->getIndex());
+#endif
 }
 
 SmallVector<size_t> getPartitionIds(Operation *op, size_t numPartitions) {
@@ -112,13 +133,13 @@ std::pair<SmallVector<size_t>, SmallVector<std::optional<size_t>>>
 getLoopVarIndicesToKeep(scf::ForOp loop, const Partition *partition,
                         ArrayRef<LoopVarCategory> loopVarCategories) {
   SmallVector<size_t> indices;
-  // The null index means an invalid index, the corresponding loop variable in
-  // the original loop is removed in the cloned loop
+  // The null index means an invalid index, the corresponding loop variable
+  // in the original loop is removed in the cloned loop
   SmallVector<std::optional<size_t>> reverseIndices(loop.getNumRegionIterArgs(),
                                                     std::nullopt);
   for (auto [i, arg] : llvm::enumerate(loop.getRegionIterArgs())) {
-    // For the default partition, keep non-tensor results used outside of the
-    // loop even if the corresponding loop variable is not used in that
+    // For the default partition, keep non-tensor results used outside of
+    // the loop even if the corresponding loop variable is not used in that
     // partition.
     if (loopVarCategories[i] == LoopVarCategory::Used ||
         (partition->getIndex() == 0 && !loop.getResult(i).use_empty() &&
@@ -391,7 +412,8 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
           llvm::is_contained(*partitionIds, partition.getIndex()))
         return;
 
-      // check if consumer partition set is a subset of the producer partitions
+      // check if consumer partition set is a subset of the producer
+      // partitions
       auto defOpPartitionIds = getPartitionIds(output.getDefiningOp());
       bool isValidSubset = std::all_of(
           partitionIds->begin(), partitionIds->end(), [&](int consumerId) {
@@ -481,14 +503,13 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     if (b.partitionId == 0) {
       b.create<nvws::WarpGroupYieldOp>(wgOp.getLoc(), outputs);
     } else {
-      // Tensor results computed by non-default partitions are communicated back
-      // via SMEM.
-      // The calls to getLoopVarIndicesToKeep and isTensorResultComputedBy
-      // below are unnecessary if we can encode the partition index and the
-      // corresponding result tensor index of newForOp in
-      // LoopVarCategory::TensorResultFromOtherPartition. In the absence of such
-      // language support, we end up computing the same information multiple
-      // times.
+      // Tensor results computed by non-default partitions are communicated
+      // back via SMEM. The calls to getLoopVarIndicesToKeep and
+      // isTensorResultComputedBy below are unnecessary if we can encode the
+      // partition index and the corresponding result tensor index of newForOp
+      // in LoopVarCategory::TensorResultFromOtherPartition. In the absence of
+      // such language support, we end up computing the same information
+      // multiple times.
       auto [_, reverseIndices] =
           getLoopVarIndicesToKeep(loop, &partition, partitions);
       for (size_t i = 0; i < loop.getNumRegionIterArgs(); ++i) {
