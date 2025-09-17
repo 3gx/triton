@@ -89,7 +89,8 @@ template <class T> struct AssignStagePhase {
 
   bool analyzeArefUseInBlock(Block *block) {
     for (auto &op : *block) {
-      if (isValidOp(&op)) {
+      if (isValidOp(&op) ||
+          (isa<ArefBufferOp>(op) && op.getOperand(0) == aref)) {
         return true;
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
         if (analyzeArefUseInBlock(forOp.getBody()))
@@ -281,13 +282,16 @@ template <class T> struct AssignStagePhase {
       visited.insert(owner);
       if (auto stageOp = dyn_cast<ArefStageInterface>(owner)) {
         stageOp.setStage(stage);
+      } else if (auto forOp = dyn_cast<scf::ForOp>(owner)) {
+        auto tokPos = tokUse.getOperandNumber() - 3;
+        auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+        auto stagePos = tokToStagePosMap.at(yieldOp.getOperand(tokPos));
+        propagateStage(forOp.getRegionIterArgs()[tokPos],
+                       forOp.getRegionIterArgs()[stagePos], visited);
       } else if (auto yieldOp = dyn_cast<scf::YieldOp>(owner)) {
         auto tokPos = tokUse.getOperandNumber();
         auto stagePos = tokToStagePosMap.at(token);
         auto parentOp = yieldOp->getParentOp();
-        if (auto forOp = dyn_cast<scf::ForOp>(parentOp))
-          propagateStage(forOp.getRegionIterArgs()[tokPos],
-                         forOp.getRegionIterArgs()[stagePos], visited);
         propagateStage(parentOp->getResult(tokPos),
                        parentOp->getResult(stagePos), visited);
       }
@@ -315,8 +319,7 @@ template <class T> struct AssignStagePhase {
     StagePhase index;
     ImplicitLocOpBuilder b(arefOp.getLoc(), arefOp);
     b.setInsertionPointAfter(arefOp);
-    auto depth =
-        cast<MemDescType>(arefOp.getOperand(0).getType()).getShape().front();
+    auto depth = getArefDepth(cast<MemDescType>(arefOp.getOperand(0).getType()));
     index.stage = b.create<arith::ConstantIntOp>(depth - 1, 32);
 
     static_assert(std::is_same_v<T, ArefPutEnterOp> ||
