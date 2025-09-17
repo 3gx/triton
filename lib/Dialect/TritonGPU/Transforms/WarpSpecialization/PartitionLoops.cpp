@@ -200,7 +200,7 @@ void cloneIfOp(scf::IfOp ifOp, SmallVector<WarpGroupBuilder> &builders,
     SmallVector<int> newIfResultIndices;
     for (auto pos = 0; pos < ifOp.getResultTypes().size(); ++pos) {
       auto partitionIds = cast<DenseI32ArrayAttr>(attrArray[pos]).asArrayRef();
-      if (llvm::is_contained(partitionIds, idx)) {
+      if (llvm::is_contained(partitionIds, b.partitionId)) {
         newIfResultTypes.push_back(ifOp.getResult(pos).getType());
         newIfResultIndices.push_back(pos);
       }
@@ -221,8 +221,8 @@ void cloneIfOp(scf::IfOp ifOp, SmallVector<WarpGroupBuilder> &builders,
   cloneOpsInBlock(ifOp.thenBlock(), builders, partitions);
 
   if (auto elseBlock = ifOp.elseBlock()) {
-    for (auto [builder, newIfOp] : llvm::zip(builders, newIfOps)) {
-      builder.setInsertionPointToStart(newIfOp.elseBlock());
+    for (auto [idx, newIfOp] : llvm::zip(partitionIndices, newIfOps)) {
+      builders[idx].setInsertionPointToStart(newIfOp.elseBlock());
     }
     cloneOpsInBlock(elseBlock, builders, partitions);
   }
@@ -316,6 +316,7 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
       for (size_t idx : partitionIndices) {
         auto &builder = builders[idx];
         SmallVector<size_t> newOperandIndices;
+        bool skip = false;
         if (auto forOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp())) {
           newOperandIndices =
               getLoopVarIndicesToKeep(
@@ -334,6 +335,7 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
           auto ifOp = cast<scf::IfOp>(yieldOp->getParentOp());
           llvm::errs() << "isThenBlock:"
                        << (yieldOp->getBlock() == ifOp.thenBlock()) << "\n";
+          //skip = yieldOp->getBlock() != ifOp.thenBlock();
           auto attrArray =
               ifOp->getAttrOfType<ArrayAttr>(kPartitionOutputsAttrName);
           llvm::errs() << "attrArray: " << attrArray << "\n";
@@ -363,9 +365,13 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
               builder.mapping.lookupOrDefault(yieldOp.getOperand(i)));
         }
 
-        if (!newYieldOperands.empty()) {
-          builder.create<scf::YieldOp>(op->getLoc(), newYieldOperands);
-        }
+        llvm::errs() << "^^++ SKIP:" << skip << "\n";
+
+        if (!skip)
+          if (!newYieldOperands.empty()) {
+            llvm::errs() << "^^++ CREATE YIELD\n";
+            builder.create<scf::YieldOp>(op->getLoc(), newYieldOperands);
+          }
       }
     } else {
       auto partitionIndices =
