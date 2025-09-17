@@ -65,8 +65,8 @@ bool isTensorResultComputedBy(scf::ForOp loop, size_t resultIdx,
   return ret;
 #else
   auto value = loop.getYieldedValues()[resultIdx];
-  llvm::errs() << "  -- resultIdx: " << resultIdx << "\n";
-  llvm::errs() << "  -- partitionIndex: " << partition->getIndex() << "\n";
+  // llvm::errs() << "  -- resultIdx: " << resultIdx << "\n";
+  // llvm::errs() << "  -- partitionIndex: " << partition->getIndex() << "\n";
   if (!isa<RankedTensorType>(value.getType()))
     return false;
   auto defOp = value.getDefiningOp();
@@ -85,13 +85,13 @@ bool isTensorResultComputedBy(scf::ForOp loop, size_t resultIdx,
     assert(arrayAttr.size() == ifOp.getResultTypes().size());
     partitionIdsRef = cast<DenseI32ArrayAttr>(arrayAttr[pos]).asArrayRef();
   }
-  llvm::errs() << "  -- partitionIdsRef: [";
-  for (auto p : partitionIdsRef) {
-    llvm::errs() << p << " ";
-  }
-  llvm::errs() << "]\n";
+  // llvm::errs() << "  -- partitionIdsRef: [";
+  // for (auto p : partitionIdsRef) {
+  //   llvm::errs() << p << " ";
+  // }
+  // llvm::errs() << "]\n";
   bool contained = llvm::is_contained(partitionIdsRef, partition->getIndex());
-  llvm::errs() << "  -- contained: " << contained << "\n";
+  // llvm::errs() << "  -- contained: " << contained << "\n";
   return contained;
 #endif
 }
