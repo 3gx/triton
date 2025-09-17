@@ -323,16 +323,38 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
                   partitions)
                   .first;
         } else {
+          llvm::errs() << "ifOp: partition-idx: " << idx << "\n";
+          llvm::errs() << "yieldOp: ";
+          {
+            mlir::OpPrintingFlags flags;
+            flags.printGenericOpForm();
+            yieldOp->print(llvm::errs(), flags);
+            llvm::errs() << "\n";
+          }
           auto ifOp = cast<scf::IfOp>(yieldOp->getParentOp());
+          llvm::errs() << "isThenBlock:"
+                       << (yieldOp->getBlock() == ifOp.thenBlock()) << "\n";
           auto attrArray =
               ifOp->getAttrOfType<ArrayAttr>(kPartitionOutputsAttrName);
+          llvm::errs() << "attrArray: " << attrArray << "\n";
           assert(attrArray.size() == yieldOp.getOperands().size());
           for (size_t i = 0; i < yieldOp.getOperands().size(); ++i) {
             auto ids = cast<DenseI32ArrayAttr>(attrArray[i]).asArrayRef();
-            if (llvm::is_contained(ids, idx)) {
+            llvm::errs() << " -- opnd: " << i << " idx: " << idx
+                         << " pId: " << builder.partitionId << " ids: [";
+            for (size_t id : ids) {
+              llvm::errs() << id << " ";
+            }
+            llvm::errs() << "]\n";
+            if (llvm::is_contained(ids, builder.partitionId)) {
               newOperandIndices.push_back(i);
             }
           }
+          llvm::errs() << "newOperandsIndices= [";
+          for (size_t i : newOperandIndices) {
+            llvm::errs() << i << " ";
+          }
+          llvm::errs() << "]\n";
         }
 
         SmallVector<Value> newYieldOperands;
@@ -509,6 +531,7 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     }
   }
 
+  llvm::errs() << "PRERASE:\n" << loop->getParentOfType<ModuleOp>() << "\n";
   for (auto op : llvm::reverse(opsToErase))
     op->erase();
 

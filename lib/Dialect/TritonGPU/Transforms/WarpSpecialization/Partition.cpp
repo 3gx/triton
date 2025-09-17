@@ -54,8 +54,27 @@ void Partition::iterateOutputs(
     scf::ForOp loop,
     function_ref<void(Operation *, OpOperand &)> callback) const {
   for (Operation *op : getOps()) {
+    mlir::OpPrintingFlags flags;
+    // flags.printGenericOpForm();
+    // llvm::errs() << "====>> OP:\n";
+    // op->print(llvm::errs(), flags);
+    // llvm::errs() << "\n";
     for (OpOperand &use : op->getUses()) {
-      Operation *owner = loop.getBody()->findAncestorOpInBlock(*use.getOwner());
+      // llvm::errs() << "  use: ";
+      // use.get().print(llvm::errs(), flags);
+      // llvm::errs() << "\n";
+
+      // llvm::errs() << "  owner: ";
+      // use.getOwner()->print(llvm::errs(), flags);
+      // llvm::errs() << "\n";
+
+      // llvm::errs() << "  opndNumber: " << use.getOperandNumber() << "\n";
+
+      //Operation *owner = loop.getBody()->findAncestorOpInBlock(*use.getOwner());
+      Operation *owner = use.getOwner();
+      // llvm::errs() << "  body-owner: [" << owner << "]: ";
+      // owner->print(llvm::errs(), flags);
+      // llvm::errs() << "\n";
       auto partitionIds = getPartitionIds(owner);
       if (isa<scf::YieldOp>(owner)) {
         // This value is used in a subsequent iteration.
@@ -181,10 +200,7 @@ void setPartition(Operation *op, ArrayRef<int> partitionIds) {
   Builder b(op->getContext());
   op->setAttr(kPartitionAttrName, b.getDenseI32ArrayAttr(partitionIds));
 }
-void unsetPartition(Operation *op) {
-  op->removeAttr(kPartitionAttrName);
-}
-
+void unsetPartition(Operation *op) { op->removeAttr(kPartitionAttrName); }
 
 void setPartition(Operation *op, const SetVector<int> &partitionIds) {
   SmallVector<int> partitions(partitionIds.begin(), partitionIds.end());
