@@ -177,10 +177,10 @@ std::pair<SmallVector<size_t>, SmallVector<std::optional<size_t>>>
 getLoopVarIndicesToKeep(scf::ForOp loop, const Partition *partition,
                         const PartitionSet &partitions) {
   auto loopVarCategories = classifyLoopVars(loop, partition, partitions);
-  llvm::errs() << " loopVarCategorieskeep: \n";
-  for (auto [idx, cat] : llvm::enumerate(loopVarCategories)) {
-    llvm::errs() << "  idx: " << idx << " cat: " << (int)cat << "\n";
-  }
+  // llvm::errs() << " loopVarCategorieskeep: \n";
+  // for (auto [idx, cat] : llvm::enumerate(loopVarCategories)) {
+  //   llvm::errs() << "  idx: " << idx << " cat: " << (int)cat << "\n";
+  // }
   return getLoopVarIndicesToKeep(loop, partition, loopVarCategories);
 }
 
@@ -363,20 +363,20 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
         auto &builder = builders[idx];
         SmallVector<size_t> newOperandIndices;
         if (auto forOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp())) {
-          llvm::errs() << " |++++++++| YIELDOP\n";
+          // llvm::errs() << " |++++++++| YIELDOP\n";
           newOperandIndices =
               getLoopVarIndicesToKeep(
                   forOp, partitions.getPartition(builder.partitionId),
                   partitions)
                   .first;
-          llvm::errs() << " >>> FOROP:\n";
-          llvm::errs() << "partitionIdx: " << builder.partitionId << "\n";
-          llvm::errs() << "newOperandsIndices= [";
-          for (size_t i : newOperandIndices) {
-            llvm::errs() << i << " ";
-          }
-          llvm::errs() << "]\n";
-          llvm::errs() << "|-----| DONE YIELDOP\n";
+          // llvm::errs() << " >>> FOROP:\n";
+          // llvm::errs() << "partitionIdx: " << builder.partitionId << "\n";
+          // llvm::errs() << "newOperandsIndices= [";
+          // for (size_t i : newOperandIndices) {
+          //   llvm::errs() << i << " ";
+          // }
+          // llvm::errs() << "]\n";
+          // llvm::errs() << "|-----| DONE YIELDOP\n";
         } else {
           auto ifOp = cast<scf::IfOp>(yieldOp->getParentOp());
           auto attrArray =
@@ -564,7 +564,7 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     }
   }
 
-  llvm::errs() << "PRERASE:\n" << loop->getParentOfType<ModuleOp>() << "\n";
+  // llvm::errs() << "PRERASE:\n" << loop->getParentOfType<ModuleOp>() << "\n";
   for (auto op : llvm::reverse(opsToErase))
     op->erase();
 
