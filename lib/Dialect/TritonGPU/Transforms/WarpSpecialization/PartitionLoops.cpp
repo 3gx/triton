@@ -580,7 +580,7 @@ LogicalResult inferIfStmtPartitions(scf::IfOp ifOp) {
         // for all other ops, compute a set of partition where if-op has to
         // be executed
         auto opPartitions = getPartitionIds(&op);
-        llvm::errs() << "YYY: op:" << op << "\n";
+        // llvm::errs() << "YYY: op:" << op << "\n";
         assert(opPartitions);
         for (auto p : *opPartitions) {
           ifOpPartitions.insert(p);
@@ -595,18 +595,18 @@ LogicalResult inferIfStmtPartitions(scf::IfOp ifOp) {
   if (failed(processBlock(ifOp.elseBlock())))
     return failure();
 
-  llvm::errs() << "ifOp:" << ifOp << "\n";
-  for (auto [idx, partition] : llvm::enumerate(partitionIndices)) {
-    llvm::errs() << "idx: " << idx << " partition: [";
-    if (partition) {
-      llvm::errs() << " [ ";
-      for (auto p : *partition) {
-        llvm::errs() << p << " ";
-      }
-      llvm::errs() << "]";
-    }
-    llvm::errs() << " ]\n";
-  }
+  // llvm::errs() << "ifOp:" << ifOp << "\n";
+  // for (auto [idx, partition] : llvm::enumerate(partitionIndices)) {
+  //   llvm::errs() << "idx: " << idx << " partition: [";
+  //   if (partition) {
+  //     llvm::errs() << " [ ";
+  //     for (auto p : *partition) {
+  //       llvm::errs() << p << " ";
+  //     }
+  //     llvm::errs() << "]";
+  //   }
+  //   llvm::errs() << " ]\n";
+  // }
 
   llvm::SmallVector<Attribute> partitionAttrs;
   for (auto [idx, partition] : llvm::enumerate(partitionIndices)) {
@@ -620,17 +620,17 @@ LogicalResult inferIfStmtPartitions(scf::IfOp ifOp) {
     }
     ArrayRef<int> ids(partition->begin(), partition->end());
     OpBuilder b(ifOp);
-    llvm::errs() << "idx:" << idx << " ids: [";
-    for (auto p : ids) {
-      llvm::errs() << p << " ";
-    }
-    llvm::errs() << "]\n";
+    // llvm::errs() << "idx:" << idx << " ids: [";
+    // for (auto p : ids) {
+    //   llvm::errs() << p << " ";
+    // }
+    // llvm::errs() << "]\n";
     partitionAttrs.push_back(b.getDenseI32ArrayAttr(ids));
   }
   ifOp->setAttr(kPartitionOutputsAttrName,
                 ArrayAttr::get(ifOp.getContext(), partitionAttrs));
   setPartition(ifOp, ifOpPartitions);
-  llvm::errs() << "ifOp:" << ifOp << "\n";
+  // llvm::errs() << "ifOp:" << ifOp << "\n";
   return success();
 } // namespace
 
@@ -671,15 +671,15 @@ void PartitionLoops::runOnOperation() {
   });
 
   for (scf::ForOp loop : loops) {
-    loop.walk([&](scf::IfOp ifOp) {
-      if (failed(inferIfStmtPartitions(ifOp)))
-        signalPassFailure();
-    });
     loop.walk([&](triton::ReduceOp reduceOp) {
       if (failed(inferReduceOpPartitions(reduceOp)))
         signalPassFailure();
     });
-    llvm::errs() << "MODUX: " << getOperation() << "\n";
+    loop.walk([&](scf::IfOp ifOp) {
+      if (failed(inferIfStmtPartitions(ifOp)))
+        signalPassFailure();
+    });
+    // llvm::errs() << "MODUX: " << getOperation() << "\n";
     if (failed(partitionLoop(loop)))
       return signalPassFailure();
   }
