@@ -135,6 +135,10 @@ std::pair<SmallVector<size_t>, SmallVector<std::optional<size_t>>>
 getLoopVarIndicesToKeep(scf::ForOp loop, const Partition *partition,
                         const PartitionSet &partitions) {
   auto loopVarCategories = classifyLoopVars(loop, partition, partitions);
+  llvm::errs() << " loopVarCategorieskeep: \n";
+  for (auto [idx, cat] : llvm::enumerate(loopVarCategories)) {
+    llvm::errs() << "  idx: " << idx << " cat: " << (int)cat << "\n";
+  }
   return getLoopVarIndicesToKeep(loop, partition, loopVarCategories);
 }
 
@@ -316,47 +320,32 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
       for (size_t idx : partitionIndices) {
         auto &builder = builders[idx];
         SmallVector<size_t> newOperandIndices;
-        bool skip = false;
         if (auto forOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp())) {
+          llvm::errs() << " |++++++++| YIELDOP\n";
           newOperandIndices =
               getLoopVarIndicesToKeep(
                   forOp, partitions.getPartition(builder.partitionId),
                   partitions)
                   .first;
-        } else {
-          llvm::errs() << "ifOp: partition-idx: " << idx << "\n";
-          llvm::errs() << "yieldOp: ";
-          {
-            mlir::OpPrintingFlags flags;
-            flags.printGenericOpForm();
-            yieldOp->print(llvm::errs(), flags);
-            llvm::errs() << "\n";
-          }
-          auto ifOp = cast<scf::IfOp>(yieldOp->getParentOp());
-          llvm::errs() << "isThenBlock:"
-                       << (yieldOp->getBlock() == ifOp.thenBlock()) << "\n";
-          //skip = yieldOp->getBlock() != ifOp.thenBlock();
-          auto attrArray =
-              ifOp->getAttrOfType<ArrayAttr>(kPartitionOutputsAttrName);
-          llvm::errs() << "attrArray: " << attrArray << "\n";
-          assert(attrArray.size() == yieldOp.getOperands().size());
-          for (size_t i = 0; i < yieldOp.getOperands().size(); ++i) {
-            auto ids = cast<DenseI32ArrayAttr>(attrArray[i]).asArrayRef();
-            llvm::errs() << " -- opnd: " << i << " idx: " << idx
-                         << " pId: " << builder.partitionId << " ids: [";
-            for (size_t id : ids) {
-              llvm::errs() << id << " ";
-            }
-            llvm::errs() << "]\n";
-            if (llvm::is_contained(ids, builder.partitionId)) {
-              newOperandIndices.push_back(i);
-            }
-          }
+          llvm::errs() << " >>> FOROP:\n";
+          llvm::errs() << "partitionIdx: " << builder.partitionId << "\n";
           llvm::errs() << "newOperandsIndices= [";
           for (size_t i : newOperandIndices) {
             llvm::errs() << i << " ";
           }
           llvm::errs() << "]\n";
+          llvm::errs() << "|-----| DONE YIELDOP\n";
+        } else {
+          auto ifOp = cast<scf::IfOp>(yieldOp->getParentOp());
+          auto attrArray =
+              ifOp->getAttrOfType<ArrayAttr>(kPartitionOutputsAttrName);
+          assert(attrArray.size() == yieldOp.getOperands().size());
+          for (size_t i = 0; i < yieldOp.getOperands().size(); ++i) {
+            auto ids = cast<DenseI32ArrayAttr>(attrArray[i]).asArrayRef();
+            if (llvm::is_contained(ids, builder.partitionId)) {
+              newOperandIndices.push_back(i);
+            }
+          }
         }
 
         SmallVector<Value> newYieldOperands;
@@ -365,13 +354,9 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
               builder.mapping.lookupOrDefault(yieldOp.getOperand(i)));
         }
 
-        llvm::errs() << "^^++ SKIP:" << skip << "\n";
-
-        if (!skip)
-          if (!newYieldOperands.empty()) {
-            llvm::errs() << "^^++ CREATE YIELD\n";
-            builder.create<scf::YieldOp>(op->getLoc(), newYieldOperands);
-          }
+        if (!newYieldOperands.empty()) {
+          builder.create<scf::YieldOp>(op->getLoc(), newYieldOperands);
+        }
       }
     } else {
       auto partitionIndices =
