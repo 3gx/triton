@@ -700,7 +700,7 @@ void PartitionLoops::runOnOperation() {
       if (failed(inferIfStmtPartitions(ifOp)))
         signalPassFailure();
     });
-    llvm::errs() << "MODUX: " << getOperation() << "\n";
+    // llvm::errs() << "MODUX: " << getOperation() << "\n";
     if (failed(partitionLoop(loop)))
       return signalPassFailure();
   }
