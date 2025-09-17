@@ -545,17 +545,20 @@ void assignRootPartition(scf::ForOp loop, PartitionSet &partitions) {
 
 void assignRegionBodyPartition(scf::ForOp loop, PartitionSet &partitions) {
   loop->walk([&](Operation *op) {
-    if (!isa<scf::ForOp>(op) && !hasPartition(op)) {
-      auto parentOp = loop.getBody()->findAncestorOpInBlock(*op);
-      if (auto partitionIds = triton::gpu::getPartitionIds(parentOp)) {
-        SetVector<Partition *> parentPartitions;
-        for (auto id : *partitionIds) {
-          parentPartitions.insert(partitions.getPartition(id));
-        }
-        setPartition(op, parentPartitions);
+    if (isa<scf::YieldOp, scf::ForOp>(op) || hasPartition(op))
+      return WalkResult::advance();
+
+    auto parentOp = loop.getBody()->findAncestorOpInBlock(*op);
+    if (auto partitionIds = triton::gpu::getPartitionIds(parentOp)) {
+      SetVector<Partition *> parentPartitions;
+      for (auto id : *partitionIds) {
+        parentPartitions.insert(partitions.getPartition(id));
       }
+      setPartition(op, parentPartitions);
     }
+    return WalkResult::advance();
   });
+
   loop->walk([&](Operation *op) {
     // unset partition in ops that have regions
     // such op's partition set will be inferred from regions
