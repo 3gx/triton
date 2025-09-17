@@ -65,6 +65,10 @@ bool isTensorResultComputedBy(scf::ForOp loop, size_t resultIdx,
   return ret;
 #else
   auto value = loop.getYieldedValues()[resultIdx];
+  llvm::errs() << "  -- resultIdx: " << resultIdx << "\n";
+  llvm::errs() << "  -- partitionIndex: " << partition->getIndex() << "\n";
+  if (!isa<RankedTensorType>(value.getType()))
+    return false;
   auto defOp = value.getDefiningOp();
   auto partitionIds = getPartitionIds(defOp);
   ArrayRef<int> partitionIdsRef{partitionIds->begin(), partitionIds->end()};
@@ -81,7 +85,14 @@ bool isTensorResultComputedBy(scf::ForOp loop, size_t resultIdx,
     assert(arrayAttr.size() == ifOp.getResultTypes().size());
     partitionIdsRef = cast<DenseI32ArrayAttr>(arrayAttr[pos]).asArrayRef();
   }
-  return llvm::is_contained(partitionIdsRef, partition->getIndex());
+  llvm::errs() << "  -- partitionIdsRef: [";
+  for (auto p : partitionIdsRef) {
+    llvm::errs() << p << " ";
+  }
+  llvm::errs() << "]\n";
+  bool contained = llvm::is_contained(partitionIdsRef, partition->getIndex());
+  llvm::errs() << "  -- contained: " << contained << "\n";
+  return contained;
 #endif
 }
 
@@ -99,9 +110,19 @@ SmallVector<size_t> getPartitionIds(Operation *op, size_t numPartitions) {
 SmallVector<LoopVarCategory> classifyLoopVars(scf::ForOp loop,
                                               const Partition *partition,
                                               const PartitionSet &partitions) {
-  auto inPartition = [&](Operation *op) {
-    auto opPartitionIds = getPartitionIds(op, partitions.getNumPartitions());
-    return llvm::is_contained(opPartitionIds, partition->getIndex());
+  auto inPartition = [&](OpOperand &opnd) {
+    auto op = opnd.getOwner();
+    auto partitionIds = getPartitionIds(op, partitions.getNumPartitions());
+    if (auto ifOp = dyn_cast<scf::IfOp>(op->getParentOp());
+        ifOp && isa<scf::YieldOp>(op)) {
+      auto arrayAttr =
+          ifOp->getAttrOfType<ArrayAttr>(kPartitionOutputsAttrName);
+      auto arrayRef =
+          cast<DenseI32ArrayAttr>(arrayAttr[opnd.getOperandNumber()])
+              .asArrayRef();
+      partitionIds = SmallVector<size_t>(arrayRef.begin(), arrayRef.end());
+    }
+    return llvm::is_contained(partitionIds, partition->getIndex());
   };
   auto isTensorResultFromOtherPartition = [&](int i) {
     for (auto otherPartition : partitions.getPartitions()) {
@@ -117,7 +138,7 @@ SmallVector<LoopVarCategory> classifyLoopVars(scf::ForOp loop,
 
   SmallVector<LoopVarCategory> categories(loop.getNumRegionIterArgs());
   for (auto [i, arg] : llvm::enumerate(loop.getRegionIterArgs())) {
-    if (llvm::any_of(arg.getUsers(), inPartition)) {
+    if (llvm::any_of(arg.getUses(), inPartition)) {
       categories[i] = LoopVarCategory::Used;
     } else if (isTensorResultFromOtherPartition(i)) {
       categories[i] = LoopVarCategory::TensorResultFromOtherPartition;
