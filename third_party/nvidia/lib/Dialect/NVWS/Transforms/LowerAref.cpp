@@ -163,6 +163,10 @@ BarrierCount getArrivalCount(ArefCreateOp op) {
       }
     }
   }
+  if (count.producerPendingCount == 0)
+    count.producerPendingCount = 1;
+  if (count.consumerPendingCount == 0)
+    count.consumerPendingCount = 1;
 
   return count;
 }
@@ -214,17 +218,21 @@ SmallVector<Value> getSubViews(ArefValue arefVal, Value stage, Location loc,
   SmallVector<Value> views;
   for (auto buffer : arefVal.buffers) {
     auto memDescType = cast<MemDescType>(buffer.getType());
-    auto shape = memDescType.getShape();
-    auto rank = shape.size() - 1;
-
-    SmallVector<int64_t> tensorShape(shape.begin() + 1, shape.end());
-    auto memDescTypeNew = MemDescType::get(
-        tensorShape, memDescType.getElementType(), memDescType.getEncoding(),
-        memDescType.getMemorySpace(), true);
-    auto singleBuffer =
-        rewriter.create<MemDescIndexOp>(loc, memDescTypeNew, buffer, stage);
-    assignStageCluster(singleBuffer, partitionIds, stageCluster, rewriter);
-    views.push_back(singleBuffer);
+    if (isa<nvidia_gpu::TensorMemoryScalesEncodingAttr>(
+            memDescType.getEncoding())) {
+      views.push_back(buffer);
+    } else {
+      auto shape = memDescType.getShape();
+      SmallVector<int64_t> tensorShape(shape.begin() + 1, shape.end());
+      auto memDescTypeNew = MemDescType::get(
+          tensorShape, memDescType.getElementType(), memDescType.getEncoding(),
+          memDescType.getMemorySpace(), true);
+      // TODO partition
+      auto singleBuffer =
+          rewriter.create<MemDescIndexOp>(loc, memDescTypeNew, buffer, stage);
+      assignStageCluster(singleBuffer, partitionIds, stageCluster, rewriter);
+      views.push_back(singleBuffer);
+    }
   }
 
   return views;
@@ -328,6 +336,8 @@ void rewritePutEnterOp(ArefPutEnterOp op, PatternRewriter &rewriter,
       break;
     }
   }
+  if (!exitOp)
+    return;
   assert(exitOp);
   assert(exitOp.getAref() == op.getAref() &&
          "Expecting matching Aref on the ArefPutExitOp");
@@ -390,6 +400,17 @@ void rewriteGetEnterOp(ArefGetEnterOp op, PatternRewriter &rewriter,
     // a get enter op. After lowering, all buffers are mutable.
     propagateMutability(view);
   }
+}
+
+void rewriteArefBufferOp(ArefBufferOp op, PatternRewriter &rewriter,
+                         ArefValue arefVal) {
+  auto loc = op->getLoc();
+  rewriter.setInsertionPointAfter(op);
+  auto views = getSubViews(arefVal, op.getStage(), loc, rewriter,
+                           getPartitionIds(op), getStageCluster(op));
+  assert(views.size() == op.getBuffers().size());
+  for (int i = 0; i < arefVal.buffers.size(); ++i)
+    op.getBuffers()[i].replaceAllUsesWith(views[i]);
 }
 
 void insertArriveBarrier(Location loc, ArrayRef<AsyncOp> asyncOps,
@@ -522,6 +543,8 @@ public:
         rewritePutExitOp(user, rewriter, aref);
       } else if (auto user = dyn_cast<ArefGetExitOp>(userOp)) {
         rewriteGetExitOp(user, rewriter, aref);
+      } else if (auto user = dyn_cast<ArefBufferOp>(userOp)) {
+        rewriteArefBufferOp(user, rewriter, aref);
       } else {
         llvm_unreachable("users of aref can only be ArefPut or ArefGet");
       }
@@ -565,7 +588,7 @@ void multiBufferAref(const SmallVector<ArefCreateOp> &arefOps, int numStages) {
 
     bool eligible = true;
     for (auto opnd : arefOp.getOperands()) {
-      if (!opnd.getDefiningOp()) {
+      if (!opnd.getDefiningOp() || isa<TMEMAllocOp>(opnd.getDefiningOp())) {
         eligible = false;
       }
     }
