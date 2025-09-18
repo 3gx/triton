@@ -573,6 +573,16 @@ void assignRegionBodyPartition(scf::ForOp loop, PartitionSet &partitions) {
   });
 }
 
+void patchUpTmemAlloc(scf::ForOp loop, PartitionSet &partitions) {
+  loop->walk([&](triton::nvidia_gpu::TMEMAllocOp op) {
+    if (!triton::gpu::hasPartition(op) && op.getSrc()) {
+      SetVector<int> p;
+      p.insert(0);
+      setPartition(op, p);
+    }
+  });
+}
+
 //===----------------------------------------------------------------------===//
 // Pass Definition
 //===----------------------------------------------------------------------===//
@@ -602,6 +612,7 @@ void PartitionScheduling::runOnOperation() {
     if (std::optional<PartitionSet> partitions = getInitialPartitions(loop)) {
       propagatePartitions(loop, *partitions);
       optimizePartitions(loop, *partitions);
+      patchUpTmemAlloc(loop, *partitions);
       assignRootPartition(loop, *partitions);
       assignRegionBodyPartition(loop, *partitions);
       loop->setAttr(

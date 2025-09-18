@@ -36,7 +36,7 @@ void AutomaticWarpSpecialization::runOnOperation() {
   OpPassManager pm;
   pm.addPass(createTritonGPUPartitionScheduling());
   pm.addPass(createNVWSInsertAref());
-#if 0
+#if 1
   pm.addPass(createNVWSInsertTmemAref());
 #else
   pm.addPass(createTritonGPULoadMMASpecialization({numStages}));
