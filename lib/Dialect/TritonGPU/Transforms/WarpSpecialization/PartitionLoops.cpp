@@ -183,10 +183,21 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
 
 void cloneForOp(scf::ForOp forOp, SmallVector<WarpGroupBuilder> &builders,
                 const PartitionSet &partitions) {
+  SetVector<int> forOpPartitions;
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    auto opPartitions = triton::gpu::getPartitionIds(&op);
+    if (opPartitions) {
+      forOpPartitions.insert(opPartitions->begin(), opPartitions->end());
+    }
+  }
+
   SmallVector<scf::ForOp> newForOps;
-  for (auto [b, partition] : llvm::zip(builders, partitions.getPartitions())) {
+  for (int i: forOpPartitions) {
+    llvm::outs() << i << "\n";
+    auto b = builders[i];
+    auto partition = partitions.getPartition(i);
     auto [newLoopIndices, _] =
-        getLoopVarIndicesToKeep(forOp, &partition, partitions);
+        getLoopVarIndicesToKeep(forOp, partition, partitions);
     auto lb = b.mapping.lookupOrDefault(forOp.getLowerBound());
     auto ub = b.mapping.lookupOrDefault(forOp.getUpperBound());
     auto step = b.mapping.lookupOrDefault(forOp.getStep());
@@ -213,7 +224,7 @@ void cloneForOp(scf::ForOp forOp, SmallVector<WarpGroupBuilder> &builders,
 
   cloneOpsInBlock(forOp.getBody(), builders, partitions);
 
-  for (auto [i, newForOp] : enumerate(newForOps)) {
+  for (auto [i, newForOp] : llvm::zip(forOpPartitions, newForOps)) {
     builders[i].setInsertionPointAfter(newForOp);
     newForOp.walk([&](Operation *op) { op->removeAttr(kPartitionAttrName); });
     newForOp->removeAttr(kPartitionStagesAttrName);
@@ -604,7 +615,7 @@ LogicalResult inferForOpPartitions(scf::ForOp forOp) {
     auto opPartitions = getPartitionIds(&op);
     forOpPartitions.insert(opPartitions->begin(), opPartitions->end());
   }
-  setPartition(forOp, forOpPartitions);
+  //  setPartition(forOp, forOpPartitions);
 
   SmallVector<SetVector<int>> iterArgsPartitions(forOp.getNumRegionIterArgs());
   for (auto [i, arg] : llvm::enumerate(forOp.getRegionIterArgs())) {
