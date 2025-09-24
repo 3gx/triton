@@ -102,20 +102,6 @@ SmallVector<size_t> getPartitionIds(Operation *op, size_t numPartitions) {
 SmallVector<LoopVarCategory> classifyLoopVars(scf::ForOp loop,
                                               const Partition *partition,
                                               const PartitionSet &partitions) {
-  auto inPartition = [&](OpOperand &opnd) {
-    auto op = opnd.getOwner();
-    SetVector<int> partitionIds;
-    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-      partitionIds =
-          getForOpIterArgPartitionIds(forOp, opnd.getOperandNumber() - 3);
-    } else if (auto ifOp = dyn_cast<scf::IfOp>(op->getParentOp());
-               ifOp && isa<scf::YieldOp>(op)) {
-      partitionIds = getIfOpResultPartitionIds(ifOp, opnd.getOperandNumber());
-    } else {
-      partitionIds = *triton::gpu::getPartitionIds(op);
-    }
-    return llvm::is_contained(partitionIds, partition->getIndex());
-  };
   auto isTensorResultFromOtherPartition = [&](int i) {
     for (auto otherPartition : partitions.getPartitions()) {
       if (&otherPartition == partition) {
@@ -130,7 +116,8 @@ SmallVector<LoopVarCategory> classifyLoopVars(scf::ForOp loop,
 
   SmallVector<LoopVarCategory> categories(loop.getNumRegionIterArgs());
   for (auto [i, arg] : llvm::enumerate(loop.getRegionIterArgs())) {
-    if (llvm::any_of(arg.getUses(), inPartition)) {
+    auto partitionIds = getForOpIterArgPartitionIds(loop, i);
+    if (llvm::is_contained(partitionIds, partition->getIndex())) {
       categories[i] = LoopVarCategory::Used;
     } else if (isTensorResultFromOtherPartition(i)) {
       categories[i] = LoopVarCategory::TensorResultFromOtherPartition;
@@ -184,6 +171,7 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
 void cloneForOp(scf::ForOp forOp, SmallVector<WarpGroupBuilder> &builders,
                 const PartitionSet &partitions) {
   SetVector<int> forOpPartitions;
+  // TODO: remove
   for (auto &op : forOp.getBody()->without_terminator()) {
     auto opPartitions = triton::gpu::getPartitionIds(&op);
     if (opPartitions) {
@@ -193,8 +181,7 @@ void cloneForOp(scf::ForOp forOp, SmallVector<WarpGroupBuilder> &builders,
 
   SmallVector<scf::ForOp> newForOps;
   for (int i: forOpPartitions) {
-    llvm::outs() << i << "\n";
-    auto b = builders[i];
+    auto& b = builders[i];
     auto partition = partitions.getPartition(i);
     auto [newLoopIndices, _] =
         getLoopVarIndicesToKeep(forOp, partition, partitions);
@@ -203,7 +190,7 @@ void cloneForOp(scf::ForOp forOp, SmallVector<WarpGroupBuilder> &builders,
     auto step = b.mapping.lookupOrDefault(forOp.getStep());
     SmallVector<Value> initArgs;
     for (auto idx : newLoopIndices) {
-      initArgs.push_back(forOp.getInitArgs()[idx]);
+      initArgs.push_back(b.mapping.lookupOrDefault(forOp.getInitArgs()[idx]));
     }
     auto newForOp =
         b.create<scf::ForOp>(forOp.getLoc(), lb, ub, step, initArgs);
@@ -344,7 +331,6 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
         continue;
       }
 
-      llvm::outs() << "yield op\n";
       auto partitionIndices = getPartitionIds(op, partitions.getNumPartitions());
 
       for (size_t idx : partitionIndices) {
@@ -356,6 +342,10 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
                   forOp, partitions.getPartition(builder.partitionId),
                   partitions)
                   .first;
+          llvm::outs() << "partition id = " << idx << "\n";
+	  for (auto index: newOperandIndices) {
+	    llvm::outs() << "operand index = " << index << "\n";
+	  }
         } else {
           auto ifOp = cast<scf::IfOp>(yieldOp->getParentOp());
           for (size_t i = 0; i < yieldOp.getOperands().size(); ++i) {
@@ -476,6 +466,8 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     if (!wsTag || wsTag.getInt() != partitions.getTag())
       continue;
     if (auto partitionIds = triton::gpu::getPartitionIds(op)) {
+      // TODO: remove this code path
+      assert(false);
       cloneOp(op, builders,
               SmallVector<size_t>{partitionIds->begin(), partitionIds->end()});
       opsToErase.push_back(op);
@@ -535,9 +527,9 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     }
   }
 
-  loop->getParentOfType<ModuleOp>().dump();
-  // for (auto op : llvm::reverse(opsToErase))
-  //   op->erase();
+  //  loop->getParentOfType<ModuleOp>().dump();
+  for (auto op : llvm::reverse(opsToErase))
+    op->erase();
 
   return success();
 }
@@ -696,7 +688,7 @@ void PartitionLoops::runOnOperation() {
       if (failed(inferForOpPartitions(forOp)))
         signalPassFailure();
     });
-    // if (failed(partitionLoop(loop)))
-    //   return signalPassFailure();
+    if (failed(partitionLoop(loop)))
+      return signalPassFailure();
   }
 }
