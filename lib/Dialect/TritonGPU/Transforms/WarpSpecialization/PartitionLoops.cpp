@@ -332,7 +332,6 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
                      const PartitionSet &partitions) {
   for (auto &op_ : *block) {
     auto op = &op_;
-    auto partitionIndices = getPartitionIds(op, partitions.getNumPartitions());
 
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       cloneForOp(forOp, builders, partitions);
@@ -344,6 +343,9 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
       if (yieldOp.getOperands().empty()) {
         continue;
       }
+
+      llvm::outs() << "yield op\n";
+      auto partitionIndices = getPartitionIds(op, partitions.getNumPartitions());
 
       for (size_t idx : partitionIndices) {
         auto &builder = builders[idx];
@@ -375,6 +377,7 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
         }
       }
     } else {
+      auto partitionIndices = getPartitionIds(op, partitions.getNumPartitions());
       cloneOp(op, builders, partitionIndices);
     }
   }
@@ -596,6 +599,10 @@ LogicalResult inferIfOpPartitions(scf::IfOp ifOp) {
   ifOp->setAttr(kPartitionOutputsAttrName,
                 ArrayAttr::get(ifOp.getContext(), partitionAttrs));
   setPartition(ifOp, ifOpPartitions);
+  setPartition(ifOp.thenBlock()->getTerminator(), ifOpPartitions);
+  if (ifOp.elseBlock()) {
+    setPartition(ifOp.elseBlock()->getTerminator(), ifOpPartitions);
+  }
   return success();
 }
 
@@ -615,7 +622,13 @@ LogicalResult inferForOpPartitions(scf::ForOp forOp) {
     auto opPartitions = getPartitionIds(&op);
     forOpPartitions.insert(opPartitions->begin(), opPartitions->end());
   }
-  //  setPartition(forOp, forOpPartitions);
+
+  // TODO
+  if (forOp->getParentOfType<scf::ForOp>()) {
+    setPartition(forOp, forOpPartitions);
+  }
+
+  setPartition(forOp.getBody()->getTerminator(), forOpPartitions);
 
   SmallVector<SetVector<int>> iterArgsPartitions(forOp.getNumRegionIterArgs());
   for (auto [i, arg] : llvm::enumerate(forOp.getRegionIterArgs())) {
@@ -683,7 +696,7 @@ void PartitionLoops::runOnOperation() {
       if (failed(inferForOpPartitions(forOp)))
         signalPassFailure();
     });
-    if (failed(partitionLoop(loop)))
-      return signalPassFailure();
+    // if (failed(partitionLoop(loop)))
+    //   return signalPassFailure();
   }
 }
