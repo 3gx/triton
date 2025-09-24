@@ -91,14 +91,6 @@ bool isTensorResultComputedBy(scf::ForOp loop, size_t resultIdx,
   return llvm::is_contained(partitionIds, partition->getIndex());
 }
 
-// TODO: remove
-SmallVector<size_t> getPartitionIds(Operation *op, size_t numPartitions) {
-  auto partitionIds = triton::gpu::getPartitionIds(op);
-  assert(partitionIds);
-  SmallVector<size_t> ret(partitionIds->begin(), partitionIds->end());
-  return ret;
-}
-
 SmallVector<LoopVarCategory> classifyLoopVars(scf::ForOp loop,
                                               const Partition *partition,
                                               const PartitionSet &partitions) {
@@ -170,7 +162,7 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
 
 void cloneForOp(scf::ForOp forOp, SmallVector<WarpGroupBuilder> &builders,
                 const PartitionSet &partitions) {
-  auto forOpPartitions = getPartitionIds(forOp, partitions.getNumPartitions());
+  auto forOpPartitions = *getPartitionIds(forOp);
 
   SmallVector<scf::ForOp> newForOps;
   for (int i : forOpPartitions) {
@@ -213,7 +205,7 @@ void cloneForOp(scf::ForOp forOp, SmallVector<WarpGroupBuilder> &builders,
 
 void cloneIfOp(scf::IfOp ifOp, SmallVector<WarpGroupBuilder> &builders,
                const PartitionSet &partitions) {
-  auto partitionIndices = getPartitionIds(ifOp, partitions.getNumPartitions());
+  auto partitionIndices = *getPartitionIds(ifOp);
 
   SmallVector<scf::IfOp> newIfOps;
   for (size_t idx : partitionIndices) {
@@ -258,8 +250,7 @@ void cloneIfOp(scf::IfOp ifOp, SmallVector<WarpGroupBuilder> &builders,
 void cloneReduceOp(triton::ReduceOp reduceOp,
                    SmallVector<WarpGroupBuilder> &builders,
                    const PartitionSet &partitions) {
-  auto partitionIndices =
-      getPartitionIds(reduceOp, partitions.getNumPartitions());
+  auto partitionIndices = *getPartitionIds(reduceOp);
 
   SmallVector<ReduceOp> newReduceOps;
   for (size_t idx : partitionIndices) {
@@ -294,24 +285,11 @@ void cloneReduceOp(triton::ReduceOp reduceOp,
   }
 }
 
-void cloneOp(Operation *op, SmallVector<WarpGroupBuilder> &builders,
-             ArrayRef<size_t> partitionIndices) {
-  if (op->getNumRegions() != 0) {
-    llvm::report_fatal_error(
-        "Ops are expected to be regionless at this point.");
-  }
-
-  for (size_t idx : partitionIndices) {
-    auto &builder = builders[idx];
-    auto newOp = builder.clone(*op, builder.mapping);
-    mapRange(op->getResults(), newOp->getResults(), builder.mapping);
-  }
-}
-
 void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
                      const PartitionSet &partitions) {
   for (auto &op_ : *block) {
     auto op = &op_;
+    auto partitionIndices = *getPartitionIds(op);
 
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       cloneForOp(forOp, builders, partitions);
@@ -323,9 +301,6 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
       if (yieldOp.getOperands().empty()) {
         continue;
       }
-
-      auto partitionIndices =
-          getPartitionIds(op, partitions.getNumPartitions());
 
       for (size_t idx : partitionIndices) {
         auto &builder = builders[idx];
@@ -346,20 +321,22 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
           }
         }
 
+        assert(!newOperandIndices.empty());
+
         SmallVector<Value> newYieldOperands;
         for (size_t i : newOperandIndices) {
           newYieldOperands.push_back(
               builder.mapping.lookupOrDefault(yieldOp.getOperand(i)));
         }
 
-        if (!newYieldOperands.empty()) {
-          builder.create<scf::YieldOp>(op->getLoc(), newYieldOperands);
-        }
+        builder.create<scf::YieldOp>(op->getLoc(), newYieldOperands);
       }
     } else {
-      auto partitionIndices =
-          getPartitionIds(op, partitions.getNumPartitions());
-      cloneOp(op, builders, partitionIndices);
+      for (size_t idx : partitionIndices) {
+        auto &builder = builders[idx];
+        auto newOp = builder.clone(*op, builder.mapping);
+        mapRange(op->getResults(), newOp->getResults(), builder.mapping);
+      }
     }
   }
 }
