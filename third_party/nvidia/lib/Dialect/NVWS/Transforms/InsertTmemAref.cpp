@@ -42,9 +42,6 @@ std::optional<int> getPartitionId(Operation *op) {
   auto partitionIds = getPartitionIds(op);
   if (!partitionIds)
     return std::nullopt;
-  if (partitionIds->size() != 1) {
-    return std::nullopt;
-  }
   assert(partitionIds->size() == 1);
   return *partitionIds->begin();
 }
@@ -238,8 +235,11 @@ struct TmemAccessDag {
   }
 
   static TmemAccessDag build(TMEMAllocOp allocOp) {
-    TmemAccessDag accessDag(std::make_unique<Node>(
-        allocOp, nullptr, getPartitionId(allocOp), nullptr));
+    std::optional<PartitionId> partitionId =
+        allocOp.getSrc() ? getPartitionId(allocOp) : std::nullopt;
+    TmemAccessDag accessDag(
+        std::make_unique<Node>(allocOp, nullptr, partitionId, nullptr));
+     accessDag.op2dagMap.insert({allocOp, accessDag.getRootNode()});
     accessDag.op2dagMap.insert({allocOp, accessDag.getRootNode()});
 
     if (allocOp.getSrc()) {
@@ -584,7 +584,6 @@ LogicalResult insertTmemAref(TmemAccessDag &accessDag) {
                                    allocOp.getLoc());
 
   auto stageCluster = getStageCluster(allocOp);
-  // TODO: partitionId shouldn't be null for nested loops
   auto partitionId = accessDag.getRootNode()->partitionId;
 
   TMEMAref state(
@@ -607,7 +606,7 @@ LogicalResult insertTmemAref(TmemAccessDag &accessDag) {
 
   auto node = insertTmemArefImpl(rootNode->user.get(), partitionId, state);
 
-  if (true) {
+  if (outerWsLoop) {
     // aref is only used inside ws-loop, so we use the last op to insert
     // matching exit
     partitionId = node->partitionId;
