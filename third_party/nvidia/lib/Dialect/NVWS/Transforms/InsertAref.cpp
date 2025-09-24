@@ -86,8 +86,7 @@ template <typename AllocOp> auto isGlobalLoadAndAlloc(Value result) {
   return isLoadAndAlloc<AllocOp, triton::LoadOp>(result);
 }
 
-ArefCreateOp createAref(OpBuilder &builder, ProducedValueInfo &producedValue,
-                        const SetVector<Partition *> partitions) {
+ArefCreateOp createAref(OpBuilder &builder, ProducedValueInfo &producedValue) {
   auto result = producedValue.result;
 
   auto getSmemDescType = [](Value tensorResult) {
@@ -129,11 +128,7 @@ ArefCreateOp createAref(OpBuilder &builder, ProducedValueInfo &producedValue,
   assert(isa<SharedMemorySpaceAttr>(arefBufType.getMemorySpace()));
   auto loc = result.getLoc();
   auto alloc = triton::nvws::createAlloc(builder, loc, arefBufType, Value());
-  auto aref =
-      createArefCreateOp(builder, {arefBufType}, {alloc->getResult(0)}, loc);
-  // setPartition(alloc, partitions);
-  // setPartition(aref, partitions);
-  return aref;
+  return createArefCreateOp(builder, {arefBufType}, {alloc->getResult(0)}, loc);
 }
 
 int getTxCount(Operation *descOp) {
@@ -455,12 +450,7 @@ bool insertArefs(PartitionBuilder &builder, scf::ForOp loop,
       topLevelFor = outer;
     }
     builder.setInsertionPoint(topLevelFor);
-    SetVector<Partition *> arefPartitions;
-    arefPartitions.insert(producedValue.partition);
-    for (auto consumerPartition : llvm::make_first_range(resultsPerPartition)) {
-      arefPartitions.insert(consumerPartition);
-    }
-    aref = createAref(builder, producedValue, arefPartitions);
+    aref = createAref(builder, producedValue);
   }
 
   auto tag = "aref_" + std::to_string(arefTag);
@@ -524,8 +514,7 @@ public:
           for (auto producedValue : producedValues) {
             PartitionBuilder builder(op->getLoc(), op);
             builder.setInsertionPoint(op);
-            if (insertArefs(builder, loop,
-                            *partitions, producedValue, arefTag))
+            if (insertArefs(builder, loop, *partitions, producedValue, arefTag))
               arefTag++;
           }
         }
