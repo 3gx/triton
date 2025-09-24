@@ -349,44 +349,45 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     return failure();
   PartitionSet partitions = std::move(*partitionsOr);
 
-  // // Only the root node should have consumers at this point.
-  // for (const Partition &partition : partitions.getPartitions()) {
-  //   bool failed = false;
-  //   auto callback = [&](OpResult output, OpOperand &use, unsigned distance) {
-  //     if (partitions.isInRootPartition(output.getDefiningOp())) {
-  //       return;
-  //     }
-  //     auto partitionIds = getPartitionIds(use.getOwner());
-  //     if (partitions.isInRootPartition(use.getOwner()) ||
-  //         llvm::is_contained(*partitionIds, partition.getIndex()))
-  //       return;
+  // Only the root node should have consumers at this point.
+  for (const Partition &partition : partitions.getPartitions()) {
+    bool failed = false;
+    auto callback = [&](OpResult output, OpOperand &use, unsigned distance) {
+      if (partitions.isInRootPartition(output.getDefiningOp())) {
+        return;
+      }
+      auto partitionIds = getPartitionIds(use.getOwner());
+      if (partitions.isInRootPartition(use.getOwner()) ||
+          llvm::is_contained(*partitionIds, partition.getIndex()))
+        return;
 
-  //     // check if consumer partition set is a subset of the producer
-  //     partitions auto defOpPartitionIds =
-  //     getPartitionIds(output.getDefiningOp()); bool isValidSubset =
-  //     std::all_of(
-  //         partitionIds->begin(), partitionIds->end(), [&](int consumerId) {
-  //           return llvm::is_contained(*defOpPartitionIds, consumerId);
-  //         });
+      // check if consumer partition set is a subset of the producer
+      // partitions
+	auto defOpPartitionIds =
+      getPartitionIds(output.getDefiningOp()); bool isValidSubset =
+      std::all_of(
+          partitionIds->begin(), partitionIds->end(), [&](int consumerId) {
+            return llvm::is_contained(*defOpPartitionIds, consumerId);
+          });
 
-  //     if (isValidSubset)
-  //       return; // Valid: consumer ⊆ producer
+      if (isValidSubset)
+        return; // Valid: consumer ⊆ producer
 
-  //     failed = true;
-  //     InFlightDiagnostic diag =
-  //         mlir::emitWarning(output.getLoc(), "non-root partition #")
-  //         << partition.getIndex() << " has direct SSA consumer";
+      failed = true;
+      InFlightDiagnostic diag =
+          mlir::emitWarning(output.getLoc(), "non-root partition #")
+          << partition.getIndex() << " has direct SSA consumer";
 
-  //     for (auto partitionId : *partitionIds) {
-  //       diag.attachNote(use.getOwner()->getLoc())
-  //           << "use at distance " << distance << " in partition #"
-  //           << partitionId << " here";
-  //     }
-  //   };
-  //   partition.iterateUses(loop, callback);
-  //   if (failed)
-  //     return failure();
-  // }
+      for (auto partitionId : *partitionIds) {
+        diag.attachNote(use.getOwner()->getLoc())
+            << "use at distance " << distance << " in partition #"
+            << partitionId << " here";
+      }
+    };
+    partition.iterateUses(loop, callback);
+    if (failed)
+      return failure();
+  }
 
   // There is nothing to do if the loop has 1 or fewer partitions.
   if (llvm::size(partitions.getPartitions()) <= 1)
