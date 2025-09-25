@@ -643,7 +643,8 @@ void assignRegionBodyPartition(scf::ForOp loop, PartitionSet &partitions) {
     if (isa<scf::YieldOp, scf::ForOp>(op) || hasPartition(op))
       return WalkResult::advance();
 
-    auto parentOp = loop.getBody()->findAncestorOpInBlock(*op);
+    auto parentOp =
+        op->getParentOfType<scf::ForOp>().getBody()->findAncestorOpInBlock(*op);
     if (auto partitionIds = triton::gpu::getPartitionIds(parentOp)) {
       SetVector<Partition *> parentPartitions;
       for (auto id : *partitionIds) {
