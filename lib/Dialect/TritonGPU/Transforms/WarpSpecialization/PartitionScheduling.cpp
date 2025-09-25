@@ -291,6 +291,7 @@ static std::optional<PartitionSet> getInitialPartitions(scf::ForOp loop) {
   Partition *loadPartition = partitions.addPartition(0);
 
   SmallVector<Operation*> toHoist;
+  SmallVector<Operation *> loadsAndAllocs;
   for (Operation &op : loop.getOps()) {
     if (auto innerFor = dyn_cast<scf::ForOp>(op)) {
       scheduleInnerLoop(innerFor, partitions, defaultPartition, mmaPartition,
@@ -300,8 +301,30 @@ static std::optional<PartitionSet> getInitialPartitions(scf::ForOp loop) {
       toHoist.push_back(&op);
     } else if (isa<ttng::TMEMLoadOp>(op)) {
       setPartition(&op, defaultPartition);
+    } else if (isa<DescriptorLoadOp, DescriptorGatherOp>(op)) {
+      // TODO: dedup
+      setPartition(&op, loadPartition);
+      loadsAndAllocs.push_back(&op);
+      // Local alloc users of the load with matching encoding will cause the
+      // underlying buffer to be pass through. Keep track of them.
+      SharedEncodingTrait sharedEnc = getSharedEncoding(&op);
+      for (Operation *user : op.getUsers()) {
+        if (auto alloc = dyn_cast<LocalAllocOp>(user)) {
+          if (sharedEnc == alloc.getType().getEncoding()) {
+            setPartition(alloc, loadPartition);
+            loadsAndAllocs.push_back(alloc);
+          }
+        } else if (isa<ttng::TMEMAllocOp>(user)) {
+          setPartition(user, loadPartition);
+          loadsAndAllocs.push_back(user);
+        }
+      }
     }
   }
+
+  // Propagate users of loads
+  for (Operation *loadOrAlloc : loadsAndAllocs)
+    scheduleUsers(loop, partitions, defaultPartition, loadOrAlloc);
 
   // for (auto op: toHoist) {
   //   op->moveBefore(loop);

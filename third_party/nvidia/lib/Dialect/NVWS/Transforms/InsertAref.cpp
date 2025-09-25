@@ -266,6 +266,8 @@ SetVector<Operation *> getTransitiveConsumers(Operation *op,
     } else {
       if (partitions.getPartition(user) == consumerPartition) {
         opConsumers.insert(user);
+	// TODO
+	opConsumers.insert(op->getBlock()->findAncestorOpInBlock(*user));
       }
     }
   }
@@ -288,6 +290,9 @@ SmallVector<Attribute> getConsumerAsyncOpKinds(ArrayRef<Operation *> consumers,
                                                MLIRContext *ctx) {
   SetVector<AsyncOp> kindSet;
   for (auto consumer : consumers) {
+    if (isa<scf::ForOp>(consumer)) {
+      continue;
+    }
     if (isa<WarpGroupDotOp>(consumer)) {
       kindSet.insert(AsyncOp::WGMMA);
     } else if (isa<MMAv5OpInterface>(consumer)) {
