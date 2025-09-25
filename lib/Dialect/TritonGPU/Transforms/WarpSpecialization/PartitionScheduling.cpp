@@ -154,10 +154,11 @@ static void scheduleUsers(scf::ForOp loop, PartitionSet &partitions,
   }
 }
 
-
-void scheduleInnerLoop(scf::ForOp loop, PartitionSet &partitions,
-                       Partition *defaultPartition, Partition *mmaPartition,
-                       Partition *loadPartition) {
+SmallVector<Partition *> scheduleInnerLoop(scf::ForOp loop,
+                                           PartitionSet &partitions,
+                                           Partition *defaultPartition,
+                                           Partition *mmaPartition,
+                                           Partition *loadPartition) {
   for (Operation &op : loop.getOps()) {
     if (auto innerFor = dyn_cast<scf::ForOp>(op)) {
       scheduleInnerLoop(innerFor, partitions, defaultPartition, mmaPartition,
@@ -234,7 +235,7 @@ void scheduleInnerLoop(scf::ForOp loop, PartitionSet &partitions,
   }
 
   if (loadsAndAllocs.empty() && mmas.empty()) {
-    return;
+    return {};
   }
 
   // Propagate defs of exp.
@@ -273,6 +274,7 @@ void scheduleInnerLoop(scf::ForOp loop, PartitionSet &partitions,
   }
 
   setPartition(loop, bodyPartitons);
+  return userPartitions;
 }
 
 // Given a partitioning scheme, determine an initial schedule by performing a
@@ -292,15 +294,20 @@ static std::optional<PartitionSet> getInitialPartitions(scf::ForOp loop) {
 
   SmallVector<Operation*> toHoist;
   SmallVector<Operation *> loadsAndAllocs;
+  SetVector<Partition *> userPartitions;
   for (Operation &op : loop.getOps()) {
     if (auto innerFor = dyn_cast<scf::ForOp>(op)) {
-      scheduleInnerLoop(innerFor, partitions, defaultPartition, mmaPartition,
-                        loadPartition);
+      for (auto userPartition :
+           scheduleInnerLoop(innerFor, partitions, defaultPartition,
+                             mmaPartition, loadPartition)) {
+        userPartitions.insert(userPartition);
+      }
     } else if (isa<ttng::TMEMAllocOp, ttng::TMEMStoreOp>(op)) {
       // TODO, fix hoisting pass
       toHoist.push_back(&op);
     } else if (isa<ttng::TMEMLoadOp>(op)) {
-      setPartition(&op, defaultPartition);
+      // TODO: which user partition should be responsible for this load
+      setPartition(&op, userPartitions.back());
     } else if (isa<DescriptorLoadOp, DescriptorGatherOp>(op)) {
       // TODO: dedup
       setPartition(&op, loadPartition);
