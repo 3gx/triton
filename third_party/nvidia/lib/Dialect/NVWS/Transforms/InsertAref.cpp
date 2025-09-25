@@ -266,8 +266,8 @@ SetVector<Operation *> getTransitiveConsumers(Operation *op,
     } else {
       if (partitions.getPartition(user) == consumerPartition) {
         opConsumers.insert(user);
-	// TODO
-	opConsumers.insert(op->getBlock()->findAncestorOpInBlock(*user));
+        // TODO
+        opConsumers.insert(op->getBlock()->findAncestorOpInBlock(*user));
       }
     }
   }

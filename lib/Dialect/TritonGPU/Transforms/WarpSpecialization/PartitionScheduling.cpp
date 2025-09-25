@@ -306,7 +306,8 @@ static std::optional<PartitionSet> getInitialPartitions(scf::ForOp loop) {
       // TODO, fix hoisting pass
       toHoist.push_back(&op);
     } else if (isa<ttng::TMEMLoadOp>(op)) {
-      // TODO: which user partition should be responsible for this load
+      // TODO: Check the non-MMA user partition that uses this tmem
+      // If none, use the default partition
       setPartition(&op, userPartitions.back());
     } else if (isa<DescriptorLoadOp, DescriptorGatherOp>(op)) {
       // TODO: dedup

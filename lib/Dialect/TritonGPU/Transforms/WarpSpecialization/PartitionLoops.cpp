@@ -562,7 +562,9 @@ LogicalResult inferForOpPartitions(scf::ForOp forOp) {
   SetVector<int> forOpPartitions;
   for (auto &op : forOp.getBody()->without_terminator()) {
     auto opPartitions = getPartitionIds(&op);
-    forOpPartitions.insert(opPartitions->begin(), opPartitions->end());
+    if (opPartitions) {
+      forOpPartitions.insert(opPartitions->begin(), opPartitions->end());
+    }
   }
 
   setPartition(forOp, forOpPartitions);
