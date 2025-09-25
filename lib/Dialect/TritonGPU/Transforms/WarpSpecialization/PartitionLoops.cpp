@@ -363,9 +363,8 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
 
       // check if consumer partition set is a subset of the producer
       // partitions
-	auto defOpPartitionIds =
-      getPartitionIds(output.getDefiningOp()); bool isValidSubset =
-      std::all_of(
+      auto defOpPartitionIds = getPartitionIds(output.getDefiningOp());
+      bool isValidSubset = std::all_of(
           partitionIds->begin(), partitionIds->end(), [&](int consumerId) {
             return llvm::is_contained(*defOpPartitionIds, consumerId);
           });
