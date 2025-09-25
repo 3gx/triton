@@ -497,7 +497,7 @@ def attention_persistent_inner_loop_kernel(  #
         tiles_per_sm += 1
 
     tile_idx = prog_id
-    for _ in range(0, tiles_per_sm):
+    for _ in range(0, tiles_per_sm, warp_specialize=True):
         m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
         acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
@@ -505,7 +505,7 @@ def attention_persistent_inner_loop_kernel(  #
         off_m = tile_idx * BLOCK_M
         q = desc_q.load([off_m, 0])
 
-        for start_n in tl.range(0, N, HEAD_DIM, warp_specialize=False):
+        for start_n in tl.range(0, N, HEAD_DIM):
             start_n = tl.multiple_of(start_n, HEAD_DIM)
             k = desc_k.load([start_n, 0]).T
 
