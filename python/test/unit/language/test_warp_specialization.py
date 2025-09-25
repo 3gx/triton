@@ -477,3 +477,105 @@ def test_warp_specialize_attention_forward(M, N, BLOCK_M, HEAD_DIM, num_stages, 
     torch.testing.assert_close(acc.to(torch.float32), acc_ref.to(torch.float32), atol=0, rtol=0)
     torch.testing.assert_close(l_i.to(torch.float32), l_i_ref.to(torch.float32), atol=0, rtol=0)
     torch.testing.assert_close(m_i.to(torch.float32), m_i_ref.to(torch.float32), atol=0, rtol=0)
+
+
+@triton.jit
+def attention_persistent_inner_loop_kernel(  #
+        desc_q, desc_k, desc_v,  #
+        desc_acc, l_i_ptr, m_i_ptr,  #
+        M, N, qk_scale,  #
+        BLOCK_M: tl.constexpr,  #
+        HEAD_DIM: tl.constexpr,  #
+        warp_specialize: tl.constexpr  #
+):
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    prog_id = tl.program_id(0)
+    num_sm = tl.num_programs(0)
+    num_tiles = tl.cdiv(M, BLOCK_M)
+
+    tiles_per_sm = num_tiles // num_sm
+    if prog_id < num_tiles % num_sm:
+        tiles_per_sm += 1
+
+    tile_idx = prog_id
+    for _ in range(0, tiles_per_sm):
+
+        off_m = tile_idx * BLOCK_M
+        q = desc_q.load([off_m, 0])
+
+        for start_n in tl.range(0, N, HEAD_DIM, warp_specialize=False):
+            start_n = tl.multiple_of(start_n, HEAD_DIM)
+            k = desc_k.load([start_n, 0]).T
+
+            qk = tl.dot(q, k)
+
+            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+            qk = qk * qk_scale - m_ij[:, None]
+            p = tl.math.exp2(qk)
+            alpha = tl.math.exp2(m_i - m_ij)
+            l_ij = tl.sum(p, 1)
+            acc = acc * alpha[:, None]
+
+            v = desc_v.load([start_n, 0])
+            p = p.to(v.dtype)
+            acc = tl.dot(p, v, acc)
+
+            l_i = l_i * alpha + l_ij
+            m_i = m_ij
+
+        desc_acc.store([off_m, 0], acc.to(q.dtype))
+        tl.store(l_i_ptr + off_m + tl.arange(0, BLOCK_M), l_i)
+        tl.store(m_i_ptr + off_m + tl.arange(0, BLOCK_M), m_i)
+
+        tile_idx += num_sm
+
+
+@pytest.mark.parametrize("M, N", [(8192, 8192), (1024, 1024)])
+@pytest.mark.parametrize("BLOCK_M", [64, 128])
+@pytest.mark.parametrize("HEAD_DIM", [64, 128])
+@pytest.mark.parametrize("num_stages", [2, 3])
+@pytest.mark.parametrize("disable_acc_multibuf", [False, True])
+@pytest.mark.parametrize("num_warps", [4, 8])
+@pytest.mark.parametrize("use_fp8", [False, True])
+@pytest.mark.skipif(is_hip(), reason="warp specialization is not supported on hip devices")
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+def test_warp_specialize_attention_persistent_forward(M, N, BLOCK_M, HEAD_DIM, num_stages, disable_acc_multibuf, num_warps,
+                                                      use_fp8):
+    if BLOCK_M == 128 and HEAD_DIM == 128 and not use_fp8:
+        # These configurations currently use too much shared memory.
+        if (num_warps, num_stages) in [(4, 4), (8, 4), (8, 3)]:
+            pytest.skip("uses too much shared memory")
+
+    dtype = torch.float8_e4m3fn if use_fp8 else torch.float16
+
+    torch.manual_seed(42)
+    q = torch.randn((M, HEAD_DIM), device="cuda").to(dtype)
+    k = torch.randn((N, HEAD_DIM), device="cuda").to(dtype)
+    v = torch.randn((N, HEAD_DIM), device="cuda").to(dtype)
+
+    acc_ref = torch.empty((M, HEAD_DIM), dtype=dtype, device="cuda")
+    l_i_ref = torch.empty((M, ), dtype=dtype, device="cuda")
+    m_i_ref = torch.empty((M, ), dtype=dtype, device="cuda")
+    acc = torch.empty((M, HEAD_DIM), dtype=dtype, device="cuda")
+    l_i = torch.empty((M, ), dtype=dtype, device="cuda")
+    m_i = torch.empty((M, ), dtype=dtype, device="cuda")
+
+    desc_q = TensorDescriptor(q, shape=[M, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=[BLOCK_M, HEAD_DIM])
+    desc_k = TensorDescriptor(k, shape=[N, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=[BLOCK_M, HEAD_DIM])
+    desc_v = TensorDescriptor(v, shape=[N, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=[BLOCK_M, HEAD_DIM])
+    desc_acc_ref = TensorDescriptor(acc_ref, shape=[M, HEAD_DIM], strides=[HEAD_DIM, 1],
+                                    block_shape=[BLOCK_M, HEAD_DIM])
+    desc_acc = TensorDescriptor(acc, shape=[M, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=[BLOCK_M, HEAD_DIM])
+
+    NUM_SM = 4
+    attention_persistent_inner_loop_kernel[(NUM_SM,)](desc_q, desc_k, desc_v, desc_acc_ref, l_i_ref, m_i_ref, M, N, 0.5,
+                                                       BLOCK_M, HEAD_DIM, True, num_stages=num_stages, num_warps=num_warps)
+    attention_inner_loop_kernel[(M // BLOCK_M, )](desc_q, desc_k, desc_v, desc_acc, l_i, m_i, M, N, 0.5, BLOCK_M,
+                                                  HEAD_DIM, False, num_stages=num_stages, num_warps=num_warps)
+
+    torch.testing.assert_close(acc.to(torch.float32), acc_ref.to(torch.float32), atol=0, rtol=0)
+    torch.testing.assert_close(l_i.to(torch.float32), l_i_ref.to(torch.float32), atol=0, rtol=0)
+    torch.testing.assert_close(m_i.to(torch.float32), m_i_ref.to(torch.float32), atol=0, rtol=0)
