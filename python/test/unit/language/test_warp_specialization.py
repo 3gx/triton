@@ -488,10 +488,6 @@ def attention_persistent_inner_loop_kernel(  #
         HEAD_DIM: tl.constexpr,  #
         warp_specialize: tl.constexpr  #
 ):
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-
     prog_id = tl.program_id(0)
     num_sm = tl.num_programs(0)
     num_tiles = tl.cdiv(M, BLOCK_M)
@@ -502,6 +498,9 @@ def attention_persistent_inner_loop_kernel(  #
 
     tile_idx = prog_id
     for _ in range(0, tiles_per_sm):
+        m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+        l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+        acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
         off_m = tile_idx * BLOCK_M
         q = desc_q.load([off_m, 0])
@@ -571,11 +570,16 @@ def test_warp_specialize_attention_persistent_forward(M, N, BLOCK_M, HEAD_DIM, n
     desc_acc = TensorDescriptor(acc, shape=[M, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=[BLOCK_M, HEAD_DIM])
 
     NUM_SM = 4
-    attention_persistent_inner_loop_kernel[(NUM_SM,)](desc_q, desc_k, desc_v, desc_acc_ref, l_i_ref, m_i_ref, M, N, 0.5,
+    out = attention_persistent_inner_loop_kernel[(NUM_SM,)](desc_q, desc_k, desc_v, desc_acc_ref, l_i_ref, m_i_ref, M, N, 0.5,
                                                        BLOCK_M, HEAD_DIM, True, num_stages=num_stages, num_warps=num_warps)
     attention_inner_loop_kernel[(M // BLOCK_M, )](desc_q, desc_k, desc_v, desc_acc, l_i, m_i, M, N, 0.5, BLOCK_M,
                                                   HEAD_DIM, False, num_stages=num_stages, num_warps=num_warps)
 
+    # print(out.asm["ttgir"])
+
     torch.testing.assert_close(acc.to(torch.float32), acc_ref.to(torch.float32), atol=0, rtol=0)
     torch.testing.assert_close(l_i.to(torch.float32), l_i_ref.to(torch.float32), atol=0, rtol=0)
     torch.testing.assert_close(m_i.to(torch.float32), m_i_ref.to(torch.float32), atol=0, rtol=0)
+
+
+test_warp_specialize_attention_persistent_forward(1024, 1024, 128, 128, 3, True, 4, True)
