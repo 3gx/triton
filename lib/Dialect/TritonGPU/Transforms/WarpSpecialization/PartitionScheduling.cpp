@@ -154,87 +154,83 @@ static void scheduleUsers(scf::ForOp loop, PartitionSet &partitions,
   }
 }
 
-SmallVector<Partition *> scheduleInnerLoop(scf::ForOp loop,
-                                           PartitionSet &partitions,
-                                           Partition *defaultPartition,
-                                           Partition *mmaPartition,
-                                           Partition *loadPartition) {
+SetVector<Partition *> getInitialPartitions(scf::ForOp loop,
+                                            PartitionSet &partitions,
+                                            Partition *defaultPartition,
+                                            Partition *mmaPartition,
+                                            Partition *loadPartition) {
+  SmallVector<Operation *> loadsAndAllocs;
+  SmallVector<ttng::MMAv5OpInterface> mmas;
+  SetVector<Partition *> userPartitions;
+  userPartitions.insert(defaultPartition);
+
   for (Operation &op : loop.getOps()) {
     if (auto innerFor = dyn_cast<scf::ForOp>(op)) {
-      scheduleInnerLoop(innerFor, partitions, defaultPartition, mmaPartition,
-                        loadPartition);
-    }
-  }
-
-  // Find loads to pipeline.
-  SmallVector<Operation *> loadsAndAllocs;
-  for (Operation &op : loop.getOps()) {
-    // Only TMA loads are supported at the moment.
-    if (!isa<DescriptorLoadOp, DescriptorGatherOp>(op))
-      continue;
-    setPartition(&op, loadPartition);
-    loadsAndAllocs.push_back(&op);
-
-    // Local alloc users of the load with matching encoding will cause the
-    // underlying buffer to be pass through. Keep track of them.
-    SharedEncodingTrait sharedEnc = getSharedEncoding(&op);
-    for (Operation *user : op.getUsers()) {
-      if (auto alloc = dyn_cast<LocalAllocOp>(user)) {
-        if (sharedEnc == alloc.getType().getEncoding()) {
-          setPartition(alloc, loadPartition);
-          loadsAndAllocs.push_back(alloc);
+      for (auto userPartition :
+           getInitialPartitions(innerFor, partitions, defaultPartition,
+                                mmaPartition, loadPartition)) {
+        userPartitions.insert(userPartition);
+      }
+    } else if (isa<DescriptorLoadOp, DescriptorGatherOp>(op)) {
+      setPartition(&op, loadPartition);
+      loadsAndAllocs.push_back(&op);
+      // Local alloc users of the load with matching encoding will cause the
+      // underlying buffer to be pass through. Keep track of them.
+      SharedEncodingTrait sharedEnc = getSharedEncoding(&op);
+      for (Operation *user : op.getUsers()) {
+        if (auto alloc = dyn_cast<LocalAllocOp>(user)) {
+          if (sharedEnc == alloc.getType().getEncoding()) {
+            setPartition(alloc, loadPartition);
+            loadsAndAllocs.push_back(alloc);
+          }
+        } else if (isa<ttng::TMEMAllocOp>(user)) {
+          setPartition(user, loadPartition);
+          loadsAndAllocs.push_back(user);
         }
-      } else if (isa<ttng::TMEMAllocOp>(user)) {
-        setPartition(user, loadPartition);
-        loadsAndAllocs.push_back(user);
+      }
+    } else if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op)) {
+      setPartition(mmaOp, mmaPartition);
+      mmas.push_back(mmaOp);
+
+      // If the store is unrelated to the use of the MMA, then it gets placed in
+      // the MMA partition.
+      auto storeOp = dyn_cast_or_null<ttng::TMEMStoreOp>(
+          findDefOpInLoop(loop, mmaOp.getAccDep()));
+      if (!ttng::hasAccReadModifyWrite(mmaOp, loop) && storeOp &&
+          loop.isDefinedOutsideOfLoop(storeOp.getSrc()))
+        setPartition(storeOp, mmaPartition);
+
+      // Look for views into the operands.
+      SmallVector<Operation *> operandViews;
+      for (Value operand : mmaOp->getOperands()) {
+        if (Operation *defOp = operand.getDefiningOp())
+          operandViews.push_back(defOp);
+      }
+      while (!operandViews.empty()) {
+        Operation *op = operandViews.pop_back_val();
+        if (!op->hasTrait<OpTrait::MemDescViewTrait>())
+          continue;
+
+        // Duplicate the op if necessary to ensure that the MMA partition is the
+        // only user.
+        if (!llvm::all_of(op->getUsers(), [&](Operation *user) {
+              return mmaPartition->hasOp(user);
+            })) {
+          Operation *newOp = OpBuilder(op).clone(*op);
+          op->replaceUsesWithIf(newOp->getResults(), [&](OpOperand &use) {
+            return mmaPartition->hasOp(use.getOwner());
+          });
+          op = newOp;
+        }
+
+        setPartition(op, mmaPartition);
+        if (Operation *defOp = op->getOperand(0).getDefiningOp())
+          operandViews.push_back(defOp);
       }
     }
   }
 
-  // Find MMAs to pipeline.
-  SmallVector<ttng::MMAv5OpInterface> mmas;
-  for (auto mmaOp : loop.getOps<ttng::MMAv5OpInterface>()) {
-    setPartition(mmaOp, mmaPartition);
-    mmas.push_back(mmaOp);
-
-    // If the store is unrelated to the use of the MMA, then it gets placed in
-    // the MMA partition.
-    auto storeOp = dyn_cast_or_null<ttng::TMEMStoreOp>(
-        findDefOpInLoop(loop, mmaOp.getAccDep()));
-    if (!ttng::hasAccReadModifyWrite(mmaOp, loop) && storeOp &&
-        loop.isDefinedOutsideOfLoop(storeOp.getSrc()))
-      setPartition(storeOp, mmaPartition);
-
-    // Look for views into the operands.
-    SmallVector<Operation *> operandViews;
-    for (Value operand : mmaOp->getOperands()) {
-      if (Operation *defOp = operand.getDefiningOp())
-        operandViews.push_back(defOp);
-    }
-    while (!operandViews.empty()) {
-      Operation *op = operandViews.pop_back_val();
-      if (!op->hasTrait<OpTrait::MemDescViewTrait>())
-        continue;
-
-      // Duplicate the op if necessary to ensure that the MMA partition is the
-      // only user.
-      if (!llvm::all_of(op->getUsers(), [&](Operation *user) {
-            return mmaPartition->hasOp(user);
-          })) {
-        Operation *newOp = OpBuilder(op).clone(*op);
-        op->replaceUsesWithIf(newOp->getResults(), [&](OpOperand &use) {
-          return mmaPartition->hasOp(use.getOwner());
-        });
-        op = newOp;
-      }
-
-      setPartition(op, mmaPartition);
-      if (Operation *defOp = op->getOperand(0).getDefiningOp())
-        operandViews.push_back(defOp);
-    }
-  }
-
-  if (loadsAndAllocs.empty() && mmas.empty()) {
+  if (loadPartition->empty() && mmaPartition->empty()) {
     return {};
   }
 
@@ -257,91 +253,57 @@ SmallVector<Partition *> scheduleInnerLoop(scf::ForOp loop,
   for (Operation *loadOrAlloc : loadsAndAllocs)
     scheduleUsers(loop, partitions, defaultPartition, loadOrAlloc);
 
-  SmallVector<Partition *> userPartitions{defaultPartition};
   while (userPartitions.size() < mmas.size()) {
-    userPartitions.push_back(partitions.addPartition(userPartitions.size()));
+    userPartitions.insert(partitions.addPartition(userPartitions.size()));
   }
   for (auto [mmaOp, userPartition] :
        llvm::reverse(llvm::zip(mmas, userPartitions))) {
     scheduleUsers(loop, partitions, userPartition, mmaOp);
   }
 
-  SetVector<Partition *> bodyPartitons;
-  for (Operation &op : loop.getOps()) {
-    if (hasPartition(&op)) {
-      bodyPartitons.insert(partitions.getPartition(&op));
+  // Annotate remaining unannotated tmem loads, for example those outside of the
+  // inner loop
+  for (ttng::TMEMLoadOp tmemLoad : loop.getOps<ttng::TMEMLoadOp>()) {
+    if (hasPartition(tmemLoad)) {
+      continue;
+    }
+
+    if (userPartitions.size() <= 1) {
+      setPartition(tmemLoad, defaultPartition);
+    } else {
+      auto tmem = tmemLoad.getSrc();
+      SetVector<Partition *> tmemUserPartitions;
+      for (auto user : tmem.getUsers()) {
+        if (!hasPartition(user)) {
+          continue;
+        }
+        if (auto partition = partitions.getPartition(user);
+            partition != mmaPartition) {
+          tmemUserPartitions.insert(partition);
+        }
+      }
+      // TMEM should only used by MMA and one user partition
+      assert(tmemUserPartitions.size() == 1);
+      setPartition(tmemLoad, tmemUserPartitions.front());
     }
   }
 
-  setPartition(loop, bodyPartitons);
+  // Annotate the inner loop with its body partitions
+  if (!loop->hasAttr(kWarpSpecializeAttrName)) {
+    SetVector<Partition *> bodyPartitons;
+    for (Operation &op : loop.getOps()) {
+      if (auto ids = getPartitionIds(&op)) {
+        for (auto id : *ids) {
+          bodyPartitons.insert(partitions.getPartition(id));
+        }
+      }
+    }
+
+    setPartition(loop, bodyPartitons);
+  }
+
   return userPartitions;
 }
-
-// SmallVector<Partition *> getInitialPartition(scf::ForOp loop,
-//                                              PartitionSet &partitions,
-//                                              Partition *defaultPartition,
-//                                              Partition *mmaPartition,
-//                                              Partition *loadPartition) {
-//   SmallVector<Operation *> loadsAndAllocs;
-//   SetVector<Partition *> userPartitions;
-//   for (Operation &op : loop.getOps()) {
-//     if (auto innerFor = dyn_cast<scf::ForOp>(op)) {
-//       for (auto userPartition :
-//            getInitialPartition(innerFor, partitions, defaultPartition,
-// 			       mmaPartition, loadPartition)) {
-//         userPartitions.insert(userPartition);
-//       }
-//     } else if (auto tmemLoad = dyn_cast<ttng::TMEMLoadOp>(op)) {
-//       if (userPartitions.empty()) {
-//         setPartition(&op, defaultPartition);
-//       } else {
-//         auto tmem = tmemLoad.getSrc();
-//         SetVector<Partition *> tmemUserPartitions;
-//         for (auto user : tmem.getUsers()) {
-//           if (!hasPartition(user)) {
-//             continue;
-//           }
-//           if (auto partition = partitions.getPartition(user);
-//               partition != mmaPartition) {
-//             tmemUserPartitions.insert(partition);
-//           }
-//         }
-//         // TMEM should only used by MMA and one user partition
-//         assert(tmemUserPartitions.size() == 1);
-//         setPartition(&op, userPartitions.front());
-//       }
-//     } else if (isa<DescriptorLoadOp, DescriptorGatherOp>(op)) {
-//       // TODO: dedup
-//       setPartition(&op, loadPartition);
-//       loadsAndAllocs.push_back(&op);
-//       // Local alloc users of the load with matching encoding will cause the
-//       // underlying buffer to be pass through. Keep track of them.
-//       SharedEncodingTrait sharedEnc = getSharedEncoding(&op);
-//       for (Operation *user : op.getUsers()) {
-//         if (auto alloc = dyn_cast<LocalAllocOp>(user)) {
-//           if (sharedEnc == alloc.getType().getEncoding()) {
-//             setPartition(alloc, loadPartition);
-//             loadsAndAllocs.push_back(alloc);
-//           }
-//         } else if (isa<ttng::TMEMAllocOp>(user)) {
-//           setPartition(user, loadPartition);
-//           loadsAndAllocs.push_back(user);
-//         }
-//       }
-//     }
-//   }
-
-//   // Propagate users of loads
-//   for (Operation *loadOrAlloc : loadsAndAllocs)
-//     scheduleUsers(loop, partitions, defaultPartition, loadOrAlloc);
-
-//   // // If there are no loads or MMAs, don't warp specialize.
-//   // if (loadPartition->empty() && mmaPartition->empty()) {
-//   //   return std::nullopt;
-//   // }
-
-//   // return partitions;
-// }
 
 // Given a partitioning scheme, determine an initial schedule by performing a
 // first-order partition assignment to the operations in the scheme and its
@@ -358,58 +320,8 @@ static std::optional<PartitionSet> getInitialPartitions(scf::ForOp loop) {
   Partition *mmaPartition = partitions.addPartition(1);
   Partition *loadPartition = partitions.addPartition(0);
 
-  SmallVector<Operation *> loadsAndAllocs;
-  SetVector<Partition *> userPartitions;
-  for (Operation &op : loop.getOps()) {
-    if (auto innerFor = dyn_cast<scf::ForOp>(op)) {
-      for (auto userPartition :
-           scheduleInnerLoop(innerFor, partitions, defaultPartition,
-                             mmaPartition, loadPartition)) {
-        userPartitions.insert(userPartition);
-      }
-    } else if (auto tmemLoad = dyn_cast<ttng::TMEMLoadOp>(op)) {
-      if (userPartitions.size() <= 1) {
-        setPartition(&op, defaultPartition);
-      } else {
-        auto tmem = tmemLoad.getSrc();
-        SetVector<Partition *> tmemUserPartitions;
-        for (auto user : tmem.getUsers()) {
-          if (!hasPartition(user)) {
-            continue;
-          }
-          if (auto partition = partitions.getPartition(user);
-              partition != mmaPartition) {
-            tmemUserPartitions.insert(partition);
-          }
-        }
-        // TMEM should only used by MMA and one user partition
-        assert(tmemUserPartitions.size() == 1);
-        setPartition(&op, tmemUserPartitions.front());
-      }
-    } else if (isa<DescriptorLoadOp, DescriptorGatherOp>(op)) {
-      // TODO: dedup
-      setPartition(&op, loadPartition);
-      loadsAndAllocs.push_back(&op);
-      // Local alloc users of the load with matching encoding will cause the
-      // underlying buffer to be pass through. Keep track of them.
-      SharedEncodingTrait sharedEnc = getSharedEncoding(&op);
-      for (Operation *user : op.getUsers()) {
-        if (auto alloc = dyn_cast<LocalAllocOp>(user)) {
-          if (sharedEnc == alloc.getType().getEncoding()) {
-            setPartition(alloc, loadPartition);
-            loadsAndAllocs.push_back(alloc);
-          }
-        } else if (isa<ttng::TMEMAllocOp>(user)) {
-          setPartition(user, loadPartition);
-          loadsAndAllocs.push_back(user);
-        }
-      }
-    }
-  }
-
-  // Propagate users of loads
-  for (Operation *loadOrAlloc : loadsAndAllocs)
-    scheduleUsers(loop, partitions, defaultPartition, loadOrAlloc);
+  getInitialPartitions(loop, partitions, defaultPartition, mmaPartition,
+                       loadPartition);
 
   // If there are no loads or MMAs, don't warp specialize.
   if (loadPartition->empty() && mmaPartition->empty()) {
