@@ -64,9 +64,8 @@ SmallVector<ProducedValueInfo> getProducedValues(Operation *op,
 template <typename AllocOp, typename LoadOp>
 std::optional<std::pair<AllocOp, LoadOp>> isLoadAndAlloc(Value result) {
   auto alloc = result.getDefiningOp<AllocOp>();
-  if (!alloc || !alloc.getSrc()) {
+  if (!alloc || !alloc.getSrc())
     return std::nullopt;
-  }
   if (auto load = alloc.getSrc().template getDefiningOp<LoadOp>();
       load && *getPartitionIds(alloc) == *getPartitionIds(load)) {
     // if alloc and load are in different partitions, they are treated as two
