@@ -277,6 +277,72 @@ SmallVector<Partition *> scheduleInnerLoop(scf::ForOp loop,
   return userPartitions;
 }
 
+// SmallVector<Partition *> getInitialPartition(scf::ForOp loop,
+//                                              PartitionSet &partitions,
+//                                              Partition *defaultPartition,
+//                                              Partition *mmaPartition,
+//                                              Partition *loadPartition) {
+//   SmallVector<Operation *> loadsAndAllocs;
+//   SetVector<Partition *> userPartitions;
+//   for (Operation &op : loop.getOps()) {
+//     if (auto innerFor = dyn_cast<scf::ForOp>(op)) {
+//       for (auto userPartition :
+//            getInitialPartition(innerFor, partitions, defaultPartition,
+// 			       mmaPartition, loadPartition)) {
+//         userPartitions.insert(userPartition);
+//       }
+//     } else if (auto tmemLoad = dyn_cast<ttng::TMEMLoadOp>(op)) {
+//       if (userPartitions.empty()) {
+//         setPartition(&op, defaultPartition);
+//       } else {
+//         auto tmem = tmemLoad.getSrc();
+//         SetVector<Partition *> tmemUserPartitions;
+//         for (auto user : tmem.getUsers()) {
+//           if (!hasPartition(user)) {
+//             continue;
+//           }
+//           if (auto partition = partitions.getPartition(user);
+//               partition != mmaPartition) {
+//             tmemUserPartitions.insert(partition);
+//           }
+//         }
+//         // TMEM should only used by MMA and one user partition
+//         assert(tmemUserPartitions.size() == 1);
+//         setPartition(&op, userPartitions.front());
+//       }
+//     } else if (isa<DescriptorLoadOp, DescriptorGatherOp>(op)) {
+//       // TODO: dedup
+//       setPartition(&op, loadPartition);
+//       loadsAndAllocs.push_back(&op);
+//       // Local alloc users of the load with matching encoding will cause the
+//       // underlying buffer to be pass through. Keep track of them.
+//       SharedEncodingTrait sharedEnc = getSharedEncoding(&op);
+//       for (Operation *user : op.getUsers()) {
+//         if (auto alloc = dyn_cast<LocalAllocOp>(user)) {
+//           if (sharedEnc == alloc.getType().getEncoding()) {
+//             setPartition(alloc, loadPartition);
+//             loadsAndAllocs.push_back(alloc);
+//           }
+//         } else if (isa<ttng::TMEMAllocOp>(user)) {
+//           setPartition(user, loadPartition);
+//           loadsAndAllocs.push_back(user);
+//         }
+//       }
+//     }
+//   }
+
+//   // Propagate users of loads
+//   for (Operation *loadOrAlloc : loadsAndAllocs)
+//     scheduleUsers(loop, partitions, defaultPartition, loadOrAlloc);
+
+//   // // If there are no loads or MMAs, don't warp specialize.
+//   // if (loadPartition->empty() && mmaPartition->empty()) {
+//   //   return std::nullopt;
+//   // }
+
+//   // return partitions;
+// }
+
 // Given a partitioning scheme, determine an initial schedule by performing a
 // first-order partition assignment to the operations in the scheme and its
 // users and/or dependencies. This sets up the initial partitioning of the ops.
@@ -292,7 +358,6 @@ static std::optional<PartitionSet> getInitialPartitions(scf::ForOp loop) {
   Partition *mmaPartition = partitions.addPartition(1);
   Partition *loadPartition = partitions.addPartition(0);
 
-  SmallVector<Operation*> toHoist;
   SmallVector<Operation *> loadsAndAllocs;
   SetVector<Partition *> userPartitions;
   for (Operation &op : loop.getOps()) {
@@ -302,16 +367,24 @@ static std::optional<PartitionSet> getInitialPartitions(scf::ForOp loop) {
                              mmaPartition, loadPartition)) {
         userPartitions.insert(userPartition);
       }
-    } else if (isa<ttng::TMEMAllocOp, ttng::TMEMStoreOp>(op)) {
-      // TODO, fix hoisting pass
-      toHoist.push_back(&op);
-    } else if (isa<ttng::TMEMLoadOp>(op)) {
-      // TODO: Check the non-MMA user partition that uses this tmem
-      // If none, use the default partition
-      if (userPartitions.empty()) {
-	setPartition(&op, defaultPartition);
+    } else if (auto tmemLoad = dyn_cast<ttng::TMEMLoadOp>(op)) {
+      if (userPartitions.size() <= 1) {
+        setPartition(&op, defaultPartition);
       } else {
-	setPartition(&op, userPartitions.back());
+        auto tmem = tmemLoad.getSrc();
+        SetVector<Partition *> tmemUserPartitions;
+        for (auto user : tmem.getUsers()) {
+          if (!hasPartition(user)) {
+            continue;
+          }
+          if (auto partition = partitions.getPartition(user);
+              partition != mmaPartition) {
+            tmemUserPartitions.insert(partition);
+          }
+        }
+        // TMEM should only used by MMA and one user partition
+        assert(tmemUserPartitions.size() == 1);
+        setPartition(&op, tmemUserPartitions.front());
       }
     } else if (isa<DescriptorLoadOp, DescriptorGatherOp>(op)) {
       // TODO: dedup
@@ -337,10 +410,6 @@ static std::optional<PartitionSet> getInitialPartitions(scf::ForOp loop) {
   // Propagate users of loads
   for (Operation *loadOrAlloc : loadsAndAllocs)
     scheduleUsers(loop, partitions, defaultPartition, loadOrAlloc);
-
-  // for (auto op: toHoist) {
-  //   op->moveBefore(loop);
-  // }
 
   // If there are no loads or MMAs, don't warp specialize.
   if (loadPartition->empty() && mmaPartition->empty()) {
@@ -512,16 +581,6 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &partitions) {
     assert(!cluster.defPartitions.empty());
     assert(llvm::all_of(cluster.ops,
                         [&](Operation *op) { return !hasPartition(op); }));
-
-    // TODO
-    // // If there are multiple def or sink partitions, don't know what to do.
-    // // Assign the whole cluster to its own partition.
-    // if (cluster.defPartitions.size() > 1 || cluster.sinkPartitions.size() > 1) {
-    //   Partition *newPartition = partitions.addPartition(0);
-    //   for (Operation *op : cluster.ops)
-    //     setPartition(op, newPartition);
-    //   continue;
-    // }
 
     // If there is no sink partition, this means there is a backedge somewhere,
     // for now assign the cluster to the def partition.
