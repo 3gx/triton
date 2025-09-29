@@ -204,7 +204,11 @@ struct TmemAccessDag {
       return tokOperand.get(); // return token back to the caller
 
     auto op = tokOperand.getOwner();
-    node->user.reset(new Node(op, &tokOperand, getPartitionId(op), node));
+    std::optional<PartitionId> partitionId;
+    // tmem owning partition for if & for ops are inferred from their regions
+    if (op->getNumRegions() == 0)
+      partitionId = getPartitionId(op);
+    node->user.reset(new Node(op, &tokOperand, partitionId, node));
     auto newNode = node->user.get();
     op2dagMap.insert({op, newNode});
     Value newTok;
@@ -630,6 +634,24 @@ LogicalResult insertTmemAref(TmemAccessDag &accessDag) {
     b.setInsertionPointAfter(op1);
   }
   state.release(b, node->op->getLoc(), {partitionId, stageCluster});
+
+  if (state.kind == TMEMAref::GET) {
+    // When the state ends up in a GET operation, we need to acquire and release
+    // the corresponding partition to prevent deadlocks. This is necessary
+    // because if we're inside an outer loop, re-entering the loop without
+    // posting a matching GET operation for the PUT would cause the dead-lock.
+    auto partitions = accessDag.collectPartitions(accessDag.getRootNode());
+    int otherPartitionId;
+    // since we only hve two partition, we just pick the other partition for get
+    for (auto partitionId : partitions) {
+      if (partitionId != node->partitionId) {
+        otherPartitionId = partitionId;
+        break;
+      }
+    }
+    state.acquire(b, node->op->getLoc(), {otherPartitionId, {}});
+    state.release(b, node->op->getLoc(), {otherPartitionId, {}});
+  }
 
   return success();
 }
