@@ -289,7 +289,15 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
                      const PartitionSet &partitions) {
   for (auto &op_ : *block) {
     auto op = &op_;
-    auto partitionIndices = *getPartitionIds(op);
+    SetVector<int> partitionIndices;
+
+    if (hasPartition(op)) {
+      partitionIndices = *getPartitionIds(op);
+    } else {
+      for (int i = 0; i < partitions.getNumPartitions(); ++i) {
+        partitionIndices.insert(i);
+      }
+    }
 
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       cloneForOp(forOp, builders, partitions);
@@ -391,6 +399,13 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
   // There is nothing to do if the loop has 1 or fewer partitions.
   if (llvm::size(partitions.getPartitions()) <= 1)
     return success();
+
+  // WA for exisiting lit tests
+  SetVector<Partition *> root;
+  for (int i = 0; i < partitions.getNumPartitions(); ++i) {
+    root.insert(partitions.getPartition(i));
+  }
+  setPartition(loop, root);
 
   auto numPartitions = partitions.getNumPartitions();
   auto defaultPartition = partitions.getPartition((int)0);
@@ -558,12 +573,17 @@ LogicalResult inferReduceOpPartitions(triton::ReduceOp reduceOp) {
 }
 
 // Assume that inner loops have already been processed
-LogicalResult inferForOpPartitions(scf::ForOp forOp) {
+LogicalResult inferForOpPartitions(scf::ForOp forOp, int numPartitions) {
   SetVector<int> forOpPartitions;
   for (auto &op : forOp.getBody()->without_terminator()) {
     auto opPartitions = getPartitionIds(&op);
     if (opPartitions) {
       forOpPartitions.insert(opPartitions->begin(), opPartitions->end());
+    } else {
+      // WA for lit
+      for (int j = 0; j < numPartitions; ++j) {
+        forOpPartitions.insert(j);
+      }
     }
   }
 
@@ -578,9 +598,14 @@ LogicalResult inferForOpPartitions(scf::ForOp forOp) {
             getForOpIterArgPartitionIds(inner, use.getOperandNumber() - 3);
       } else {
         auto userPartitions = getPartitionIds(use.getOwner());
-        assert(userPartitions);
-        iterArgsPartitions[i].insert(userPartitions->begin(),
-                                     userPartitions->end());
+        if (userPartitions) {
+          iterArgsPartitions[i].insert(userPartitions->begin(),
+                                       userPartitions->end());
+        } else {
+	  for (int j = 0; j < numPartitions; ++j) {
+	    iterArgsPartitions[i].insert(j);
+	  }
+	}
       }
     }
   }
@@ -617,13 +642,14 @@ struct PartitionLoops
 void PartitionLoops::runOnOperation() {
   // Collect for loops to warp specialize. This pass expects the loop to already
   // be annotated with partitions.
-  SmallVector<scf::ForOp> loops;
+  SmallVector<std::pair<scf::ForOp, int>> loops;
   getOperation().walk([&](scf::ForOp loop) {
-    if (loop->hasAttrOfType<ArrayAttr>(kPartitionStagesAttrName))
-      loops.push_back(loop);
+    if (auto stages = loop->getAttrOfType<ArrayAttr>(kPartitionStagesAttrName)) {
+      loops.push_back({loop, stages.size()});
+    }
   });
 
-  for (scf::ForOp loop : loops) {
+  for (auto [loop, numPartitions] : loops) {
     loop.walk([&](triton::ReduceOp reduceOp) {
       if (failed(inferReduceOpPartitions(reduceOp)))
         signalPassFailure();
@@ -632,8 +658,8 @@ void PartitionLoops::runOnOperation() {
       if (failed(inferIfOpPartitions(ifOp)))
         signalPassFailure();
     });
-    loop.walk([&](scf::ForOp forOp) {
-      if (failed(inferForOpPartitions(forOp)))
+    loop.walk([&, numPartitions = numPartitions](scf::ForOp forOp) {
+      if (failed(inferForOpPartitions(forOp, numPartitions)))
         signalPassFailure();
     });
     if (failed(partitionLoop(loop)))
