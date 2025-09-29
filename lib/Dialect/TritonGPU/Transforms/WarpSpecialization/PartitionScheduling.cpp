@@ -268,7 +268,7 @@ SetVector<Partition *> getInitialPartitions(scf::ForOp loop,
       continue;
     }
 
-    if (userPartitions.size() <= 1) {
+    if (userPartitions.size() == 1) {
       setPartition(tmemLoad, defaultPartition);
     } else {
       auto tmem = tmemLoad.getSrc();

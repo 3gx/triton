@@ -285,6 +285,20 @@ void cloneReduceOp(triton::ReduceOp reduceOp,
   }
 }
 
+void cloneOp(Operation *op, SmallVector<WarpGroupBuilder> &builders,
+             const SetVector<int>& partitionIndices) {
+  if (op->getNumRegions() != 0) {
+    llvm::report_fatal_error(
+        "Ops are expected to be regionless at this point.");
+  }
+
+  for (size_t idx : partitionIndices) {
+    auto &builder = builders[idx];
+    auto newOp = builder.clone(*op, builder.mapping);
+    mapRange(op->getResults(), newOp->getResults(), builder.mapping);
+  }
+}
+
 void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
                      const PartitionSet &partitions) {
   for (auto &op_ : *block) {
@@ -340,11 +354,7 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
         builder.create<scf::YieldOp>(op->getLoc(), newYieldOperands);
       }
     } else {
-      for (size_t idx : partitionIndices) {
-        auto &builder = builders[idx];
-        auto newOp = builder.clone(*op, builder.mapping);
-        mapRange(op->getResults(), newOp->getResults(), builder.mapping);
-      }
+      cloneOp(op, builders, partitionIndices);
     }
   }
 }
@@ -442,7 +452,22 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     builders.push_back(WarpGroupBuilder(&block, block.end(), partitionId));
   }
 
-  cloneForOp(loop, builders, partitions);
+  SmallVector<Operation *> opsToErase;
+  for (auto &op_ : *loop->getBlock()) {
+    auto op = &op_;
+    auto wsTag = op->getAttrOfType<IntegerAttr>(kWarpSpecializeTagAttrName);
+    if (!wsTag || wsTag.getInt() != partitions.getTag())
+      continue;
+    if (auto partitionIds = triton::gpu::getPartitionIds(op);
+        partitionIds && !isa<scf::ForOp>(op)) {
+      cloneOp(op, builders, *partitionIds);
+      opsToErase.push_back(op);
+    } else {
+      assert(loop.getOperation() == op && "Unexpected op");
+      cloneForOp(loop, builders, partitions);
+      opsToErase.push_back(loop);
+    }
+  }
 
   for (auto [b, region, partition] : llvm::zip(
            builders, wgOp.getPartitionRegions(), partitions.getPartitions())) {
