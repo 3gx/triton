@@ -590,6 +590,16 @@ void optimizePartitions(scf::ForOp loop, PartitionSet &partitions) {
   }
 }
 
+template <typename Range>
+inline std::optional<int> findValuePosInRange(const Range &range,
+                                              mlir::Value v) {
+  for (auto [pos, arg] : llvm::enumerate(range)) {
+    if (arg == v)
+      return pos;
+  }
+  return {};
+}
+
 // TODO: Implement a mutually-recursive traversal that can handle
 //       nested control flow structures (if/reduce/for operations).
 //       While we don't currently have use cases requiring this,
@@ -604,33 +614,85 @@ LogicalResult assignMissingPartitions(scf::ForOp loop,
     });
   };
 
+  loop.walk([&](ttng::TMEMAllocOp allocOp) {
+    std::optional<int> mmaPartitionId, loadPartitionId, storePartitionId;
+    for (auto users : allocOp.getResult().getUsers()) {
+      if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(users)) {
+        if (auto pid = getPartitionIds(mma)) {
+          mmaPartitionId = pid->front();
+        }
+      } else if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(users)) {
+        if (auto pid = getPartitionIds(storeOp)) {
+          storePartitionId = pid->front();
+        }
+      } else {
+        auto loadOp = cast<ttng::TMEMLoadOp>(users);
+        if (auto pid = getPartitionIds(loadOp)) {
+          loadPartitionId = pid->front();
+        }
+      }
+    }
+    assert(mmaPartitionId && "mma must have a partition");
+    assert((loadPartitionId || storePartitionId) &&
+           "at least one of load or store must have a partition");
+    if (loadPartitionId && storePartitionId) {
+      assert(loadPartitionId == storePartitionId &&
+             "load and store partitions must be in the same partition");
+    }
+    int simtPartitionId;
+    if (loadPartitionId) {
+      simtPartitionId = *loadPartitionId;
+    } else {
+      simtPartitionId = *storePartitionId;
+    }
+
+    for (auto user : allocOp->getUsers()) {
+      if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp>(user)) {
+        if (!hasPartition(user)) {
+          SetVector<int> simtPartitionIds;
+          simtPartitionIds.insert(simtPartitionId);
+          setPartition(user, simtPartitionIds);
+        }
+      }
+    }
+  });
+
   llvm::MapVector<Operation *, SetVector<Operation *>> opsMap;
   DenseMap<Operation *, DenseSet<int>> partitionMap;
-  for (auto &op_ : *loop.getBody()) {
-    auto op = &op_;
+  loop.walk([&](Operation *op) {
+    if (op->getNumRegions() > 0)
+      return WalkResult::advance();
 
     DenseSet<int> ids;
     if (auto partitionIds = getPartitionIds(op)) {
       ids.insert(partitionIds->begin(), partitionIds->end());
-    } else if (isScalarOp(op)) {
-      for (int i = 0; i < partitions.getNumPartitions(); ++i) {
-        ids.insert(i);
-      }
     }
     partitionMap[op] = ids;
 
-    if (hasPartition(op) || isScalarOp(op) || isa<scf::YieldOp>(op))
-      continue;
+    if (hasPartition(op) || isa<scf::YieldOp>(op))
+      return WalkResult::advance();
 
     SetVector<Operation *> useOps;
     for (auto &use : op->getUses()) {
-      auto useOp = loop.getBody()->findAncestorOpInBlock(*use.getOwner());
-      if (isa<scf::YieldOp>(useOp)) {
-        auto forOp = cast<scf::ForOp>(useOp->getParentOp());
-        auto arg = forOp.getRegionIterArg(use.getOperandNumber());
-        for (auto &use : arg.getUses()) {
-          auto useOp = loop.getBody()->findAncestorOpInBlock(*use.getOwner());
-          useOps.insert(useOp);
+      auto useOp = use.getOwner();
+      if (auto forOp = dyn_cast<scf::ForOp>(useOp)) {
+        auto pos = findValuePosInRange(forOp.getInitArgs(), use.get());
+        assert(pos && "use not found in init args");
+        auto arg = forOp.getRegionIterArg(*pos);
+        for (auto user : arg.getUsers()) {
+          useOps.insert(user);
+        }
+      } else if (isa<scf::YieldOp>(useOp)) {
+        auto parentOp = useOp->getParentOp();
+        Value arg;
+        if (auto forOp = cast<scf::ForOp>(parentOp)) {
+          arg = forOp.getRegionIterArg(use.getOperandNumber());
+        } else {
+          auto ifOp = cast<scf::IfOp>(parentOp);
+          arg = ifOp.getResults()[use.getOperandNumber()];
+        }
+        for (auto user : arg.getUsers()) {
+          useOps.insert(user);
         }
       } else {
         useOps.insert(useOp);
@@ -638,7 +700,8 @@ LogicalResult assignMissingPartitions(scf::ForOp loop,
     }
 
     opsMap[op] = useOps;
-  }
+    return WalkResult::advance();
+  });
 
   int maxIter = 100;
   while (maxIter-- > 0) {
@@ -739,10 +802,10 @@ void PartitionScheduling::runOnOperation() {
   for (auto [idx, loop] : llvm::enumerate(loops)) {
     if (std::optional<PartitionSet> partitions = getInitialPartitions(loop)) {
       propagatePartitions(loop, *partitions);
+      assignRegionBodyPartition(loop, *partitions);
       optimizePartitions(loop, *partitions);
       if (failed(assignMissingPartitions(loop, *partitions)))
         return signalPassFailure();
-      assignRegionBodyPartition(loop, *partitions);
       loop->setAttr(
           kWarpSpecializeTagAttrName,
           IntegerAttr::get(IntegerType::get(loop.getContext(), 32), idx));
