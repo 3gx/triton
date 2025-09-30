@@ -147,6 +147,15 @@ AsyncRef DependencyRewriter::allocateAsyncValue(RankedTensorType tensorType,
                   b.getType<AsyncTokenType>()};
 }
 
+bool intersect(const SetVector<int> &set1, const SetVector<int> &set2) {
+  for (auto v : set1) {
+    if (llvm::is_contained(set2, v)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 LogicalResult DependencyRewriter::run() {
   SmallVector<llvm::MapVector<Value, UseInfo>> partitionUseInfo;
 
@@ -156,34 +165,30 @@ LogicalResult DependencyRewriter::run() {
     auto &useInfo = partitionUseInfo.emplace_back();
     SmallVector<std::tuple<Value, OpOperand *, unsigned>> uses;
 
-    std::function<void(OpOperand &)> collectUses;
-    collectUses = [&](OpOperand &use) {
+    std::function<void(OpOperand &, const SetVector<int> &)> collectUses;
+    collectUses = [&](OpOperand &use, const SetVector<int> &opPartitionIds) {
       Operation *owner = loop.getBody()->findAncestorOpInBlock(*use.getOwner());
       if (!owner) {
         return;
       }
-      auto partitionIds = getPartitionIds(owner);
+      auto userPartitionIds = getPartitionIds(owner);
       if (isa<scf::YieldOp>(owner)) {
         // This value is used in a subsequent iteration.
         // collect the uses of the appropriate loop arg
         for (auto &newUse : loop.getBody()
                                 ->getArgument(use.getOperandNumber() + 1)
                                 .getUses()) {
-          collectUses(newUse);
+          collectUses(newUse, opPartitionIds);
         }
-      } else if (partitionIds &&
-                 !llvm::is_contained(*partitionIds, partition.getIndex())) {
+      } else if (userPartitionIds &&
+                 !intersect(*userPartitionIds, opPartitionIds)) {
         // This value is used in a different partition in the same iteration.
         uses.emplace_back(use.get(), &use, 0);
       }
     };
     for (Operation *op : partition.getOps()) {
-      if (partitions.isInRootPartition(op)) {
-        // skip ops in the root partition
-        continue;
-      }
       for (OpOperand &use : op->getUses()) {
-        collectUses(use);
+        collectUses(use, *getPartitionIds(op));
       }
     }
 

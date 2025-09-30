@@ -44,6 +44,7 @@ void AutomaticWarpSpecialization::runOnOperation() {
   pm.addPass(createSCCPPass());
   pm.addPass(createCSEPass());
   pm.addPass(createNVWSLowerAref({numStages}));
+  pm.addPass(createCanonicalizerPass());
   pm.addPass(createTritonGPUPartitionLoops());
   pm.addPass(createNVWSLowerWarpGroup());
   pm.addPass(createTritonGPUOptimizePartitionWarps());
