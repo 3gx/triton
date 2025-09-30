@@ -180,19 +180,19 @@ tt.func @multiple_partitions_two_loops(%lb: i32, %ub: i32, %step: i32,
   // CHECK: partition0 num_warps(4)
   // CHECK-NEXT: op_10b
   // CHECK-NEXT: scf.for
-  // CHECK: } {ttg.warp_specialize.tag = 1
+  // CHECK: } {ttg.partition.outputs = [], ttg.warp_specialize.tag = 1
   // CHECK-NEXT: op_10e
 
   // CHECK: partition1
   // CHECK-NEXT: op_11b
   // CHECK-NEXT: scf.for
-  // CHECK: } {ttg.warp_specialize.tag = 1
+  // CHECK: } {ttg.partition.outputs = [], ttg.warp_specialize.tag = 1
   // CHECK-NEXT: op_11e
 
   // CHECK: partition2
   // CHECK-NEXT: op_12b
   // CHECK-NEXT: scf.for
-  // CHECK: } {ttg.warp_specialize.tag = 1
+  // CHECK: } {ttg.partition.outputs = [], ttg.warp_specialize.tag = 1
   // CHECK-NEXT: op_12e
   "op_10b"() {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 1} : () -> ()
   "op_11b"() {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 1} : () -> ()

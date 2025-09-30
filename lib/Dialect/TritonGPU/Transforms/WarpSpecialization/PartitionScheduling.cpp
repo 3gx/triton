@@ -616,17 +616,17 @@ LogicalResult assignMissingPartitions(scf::ForOp loop,
 
   loop.walk([&](ttng::TMEMAllocOp allocOp) {
     std::optional<int> mmaPartitionId, loadPartitionId, storePartitionId;
-    for (auto users : allocOp.getResult().getUsers()) {
-      if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(users)) {
+    for (auto user : allocOp.getResult().getUsers()) {
+      if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(user)) {
         if (auto pid = getPartitionIds(mma)) {
           mmaPartitionId = pid->front();
         }
-      } else if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(users)) {
+      } else if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user)) {
         if (auto pid = getPartitionIds(storeOp)) {
           storePartitionId = pid->front();
         }
       } else {
-        auto loadOp = cast<ttng::TMEMLoadOp>(users);
+        auto loadOp = cast<ttng::TMEMLoadOp>(user);
         if (auto pid = getPartitionIds(loadOp)) {
           loadPartitionId = pid->front();
         }
@@ -685,7 +685,7 @@ LogicalResult assignMissingPartitions(scf::ForOp loop,
       } else if (isa<scf::YieldOp>(useOp)) {
         auto parentOp = useOp->getParentOp();
         Value arg;
-        if (auto forOp = cast<scf::ForOp>(parentOp)) {
+        if (auto forOp = dyn_cast<scf::ForOp>(parentOp)) {
           arg = forOp.getRegionIterArg(use.getOperandNumber());
         } else {
           auto ifOp = cast<scf::IfOp>(parentOp);
