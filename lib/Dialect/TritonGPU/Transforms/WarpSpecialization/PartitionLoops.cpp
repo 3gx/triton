@@ -518,7 +518,7 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     }
   }
 
-  // loop->getParentOfType<ModuleOp>().dump();
+  //  loop->getParentOfType<ModuleOp>().dump();
   for (auto op : llvm::reverse(opsToErase))
     op->erase();
 
@@ -621,21 +621,27 @@ LogicalResult inferForOpPartitions(scf::ForOp forOp, int numPartitions) {
 
   SmallVector<SetVector<int>> iterArgsPartitions(forOp.getNumRegionIterArgs());
   for (auto [i, arg] : llvm::enumerate(forOp.getRegionIterArgs())) {
-    for (auto &use : arg.getUses()) {
-      if (auto yield = dyn_cast<scf::YieldOp>(use.getOwner());
-          yield && yield->getParentOp()->hasAttr(kPartitionOutputsAttrName)) {
-        iterArgsPartitions[i] =
-            getResultPartitionIds(yield->getParentOp(), use.getOperandNumber());
-        break;
-      } else if (auto inner = dyn_cast<scf::ForOp>(use.getOwner())) {
-        iterArgsPartitions[i] =
-            getResultPartitionIds(inner, use.getOperandNumber() - 3);
-        break;
-      } else {
-        auto userPartitions = getPartitionIds(use.getOwner());
-        if (userPartitions)
-          iterArgsPartitions[i].insert(userPartitions->begin(),
-                                       userPartitions->end());
+    if (forOp.getInitArgs()[i].getDefiningOp() &&
+        getPartitionIds(forOp.getInitArgs()[i].getDefiningOp())) {
+      iterArgsPartitions[i] =
+          *getPartitionIds(forOp.getInitArgs()[i].getDefiningOp());
+    } else {
+      for (auto &use : arg.getUses()) {
+        if (auto yield = dyn_cast<scf::YieldOp>(use.getOwner());
+            yield && yield->getParentOp()->hasAttr(kPartitionOutputsAttrName)) {
+          iterArgsPartitions[i] = getResultPartitionIds(yield->getParentOp(),
+                                                        use.getOperandNumber());
+          break;
+        } else if (auto inner = dyn_cast<scf::ForOp>(use.getOwner())) {
+          iterArgsPartitions[i] =
+              getResultPartitionIds(inner, use.getOperandNumber() - 3);
+          break;
+        } else {
+          auto userPartitions = getPartitionIds(use.getOwner());
+          if (userPartitions)
+            iterArgsPartitions[i].insert(userPartitions->begin(),
+                                         userPartitions->end());
+        }
       }
     }
   }
