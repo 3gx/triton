@@ -618,19 +618,16 @@ LogicalResult inferForOpPartitions(scf::ForOp forOp, int numPartitions) {
   SmallVector<SetVector<int>> iterArgsPartitions(forOp.getNumRegionIterArgs());
   for (auto [i, arg] : llvm::enumerate(forOp.getRegionIterArgs())) {
     for (auto &use : arg.getUses()) {
-      if (auto inner = dyn_cast<scf::ForOp>(use.getOwner())) {
+      if (isa<scf::YieldOp>(use.getOwner())) {
+	continue;
+      } else if (auto inner = dyn_cast<scf::ForOp>(use.getOwner())) {
         iterArgsPartitions[i] =
             getForOpIterArgPartitionIds(inner, use.getOperandNumber() - 3);
       } else {
         auto userPartitions = getPartitionIds(use.getOwner());
-        if (userPartitions) {
-          iterArgsPartitions[i].insert(userPartitions->begin(),
-                                       userPartitions->end());
-        } else {
-	  for (int j = 0; j < numPartitions; ++j) {
-	    iterArgsPartitions[i].insert(j);
-	  }
-	}
+	assert(userPartitions);
+	iterArgsPartitions[i].insert(userPartitions->begin(),
+				     userPartitions->end());
       }
     }
   }

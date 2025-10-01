@@ -669,7 +669,7 @@ LogicalResult assignMissingPartitions(scf::ForOp loop,
     }
     partitionMap[op] = ids;
 
-    if (hasPartition(op) || isa<scf::YieldOp>(op))
+    if (hasPartition(op) || isScalarOp(op) || isa<scf::YieldOp>(op))
       return WalkResult::advance();
 
     SetVector<Operation *> useOps;
