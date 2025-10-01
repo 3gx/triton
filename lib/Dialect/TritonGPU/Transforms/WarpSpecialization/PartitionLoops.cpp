@@ -68,9 +68,9 @@ SetVector<int> getIfOpResultPartitionIds(scf::IfOp ifOp, Value value) {
   llvm_unreachable("value is not a result of if-stmt");
 }
 
-SetVector<int> getForOpIterArgPartitionIds(scf::ForOp forOp, int index) {
+SetVector<int> getResultPartitionIds(Operation *op, int index) {
   auto innerIterArgsPartitions =
-      forOp->getAttrOfType<ArrayAttr>(kPartitionOutputsAttrName);
+      op->getAttrOfType<ArrayAttr>(kPartitionOutputsAttrName);
   assert(innerIterArgsPartitions);
   auto partitions =
       cast<DenseI32ArrayAttr>(innerIterArgsPartitions[index]).asArrayRef();
@@ -108,7 +108,7 @@ SmallVector<LoopVarCategory> classifyLoopVars(scf::ForOp loop,
 
   SmallVector<LoopVarCategory> categories(loop.getNumRegionIterArgs());
   for (auto [i, arg] : llvm::enumerate(loop.getRegionIterArgs())) {
-    auto partitionIds = getForOpIterArgPartitionIds(loop, i);
+    auto partitionIds = getResultPartitionIds(loop, i);
     if (llvm::is_contained(partitionIds, partition->getIndex())) {
       categories[i] = LoopVarCategory::Used;
     } else if (isTensorResultFromOtherPartition(i)) {
@@ -286,7 +286,7 @@ void cloneReduceOp(triton::ReduceOp reduceOp,
 }
 
 void cloneOp(Operation *op, SmallVector<WarpGroupBuilder> &builders,
-             const SetVector<int>& partitionIndices) {
+             const SetVector<int> &partitionIndices) {
   if (op->getNumRegions() != 0) {
     llvm::report_fatal_error(
         "Ops are expected to be regionless at this point.");
@@ -518,8 +518,9 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     }
   }
 
-  loop->getParentOfType<ModuleOp>().dump();
-  // loop->erase();
+  // loop->getParentOfType<ModuleOp>().dump();
+  for (auto op : llvm::reverse(opsToErase))
+    op->erase();
 
   return success();
 }
@@ -598,21 +599,7 @@ LogicalResult inferReduceOpPartitions(triton::ReduceOp reduceOp) {
   return success();
 }
 
-void analyzeUses(Value arg, SetVector<int> &partitions) {
-  for (auto &use : arg.getUses()) {
-    if (auto yield = dyn_cast<scf::YieldOp>(use.getOwner())) {
-      analyzeUses(yield->getParentOp()->getResult(use.getOperandNumber()),
-                  partitions);
-    } else if (auto inner = dyn_cast<scf::ForOp>(use.getOwner())) {
-      partitions =
-          getForOpIterArgPartitionIds(inner, use.getOperandNumber() - 3);
-    } else {
-      auto userPartitions = getPartitionIds(use.getOwner());
-      if (userPartitions)
-	partitions.insert(userPartitions->begin(), userPartitions->end());
-    }
-  }
-}
+void analyzeUses(Value arg, SetVector<int> &partitions) {}
 
 // Assume that inner loops have already been processed
 LogicalResult inferForOpPartitions(scf::ForOp forOp, int numPartitions) {
@@ -634,7 +621,23 @@ LogicalResult inferForOpPartitions(scf::ForOp forOp, int numPartitions) {
 
   SmallVector<SetVector<int>> iterArgsPartitions(forOp.getNumRegionIterArgs());
   for (auto [i, arg] : llvm::enumerate(forOp.getRegionIterArgs())) {
-    analyzeUses(arg, iterArgsPartitions[i]);
+    for (auto &use : arg.getUses()) {
+      if (auto yield = dyn_cast<scf::YieldOp>(use.getOwner());
+          yield && yield->getParentOp()->hasAttr(kPartitionOutputsAttrName)) {
+        iterArgsPartitions[i] =
+            getResultPartitionIds(yield->getParentOp(), use.getOperandNumber());
+        break;
+      } else if (auto inner = dyn_cast<scf::ForOp>(use.getOwner())) {
+        iterArgsPartitions[i] =
+            getResultPartitionIds(inner, use.getOperandNumber() - 3);
+        break;
+      } else {
+        auto userPartitions = getPartitionIds(use.getOwner());
+        if (userPartitions)
+          iterArgsPartitions[i].insert(userPartitions->begin(),
+                                       userPartitions->end());
+      }
+    }
   }
 
   llvm::SmallVector<Attribute> partitionAttrs;
@@ -671,7 +674,8 @@ void PartitionLoops::runOnOperation() {
   // be annotated with partitions.
   SmallVector<std::pair<scf::ForOp, int>> loops;
   getOperation().walk([&](scf::ForOp loop) {
-    if (auto stages = loop->getAttrOfType<ArrayAttr>(kPartitionStagesAttrName)) {
+    if (auto stages =
+            loop->getAttrOfType<ArrayAttr>(kPartitionStagesAttrName)) {
       loops.push_back({loop, stages.size()});
     }
   });
