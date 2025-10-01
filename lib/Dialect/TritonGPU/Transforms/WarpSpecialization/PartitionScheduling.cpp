@@ -669,7 +669,7 @@ LogicalResult assignMissingPartitions(scf::ForOp loop,
     }
     partitionMap[op] = ids;
 
-    if (hasPartition(op) || isScalarOp(op) || isa<scf::YieldOp>(op))
+    if (hasPartition(op) || isScalarOp(op) ||isa<scf::YieldOp>(op))
       return WalkResult::advance();
 
     SetVector<Operation *> useOps;
@@ -802,10 +802,10 @@ void PartitionScheduling::runOnOperation() {
   for (auto [idx, loop] : llvm::enumerate(loops)) {
     if (std::optional<PartitionSet> partitions = getInitialPartitions(loop)) {
       propagatePartitions(loop, *partitions);
-      assignRegionBodyPartition(loop, *partitions);
       optimizePartitions(loop, *partitions);
       if (failed(assignMissingPartitions(loop, *partitions)))
         return signalPassFailure();
+      assignRegionBodyPartition(loop, *partitions);
       loop->setAttr(
           kWarpSpecializeTagAttrName,
           IntegerAttr::get(IntegerType::get(loop.getContext(), 32), idx));
