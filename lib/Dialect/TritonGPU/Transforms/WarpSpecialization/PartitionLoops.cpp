@@ -518,8 +518,8 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     }
   }
 
-  //  loop->getParentOfType<ModuleOp>().dump();
-  loop->erase();
+  loop->getParentOfType<ModuleOp>().dump();
+  // loop->erase();
 
   return success();
 }
@@ -552,6 +552,7 @@ LogicalResult inferIfOpPartitions(scf::IfOp ifOp) {
     // if-op partition set is the union of all op partitions in the block
     for (auto &op : block->without_terminator()) {
       auto opPartitions = getPartitionIds(&op);
+      assert(opPartitions);
       for (auto p : *opPartitions) {
         ifOpPartitions.insert(p);
       }
@@ -597,6 +598,22 @@ LogicalResult inferReduceOpPartitions(triton::ReduceOp reduceOp) {
   return success();
 }
 
+void analyzeUses(Value arg, SetVector<int> &partitions) {
+  for (auto &use : arg.getUses()) {
+    if (auto yield = dyn_cast<scf::YieldOp>(use.getOwner())) {
+      analyzeUses(yield->getParentOp()->getResult(use.getOperandNumber()),
+                  partitions);
+    } else if (auto inner = dyn_cast<scf::ForOp>(use.getOwner())) {
+      partitions =
+          getForOpIterArgPartitionIds(inner, use.getOperandNumber() - 3);
+    } else {
+      auto userPartitions = getPartitionIds(use.getOwner());
+      if (userPartitions)
+	partitions.insert(userPartitions->begin(), userPartitions->end());
+    }
+  }
+}
+
 // Assume that inner loops have already been processed
 LogicalResult inferForOpPartitions(scf::ForOp forOp, int numPartitions) {
   SetVector<int> forOpPartitions;
@@ -617,19 +634,7 @@ LogicalResult inferForOpPartitions(scf::ForOp forOp, int numPartitions) {
 
   SmallVector<SetVector<int>> iterArgsPartitions(forOp.getNumRegionIterArgs());
   for (auto [i, arg] : llvm::enumerate(forOp.getRegionIterArgs())) {
-    for (auto &use : arg.getUses()) {
-      if (isa<scf::YieldOp>(use.getOwner())) {
-	continue;
-      } else if (auto inner = dyn_cast<scf::ForOp>(use.getOwner())) {
-        iterArgsPartitions[i] =
-            getForOpIterArgPartitionIds(inner, use.getOperandNumber() - 3);
-      } else {
-        auto userPartitions = getPartitionIds(use.getOwner());
-	assert(userPartitions);
-	iterArgsPartitions[i].insert(userPartitions->begin(),
-				     userPartitions->end());
-      }
-    }
+    analyzeUses(arg, iterArgsPartitions[i]);
   }
 
   llvm::SmallVector<Attribute> partitionAttrs;
