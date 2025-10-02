@@ -748,12 +748,17 @@ LogicalResult assignMissingPartitions(scf::ForOp loop,
 }
 
 void assignRegionBodyPartition(scf::ForOp loop, PartitionSet &partitions) {
+  for (Operation &op : loop.getOps()) {
+    if (auto innerFor = dyn_cast<scf::ForOp>(op)) {
+      assignRegionBodyPartition(innerFor, partitions);
+    }
+  }
+
   loop->walk([&](Operation *op) {
     if (isa<scf::YieldOp, scf::ForOp>(op) || hasPartition(op))
       return WalkResult::advance();
 
-    auto parentOp =
-        op->getParentOfType<scf::ForOp>().getBody()->findAncestorOpInBlock(*op);
+    auto parentOp = loop.getBody()->findAncestorOpInBlock(*op);
     if (auto partitionIds = triton::gpu::getPartitionIds(parentOp)) {
       SetVector<Partition *> parentPartitions;
       for (auto id : *partitionIds) {
