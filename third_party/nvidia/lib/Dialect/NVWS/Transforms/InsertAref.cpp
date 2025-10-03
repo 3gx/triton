@@ -345,6 +345,14 @@ void createArefGet(PartitionBuilder &builder, scf::ForOp loop,
   assert(results.size() == 1 || results.size() == 2);
   auto loc = results[0].getLoc();
 
+  scf::ForOp scheduledLoop;
+  loop->walk([&](scf::ForOp op) {
+    if (op->hasAttr(mlir::triton::kScheduledMaxStageAttrName)) {
+      scheduledLoop = op;
+    }
+  });
+  assert(scheduledLoop);
+
   auto filterUse = [&](Operation *use) {
     if (partitions.isInRootPartition(use)) {
       return false;
@@ -352,7 +360,7 @@ void createArefGet(PartitionBuilder &builder, scf::ForOp loop,
     return partitions.getPartition(use) == consumerPartition;
   };
   auto [stageClusterEnter, stageClusterExit] =
-      getEnterAndExitStageClustersOfUses(results, filterUse, loop);
+      getEnterAndExitStageClustersOfUses(results, filterUse, scheduledLoop);
 
   auto arefBufType = cast<MemDescType>(aref.getOperand(0).getType());
   Type bufferType = getBufferViewType(arefBufType, /*mutable*/ false);
