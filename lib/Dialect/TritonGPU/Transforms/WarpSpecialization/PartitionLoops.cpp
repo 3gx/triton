@@ -134,7 +134,8 @@ getLoopVarIndicesToKeep(scf::ForOp loop, const Partition *partition,
     // loop even if the corresponding loop variable is not used in that
     // partition.
     if (loopVarCategories[i] == LoopVarCategory::Used ||
-        (partition->getIndex() == 0 && !loop.getResult(i).use_empty() &&
+        (loop->hasAttr(kPartitionStagesAttrName) &&
+         partition->getIndex() == 0 && !loop.getResult(i).use_empty() &&
          loopVarCategories[i] !=
              LoopVarCategory::TensorResultFromOtherPartition)) {
       reverseIndices[i] = indices.size();
@@ -518,7 +519,7 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     }
   }
 
-  //  loop->getParentOfType<ModuleOp>().dump();
+  // loop->getParentOfType<ModuleOp>().dump();
   for (auto op : llvm::reverse(opsToErase))
     op->erase();
 
@@ -599,8 +600,6 @@ LogicalResult inferReduceOpPartitions(triton::ReduceOp reduceOp) {
   return success();
 }
 
-void analyzeUses(Value arg, SetVector<int> &partitions) {}
-
 // Assume that inner loops have already been processed
 LogicalResult inferForOpPartitions(scf::ForOp forOp, int numPartitions) {
   SetVector<int> forOpPartitions;
@@ -643,6 +642,9 @@ LogicalResult inferForOpPartitions(scf::ForOp forOp, int numPartitions) {
                                          userPartitions->end());
         }
       }
+    }
+    if (iterArgsPartitions[i].empty()) {
+      iterArgsPartitions[i].insert(0);
     }
   }
 
