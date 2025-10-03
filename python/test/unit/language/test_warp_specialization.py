@@ -487,7 +487,8 @@ def attention_persistent_inner_loop_kernel(  #
         M, N, qk_scale,  #
         BLOCK_M: tl.constexpr,  #
         HEAD_DIM: tl.constexpr,  #
-        warp_specialize: tl.constexpr  #
+        warp_specialize: tl.constexpr,  #
+        num_stages: tl.constexpr
 ):
     prog_id = tl.program_id(0)
     num_sm = tl.num_programs(0)
@@ -498,7 +499,7 @@ def attention_persistent_inner_loop_kernel(  #
         tiles_per_sm += 1
 
     tile_idx = prog_id
-    for _ in range(0, tiles_per_sm, warp_specialize=True):
+    for _ in tl.range(0, tiles_per_sm, warp_specialize=warp_specialize, num_stages=num_stages):
         m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
         acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
@@ -546,7 +547,7 @@ def test_warp_specialize_attention_persistent_forward(M, N, BLOCK_M, HEAD_DIM, n
                                                       use_fp8):
     if BLOCK_M == 128 and HEAD_DIM == 128 and not use_fp8:
         # These configurations currently use too much shared memory.
-        if (num_warps, num_stages) in [(4, 4), (8, 4), (8, 3)]:
+        if (num_warps, num_stages) in [(4, 4), (8, 4), (8, 3), (4, 3)]:
             pytest.skip("uses too much shared memory")
 
     dtype = torch.float8_e4m3fn if use_fp8 else torch.float16
@@ -573,6 +574,8 @@ def test_warp_specialize_attention_persistent_forward(M, N, BLOCK_M, HEAD_DIM, n
     NUM_SM = 4
     out = attention_persistent_inner_loop_kernel[(NUM_SM,)](desc_q, desc_k, desc_v, desc_acc_ref, l_i_ref, m_i_ref, M, N, 0.5,
                                                        BLOCK_M, HEAD_DIM, True, num_stages=num_stages, num_warps=num_warps)
+    # print(out.asm["ttgir"])
+    # return
     attention_inner_loop_kernel[(M // BLOCK_M, )](desc_q, desc_k, desc_v, desc_acc, l_i, m_i, M, N, 0.5, BLOCK_M,
                                                   HEAD_DIM, False, num_stages=num_stages, num_warps=num_warps)
 
@@ -582,5 +585,9 @@ def test_warp_specialize_attention_persistent_forward(M, N, BLOCK_M, HEAD_DIM, n
     torch.testing.assert_close(l_i.to(torch.float32), l_i_ref.to(torch.float32), atol=0, rtol=0)
     torch.testing.assert_close(m_i.to(torch.float32), m_i_ref.to(torch.float32), atol=0, rtol=0)
 
+    print("ok")
 
-test_warp_specialize_attention_persistent_forward(1024, 1024, 128, 128, 3, True, 4, True)
+
+# test_warp_specialize_tma_matmul_persistent(1024, 1024, 1024, 128, 128, 128, 3, 4, True, False)
+test_warp_specialize_attention_persistent_forward(1024, 1024, 128, 128, 3, False, 4, True)
+# test_warp_specialize_attention_forward(1024, 1024, 128, 128, 3, False, 4, True)
