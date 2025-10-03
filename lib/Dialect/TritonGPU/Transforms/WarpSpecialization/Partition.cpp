@@ -190,7 +190,9 @@ namespace mlir::triton::gpu {
 
 void setPartition(Operation *op, ArrayRef<int> partitionIds) {
   Builder b(op->getContext());
-  op->setAttr(kPartitionAttrName, b.getDenseI32ArrayAttr(partitionIds));
+  auto sorted = llvm::to_vector(partitionIds);
+  llvm::sort(sorted);
+  op->setAttr(kPartitionAttrName, b.getDenseI32ArrayAttr(sorted));
 }
 
 void setPartition(Operation *op, const SetVector<int> &partitionIds) {

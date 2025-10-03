@@ -427,6 +427,8 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
   ImplicitLocOpBuilder topBuilder(loop.getLoc(), loop);
   SmallVector<Value> tensorResultAllocs(loop.getNumRegionIterArgs());
   for (auto [i, res] : llvm::enumerate(loop.getResults())) {
+    if (res.use_empty())
+      continue;
     if (loopVarCategories[i] ==
         LoopVarCategory::TensorResultFromOtherPartition) {
       auto ty = cast<RankedTensorType>(res.getType());
@@ -489,6 +491,8 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
       auto [_, reverseIndices] =
           getLoopVarIndicesToKeep(loop, &partition, partitions);
       for (size_t i = 0; i < loop.getNumRegionIterArgs(); ++i) {
+        if (loop.getResult(i).use_empty())
+          continue;
         if (loopVarCategories[i] ==
                 LoopVarCategory::TensorResultFromOtherPartition &&
             isTensorResultComputedBy(loop, i, &partition, partitions)) {
