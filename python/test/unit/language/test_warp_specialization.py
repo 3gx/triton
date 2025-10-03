@@ -343,10 +343,11 @@ def matmul_tma_persistent_ws_kernel(  #
 @pytest.mark.parametrize("num_stages", [2, 3])
 @pytest.mark.parametrize("num_warps", [4, 8])
 @pytest.mark.parametrize("use_fp8", [False, True])
+@pytest.mark.parametrize("flatten", [False, True])
 @pytest.mark.skipif(is_hip(), reason="warp specialization is not supported on hip devices")
 @pytest.mark.skipif(not is_hopper_or_blackwell(), reason="Requires Hopper or Blackwell")
 def test_warp_specialize_tma_matmul_persistent(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, num_stages, num_warps,
-                                               use_fp8):
+                                               use_fp8, flatten):
     if exceeds_smem_capacity(num_stages, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, use_fp8):
         pytest.skip("uses too much shared memory")
     dtype = torch.float8_e4m3fn if use_fp8 else torch.float16
@@ -373,7 +374,7 @@ def test_warp_specialize_tma_matmul_persistent(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE
 
     kernel = matmul_tma_persistent_ws_kernel[grid](A, B, C, *A.stride(), *B.stride(), *C.stride(), M, N, K, num_stages,
                                                    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M, NUM_SMS,
-                                                   num_warps=num_warps, USE_FP8=use_fp8, FLATTEN=is_blackwell())
+                                                   num_warps=num_warps, USE_FP8=use_fp8, FLATTEN=flatten and is_blackwell())
     ttgir = kernel.asm["ttgir"]
     if is_blackwell():
         assert "ttng.tc_gen5_mma" in ttgir
