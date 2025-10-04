@@ -314,7 +314,7 @@ getEnterAndExitStageClustersOfUses(const SetVector<Value> &producedResults,
                                    std::function<bool(Operation *)> filterUse,
                                    scf::ForOp forOp) {
   CoarseSchedule coarseSchedule;
-  if (failed(coarseSchedule.deSerialize(forOp))) {
+  if (!forOp || failed(coarseSchedule.deSerialize(forOp))) {
     return std::make_pair(std::nullopt, std::nullopt);
   }
 
@@ -351,7 +351,6 @@ void createArefGet(PartitionBuilder &builder, scf::ForOp loop,
       scheduledLoop = op;
     }
   });
-  assert(scheduledLoop);
 
   auto filterUse = [&](Operation *use) {
     if (partitions.isInRootPartition(use)) {
