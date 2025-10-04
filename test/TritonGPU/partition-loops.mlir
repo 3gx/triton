@@ -53,7 +53,7 @@ tt.func @empty_partition_fwd_root(%lb: i32, %ub: i32, %step: i32) {
   // CHECK-NEXT: scf.for [[I:%.*]] = {{.*}} iter_args([[K:%.*]] = [[C0]])
   // CHECK-NEXT:   "op_a"([[I]], [[K]])
   scf.for %i = %lb to %ub step %step iter_args(%k = %c0_i32) -> i32 : i32 {
-    %0 = "op_a"(%i, %k) : (i32, i32) -> i32
+    %0 = "op_a"(%i, %k) {ttg.partition = array<i32: 0, 1>} : (i32, i32) -> i32
     scf.yield %0 : i32
   } {ttg.partition.stages = [0, 0], ttg.warp_specialize.tag = 0 : i32}
   tt.return
