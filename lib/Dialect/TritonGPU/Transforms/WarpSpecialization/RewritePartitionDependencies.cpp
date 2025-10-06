@@ -143,6 +143,15 @@ AsyncRef DependencyRewriter::allocateAsyncValue(RankedTensorType tensorType,
                   b.getType<AsyncTokenType>()};
 }
 
+bool intersect(const SetVector<int> &set1, const SetVector<int> &set2) {
+  for (auto v : set1) {
+    if (llvm::is_contained(set2, v)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 LogicalResult DependencyRewriter::run() {
   SmallVector<llvm::MapVector<Value, UseInfo>> partitionUseInfo;
 
@@ -158,16 +167,6 @@ LogicalResult DependencyRewriter::run() {
       auto producerPartitionIds = getPartitionIds(producer);
       auto consumerPartitionIds = getPartitionIds(owner);
 
-      auto overlap = [&](SetVector<int> &producerPartitionIds,
-                         SetVector<int> &consumerPartitionIds) {
-        for (int id : consumerPartitionIds) {
-          if (!producerPartitionIds.contains(id)) {
-            return false;
-          }
-        }
-        return true;
-      };
-
       if (isa<scf::YieldOp>(owner)) {
         // This value is used in a subsequent iteration.
         // collect the uses of the appropriate loop arg
@@ -177,7 +176,7 @@ LogicalResult DependencyRewriter::run() {
           collectUses(producer, newUse);
         }
       } else if (producerPartitionIds && consumerPartitionIds &&
-                 !overlap(*producerPartitionIds, *consumerPartitionIds)) {
+                 !intersect(*producerPartitionIds, *consumerPartitionIds)) {
         // This value is used in a different partition in the same iteration.
         uses.emplace_back(use.get(), &use, 0);
       }
