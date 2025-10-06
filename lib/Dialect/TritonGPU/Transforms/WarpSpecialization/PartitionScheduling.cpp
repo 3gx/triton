@@ -1,6 +1,7 @@
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Support/WalkResult.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
@@ -695,7 +696,7 @@ LogicalResult assignMissingPartitions(scf::ForOp loop,
     }
     partitionMap[op] = ids;
 
-    if (hasPartition(op) || isScalarOp(op) || isa<scf::YieldOp>(op))
+    if (hasPartition(op) || isa<scf::YieldOp>(op))
       return WalkResult::advance();
 
     SetVector<Operation *> useOps;
@@ -708,56 +709,111 @@ LogicalResult assignMissingPartitions(scf::ForOp loop,
     return WalkResult::advance();
   });
 
-  int maxIter = 100;
-  while (maxIter-- > 0) {
-    bool converged = true;
-    for (auto [op, useOps] : opsMap) {
-      auto oldPartitionIds = partitionMap[op];
-      auto newPartitionIds = oldPartitionIds;
-      for (auto useOp : useOps) {
-        auto partitionIds = partitionMap[useOp];
-        newPartitionIds.insert(partitionIds.begin(), partitionIds.end());
+  std::function<void(Operation *, DenseSet<int> &)> getOpPartitionIds =
+      [&](Operation *op, DenseSet<int> &opPartitionIds) {
+        for (auto &region : op->getRegions()) {
+          for (auto &block : region.getBlocks()) {
+            for (auto &op_ : block.without_terminator()) {
+              auto op = &op_;
+              getOpPartitionIds(op, opPartitionIds);
+            }
+          }
+        }
+        auto partitionIds = partitionMap[op];
+        opPartitionIds.insert(partitionIds.begin(), partitionIds.end());
+      };
+
+  auto iteratePartitions = [&]() {
+    int maxIter = 100;
+    while (maxIter-- > 0) {
+      bool converged = true;
+      for (auto [op, useOps] : opsMap) {
+        auto oldPartitionIds = partitionMap[op];
+        auto newPartitionIds = oldPartitionIds;
+        for (auto useOp : useOps) {
+          getOpPartitionIds(useOp, newPartitionIds);
+        }
+        converged = converged && oldPartitionIds == newPartitionIds;
+        partitionMap[op] = newPartitionIds;
       }
-      converged = converged && oldPartitionIds == newPartitionIds;
-      partitionMap[op] = newPartitionIds;
+      if (converged)
+        break;
     }
-    if (converged)
-      break;
-  }
-  if (maxIter <= 0) {
-    return emitError(loop.getLoc(),
-                     "assignMissingPartitions failed to converge");
+    if (maxIter <= 0) {
+      emitError(loop.getLoc(), "assignMissingPartitions failed to converge");
+      return failure();
+    }
+
+    for (auto [op, partitionIds] : partitionMap) {
+      if (partitionIds.empty())
+        continue;
+      setPartition(op,
+                   SetVector<int>(partitionIds.begin(), partitionIds.end()));
+    }
+    return success();
+  };
+  if (failed(iteratePartitions())) {
+    return failure();
   }
 
-  for (auto [op, partitionIds] : partitionMap) {
-    if (partitionIds.empty())
-      continue;
-    setPartition(op, SetVector<int>(partitionIds.begin(), partitionIds.end()));
+  // Work-around for use cases where the partitioner doesn't assign partitions
+  // to scalar operations. This handles remaining scalars that have no partition
+  // assignments by propagating partitions forward through the def-use chain.
+  // Example scenario:
+  //    %46 = scalar_op ..  @2     // has partition assignment
+  //    %47 = scalar_op %46        // no partition assignment
+  //    llvm.intr.assume %47: i1   // terminal use, no further uses
+  std::function<void(Operation *, SetVector<Operation *> &,
+                     DenseSet<Operation *> &)>
+      getDefOps = [&](Operation *op, SetVector<Operation *> &defOps,
+                      DenseSet<Operation *> &visited) {
+        if (!visited.insert(op).second)
+          return;
+        for (auto value : op->getOperands()) {
+          if (auto defOp = value.getDefiningOp()) {
+            defOps.insert(defOp);
+          }
+        }
+      };
+  opsMap.clear();
+  loop.walk([&](Operation *op) {
+    if (hasPartition(op))
+      return WalkResult::advance();
+    // skip region ops and their terminators
+    if (op->getNumRegions() > 0 ||
+        isa<scf::YieldOp, triton::ReduceReturnOp>(op))
+      return WalkResult::advance();
+
+    // skip non-scalar ops that return value
+    if (op->getNumResults() > 0 && !isScalarOp(op))
+      return WalkResult::advance();
+
+    SetVector<Operation *> defOps;
+    DenseSet<Operation *> visited;
+    getDefOps(op, defOps, visited);
+
+    opsMap[op] = defOps;
+
+    return WalkResult::advance();
+  });
+
+  if (failed(iteratePartitions())) {
+    return failure();
   }
 
   return success();
 }
 
-void assignRootPartitions(scf::ForOp loop, PartitionSet &partitions) {
-  // remaining unannotated ops are assigned to all partitions
-  auto ctx = loop.getContext();
-  Builder b(ctx);
-  SetVector<Partition *> root;
-  for (int i = 0; i < partitions.getNumPartitions(); ++i) {
-    root.insert(partitions.getPartition(i));
-  }
-
+void verifyPartitions(scf::ForOp loop, PartitionSet &partitions) {
   loop.walk([&](Operation *op) {
     if (hasPartition(op))
       return WalkResult::advance();
-    if (op->getNumRegions() > 0)
+    if (op->hasAttr(kWarpSpecializeAttrName))
       return WalkResult::advance();
     if (isa<scf::YieldOp, triton::ReduceReturnOp>(op))
       return WalkResult::advance();
-    setPartition(op, root);
-    return WalkResult::advance();
+    llvm_unreachable("no partition");
   });
-
 }
 
 SetVector<int> getBlockPartitions(Block *block);
@@ -780,43 +836,37 @@ SmallVector<SetVector<int>> getYieldPartitions(Block *block) {
         }
       }
     }
-//    assert(!partitionIds->empty());
     yieldPartitions[opnd.getOperandNumber()] = *partitionIds;
   }
   return yieldPartitions;
 }
 
 SetVector<int>
-setOutputPartitions(Operation *op,
+setOutputPartitions(Operation *op, SetVector<int> opPartitions,
                     SmallVector<SetVector<int>> outputPartitions) {
   Builder b(op->getContext());
   llvm::SmallVector<Attribute> partitionAttrs;
-  SetVector<int> partitionIds;
   for (auto [idx, partition] : llvm::enumerate(outputPartitions)) {
     SmallVector<int> ids(partition.begin(), partition.end());
     assert(!ids.empty());
     llvm::sort(ids);
     partitionAttrs.push_back(b.getDenseI32ArrayAttr(ids));
-    partitionIds.insert(ids.begin(), ids.end());
+    opPartitions.insert(ids.begin(), ids.end());
   }
   op->setAttr(kPartitionOutputsAttrName, b.getArrayAttr(partitionAttrs));
-  return partitionIds;
+  setPartition(op, opPartitions);
+  return opPartitions;
 }
 
 SetVector<int> assignIfOpPartitions(scf::IfOp ifOp) {
   auto ifOpPartitions = getBlockPartitions(ifOp.thenBlock());
-  if (ifOp.elseBlock()) {
-    auto elsePartitions = getBlockPartitions(ifOp.elseBlock());
-    ifOpPartitions.insert(elsePartitions.begin(), elsePartitions.end());
-  }
-
   auto thenYieldPartitions = getYieldPartitions(ifOp.thenBlock());
   if (!ifOp.elseBlock()) {
-    auto ifOutputPartitions = setOutputPartitions(ifOp, thenYieldPartitions);
-    ifOpPartitions.insert(ifOutputPartitions.begin(), ifOutputPartitions.end());
-    setPartition(ifOp, ifOpPartitions);
-    return ifOpPartitions;
+    return setOutputPartitions(ifOp, ifOpPartitions, thenYieldPartitions);
   }
+
+  auto elsePartitions = getBlockPartitions(ifOp.elseBlock());
+  ifOpPartitions.insert(elsePartitions.begin(), elsePartitions.end());
 
   auto elseYieldPartitions = getYieldPartitions(ifOp.elseBlock());
   assert(thenYieldPartitions.size() == elseYieldPartitions.size());
@@ -824,12 +874,10 @@ SetVector<int> assignIfOpPartitions(scf::IfOp ifOp) {
   for (int i = 0; i < thenYieldPartitions.size(); ++i) {
     auto &thenIds = thenYieldPartitions[i];
     auto &elseIds = elseYieldPartitions[i];
-    if (thenIds == elseIds) {
+    if (thenIds == elseIds || elseIds.empty()) {
       outputPartitions.push_back(thenIds);
     } else if (thenIds.empty()) {
       outputPartitions.push_back(elseIds);
-    } else if (elseIds.empty()) {
-      outputPartitions.push_back(thenIds);
     } else {
       // we expect all yields that produce value have same partition ids
       // we allow for possibility that then/else yield may return tokens
@@ -852,20 +900,13 @@ SetVector<int> assignIfOpPartitions(scf::IfOp ifOp) {
       }
     }
   }
-  auto ifOutputPartitions = setOutputPartitions(ifOp, outputPartitions);
-  ifOpPartitions.insert(ifOutputPartitions.begin(), ifOutputPartitions.end());
-  setPartition(ifOp, ifOpPartitions);
-  return ifOpPartitions;
+  return setOutputPartitions(ifOp, ifOpPartitions, outputPartitions);
 }
 
 SetVector<int> assignSingleRegionOpPartition(Operation *op) {
   auto block = &op->getRegion(0).getBlocks().front();
   auto blockPartitions = getBlockPartitions(block);
-  auto yieldPartitions = setOutputPartitions(op, getYieldPartitions(block));
-  blockPartitions.insert(yieldPartitions.begin(), yieldPartitions.end());
-  setPartition(op, blockPartitions);
-  return blockPartitions;
-  // return forOpPartitions;
+  return setOutputPartitions(op, blockPartitions, getYieldPartitions(block));
 }
 
 SetVector<int> getBlockPartitions(Block *block) {
@@ -914,6 +955,30 @@ void assignRegionBodyPartition(scf::ForOp loop, PartitionSet &partitions) {
 
 void assignRegionOpPartitions(scf::ForOp loop) {
   getBlockPartitions(loop.getBody());
+
+  // Work-around for operations that don't produce results, nor use operands
+  // from inside ws-loop, but need partition assignments. These operations
+  // inherit partitions from their parent operation.
+  //   %a = ...
+  //   scf.for ... {
+  //     scf.if ... {
+  //       ...
+  //       llvm.intr.assume %a : i1  // inherits partition from scf.if
+  //       ...
+  //     } {ttg.partition = [2]}
+  //   } {ttg.ws}
+  loop.walk([&](Operation *op) {
+    if (op->getNumResults() > 0 || hasPartition(op))
+      return WalkResult::advance();
+    if (op->getNumRegions() > 0 ||
+        isa<scf::YieldOp, triton::ReduceReturnOp>(op))
+      return WalkResult::advance();
+    auto parentOp = op->getParentOp();
+    auto parentPartitionIds = getPartitionIds(parentOp);
+    assert(parentPartitionIds);
+    setPartition(op, *parentPartitionIds);
+    return WalkResult::advance();
+  });
 }
 
 //===----------------------------------------------------------------------===//
@@ -948,8 +1013,9 @@ void PartitionScheduling::runOnOperation() {
       assignRegionBodyPartition(loop, *partitions);
       if (failed(assignMissingPartitions(loop, *partitions)))
         return signalPassFailure();
-      assignRootPartitions(loop, *partitions);
       assignRegionOpPartitions(loop);
+      verifyPartitions(loop, *partitions);
+
       loop->setAttr(
           kWarpSpecializeTagAttrName,
           IntegerAttr::get(IntegerType::get(loop.getContext(), 32), idx));

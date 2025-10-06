@@ -129,13 +129,9 @@ private:
 AsyncRef DependencyRewriter::allocateAsyncValue(RankedTensorType tensorType,
                                                 unsigned maxDistance) {
   OpBuilder::InsertionGuard guard(b);
-  scf::ForOp topLevelFor = loop;
-  while (auto outer = topLevelFor->getParentOfType<scf::ForOp>()) {
-    topLevelFor = outer;
-  }
-  b.setInsertionPoint(topLevelFor);
+  b.setInsertionPoint(loop);
   unsigned numBars = maxDistance;
-  Value alloc = createAlloc(topLevelFor, tensorType, b.getLoc(),
+  Value alloc = createAlloc(loop, tensorType, b.getLoc(),
                             getSharedEncoding(tensorType), numBars);
   auto allocType = cast<MemDescType>(alloc.getType());
   auto arefTy = triton::nvws::ArefType::get(
@@ -147,15 +143,6 @@ AsyncRef DependencyRewriter::allocateAsyncValue(RankedTensorType tensorType,
                   b.getType<AsyncTokenType>()};
 }
 
-bool intersect(const SetVector<int> &set1, const SetVector<int> &set2) {
-  for (auto v : set1) {
-    if (llvm::is_contained(set2, v)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 LogicalResult DependencyRewriter::run() {
   SmallVector<llvm::MapVector<Value, UseInfo>> partitionUseInfo;
 
@@ -165,42 +152,52 @@ LogicalResult DependencyRewriter::run() {
     auto &useInfo = partitionUseInfo.emplace_back();
     SmallVector<std::tuple<Value, OpOperand *, unsigned>> uses;
 
-    std::function<void(OpOperand &, const SetVector<int> &)> collectUses;
-    collectUses = [&](OpOperand &use, const SetVector<int> &opPartitionIds) {
+    std::function<void(Operation *, OpOperand &)> collectUses;
+    collectUses = [&](Operation *producer, OpOperand &use) {
       Operation *owner = loop.getBody()->findAncestorOpInBlock(*use.getOwner());
-      if (!owner) {
-        return;
-      }
-      auto userPartitionIds = getPartitionIds(owner);
+      auto producerPartitionIds = getPartitionIds(producer);
+      auto consumerPartitionIds = getPartitionIds(owner);
+
+      auto overlap = [&](SetVector<int> &producerPartitionIds,
+                         SetVector<int> &consumerPartitionIds) {
+        for (int id : consumerPartitionIds) {
+          if (!producerPartitionIds.contains(id)) {
+            return false;
+          }
+        }
+        return true;
+      };
+
       if (isa<scf::YieldOp>(owner)) {
         // This value is used in a subsequent iteration.
         // collect the uses of the appropriate loop arg
         for (auto &newUse : loop.getBody()
                                 ->getArgument(use.getOperandNumber() + 1)
                                 .getUses()) {
-          collectUses(newUse, opPartitionIds);
+          collectUses(producer, newUse);
         }
-      } else if (userPartitionIds &&
-                 !intersect(*userPartitionIds, opPartitionIds)) {
+      } else if (producerPartitionIds && consumerPartitionIds &&
+                 !overlap(*producerPartitionIds, *consumerPartitionIds)) {
         // This value is used in a different partition in the same iteration.
         uses.emplace_back(use.get(), &use, 0);
       }
     };
     for (Operation *op : partition.getOps()) {
       for (OpOperand &use : op->getUses()) {
-        collectUses(use, *getPartitionIds(op));
+        collectUses(op, use);
       }
     }
 
     auto callback = [&](Value output, OpOperand &use, unsigned distance) {
       Operation *user = loop.getBody()->findAncestorOpInBlock(*use.getOwner());
-      Partition *usePartition = partitions.getPartition(user);
-      // Ignore uses in the same partition in the future.
-      if (usePartition == &partition) {
-        assert(distance > 0 && "self-recursion must occur in the future");
+      auto usePartitionIds = getPartitionIds(user);
+      assert(usePartitionIds && "expected partition ids");
+      // Ignore uses in the same partition
+      if (llvm::is_contained(*usePartitionIds, partition.getIndex())) {
         return;
       }
       UseInfo &info = useInfo[output];
+      Partition *usePartition = partitions.getPartition(user);
       info.consumers[{usePartition, distance}].push_back(&use);
     };
 
@@ -320,19 +317,9 @@ LogicalResult triton::gpu::rewritePartitionDependencies(scf::ForOp &loop) {
   if (failed(partitionsOr))
     return failure();
   PartitionSet partitions = std::move(*partitionsOr);
-
-  SmallVector<scf::ForOp> allLoops;
-  loop->walk([&](scf::ForOp loop) { allLoops.push_back(loop); });
-
-  for (auto loop : allLoops) {
-    DependencyRewriter rewriter(partitions, loop);
-    if (failed(rewriter.run())) {
-      llvm::outs() << "failed\n";
-      return failure();
-    }
-    break;
-  }
-
+  DependencyRewriter rewriter(partitions, loop);
+  if (failed(rewriter.run()))
+    return failure();
   return success();
 }
 
