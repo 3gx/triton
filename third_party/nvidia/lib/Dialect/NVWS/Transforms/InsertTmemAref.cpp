@@ -741,6 +741,13 @@ void workaroundForLoopScheduler(triton::FuncOp funcOp) {
     exitIf->setAttrs(ifOp->getAttrs());
     enterIf->setAttr(kLoopStageAttrName, b.getI32IntegerAttr(1));
     exitIf->setAttr(kLoopStageAttrName, b.getI32IntegerAttr(1));
+
+    SetVector<int> enterExitIds, middleIds;
+    enterExitIds.insert(1);
+    middleIds.insert(0);
+    setPartition(enterIf, enterExitIds);
+    setPartition(exitIf, enterExitIds);
+    setPartition(ifOp, middleIds);
   }
 }
 
