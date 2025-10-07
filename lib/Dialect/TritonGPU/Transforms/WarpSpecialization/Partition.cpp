@@ -215,12 +215,6 @@ void setPartitionOutputs(Operation *op,
     attrs.push_back(b.getDenseI32ArrayAttr(sorted));
   }
   op->setAttr(kPartitionOutputsAttrName, b.getArrayAttr(attrs));
-  for (auto &region : op->getRegions()) {
-    for (auto &block : region.getBlocks()) {
-      auto terminator = block.getTerminator();
-      terminator->setAttr(kPartitionOutputsAttrName, b.getArrayAttr(attrs));
-    }
-  }
 }
 
 void setPartition(Operation *op, const SetVector<int> &partitionIds) {

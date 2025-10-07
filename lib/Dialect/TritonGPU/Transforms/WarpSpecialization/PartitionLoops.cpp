@@ -296,8 +296,6 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
                      const PartitionSet &partitions) {
   for (auto &op_ : *block) {
     auto op = &op_;
-    assert(hasPartition(op));
-    auto partitionIndices = *getPartitionIds(op);
 
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       cloneForOp(forOp, builders, partitions);
@@ -309,6 +307,9 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
       if (yieldOp.getOperands().empty()) {
         continue;
       }
+      // for some reason empty yield has no partition annotations
+      assert(hasPartition(op));
+      auto partitionIndices = *getPartitionIds(op);
 
       for (size_t idx : partitionIndices) {
         auto &builder = builders[idx];
@@ -340,6 +341,8 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
         builder.create<scf::YieldOp>(op->getLoc(), newYieldOperands);
       }
     } else {
+      assert(hasPartition(op));
+      auto partitionIndices = *getPartitionIds(op);
       cloneOp(op, builders, partitionIndices);
     }
   }
@@ -511,7 +514,6 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
 
   return success();
 }
-
 
 //===----------------------------------------------------------------------===//
 // Pass Definition

@@ -825,6 +825,12 @@ SmallVector<SetVector<int>> getYieldPartitions(Block *block) {
     if (!op)
       continue;
     auto partitionIds = getPartitionIds(op);
+    if (op->getNumRegions() > 0) {
+      auto it = llvm::find(op->getResults(), opnd.get());
+      assert(it != op->getResults().end());
+      auto pos = it - op->getResults().begin();
+      partitionIds = getPartitionOutputs(op)[pos];
+    }
     if (!partitionIds) {
       // inherit from uses
       partitionIds = SetVector<int>();
