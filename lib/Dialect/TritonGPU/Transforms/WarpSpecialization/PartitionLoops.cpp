@@ -585,15 +585,6 @@ LogicalResult inferIfOpPartitions(scf::IfOp ifOp) {
   return success();
 }
 
-LogicalResult inferReduceOpPartitions(triton::ReduceOp reduceOp) {
-  auto terminator = reduceOp.getRegion().getBlocks().front().getTerminator();
-  auto partitionIds = getPartitionIds(terminator);
-  if (!partitionIds)
-    return emitError(reduceOp.getLoc(), "reduce op has no partition ids");
-  setPartition(reduceOp, *partitionIds);
-  return success();
-}
-
 // Assume that inner loops have already been processed
 LogicalResult inferForOpPartitions(scf::ForOp forOp, int numPartitions) {
   SetVector<int> forOpPartitions;
@@ -677,11 +668,16 @@ void PartitionLoops::runOnOperation() {
   });
 
   for (auto [loop, numPartitions] : loops) {
+    // TODO: move this to PartitionScheduling
+    loop.walk([&](scf::IfOp ifOp) {
+      if (failed(inferIfOpPartitions(ifOp)))
+        signalPassFailure();
+    });
     loop.walk([&, numPartitions = numPartitions](scf::ForOp forOp) {
-      // TODO: move this to PartitionScheduling
       if (failed(inferForOpPartitions(forOp, numPartitions)))
         signalPassFailure();
     });
+
     if (failed(partitionLoop(loop)))
       return signalPassFailure();
   }
