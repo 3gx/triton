@@ -686,11 +686,11 @@ void workaroundForLoopScheduler(triton::FuncOp funcOp) {
   //   scf.if %condition {
   //     aref.put.exit                    // Separate exit operation
   //   } { .. loop.stage = 1 .. }
-  //   %results, %more = scf.if %condition {
+  //   %results, %poison_tok, %more = scf.if %condition {
   //     <computation_code>               // Main computation without token ops
-  //     scf.yield %values, %other_values
+  //     scf.yield %values, %poison_tok, %other_values
   //   } else {
-  //     scf.yield %alt_values, %alt_other_values
+  //     scf.yield %alt_values, %poison_tok, %alt_other_values
   //   }
   //   %token = scf.if %condition {
   //     %new_token = aref.put.enter      // Separate enter operation
@@ -748,6 +748,14 @@ void workaroundForLoopScheduler(triton::FuncOp funcOp) {
     setPartition(enterIf, enterExitIds);
     setPartition(exitIf, enterExitIds);
     setPartition(ifOp, middleIds);
+
+    SetVector<int> p0array, p1array;
+    p0array.insert(0);
+    p1array.insert(1);
+    setPartitionOutputs(exitIf, {});
+    setPartitionOutputs(enterIf, {p1array});
+    SmallVector<SetVector<int>> outputs(ifOp->getNumResults(), p0array);
+    setPartitionOutputs(ifOp, outputs);
   }
 }
 

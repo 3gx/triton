@@ -844,17 +844,11 @@ SmallVector<SetVector<int>> getYieldPartitions(Block *block) {
 SetVector<int>
 setOutputPartitions(Operation *op, SetVector<int> opPartitions,
                     SmallVector<SetVector<int>> outputPartitions) {
-  Builder b(op->getContext());
-  llvm::SmallVector<Attribute> partitionAttrs;
-  for (auto [idx, partition] : llvm::enumerate(outputPartitions)) {
-    SmallVector<int> ids(partition.begin(), partition.end());
-    assert(!ids.empty());
-    llvm::sort(ids);
-    partitionAttrs.push_back(b.getDenseI32ArrayAttr(ids));
+  for (auto ids : outputPartitions) {
     opPartitions.insert(ids.begin(), ids.end());
   }
-  op->setAttr(kPartitionOutputsAttrName, b.getArrayAttr(partitionAttrs));
   setPartition(op, opPartitions);
+  setPartitionOutputs(op, outputPartitions);
   return opPartitions;
 }
 
@@ -954,7 +948,7 @@ void assignRegionBodyPartition(scf::ForOp loop, PartitionSet &partitions) {
 }
 
 void assignRegionOpPartitions(scf::ForOp loop) {
-  getBlockPartitions(loop.getBody());
+  assignSingleRegionOpPartition(loop);
 
   // Work-around for operations that don't produce results, nor use operands
   // from inside ws-loop, but need partition assignments. These operations

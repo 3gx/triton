@@ -128,6 +128,9 @@ void setPartition(Operation *op, const SetVector<Partition *> &partitions);
 // which does not work with Partition instances and iterate* functions, since
 // it does not keep the op attributes and the op list of a partition in sync.
 void setPartition(Operation *op, const SetVector<int> &partitionIds);
+void setPartitionOutputs(Operation *op,
+                         ArrayRef<SetVector<int>> partitionOutputsIds);
+SmallVector<SetVector<int>, 4> getPartitionOutputs(Operation *op);
 
 std::optional<SetVector<int>> getPartitionIds(Operation *op);
 

@@ -193,6 +193,34 @@ void setPartition(Operation *op, ArrayRef<int> partitionIds) {
   auto sorted = llvm::to_vector(partitionIds);
   llvm::sort(sorted);
   op->setAttr(kPartitionAttrName, b.getDenseI32ArrayAttr(sorted));
+  for (auto &region : op->getRegions()) {
+    for (auto &block : region.getBlocks()) {
+      auto terminator = block.getTerminator();
+      terminator->setAttr(kPartitionAttrName, b.getDenseI32ArrayAttr(sorted));
+    }
+  }
+}
+
+void setPartitionOutputs(Operation *op,
+                         ArrayRef<SetVector<int>> partitionOutputsIds) {
+  if (partitionOutputsIds.empty()) {
+    op->removeAttr(kPartitionOutputsAttrName);
+    return;
+  }
+  SmallVector<Attribute> attrs;
+  Builder b(op->getContext());
+  for (auto partitionIds : partitionOutputsIds) {
+    auto sorted = llvm::to_vector(partitionIds);
+    llvm::sort(sorted);
+    attrs.push_back(b.getDenseI32ArrayAttr(sorted));
+  }
+  op->setAttr(kPartitionOutputsAttrName, b.getArrayAttr(attrs));
+  for (auto &region : op->getRegions()) {
+    for (auto &block : region.getBlocks()) {
+      auto terminator = block.getTerminator();
+      terminator->setAttr(kPartitionOutputsAttrName, b.getArrayAttr(attrs));
+    }
+  }
 }
 
 void setPartition(Operation *op, const SetVector<int> &partitionIds) {
@@ -231,6 +259,23 @@ std::optional<SetVector<int>> getPartitionIds(Operation *op) {
     partitionIds.insert(id);
   }
   return partitionIds;
+}
+
+SmallVector<SetVector<int>, 4> getPartitionOutputs(Operation *op) {
+  if (!op) {
+    return {};
+  }
+
+  auto attrs = op->getAttr(kPartitionOutputsAttrName);
+  if (!attrs) {
+    return {};
+  }
+  SmallVector<SetVector<int>> partitionOutputsIds;
+  for (auto attr : cast<ArrayAttr>(attrs)) {
+    auto ids = cast<DenseI32ArrayAttr>(attr).asArrayRef();
+    partitionOutputsIds.push_back(SetVector<int>(ids.begin(), ids.end()));
+  }
+  return partitionOutputsIds;
 }
 
 bool hasPartition(Operation *op) { return getPartitionIds(op) != std::nullopt; }
