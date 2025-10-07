@@ -129,9 +129,15 @@ private:
 AsyncRef DependencyRewriter::allocateAsyncValue(RankedTensorType tensorType,
                                                 unsigned maxDistance) {
   OpBuilder::InsertionGuard guard(b);
-  b.setInsertionPoint(loop);
+
+  scf::ForOp topLevelFor = loop;
+  while (auto outer = topLevelFor->getParentOfType<scf::ForOp>()) {
+    topLevelFor = outer;
+  }
+  b.setInsertionPoint(topLevelFor);
+
   unsigned numBars = maxDistance;
-  Value alloc = createAlloc(loop, tensorType, b.getLoc(),
+  Value alloc = createAlloc(topLevelFor, tensorType, b.getLoc(),
                             getSharedEncoding(tensorType), numBars);
   auto allocType = cast<MemDescType>(alloc.getType());
   auto arefTy = triton::nvws::ArefType::get(
@@ -164,6 +170,9 @@ LogicalResult DependencyRewriter::run() {
     std::function<void(Operation *, OpOperand &)> collectUses;
     collectUses = [&](Operation *producer, OpOperand &use) {
       Operation *owner = loop.getBody()->findAncestorOpInBlock(*use.getOwner());
+      if (!owner) {
+        return;
+      }
       auto producerPartitionIds = getPartitionIds(producer);
       auto consumerPartitionIds = getPartitionIds(owner);
 
@@ -316,9 +325,18 @@ LogicalResult triton::gpu::rewritePartitionDependencies(scf::ForOp &loop) {
   if (failed(partitionsOr))
     return failure();
   PartitionSet partitions = std::move(*partitionsOr);
-  DependencyRewriter rewriter(partitions, loop);
-  if (failed(rewriter.run()))
-    return failure();
+
+  SmallVector<scf::ForOp> allLoops;
+  loop->walk([&](scf::ForOp loop) { allLoops.push_back(loop); });
+
+  for (auto loop : allLoops) {
+    DependencyRewriter rewriter(partitions, loop);
+    if (failed(rewriter.run())) {
+      return failure();
+    }
+    break;
+  }
+
   return success();
 }
 
