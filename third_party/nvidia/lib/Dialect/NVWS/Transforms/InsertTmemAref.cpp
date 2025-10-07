@@ -38,12 +38,15 @@ using namespace triton::gpu;
 using namespace triton::nvidia_gpu;
 using namespace triton::nvws;
 
-std::optional<int> getPartitionId(Operation *op) {
-  auto partitionIds = getPartitionIds(op);
-  if (!partitionIds)
+std::optional<int> getPartitionId(Operation *op, int pos = 0) {
+  if (!hasPartition(op))
     return std::nullopt;
-  assert(partitionIds->size() == 1);
-  return *partitionIds->begin();
+  auto partitionIds = *getPartitionIds(op);
+  if (op->getNumRegions() > 0) {
+    partitionIds = getPartitionOutputs(op)[pos];
+  }
+  assert(partitionIds.size() == 1);
+  return *partitionIds.begin();
 }
 using PartitionId = int;
 
@@ -91,7 +94,6 @@ struct TmemAccessDag {
     assert(ifOp.thenBlock() == useThen->getOwner()->getBlock());
     assert(ifOp.elseBlock() == useElse->getOwner()->getBlock());
 
-    auto partitionId = getPartitionId(tok.getDefiningOp());
     // Create access DAGs for then/else blocks.
     auto thenDag =
         std::make_unique<Node>(nullptr, nullptr, std::nullopt, nullptr);
@@ -100,26 +102,10 @@ struct TmemAccessDag {
     auto thenTok = addOp(*useThen, thenDag.get());
     auto elseTok = addOp(*useElse, elseDag.get());
 
-    // heuristic: assign if-Op to partition of the token producer op
-    ifOpNode->partitionId = partitionId;
 
     auto tokPos =
         *findValuePosInRange(ifOp.thenYield()->getOperands(), thenTok);
-
-    // the only use case we have today is
-    //   %newTok = if .. {  yield %tok  } else { %tok1= .. ; yield %tok1 }
-    // pick correct branch of if-stmt
-    bool useThenTok = ifOp.thenYield().getOperand(tokPos) != tok;
-    auto yieldOp = useThenTok ? ifOp.thenYield() : ifOp.elseYield();
-
-    partitionId = getPartitionId(yieldOp.getOperand(tokPos).getDefiningOp());
-    if (!partitionId) {
-      // if op producing token has no partition assigned, use the one from ifOp
-      // assigned by scheduler
-      partitionId = getPartitionId(ifOp);
-      auto newTokOp = yieldOp.getOperand(tokPos).getDefiningOp();
-      getNode(newTokOp)->partitionId = partitionId;
-    }
+    ifOpNode->partitionId = getPartitionId(ifOp, tokPos);
 
     // find final node in then-branch and assign yieldOp as its user
     // XXX: improve representation later, but for now the user's parentDag
@@ -175,8 +161,8 @@ struct TmemAccessDag {
         std::make_unique<Node>(nullptr, nullptr, std::nullopt, nullptr);
     auto tokArg = forOp.getRegionIterArg(tokPos);
     assert(tokArg.hasOneUse());
-    auto tok = addOp(*tokArg.getUses().begin(), subDag.get());
-    forOpNode->partitionId = subDag->user->partitionId;
+    addOp(*tokArg.getUses().begin(), subDag.get());
+    forOpNode->partitionId = getPartitionId(forOp, tokPos);
 
     // finalNode keep track of partition ownership transfer ownership when
     // before exiting the loop-body or re-entering loop body

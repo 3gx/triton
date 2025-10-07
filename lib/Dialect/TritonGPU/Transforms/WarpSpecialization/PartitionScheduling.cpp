@@ -822,6 +822,16 @@ SmallVector<SetVector<int>> getYieldPartitions(Block *block) {
   SmallVector<SetVector<int>> yieldPartitions(terminator->getNumOperands());
   for (auto &opnd : terminator->getOpOperands()) {
     auto op = opnd.get().getDefiningOp();
+    if (auto forOp = dyn_cast<scf::ForOp>(block->getParentOp());
+        forOp && isa<AsyncTokenType>(opnd.get().getType())) {
+      // Heuristic: when for-op yields an async-token, the output partition of
+      //            the token is that of its user.
+      // At the moment token must have only one use
+      auto arg = forOp.getRegionIterArg(opnd.getOperandNumber());
+      assert(arg.hasOneUse());
+      op = arg.getUses().begin()->getOwner();
+      assert(op);
+    }
     if (!op)
       continue;
     auto partitionIds = getPartitionIds(op);
