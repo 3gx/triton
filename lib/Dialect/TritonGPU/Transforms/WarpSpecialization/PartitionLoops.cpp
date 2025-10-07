@@ -412,11 +412,11 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     return success();
 
   // WA for exisiting lit tests
-  SetVector<Partition *> root;
-  for (int i = 0; i < partitions.getNumPartitions(); ++i) {
-    root.insert(partitions.getPartition(i));
-  }
-  setPartition(loop, root);
+  // SetVector<Partition *> root;
+  // for (int i = 0; i < partitions.getNumPartitions(); ++i) {
+  //   root.insert(partitions.getPartition(i));
+  // }
+  // setPartition(loop, root);
 
   auto numPartitions = partitions.getNumPartitions();
   auto defaultPartition = partitions.getPartition((int)0);
@@ -474,6 +474,9 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
 
   for (auto [b, region, partition] : llvm::zip(
            builders, wgOp.getPartitionRegions(), partitions.getPartitions())) {
+    if (!llvm::is_contained(*getPartitionIds(loop), b.partitionId)) {
+      continue;
+    }
     auto newForOp = *region.front().getOps<scf::ForOp>().begin();
     auto outputs = newForOp.getResults();
 
