@@ -173,6 +173,9 @@ void cloneForOp(scf::ForOp forOp, SmallVector<WarpGroupBuilder> &builders,
     auto newForOp =
         b.create<scf::ForOp>(forOp.getLoc(), lb, ub, step, initArgs);
     newForOp->setAttrs(forOp->getAttrs());
+    if (forOp->hasAttr(kPartitionOutputsAttrName)) {
+      newForOp->removeAttr(kPartitionOutputsAttrName);
+    }
     newForOps.push_back(newForOp);
 
     b.mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
@@ -216,6 +219,9 @@ void cloneIfOp(scf::IfOp ifOp, SmallVector<WarpGroupBuilder> &builders,
     auto newIfOp = b.create<scf::IfOp>(ifOp.getLoc(), newIfResultTypes, cond,
                                        ifOp.elseBlock() ? true : false);
     newIfOp->setAttrs(ifOp->getAttrs());
+    if (ifOp->hasAttr(kPartitionOutputsAttrName)) {
+      newIfOp->removeAttr(kPartitionOutputsAttrName);
+    }
     newIfOps.push_back(newIfOp);
 
     for (auto [newIdx, oldIdx] : llvm::enumerate(newIfResultIndices)) {
@@ -257,6 +263,9 @@ void cloneReduceOp(triton::ReduceOp reduceOp,
     auto newReduceOp =
         b.create<triton::ReduceOp>(reduceOp.getLoc(), srcs, axis);
     newReduceOp->setAttrs(reduceOp->getAttrs());
+    if (reduceOp->hasAttr(kPartitionOutputsAttrName)) {
+      newReduceOp->removeAttr(kPartitionOutputsAttrName);
+    }
     newReduceOps.push_back(newReduceOp);
 
     mapRange(reduceOp.getResults(), newReduceOp.getResults(), b.mapping);
