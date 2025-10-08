@@ -99,6 +99,7 @@ def _matmul_ogs(
              ScatterShardIndx=None,
              reduce_rank = 0,
              n_reduce_shards: tl.constexpr = 1,
+             FLATTEN: tl.constexpr = True,
              ):
     tl.assume(stride_y_k >= 0)
     tl.assume(stride_y_z >= 0)

@@ -314,10 +314,14 @@ class Case:
 ])
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("is_persistent", [False, True])
-def test_op(m, n, k, split_k, do_gather, do_scatter, fused_scatter, inner_expt_opt, has_y_gammas, is_persistent, n_expts_tot,
+@pytest.mark.parametrize("flatten", [False, True])
+def test_op(m, n, k, split_k, do_gather, do_scatter, fused_scatter, inner_expt_opt, has_y_gammas, is_persistent, flatten, n_expts_tot,
             n_expts_act, mode, act_dtype_str, weight_dtype_str, block_m, hbm_swizzling, epilogue_subtile,
             x_transpose, w_transpose, y_transpose,
             device, opt_flags_scope):
+    if not is_persistent and flatten is False:
+        pytest.skip("flatten = False only relevant for persistent kernel")
+
     # TODO: remove when Triton FP8 supports proper RTNE
     if is_cuda():
         if "float8" in weight_dtype_str and torch.cuda.get_device_capability()[0] < 9:
@@ -386,6 +390,7 @@ def test_op(m, n, k, split_k, do_gather, do_scatter, fused_scatter, inner_expt_o
         "fused_scatter": fused_scatter,
         "is_persistent": is_persistent,
         "epilogue_subtile": epilogue_subtile,
+        "flatten": flatten,
     }
 
     if is_hip() and hbm_swizzling and "float4" in weight_dtype_str:

@@ -26,6 +26,7 @@ class OptFlags:
     idle_sms: int
     epilogue_subtile: int | None
     arch: str
+    flatten: bool
     target_kernel_kwargs: dict
 
     def __post_init__(self):
@@ -170,7 +171,7 @@ def make_default_opt_flags_nvidia(
     has_y_acc_in,
     constraints,
 ):
-    constraints_supported = ["block_m", "block_k", "split_k", "is_persistent", "fused_scatter", "epilogue_subtile", "num_stages", "idle_sms"]
+    constraints_supported = ["block_m", "block_k", "split_k", "is_persistent", "fused_scatter", "epilogue_subtile", "num_stages", "idle_sms", "flatten"]
     assert not any([c not in constraints_supported for c in constraints]), constraints.keys()
     # tokens per expert
     if routing_data is None or batch_size > 1:
@@ -209,6 +210,12 @@ def make_default_opt_flags_nvidia(
         # TMA is slower for batched matmuls with small m/n/k.
         if m * n * k < 131072:
             is_persistent = False
+
+    if is_persistent and constraints.get("flatten", None) is not None:
+        flatten = constraints["flatten"]
+    else:
+        flatten = True
+
     block_n = block_n_tma if is_persistent else block_n
     # block k
     if constraints.get("block_k", None) is not None:
@@ -281,6 +288,7 @@ def make_default_opt_flags_nvidia(
         arch=arch,
         target_kernel_kwargs=dict(),
         idle_sms=constraints.get("idle_sms", 0),
+        flatten=flatten,
     )
     # check constraints
     assert all(getattr(ret, ck) == cv for ck, cv in constraints.items() if cv is not None), f"{ret} != {constraints}"

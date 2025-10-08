@@ -680,6 +680,7 @@ def matmul_ogs(x, w, bias,
                    SWAP_XW=get_swap_xw(precision_config, opt_flags),
                    IS_EPILOGUE_QUANT_MXFP8=epilogue.specs.name == FnName.QUANTIZE_MXFP8.name,
                    NUM_SMS = grid if opt_flags.is_persistent else 0,
+                   FLATTEN=opt_flags.flatten,
                    **fused_comm_kwargs,
                    **opt_flags.target_kernel_kwargs)
     # Build grouped reduction inputs in a uniform way

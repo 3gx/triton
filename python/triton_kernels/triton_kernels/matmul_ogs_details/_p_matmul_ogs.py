@@ -108,6 +108,7 @@ def _p_matmul_ogs(
              ScatterShardIndx=None,
              reduce_rank=0,
              n_reduce_shards: tl.constexpr = 1,
+             FLATTEN: tl.constexpr = True,
              ):
     # tl.static_assert(SWIZZLE_MX_VALUE is None, "NYI. Value swizzling")
 
@@ -211,7 +212,7 @@ def _p_matmul_ogs(
 
     DISALLOW_ACC_MULTI_BUFFER: tl.constexpr = is_w_microscaled and BLOCK_M * BLOCK_N >= 128 * 256
 
-    for tile_id in tl.range(tl.program_id(0), num_tiles, NUM_SMS, flatten=True, disallow_acc_multi_buffer=DISALLOW_ACC_MULTI_BUFFER, warp_specialize=True):
+    for tile_id in tl.range(tl.program_id(0), num_tiles, NUM_SMS, flatten=FLATTEN, disallow_acc_multi_buffer=DISALLOW_ACC_MULTI_BUFFER, warp_specialize=True):
         expt_id, start_z, start_z_out, start_m, eM, off_m, pid_n, k_tiles, pid_k, off_k_x0, off_k_w0, _ = _load_tile_attrs(
             tile_id, num_tiles, grid_m - padding_m, grid_n,
             M, K, ExptData, ExptHist, ExptOffs, ExptTileOffs,
