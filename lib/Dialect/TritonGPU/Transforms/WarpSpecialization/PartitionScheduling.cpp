@@ -667,9 +667,13 @@ LogicalResult assignMissingPartitions(scf::ForOp loop,
         for (auto &use : value.getUses()) {
           auto useOp = use.getOwner();
           if (auto forOp = dyn_cast<scf::ForOp>(useOp)) {
-            auto pos = use.getOperandNumber() - forOp.getNumControlOperands();
-            auto arg = forOp.getRegionIterArg(pos);
-            getUseOps(arg, useOps, visited);
+            if (use.getOperandNumber() < forOp.getNumControlOperands()) {
+	      useOps.insert(forOp);
+            } else {
+              auto pos = use.getOperandNumber() - forOp.getNumControlOperands();
+              auto arg = forOp.getRegionIterArg(pos);
+              getUseOps(arg, useOps, visited);
+            }
           } else if (isa<scf::YieldOp>(useOp)) {
             auto parentOp = useOp->getParentOp();
             Value arg;
