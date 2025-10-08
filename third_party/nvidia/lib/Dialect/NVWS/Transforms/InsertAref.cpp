@@ -419,6 +419,8 @@ bool insertArefs(PartitionBuilder &builder, scf::ForOp loop,
   DenseMap<Partition *, SetVector<Value>> resultsPerPartition;
   auto processResultUses = [&](Value result) {
     for (auto user : result.getUsers()) {
+      if (isa<scf::YieldOp>(user))
+        continue;
       Partition *userPartition = partitions.getPartition(user);
       if (producedValue.partition != userPartition) {
         resultsPerPartition[userPartition].insert(result);
