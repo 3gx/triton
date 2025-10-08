@@ -153,9 +153,10 @@ template <class T> struct AssignStagePhase {
     SmallVector<Value> extraYieldArgs;
     auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
 
-    // associate token with stage positional argument in the yieldOp
+    // associate token with stage positional argument in the iterArgs & yieldOp
     // we will need this in propagateStage function that will assign stage
     // to arefBuffer and arefExit ops
+    tokToStagePosMap[index.token] = nArgs + extraYieldArgs.size();
     tokToStagePosMap[indexInBlock.token] = nArgs + extraYieldArgs.size();
     extraYieldArgs.push_back(indexInBlock.stage);
     if (index.phase)
@@ -286,11 +287,10 @@ template <class T> struct AssignStagePhase {
       if (auto stageOp = dyn_cast<ArefStageInterface>(owner)) {
         stageOp.setStage(stage);
       } else if (auto forOp = dyn_cast<scf::ForOp>(owner)) {
-        auto tokPos = tokUse.getOperandNumber() - 3;
-        auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-        auto stagePos = tokToStagePosMap.at(yieldOp.getOperand(tokPos));
-        propagateStage(forOp.getRegionIterArgs()[tokPos],
-                       forOp.getRegionIterArgs()[stagePos], visited);
+        auto tokPos = tokUse.getOperandNumber() - forOp.getNumControlOperands();
+        auto iterTok = forOp.getRegionIterArg(tokPos);
+        auto stagePos = tokToStagePosMap.at(iterTok);
+        propagateStage(iterTok, forOp.getRegionIterArgs()[stagePos], visited);
       } else if (auto yieldOp = dyn_cast<scf::YieldOp>(owner)) {
         auto tokPos = tokUse.getOperandNumber();
         auto stagePos = tokToStagePosMap.at(token);
@@ -341,7 +341,9 @@ template <class T> struct AssignStagePhase {
 
       // propagate stage to exitOps following enterOp token
       for (auto user : arefOp->getUsers())
-        if (auto enterOp = dyn_cast<T>(user)) {
+        if (auto enterOp = dyn_cast<T>(user);
+            enterOp && (!hasPartition(enterOp) ||
+                        getPartitionIds(enterOp)->front() == partitionId)) {
           DenseSet<Operation *> visited;
           arefIndex.propagateStage(enterOp.getToken(), enterOp.getStage(),
                                    visited);
