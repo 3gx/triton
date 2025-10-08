@@ -237,24 +237,6 @@ void setPartition(Operation *op, const SetVector<Partition *> &partitions) {
   setPartition(op, partitionIds);
 }
 
-std::optional<SetVector<int>> getPartitionIds(Operation *op) {
-  if (!op) {
-    return std::nullopt;
-  }
-  auto attrs = op->getAttr(kPartitionAttrName);
-  if (!attrs) {
-    return std::nullopt;
-  }
-
-  assert(isa<DenseI32ArrayAttr>(attrs));
-
-  SetVector<int> partitionIds;
-  for (auto id : cast<DenseI32ArrayAttr>(attrs).asArrayRef()) {
-    partitionIds.insert(id);
-  }
-  return partitionIds;
-}
-
 SmallVector<SetVector<int>, 4> getPartitionOutputs(Operation *op) {
   if (!op) {
     return {};
