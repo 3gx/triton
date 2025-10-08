@@ -3781,16 +3781,19 @@ LogicalResult TritonGPUDialect::verifyOperationAttribute(Operation *op,
   }
 
   if (attr.getName() == kPartitionOutputsAttrName) {
-    if (!isa<scf::ForOp, scf::IfOp>(op))
+    if (!isa<scf::ForOp, scf::IfOp, triton::ReduceOp>(op))
       return op->emitOpError("has unexpected attribute ") << attr.getName();
 
     // Verify that number of output partitions matches number of For/If results
     size_t numResults = 0;
     if (isa<scf::ForOp>(op)) {
       numResults = cast<scf::ForOp>(op).getResults().size();
-    } else {
+    } else if (isa<scf::IfOp>(op)) {
       numResults = cast<scf::IfOp>(op).getResults().size();
+    } else {
+      numResults = cast<triton::ReduceOp>(op).getResults().size();
     }
+
     if (cast<ArrayAttr>(attr.getValue()).size() != numResults) {
       return op->emitOpError("does not have expected number of output "
                              "partition sets in attr ")
