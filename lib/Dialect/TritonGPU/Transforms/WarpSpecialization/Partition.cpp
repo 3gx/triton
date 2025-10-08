@@ -264,7 +264,7 @@ SmallVector<SetVector<int>, 4> getPartitionOutputs(Operation *op) {
   if (!attrs) {
     return {};
   }
-  SmallVector<SetVector<int>> partitionOutputsIds;
+  SmallVector<SetVector<int>, 4> partitionOutputsIds;
   for (auto attr : cast<ArrayAttr>(attrs)) {
     auto ids = cast<DenseI32ArrayAttr>(attr).asArrayRef();
     partitionOutputsIds.push_back(SetVector<int>(ids.begin(), ids.end()));
