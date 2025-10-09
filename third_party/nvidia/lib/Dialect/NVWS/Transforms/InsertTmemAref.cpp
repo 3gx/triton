@@ -102,7 +102,6 @@ struct TmemAccessDag {
     auto thenTok = addOp(*useThen, thenDag.get());
     auto elseTok = addOp(*useElse, elseDag.get());
 
-
     auto tokPos =
         *findValuePosInRange(ifOp.thenYield()->getOperands(), thenTok);
     ifOpNode->partitionId = getPartitionId(ifOp, tokPos);
@@ -323,13 +322,6 @@ struct TmemAccessDag {
   DenseMap<scf::ForOp, TMEMAllocOp> arefTmemAllocs;
 };
 
-Value intCst(OpBuilder &b, Location loc, int value, unsigned width) {
-  return b.create<arith::ConstantIntOp>(loc, value, width);
-}
-
-Value boolCst(OpBuilder &b, Location loc, bool value) {
-  return intCst(b, loc, value, /*width=*/1);
-}
 void assignStage(OpBuilder &b, Operation *op, StageCluster stageCluster) {
   if (stageCluster) {
     op->setAttr(kLoopStageAttrName, b.getI32IntegerAttr(stageCluster->first));
@@ -595,9 +587,11 @@ LogicalResult insertTmemAref(TmemAccessDag &accessDag) {
   if (auto src = allocOp.getSrc()) {
     auto buffer = state.getBuffer(b, partitionId, allocOp);
     state.asyncOp = AsyncOp::NONE;
+    auto vTrue = createInto<arith::ConstantIntOp>(
+        b, allocOp.getLoc(), {partitionId, stageCluster}, true, 1);
     createInto<TMEMStoreOp>(b, allocOp.getLoc(), {partitionId, stageCluster},
                             b.getType<AsyncTokenType>(), buffer, state.token,
-                            src, boolCst(b, allocOp.getLoc(), true));
+                            src, vTrue);
   } else {
     // allocOp w/o src, assume the ownership of tmem belongs to first user
     // partitionId = accessDag.getRootNode()->user->partitionId;
