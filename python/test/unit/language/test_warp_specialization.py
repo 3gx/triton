@@ -553,6 +553,7 @@ def test_warp_specialize_attention_persistent_forward(M, N, BLOCK_M, HEAD_DIM, n
     dtype = torch.float8_e4m3fn if use_fp8 else torch.float16
 
     torch.manual_seed(42)
+
     q = torch.randn((M, HEAD_DIM), device="cuda").to(dtype)
     k = torch.randn((N, HEAD_DIM), device="cuda").to(dtype)
     v = torch.randn((N, HEAD_DIM), device="cuda").to(dtype)
@@ -571,23 +572,21 @@ def test_warp_specialize_attention_persistent_forward(M, N, BLOCK_M, HEAD_DIM, n
                                     block_shape=[BLOCK_M, HEAD_DIM])
     desc_acc = TensorDescriptor(acc, shape=[M, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=[BLOCK_M, HEAD_DIM])
 
-    NUM_SM = 4
-    out = attention_persistent_inner_loop_kernel[(NUM_SM,)](desc_q, desc_k, desc_v, desc_acc_ref, l_i_ref, m_i_ref, M, N, 0.5,
+    NUM_SM = torch.cuda.get_device_properties("cuda").multi_processor_count
+    out = attention_persistent_inner_loop_kernel[(NUM_SM,)](desc_q, desc_k, desc_v, desc_acc, l_i, m_i, M, N, 0.5,
                                                        BLOCK_M, HEAD_DIM, True, num_stages=num_stages, num_warps=num_warps)
     # print(out.asm["ttgir"])
     # return
-    attention_inner_loop_kernel[(M // BLOCK_M, )](desc_q, desc_k, desc_v, desc_acc, l_i, m_i, M, N, 0.5, BLOCK_M,
+    attention_inner_loop_kernel[(M // BLOCK_M, )](desc_q, desc_k, desc_v, desc_acc_ref, l_i_ref, m_i_ref, M, N, 0.5, BLOCK_M,
                                                   HEAD_DIM, False, num_stages=num_stages, num_warps=num_warps)
 
-    # print(out.asm["ttgir"])
-
+    print(acc.to(torch.float32).sum(), acc_ref.to(torch.float32).sum())
     torch.testing.assert_close(acc.to(torch.float32), acc_ref.to(torch.float32), atol=0, rtol=0)
     torch.testing.assert_close(l_i.to(torch.float32), l_i_ref.to(torch.float32), atol=0, rtol=0)
     torch.testing.assert_close(m_i.to(torch.float32), m_i_ref.to(torch.float32), atol=0, rtol=0)
 
-    print("ok")
 
 
 # test_warp_specialize_tma_matmul_persistent(1024, 1024, 1024, 128, 128, 128, 3, 4, True, False)
-test_warp_specialize_attention_persistent_forward(1024, 1024, 128, 128, 3, False, 4, True)
+# test_warp_specialize_attention_persistent_forward(8192, 8192, 64, 64, 2, True, 4, True)
 # test_warp_specialize_attention_forward(1024, 1024, 128, 128, 3, False, 4, True)
