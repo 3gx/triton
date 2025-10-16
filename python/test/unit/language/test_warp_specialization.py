@@ -572,7 +572,7 @@ def test_warp_specialize_attention_persistent_forward(M, N, BLOCK_M, HEAD_DIM, n
                                     block_shape=[BLOCK_M, HEAD_DIM])
     desc_acc = TensorDescriptor(acc, shape=[M, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=[BLOCK_M, HEAD_DIM])
 
-    NUM_SM = torch.cuda.get_device_properties("cuda").multi_processor_count
+    NUM_SM = 4 # torch.cuda.get_device_properties("cuda").multi_processor_count
     out = attention_persistent_inner_loop_kernel[(NUM_SM,)](desc_q, desc_k, desc_v, desc_acc, l_i, m_i, M, N, 0.5,
                                                        BLOCK_M, HEAD_DIM, True, num_stages=num_stages, num_warps=num_warps)
     # print(out.asm["ttgir"])
