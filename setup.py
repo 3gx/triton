@@ -217,14 +217,10 @@ def get_llvm_package_info():
                 # Ubuntu 22 LTS (v2.35)
                 # Ubuntu 20 LTS (v2.31)
                 system_suffix = "ubuntu-x64"
-            elif vglibc > 217:
+            else:
                 # Manylinux_2.28 (v2.28)
                 # AlmaLinux 8 (v2.28)
                 system_suffix = "almalinux-x64"
-            else:
-                # Manylinux_2014 (v2.17)
-                # CentOS 7 (v2.17)
-                system_suffix = "centos-x64"
         else:
             print(
                 f"LLVM pre-compiled image is not available for {system}-{arch}. Proceeding with user-configured LLVM from source build."
@@ -542,6 +538,17 @@ def download_and_copy_dependencies():
         dst_path="bin/ptxas",
         variable="TRITON_PTXAS_PATH",
         version=NVIDIA_TOOLCHAIN_VERSION["ptxas"],
+        url_func=lambda system, arch, version:
+        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
+    )
+
+    # We download a separate ptxas for blackwell, since there are some bugs when using it for hopper
+    download_and_copy(
+        name="nvcc",
+        src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin/ptxas{exe_extension}",
+        dst_path="bin/ptxas-blackwell",
+        variable="TRITON_PTXAS_BLACKWELL_PATH",
+        version=NVIDIA_TOOLCHAIN_VERSION["ptxas-blackwell"],
         url_func=lambda system, arch, version:
         f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
     )

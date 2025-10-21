@@ -63,7 +63,7 @@ def _p_matmul_ogs(
              M, N, K, K_W, # shapes
              # expt data
              Betas, Gammas,
-             GatherIndx,
+             GatherIndx, GatherDstIndx,  # GatherDstIndx is only used for launch metadata.
              ScatterSrcIndx, num_idxs,
              WriteBackIndx, writeback_size,
              ExptHist, ExptOffs, ExptTileOffs, ExptData,
@@ -404,14 +404,24 @@ def _p_matmul_ogs(
         biases = (bias,)
 
         if SUBTILE_FACTOR >= 2:
-            acc0, acc1 = acc.reshape(BLOCK_M, 2, BLOCK_N // 2).permute(0, 2, 1).split()
+            if SWAP_XW:
+                acc = acc.reshape(2, BLOCK_N // 2, BLOCK_M).permute(1, 2, 0)
+            else:
+                acc = acc.reshape(BLOCK_M, 2, BLOCK_N // 2).permute(0, 2, 1)
+            acc0, acc1 = acc.split()
             accs = (acc0, acc1)
             bias0, bias1 = bias.reshape(2, BLOCK_N // 2).permute(1, 0).split()
             biases = (bias0, bias1)
 
         if SUBTILE_FACTOR >= 4:
-            acc00, acc01 = acc0.reshape(BLOCK_M, 2, BLOCK_N // 4).permute(0, 2, 1).split()
-            acc10, acc11 = acc1.reshape(BLOCK_M, 2, BLOCK_N // 4).permute(0, 2, 1).split()
+            if SWAP_XW:
+                acc0 = acc0.reshape(2, BLOCK_N // 4, BLOCK_M).permute(1, 2, 0)
+                acc1 = acc1.reshape(2, BLOCK_N // 4, BLOCK_M).permute(1, 2, 0)
+            else:
+                acc0 = acc0.reshape(BLOCK_M, 2, BLOCK_N // 4).permute(0, 2, 1)
+                acc1 = acc1.reshape(BLOCK_M, 2, BLOCK_N // 4).permute(0, 2, 1)
+            acc00, acc01 = acc0.split()
+            acc10, acc11 = acc1.split()
             accs = (acc00, acc01, acc10, acc11)
             bias00, bias01 = bias0.reshape(2, BLOCK_N // 4).permute(1, 0).split()
             bias10, bias11 = bias1.reshape(2, BLOCK_N // 4).permute(1, 0).split()
