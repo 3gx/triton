@@ -411,6 +411,7 @@ void createArefGet(PartitionBuilder &builder, scf::ForOp loop,
   }
 
   if (exitInsertPointAfter == nullptr) {
+    // TODO: is this correct for nested loop?
     PostDominanceInfo dom(loop);
     exitInsertPointAfter = findNearestCommonPostDominator(consumers, dom);
   }

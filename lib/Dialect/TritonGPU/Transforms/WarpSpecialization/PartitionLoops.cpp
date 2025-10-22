@@ -126,6 +126,7 @@ getLoopVarIndicesToKeep(scf::ForOp loop, const Partition *partition,
     // loop even if the corresponding loop variable is not used in that
     // partition.
     if (loopVarCategories[i] == LoopVarCategory::Used ||
+	// TODO: Remove this logic?
         (loop->hasAttr(kPartitionStagesAttrName) &&
          partition->getIndex() == 0 && !loop.getResult(i).use_empty() &&
          loopVarCategories[i] !=
