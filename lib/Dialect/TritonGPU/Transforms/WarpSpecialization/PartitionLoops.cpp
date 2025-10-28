@@ -51,22 +51,18 @@ enum class LoopVarCategory {
   TensorResultFromOtherPartition,
 };
 
-SetVector<int> getIfOpResultPartitionIds(scf::IfOp ifOp, int pos) {
-  return getPartitionOutputs(ifOp)[pos];
+SetVector<int> getResultPartitionIds(Operation *op, int index) {
+  return getPartitionOutputs(op)[index];
 }
 
 SetVector<int> getIfOpResultPartitionIds(scf::IfOp ifOp, Value value) {
   for (auto result : ifOp.getResults()) {
     if (result == value) {
       auto pos = result.getResultNumber();
-      return getIfOpResultPartitionIds(ifOp, pos);
+      return getResultPartitionIds(ifOp, pos);
     }
   }
   llvm_unreachable("value is not a result of if-stmt");
-}
-
-SetVector<int> getResultPartitionIds(Operation *op, int index) {
-  return getPartitionOutputs(op)[index];
 }
 
 bool isTensorResultComputedBy(scf::ForOp loop, size_t resultIdx,
@@ -103,7 +99,8 @@ SmallVector<LoopVarCategory> classifyLoopVars(scf::ForOp loop,
     auto partitionIds = getResultPartitionIds(loop, i);
     if (llvm::is_contained(partitionIds, partition->getIndex())) {
       categories[i] = LoopVarCategory::Used;
-    } else if (isTensorResultFromOtherPartition(i)) {
+    } else if (isTensorResultFromOtherPartition(i) &&
+               !loop.getResult(i).use_empty()) {
       categories[i] = LoopVarCategory::TensorResultFromOtherPartition;
     } else {
       categories[i] = LoopVarCategory::Unused;
@@ -122,15 +119,7 @@ getLoopVarIndicesToKeep(scf::ForOp loop, const Partition *partition,
   SmallVector<std::optional<size_t>> reverseIndices(loop.getNumRegionIterArgs(),
                                                     std::nullopt);
   for (auto [i, arg] : llvm::enumerate(loop.getRegionIterArgs())) {
-    // For the default partition, keep non-tensor results used outside of the
-    // loop even if the corresponding loop variable is not used in that
-    // partition.
-    if (loopVarCategories[i] == LoopVarCategory::Used ||
-	// TODO: Remove this logic?
-        (loop->hasAttr(kPartitionStagesAttrName) &&
-         partition->getIndex() == 0 && !loop.getResult(i).use_empty() &&
-         loopVarCategories[i] !=
-             LoopVarCategory::TensorResultFromOtherPartition)) {
+    if (loopVarCategories[i] == LoopVarCategory::Used) {
       reverseIndices[i] = indices.size();
       indices.push_back(i);
     }
@@ -211,7 +200,7 @@ void cloneIfOp(scf::IfOp ifOp, SmallVector<WarpGroupBuilder> &builders,
     SmallVector<Type> newIfResultTypes;
     SmallVector<int> newIfResultIndices;
     for (auto pos = 0; pos < ifOp.getResultTypes().size(); ++pos) {
-      auto partitionIds = getIfOpResultPartitionIds(ifOp, pos);
+      auto partitionIds = getResultPartitionIds(ifOp, pos);
       if (llvm::is_contained(partitionIds, b.partitionId)) {
         newIfResultTypes.push_back(ifOp.getResult(pos).getType());
         newIfResultIndices.push_back(pos);
@@ -317,7 +306,7 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
       if (yieldOp.getOperands().empty()) {
         continue;
       }
-      // for some reason empty yield has no partition annotations
+      // empty yield has no partition annotations
       assert(hasPartition(op));
       auto partitionIndices = *getPartitionIds(op);
 
@@ -333,7 +322,7 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
         } else {
           auto ifOp = cast<scf::IfOp>(yieldOp->getParentOp());
           for (size_t i = 0; i < yieldOp.getOperands().size(); ++i) {
-            auto ids = getIfOpResultPartitionIds(ifOp, i);
+            auto ids = getResultPartitionIds(ifOp, i);
             if (llvm::is_contained(ids, builder.partitionId)) {
               newOperandIndices.push_back(i);
             }
@@ -378,8 +367,7 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
           llvm::is_contained(*partitionIds, partition.getIndex()))
         return;
 
-      // check if consumer partition set is a subset of the producer
-      // partitions
+      // check if consumer partition set is a subset of the producer partitions
       auto defOpPartitionIds = getPartitionIds(output.getDefiningOp());
       bool isValidSubset = std::all_of(
           partitionIds->begin(), partitionIds->end(), [&](int consumerId) {
@@ -418,8 +406,6 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
   ImplicitLocOpBuilder topBuilder(loop.getLoc(), loop);
   SmallVector<Value> tensorResultAllocs(loop.getNumRegionIterArgs());
   for (auto [i, res] : llvm::enumerate(loop.getResults())) {
-    if (res.use_empty())
-      continue;
     if (loopVarCategories[i] ==
         LoopVarCategory::TensorResultFromOtherPartition) {
       auto ty = cast<RankedTensorType>(res.getType());
@@ -486,8 +472,6 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
       auto [_, reverseIndices] =
           getLoopVarIndicesToKeep(loop, &partition, partitions);
       for (size_t i = 0; i < loop.getNumRegionIterArgs(); ++i) {
-        if (loop.getResult(i).use_empty())
-          continue;
         if (loopVarCategories[i] ==
                 LoopVarCategory::TensorResultFromOtherPartition &&
             isTensorResultComputedBy(loop, i, &partition, partitions)) {
@@ -518,7 +502,6 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     }
   }
 
-  // loop->getParentOfType<ModuleOp>().dump();
   for (auto op : llvm::reverse(opsToErase))
     op->erase();
 
@@ -546,15 +529,13 @@ struct PartitionLoops
 void PartitionLoops::runOnOperation() {
   // Collect for loops to warp specialize. This pass expects the loop to already
   // be annotated with partitions.
-  SmallVector<std::pair<scf::ForOp, int>> loops;
+  SmallVector<scf::ForOp> loops;
   getOperation().walk([&](scf::ForOp loop) {
-    if (auto stages =
-            loop->getAttrOfType<ArrayAttr>(kPartitionStagesAttrName)) {
-      loops.push_back({loop, stages.size()});
-    }
+    if (loop->hasAttrOfType<ArrayAttr>(kPartitionStagesAttrName))
+      loops.push_back(loop);
   });
 
-  for (auto [loop, numPartitions] : loops) {
+  for (scf::ForOp loop : loops) {
     if (failed(partitionLoop(loop)))
       return signalPassFailure();
   }
