@@ -71,7 +71,7 @@ template <class T> struct AssignStagePhase {
   };
   Value aref;
   int partitionId;
-  DenseMap<Value, int> tokToStagePosMap;
+  DenseMap<std::pair<Operation *, Value>, int> tokToStagePosMap;
 
   AssignStagePhase(Value aref, int partitionId)
       : aref(aref), partitionId(partitionId) {}
@@ -153,14 +153,18 @@ template <class T> struct AssignStagePhase {
     SmallVector<Value> extraYieldArgs;
     auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
 
-    // associate token with stage positional argument in the yieldOp
+    // associate token with stage positional argument in the iterArgs & yieldOp
     // we will need this in propagateStage function that will assign stage
     // to arefBuffer and arefExit ops
-    tokToStagePosMap[indexInBlock.token] = nArgs + extraYieldArgs.size();
+
+    int nargs = extraYieldArgs.size();
     extraYieldArgs.push_back(indexInBlock.stage);
     if (index.phase)
       extraYieldArgs.push_back(indexInBlock.phase);
     appendToForOpYield(forOp, extraYieldArgs);
+    tokToStagePosMap[{forOp, index.token}] = nArgs + nargs;
+    tokToStagePosMap[{forOp.getBody()->getTerminator(), indexInBlock.token}] =
+        nArgs + nargs;
 
     // update partitions of the forOp
     assert(hasPartition(forOp));
@@ -244,8 +248,10 @@ template <class T> struct AssignStagePhase {
       arefTokenRefs[*pos] = &index.token;
     }
 
-    tokToStagePosMap[thenIndex.token] = thenYieldOp.getNumOperands();
-    tokToStagePosMap[elseIndex.token] = elseYieldOp.getNumOperands();
+    tokToStagePosMap[{newIfOp.thenYield(), thenIndex.token}] =
+        thenYieldOp.getNumOperands();
+    tokToStagePosMap[{newIfOp.elseYield(), elseIndex.token}] =
+        elseYieldOp.getNumOperands();
     thenYieldOp->insertOperands(thenYieldOp.getNumOperands(), thenIndex.stage);
     elseYieldOp->insertOperands(elseYieldOp.getNumOperands(), elseIndex.stage);
     thenYieldOp->insertOperands(thenYieldOp.getNumOperands(), thenIndex.phase);
@@ -345,14 +351,13 @@ template <class T> struct AssignStagePhase {
         }
         stageOp.setStage(stage);
       } else if (auto forOp = dyn_cast<scf::ForOp>(owner)) {
-        auto tokPos = tokUse.getOperandNumber() - 3;
-        auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-        auto stagePos = tokToStagePosMap.at(yieldOp.getOperand(tokPos));
-        propagateStage(forOp.getRegionIterArgs()[tokPos],
-                       forOp.getRegionIterArgs()[stagePos], visited);
+        auto tokPos = tokUse.getOperandNumber() - forOp.getNumControlOperands();
+        auto iterTok = forOp.getRegionIterArg(tokPos);
+        auto stagePos = tokToStagePosMap.at({forOp, iterTok});
+        propagateStage(iterTok, forOp.getRegionIterArgs()[stagePos], visited);
       } else if (auto yieldOp = dyn_cast<scf::YieldOp>(owner)) {
         auto tokPos = tokUse.getOperandNumber();
-        auto stagePos = tokToStagePosMap.at(token);
+        auto stagePos = tokToStagePosMap.at({yieldOp, token});
         auto parentOp = yieldOp->getParentOp();
         propagateStage(parentOp->getResult(tokPos),
                        parentOp->getResult(stagePos), visited);
@@ -400,7 +405,9 @@ template <class T> struct AssignStagePhase {
 
       // propagate stage to exitOps following enterOp token
       for (auto user : arefOp->getUsers())
-        if (auto enterOp = dyn_cast<T>(user)) {
+        if (auto enterOp = dyn_cast<T>(user);
+            enterOp && (!hasPartition(enterOp) ||
+                        getPartitionIds(enterOp)->front() == partitionId)) {
           DenseSet<Operation *> visited;
           arefIndex.propagateStage(enterOp.getToken(), enterOp.getStage(),
                                    visited);
@@ -411,7 +418,7 @@ template <class T> struct AssignStagePhase {
   }
 };
 
-void updateOutputWithRootPartition(Operation *op, int pos) {
+void updateOutputWithDefaultPartition(Operation *op, int pos) {
   auto opIds = *getPartitionIds(op);
   opIds.insert(0);
   setPartition(op, opIds);
@@ -439,7 +446,7 @@ void visitBackwardSlice(scf::ForOp wsLoop, Value value,
              isa<scf::IfOp, scf::ForOp>(defOp)) {
     auto pos = findValuePosInRange(defOp->getResults(), value);
     assert(pos);
-    updateOutputWithRootPartition(defOp, *pos);
+    updateOutputWithDefaultPartition(defOp, *pos);
     if (auto ifOp = dyn_cast<scf::IfOp>(defOp)) {
       visitBackwardSlice(wsLoop, ifOp.thenYield()->getOperand(*pos), callback,
                          visited);
@@ -490,7 +497,7 @@ LogicalResult assignStagePhase(triton::FuncOp funcOp) {
             !result.use_empty()) {
           auto arg = forOp.getBody()->getTerminator()->getOperand(
               result.getResultNumber());
-          updateOutputWithRootPartition(forOp, result.getResultNumber());
+          updateOutputWithDefaultPartition(forOp, result.getResultNumber());
           visitBackwardSlice(forOp, arg, callback, visited);
         }
       }
