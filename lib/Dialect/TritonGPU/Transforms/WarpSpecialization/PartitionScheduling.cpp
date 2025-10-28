@@ -264,6 +264,7 @@ SetVector<Partition *> getInitialPartitions(scf::ForOp loop,
 
   // Annotate remaining unannotated tmem loads, for example those outside of the
   // inner loop
+  // TODO: remove?
   for (ttng::TMEMLoadOp tmemLoad : loop.getOps<ttng::TMEMLoadOp>()) {
     if (hasPartition(tmemLoad)) {
       continue;
@@ -290,6 +291,7 @@ SetVector<Partition *> getInitialPartitions(scf::ForOp loop,
   }
 
   // Annotate the inner loop with its body partitions
+  // TODO: remove?
   if (!loop->hasAttr(kWarpSpecializeAttrName)) {
     SetVector<Partition *> bodyPartitons;
     for (Operation &op : loop.getOps()) {

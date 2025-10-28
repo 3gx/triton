@@ -832,8 +832,6 @@ void combineArefs(ArrayRef<ArefGetEnterOp> getEnterOps) {
       continue;
     }
 
-    assert(false);
-
     SmallVector<Type> arefBufTypes;
     SmallVector<Value> arefBufs;
     for (auto aref : arefs) {
