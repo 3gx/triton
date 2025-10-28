@@ -165,6 +165,7 @@ def make_default_opt_flags_amd(
         idle_sms=0,
         epilogue_subtile=epilogue_subtile,
         arch=None,
+        flatten=True,
         target_kernel_kwargs=target_kernel_kwargs,
     )
     # check constraints
