@@ -87,7 +87,7 @@ def block_scaled_matmul_kernel_persistent(
 
     MIXED_PREC: tl.constexpr = ELEM_PER_BYTE_A == 1 and ELEM_PER_BYTE_B == 2
 
-    for tile_id in tl.range(start_pid, num_tiles, tl.num_programs(0)):
+    for tile_id in tl.range(start_pid, num_tiles, tl.num_programs(0), warp_specialize=True):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_M
         offs_bn = pid_n * BLOCK_N
@@ -297,7 +297,7 @@ def block_scaled_matmul(
             num_stages=num_stages,
         )
 
-    # print(out.asm["ttgir"])
+    print(out.asm["ttgir"])
     return output
 
 
