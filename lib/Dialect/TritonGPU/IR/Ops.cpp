@@ -338,6 +338,7 @@ struct CanonicalizeConvertFromConvert
       rewriter.replaceOpWithNewOp<LocalLoadOp>(op, op->getResult(0).getType(),
                                                sharedLoad.getSrc(),
                                                sharedLoad.getToken());
+
       return success();
     }
 

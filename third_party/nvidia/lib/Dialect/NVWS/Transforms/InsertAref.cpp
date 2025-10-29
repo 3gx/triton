@@ -265,7 +265,10 @@ SetVector<Operation *> getTransitiveConsumers(Operation *op,
     } else {
       if (partitions.getPartition(user) == consumerPartition) {
         opConsumers.insert(user);
-        // TODO
+        // If an op is defined before an inner loop and used inside, the loop
+        // itself should be considered as an additional consumer. This is
+        // necessary for persistent attention, where the load of Q is done
+        // before the inner loop.
         opConsumers.insert(op->getBlock()->findAncestorOpInBlock(*user));
       }
     }
@@ -411,7 +414,6 @@ void createArefGet(PartitionBuilder &builder, scf::ForOp loop,
   }
 
   if (exitInsertPointAfter == nullptr) {
-    // TODO: is this correct for nested loop?
     PostDominanceInfo dom(loop);
     exitInsertPointAfter = findNearestCommonPostDominator(consumers, dom);
   }
