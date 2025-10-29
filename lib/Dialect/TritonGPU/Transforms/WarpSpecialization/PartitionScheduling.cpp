@@ -1,7 +1,9 @@
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Support/WalkResult.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
@@ -981,6 +983,16 @@ void assignRegionOpPartitions(scf::ForOp loop) {
   });
 }
 
+class FoldTmemStoreIntoAlloc : public OpRewritePattern<ttng::TMEMAllocOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ttng::TMEMAllocOp alloc,
+                                PatternRewriter &rewriter) const override {
+    return success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // Pass Definition
 //===----------------------------------------------------------------------===//
@@ -1001,6 +1013,16 @@ struct PartitionScheduling
 } // namespace
 
 void PartitionScheduling::runOnOperation() {
+  MLIRContext *context = &getContext();
+  ModuleOp m = getOperation();
+
+  OpPassManager pm;
+  mlir::RewritePatternSet patterns(context);
+  patterns.add<FoldTmemStoreIntoAlloc>(context);
+  ConvertLayoutOp::getCanonicalizationPatterns(patterns, context);
+  if (failed(applyPatternsGreedily(m, std::move(patterns))))
+    signalPassFailure();
+
   SmallVector<scf::ForOp> loops;
   getOperation().walk([&](scf::ForOp loop) {
     if (loop->hasAttr(kWarpSpecializeAttrName))
