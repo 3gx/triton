@@ -191,6 +191,13 @@ template <class T> struct AssignStagePhase {
           auto ids = *getPartitionIds(user);
           argIds.insert(ids.begin(), ids.end());
         }
+        if (argIds.empty()) {
+          auto blockArg = cast<BlockArgument>(arg);
+          auto pos = blockArg.getArgNumber() - 1;
+          auto initArg = forOp.getInitArgs()[pos];
+          auto ids = *getPartitionIds(initArg.getDefiningOp());
+          argIds.insert(ids.begin(), ids.end());
+        }
       }
       forOpIds.insert(argIds.begin(), argIds.end());
       forOpOutputsIds.push_back(argIds);
