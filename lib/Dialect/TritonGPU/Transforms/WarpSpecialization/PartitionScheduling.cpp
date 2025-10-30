@@ -5,6 +5,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/WalkResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Transforms/RegionUtils.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
@@ -1052,13 +1053,59 @@ void PartitionScheduling::runOnOperation() {
   if (failed(applyPatternsGreedily(m, std::move(patterns))))
     signalPassFailure();
 
-  return;
-
   SmallVector<scf::ForOp> loops;
+
   getOperation().walk([&](scf::ForOp loop) {
-    if (loop->hasAttr(kWarpSpecializeAttrName))
-      loops.push_back(loop);
+    if (loop->hasAttr(kWarpSpecializeAttrName)) {
+      SmallVector<ttng::TMEMAllocOp> tmemAllocToHoist;
+      loop.walk([&](ttng::TMEMAllocOp tmemAlloc) {
+        if (tmemAlloc->getParentOfType<scf::ForOp>() == loop) {
+          // For simplicity, only handle one additional level of hoisting. This
+          // is sufficient for a typical persistent kernel whose outermost loop
+          // is over output tiles.
+          tmemAllocToHoist.push_back(tmemAlloc);
+        }
+      });
+
+      for (auto alloc : tmemAllocToHoist) {
+        if (auto tok = alloc.getToken()) {
+          auto tokUsers = tok.getUsers();
+          if (tokUsers.empty()) {
+            return;
+          }
+          auto tokUser = *tokUsers.begin();
+
+          Value newTok;
+          if (auto store = dyn_cast<ttng::TMEMStoreOp>(tokUser)) {
+            newTok = store.getToken();
+          } else if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(tokUser)) {
+            newTok = mma.getToken();
+          } else if (auto innerFor = dyn_cast<scf::ForOp>(tokUser)) {
+            auto tokenVarIdx = tok.getUses().begin()->getOperandNumber() -
+                               innerFor.getNumControlOperands();
+            newTok = innerFor.getResult(tokenVarIdx);
+          } else {
+            // Unhandled case, skip hoisting
+            continue;
+          }
+
+          alloc->moveBefore(loop);
+
+          // Thread the token across loop nests
+          OpBuilder builder(loop);
+          loop = addIterArgsToLoop(builder, loop, {tok});
+          mlir::replaceAllUsesInRegionWith(tok, loop.getRegionIterArgs().back(),
+                                           loop.getRegion());
+          appendToForOpYield(loop, {newTok});
+        } else {
+          alloc->moveBefore(loop);
+        }
+      }
+    }
+
+    loops.push_back(loop);
   });
+
   for (auto [idx, loop] : llvm::enumerate(loops)) {
     if (std::optional<PartitionSet> partitions = getInitialPartitions(loop)) {
       propagatePartitions(loop, *partitions);
