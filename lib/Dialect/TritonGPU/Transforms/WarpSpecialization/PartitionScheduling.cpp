@@ -826,27 +826,31 @@ SetVector<int> getBlockPartitions(Block *block);
 SmallVector<SetVector<int>> getYieldPartitions(Block *block) {
   auto terminator = block->getTerminator();
   SmallVector<SetVector<int>> yieldPartitions(terminator->getNumOperands());
-  for (auto &opnd : terminator->getOpOperands()) {
-    auto op = opnd.get().getDefiningOp();
+  for (auto &opnd_ : terminator->getOpOperands()) {
+    auto opnd = &opnd_;
+    auto op = opnd->get().getDefiningOp();
+    std::optional<int> pos;
     if (auto forOp = dyn_cast<scf::ForOp>(block->getParentOp());
-        forOp && isa<AsyncTokenType>(opnd.get().getType())) {
+        forOp && isa<AsyncTokenType>(opnd->get().getType())) {
       // Heuristic: when for-op yields an async-token, the output partition of
       //            the token is that of its user.
       // At the moment token must have only one use
-      auto arg = forOp.getRegionIterArg(opnd.getOperandNumber());
+      auto arg = forOp.getRegionIterArg(opnd->getOperandNumber());
       assert(arg.hasOneUse());
       op = arg.getUses().begin()->getOwner();
-      assert(op);
+      if (isa<scf::ForOp, triton::ReduceOp>(op)) {
+        pos = arg.getArgNumber();
+      }
+    } else if (op && op->getNumRegions() > 0) {
+      // if producer is a regioned op, get positional result index
+      auto it = llvm::find(op->getResults(), opnd->get());
+      assert(it != op->getResults().end());
+      pos = it - op->getResults().begin();
     }
     if (!op)
       continue;
-    auto partitionIds = getPartitionIds(op);
-    if (op->getNumRegions() > 0) {
-      auto it = llvm::find(op->getResults(), opnd.get());
-      assert(it != op->getResults().end());
-      auto pos = it - op->getResults().begin();
-      partitionIds = getPartitionOutputs(op)[pos];
-    }
+    auto partitionIds =
+        pos ? getPartitionOutputs(op)[*pos] : getPartitionIds(op);
     if (!partitionIds) {
       // inherit from uses
       partitionIds = SetVector<int>();
@@ -858,7 +862,7 @@ SmallVector<SetVector<int>> getYieldPartitions(Block *block) {
         }
       }
     }
-    yieldPartitions[opnd.getOperandNumber()] = *partitionIds;
+    yieldPartitions[opnd->getOperandNumber()] = *partitionIds;
   }
   return yieldPartitions;
 }

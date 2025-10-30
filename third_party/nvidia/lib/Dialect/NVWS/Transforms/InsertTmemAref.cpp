@@ -232,11 +232,10 @@ struct TmemAccessDag {
         std::make_unique<Node>(allocOp, nullptr, partitionId, nullptr));
     accessDag.op2dagMap.insert({allocOp, accessDag.getRootNode()});
 
-    if (allocOp.getSrc()) {
+    if (allocOp.getSrc() && !allocOp.getToken()) {
       // Handle tmem_alloc with src operand specially. When a src operand is
       // present, no async tokens are generated, we can't traverse IR,
       // and we directly add the single user operation to the access DAG.
-      assert(!allocOp.getToken());
       assert(allocOp->hasOneUse());
       auto user = *allocOp->getUsers().begin();
       accessDag.getRootNode()->user.reset(new Node{
@@ -744,10 +743,7 @@ void workaroundForLoopScheduler(triton::FuncOp funcOp) {
 LogicalResult runOnFunction(triton::FuncOp funcOp) {
   SmallVector<TmemAccessDag> tmemDags;
   funcOp.walk([&](TMEMAllocOp allocOp) {
-    // skip allocOps with source and > 1 partition
-    auto partitionIds = getPartitionIds(allocOp);
-    if (!allocOp.getSrc() || (partitionIds && partitionIds->size() == 1))
-      tmemDags.push_back(TmemAccessDag::build(allocOp));
+    tmemDags.push_back(TmemAccessDag::build(allocOp));
   });
 
   for (auto &accessDag : tmemDags) {
