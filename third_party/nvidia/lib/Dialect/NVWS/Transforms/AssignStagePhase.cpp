@@ -151,20 +151,16 @@ template <class T> struct AssignStagePhase {
 
     // update yieldOp to return new indexes
     SmallVector<Value> extraYieldArgs;
-    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-
     // associate token with stage positional argument in the iterArgs & yieldOp
     // we will need this in propagateStage function that will assign stage
     // to arefBuffer and arefExit ops
-
-    int nargs = extraYieldArgs.size();
     extraYieldArgs.push_back(indexInBlock.stage);
     if (index.phase)
       extraYieldArgs.push_back(indexInBlock.phase);
     appendToForOpYield(forOp, extraYieldArgs);
-    tokToStagePosMap[{forOp, index.token}] = nArgs + nargs;
+    tokToStagePosMap[{forOp, index.token}] = nArgs;
     tokToStagePosMap[{forOp.getBody()->getTerminator(), indexInBlock.token}] =
-        nArgs + nargs;
+        nArgs;
 
     // update partitions of the forOp
     assert(hasPartition(forOp));
@@ -195,7 +191,8 @@ template <class T> struct AssignStagePhase {
           auto blockArg = cast<BlockArgument>(arg);
           auto pos = blockArg.getArgNumber() - 1;
           auto initArg = forOp.getInitArgs()[pos];
-          if (auto initOp = initArg.getDefiningOp(); initOp && hasPartition(initOp)) {
+          if (auto initOp = initArg.getDefiningOp();
+              initOp && hasPartition(initOp)) {
             auto ids = *getPartitionIds(initOp);
             argIds.insert(ids.begin(), ids.end());
           }
