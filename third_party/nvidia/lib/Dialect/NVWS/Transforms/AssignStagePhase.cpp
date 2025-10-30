@@ -191,8 +191,11 @@ template <class T> struct AssignStagePhase {
           auto blockArg = cast<BlockArgument>(arg);
           auto pos = blockArg.getArgNumber() - 1;
           auto initArg = forOp.getInitArgs()[pos];
-          auto ids = *getPartitionIds(initArg.getDefiningOp());
-          argIds.insert(ids.begin(), ids.end());
+          if (auto ids = getPartitionIds(initArg.getDefiningOp())) {
+            // initArg can be from outside ttg.ws loop and may not have
+            // annotations
+            argIds.insert(ids->begin(), ids->end());
+          }
         }
       }
       forOpIds.insert(argIds.begin(), argIds.end());
