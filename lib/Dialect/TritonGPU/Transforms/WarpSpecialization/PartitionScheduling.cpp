@@ -1,5 +1,6 @@
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/WalkResult.h"
@@ -989,7 +990,35 @@ public:
 
   LogicalResult matchAndRewrite(ttng::TMEMAllocOp alloc,
                                 PatternRewriter &rewriter) const override {
-    return success();
+    if (alloc.getSrc()) {
+      return failure();
+    }
+
+    for (auto user : alloc->getUsers()) {
+      if (auto store = dyn_cast<ttng::TMEMStoreOp>(user)) {
+        auto storeSrc = store.getSrc();
+        if (auto storeSrcDef = storeSrc.getDefiningOp()) {
+          DominanceInfo dom(storeSrcDef);
+          if (dom.dominates(storeSrcDef, alloc)) {
+            auto newAlloc = rewriter.create<ttng::TMEMAllocOp>(
+                alloc.getLoc(), alloc.getResultTypes()[0],
+                rewriter.getType<AsyncTokenType>(), storeSrc);
+
+            if (auto allocTok = alloc.getToken()) {
+              allocTok.replaceAllUsesWith(newAlloc.getToken());
+            }
+            if (auto storeTok = store.getToken()) {
+              storeTok.replaceAllUsesWith(newAlloc.getToken());
+            }
+            rewriter.eraseOp(store);
+            rewriter.replaceOp(alloc, newAlloc);
+            return success();
+          }
+        }
+      }
+    }
+
+    return failure();
   }
 };
 
@@ -1022,6 +1051,8 @@ void PartitionScheduling::runOnOperation() {
   ConvertLayoutOp::getCanonicalizationPatterns(patterns, context);
   if (failed(applyPatternsGreedily(m, std::move(patterns))))
     signalPassFailure();
+
+  return;
 
   SmallVector<scf::ForOp> loops;
   getOperation().walk([&](scf::ForOp loop) {
