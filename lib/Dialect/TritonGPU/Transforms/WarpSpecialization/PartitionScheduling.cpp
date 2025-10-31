@@ -1072,23 +1072,42 @@ void PartitionScheduling::runOnOperation() {
       });
 
       for (auto alloc : tmemAllocToHoist) {
+	// TODO: check if hoisting is safe
+
         if (auto tok = alloc.getToken()) {
           auto tokUsers = tok.getUsers();
           if (tokUsers.empty()) {
             return;
           }
-          auto tokUser = *tokUsers.begin();
 
-          Value newTok;
-          if (auto store = dyn_cast<ttng::TMEMStoreOp>(tokUser)) {
-            newTok = store.getToken();
-          } else if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(tokUser)) {
-            newTok = mma.getToken();
-          } else if (auto innerFor = dyn_cast<scf::ForOp>(tokUser)) {
-            auto tokenVarIdx = tok.getUses().begin()->getOperandNumber() -
-                               innerFor.getNumControlOperands();
-            newTok = innerFor.getResult(tokenVarIdx);
-          } else {
+          Value lastTok;
+
+          while (!tokUsers.empty()) {
+            auto tokUser = *tokUsers.begin();
+
+            Value newTok;
+            if (auto load = dyn_cast<ttng::TMEMLoadOp>(tokUser)) {
+              newTok = load.getToken();
+            }
+            if (auto store = dyn_cast<ttng::TMEMStoreOp>(tokUser)) {
+              newTok = store.getToken();
+            } else if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(tokUser)) {
+              newTok = mma.getToken();
+            } else if (auto innerFor = dyn_cast<scf::ForOp>(tokUser)) {
+              auto tokenVarIdx = tok.getUses().begin()->getOperandNumber() -
+                                 innerFor.getNumControlOperands();
+              newTok = innerFor.getResult(tokenVarIdx);
+            }
+
+	    if (!newTok) {
+	      break;
+	    }
+
+            tokUsers = newTok.getUsers();
+            lastTok = newTok;
+          }
+
+          if (!lastTok) {
             // Unhandled case, skip hoisting
             continue;
           }
@@ -1100,7 +1119,7 @@ void PartitionScheduling::runOnOperation() {
           loop = addIterArgsToLoop(builder, loop, {tok});
           mlir::replaceAllUsesInRegionWith(tok, loop.getRegionIterArgs().back(),
                                            loop.getRegion());
-          appendToForOpYield(loop, {newTok});
+          appendToForOpYield(loop, {lastTok});
         } else {
           alloc->moveBefore(loop);
         }
