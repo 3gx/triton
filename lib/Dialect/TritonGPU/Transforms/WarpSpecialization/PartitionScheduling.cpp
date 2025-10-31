@@ -1072,7 +1072,7 @@ void PartitionScheduling::runOnOperation() {
       });
 
       for (auto alloc : tmemAllocToHoist) {
-	// TODO: check if hoisting is safe
+        // TODO: check if hoisting is safe
 
         if (auto tok = alloc.getToken()) {
           auto tokUsers = tok.getUsers();
@@ -1099,9 +1099,9 @@ void PartitionScheduling::runOnOperation() {
               newTok = innerFor.getResult(tokenVarIdx);
             }
 
-	    if (!newTok) {
-	      break;
-	    }
+            if (!newTok) {
+              break;
+            }
 
             tokUsers = newTok.getUsers();
             lastTok = newTok;
@@ -1124,9 +1124,9 @@ void PartitionScheduling::runOnOperation() {
           alloc->moveBefore(loop);
         }
       }
-    }
 
-    loops.push_back(loop);
+      loops.push_back(loop);
+    }
   });
 
   for (auto [idx, loop] : llvm::enumerate(loops)) {
