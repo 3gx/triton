@@ -16,6 +16,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "llvm/ADT/SmallVector.h"
 
 namespace mlir {
 namespace triton {
@@ -35,38 +36,25 @@ struct ProducedValueInfo {
   Value result;
 };
 
-bool samePartition(Operation *op1, Operation *op2) {
-  auto part1 = getPartitionIds(op1);
-  auto part2 = getPartitionIds(op2);
-
-  if (!part1 || !part2) {
-    return false;
-  }
-
-  return *part1 == *part2;
-}
-
 SmallVector<ProducedValueInfo> getProducedValues(Operation *op,
                                                  Block *loopBody) {
   SmallVector<ProducedValueInfo> producedValues;
   auto partitionIds = getPartitionIds(op);
 
-  if (partitionIds) {
-    if (op->getNumRegions() == 0) {
-      for (auto result : op->getResults()) {
-        if (isa<AsyncTokenType>(result.getType()))
-          continue;
-        producedValues.push_back({*partitionIds, result});
-      }
-    } else if (op->getNumRegions() > 0) {
-      auto partitionOutputs = getPartitionOutputs(op);
-      for (auto result : op->getResults()) {
-        if (isa<AsyncTokenType>(result.getType()))
-          continue;
-        producedValues.push_back(
-            {partitionOutputs[result.getResultNumber()], result});
-      }
-    }
+  if (!partitionIds)
+    return {};
+
+  // For ops without regions, all results share the same partition IDs
+  auto partitionOutputs =
+      op->getNumRegions() == 0
+          ? SmallVector<SetVector<int>, 4>(op->getNumResults(), *partitionIds)
+          : getPartitionOutputs(op);
+
+  for (auto result : op->getResults()) {
+    if (isa<AsyncTokenType>(result.getType()))
+      continue;
+    producedValues.push_back(
+        {partitionOutputs[result.getResultNumber()], result});
   }
 
   return producedValues;
@@ -273,7 +261,8 @@ getTransitiveConsumers(Operation *op,
     if (llvm::count_if(use.getOwner()->getResults(), isMemDesc) > 0) {
       // Recurse into consumers of memdesc ops, since the liveness of the
       // produced value extends beyond such ops.
-      auto consumers = getTransitiveConsumers(use.getOwner(), consumerPartitions);
+      auto consumers =
+          getTransitiveConsumers(use.getOwner(), consumerPartitions);
       opConsumers.insert(consumers.begin(), consumers.end());
     } else {
       if (getPartitionIds(&use) == consumerPartitions) {
@@ -290,9 +279,9 @@ getTransitiveConsumers(const SetVector<Value> &results,
   SetVector<Operation *> opSet;
   for (auto result : results) {
     if (isa<BlockArgument>(result)) {
-      for (auto user : result.getUsers()) {
-        if (*getPartitionIds(user) == consumerPartitions) {
-          opSet.insert(user);
+      for (auto &use : result.getUses()) {
+        if (getPartitionIds(&use) == consumerPartitions) {
+          opSet.insert(use.getOwner());
         }
       }
     } else {
@@ -337,6 +326,10 @@ getEnterAndExitStageClustersOfUses(const SetVector<Value> &producedResults,
   SmallVector<Operation *> ops;
   for (auto res : producedResults) {
     if (auto blockArg = dyn_cast<BlockArgument>(res)) {
+      // If the producer is a block argument, this means we need to communicate
+      // iteration arguments from the producer partition in the previous
+      // iteration to the consumer partition in the current iteration. There
+      // must be only one produced result in this case.
       assert(producedResults.size() == 1);
       auto block = blockArg.getOwner();
       auto forOp = cast<scf::ForOp>(block->getParentOp());
@@ -356,17 +349,6 @@ getEnterAndExitStageClustersOfUses(const SetVector<Value> &producedResults,
   assert(firstOp && lastOp);
 
   return std::make_pair(getStageCluster(firstOp), getStageCluster(lastOp));
-}
-
-static Operation *getEarliestUserInBlock(Block *block,
-                                         ArrayRef<OpOperand *> uses) {
-  OpOperand *use =
-      *llvm::min_element(uses, [block](OpOperand *lhs, OpOperand *rhs) {
-        auto lhsOwner = block->findAncestorOpInBlock(*lhs->getOwner());
-        auto rhsOwner = block->findAncestorOpInBlock(*rhs->getOwner());
-        return lhsOwner->isBeforeInBlock(rhsOwner);
-      });
-  return block->findAncestorOpInBlock(*use->getOwner());
 }
 
 void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
@@ -411,7 +393,6 @@ void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
 
     for (auto use : uses) {
       if (use->get() == result) {
-        assert(isa<RankedTensorType>(use->get().getType()));
         use->set(localLoadOp.getResult());
       }
     }
@@ -425,7 +406,6 @@ void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
 
   for (auto result : results) {
     if (auto localAlloc = result.getDefiningOp<LocalAllocOp>()) {
-      // auto memDescType = cast<MemDescType>(result.getType());
       auto callback = [&](Operation *oldOp, Operation *newOp) {
         assert(llvm::is_contained(*getPartitionIds(oldOp), consumerPartition));
         setPartition(newOp, consumerPartitions);
@@ -455,6 +435,16 @@ void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
                                          builder.getArrayAttr(asyncKinds));
 };
 
+Operation *getEarliestUserInBlock(Block *block, ArrayRef<OpOperand *> uses) {
+  OpOperand *use =
+      *llvm::min_element(uses, [block](OpOperand *lhs, OpOperand *rhs) {
+        auto lhsOwner = block->findAncestorOpInBlock(*lhs->getOwner());
+        auto rhsOwner = block->findAncestorOpInBlock(*rhs->getOwner());
+        return lhsOwner->isBeforeInBlock(rhsOwner);
+      });
+  return block->findAncestorOpInBlock(*use->getOwner());
+}
+
 bool insertArefs(OpBuilder &builder, scf::ForOp loop, Block *block,
                  ProducedValueInfo producedValue) {
   // Collect uses of local_alloc(desc_load()) or desc_load() results by each
@@ -466,8 +456,7 @@ bool insertArefs(OpBuilder &builder, scf::ForOp loop, Block *block,
       auto user = use.getOwner();
       auto userPartitions = getPartitionIds(user);
       if (isa<scf::YieldOp>(user)) {
-        userPartitions =
-            getPartitionOutputs(user->getParentOp())[use.getOperandNumber()];
+        userPartitions = getPartitionIds(&use);
       }
       assert(userPartitions);
       for (auto id : producedValue.partitions) {
@@ -534,9 +523,10 @@ public:
     });
 
     for (scf::ForOp loop : loops) {
-      if (!loop->hasAttr(triton::kWarpSpecializeAttrName))
-        continue;
 
+      // Communicate tensor arguments in iter_args from producer partition in
+      // current iteration to consumer partition in previous iteration or
+      // initial value
       loop.walk([&](scf::ForOp forOp) {
         for (auto arg : forOp.getRegionIterArgs()) {
           if (isa<RankedTensorType>(arg.getType())) {
@@ -549,8 +539,6 @@ public:
           }
         }
       });
-
-      int arefTag = 0;
 
       // To handle cases where desc_load result in registers is used as is in
       // addition to being consumed by local_alloc op, we process
