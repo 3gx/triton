@@ -455,10 +455,12 @@ bool insertArefs(OpBuilder &builder, scf::ForOp loop, Block *block,
     for (auto &use : result.getUses()) {
       auto user = use.getOwner();
       auto userPartitions = getPartitionIds(user);
+      // if use is outside ttg.ws, it may not have partition ids, skip it
+      if (!userPartitions)
+        continue;
       if (isa<scf::YieldOp>(user)) {
         userPartitions = getPartitionIds(&use);
       }
-      assert(userPartitions);
       for (auto id : producedValue.partitions) {
         userPartitions->remove(id);
       }
@@ -565,25 +567,30 @@ public:
       ops.clear();
       // handle all other ops, including register uses of desc_load results.
       loop.walk([&](Operation *op) {
-      //   if (op->getNumResults() == 0) {
-      //     return WalkResult::advance();
-      //   }
-      //   if (isDescLoadAndAlloc<LocalAllocOp>(op->getResult(0)) ||
-      //       isDescLoadAndAlloc<TMEMAllocOp>(op->getResult(0)) ||
-      //       isa<LocalAllocOp, MMAv5OpInterface, TMEMAllocOp, TMEMStoreOp,
-      //           TMEMAllocOp>(op)) {
-      //     return WalkResult::advance();
-      //   }
-      //   ops.push_back(op);
-      //   return WalkResult::advance();
-      // });
-      // for (auto op : ops) {
+        if (isa<LocalAllocOp, MMAv5OpInterface, TMEMAllocOp, TMEMStoreOp,
+                TMEMAllocOp>(op)) {
+          return WalkResult::advance();
+        }
+        //   if (op->getNumResults() == 0) {
+        //     return WalkResult::advance();
+        //   }
+        //   if (isDescLoadAndAlloc<LocalAllocOp>(op->getResult(0)) ||
+        //       isDescLoadAndAlloc<TMEMAllocOp>(op->getResult(0)) ||
+        //       isa<LocalAllocOp, MMAv5OpInterface, TMEMAllocOp, TMEMStoreOp,
+        //           TMEMAllocOp>(op)) {
+        //     return WalkResult::advance();
+        //   }
+        //   ops.push_back(op);
+        //   return WalkResult::advance();
+        // });
+        // for (auto op : ops) {
         auto producedValues = getProducedValues(op, loop.getBody());
         for (auto producedValue : producedValues) {
           OpBuilder builder(op);
           builder.setInsertionPointAfter(op);
           insertArefs(builder, loop, op->getBlock(), producedValue);
         }
+        return WalkResult::advance();
       });
     }
   }
