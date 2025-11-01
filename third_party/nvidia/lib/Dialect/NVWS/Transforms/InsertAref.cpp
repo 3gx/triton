@@ -269,9 +269,7 @@ getTransitiveConsumers(Operation *op,
                        SetVector<int> const &consumerPartitions) {
   SetVector<Operation *> opConsumers;
   auto isMemDesc = [](auto res) { return isa<MemDescType>(res.getType()); };
-  // llvm::errs() << "Xop: " << *op << "\n";
   for (auto user : op->getUsers()) {
-    // llvm::errs() << "Xuser: " << *user << "\n";
     if (llvm::count_if(user->getResults(), isMemDesc) > 0) {
       // Recurse into consumers of memdesc ops, since the liveness of the
       // produced value extends beyond such ops.
@@ -411,34 +409,18 @@ void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
         builder, loc, consumerPartitions, stageCluster, result.getType(),
         dataBuf);
 
-#if 1
     for (auto use : uses) {
-      // auto userPartition = getPartitionIds(use->getOwner());
-      // for (auto id : *userPartition) {
-      //   if (llvm::is_contained(consumerPartitions, id)) {
-      //     use->set(localLoadOp.getResult());
-      //   }
-      // }
       if (use->get() == result) {
         assert(isa<RankedTensorType>(use->get().getType()));
         use->set(localLoadOp.getResult());
       }
     }
-#else
-    result.replaceAllUsesWith(localLoadOp.getResult());
-#endif
     if (dataBuf.hasOneUse()) {
       // If there is only one consumer for dataBuf, it is localLoadOp then
       // above, and we hit this code path, the empty barrier can be released
       // after local load.
       exitInsertPointAfter = localLoadOp;
     }
-    // llvm::errs()<< "consumers.size(): " << consumers.size() << "\n";
-    //    if (consumers.size() == 1) {
-    // If there is only one consumer and we hit this code path, the empty
-    // barrier can be released after local load.
-    // exitInsertPointAfter = localLoadOp;
-    //   }
   };
 
   for (auto result : results) {
@@ -479,7 +461,6 @@ bool insertArefs(OpBuilder &builder, scf::ForOp loop, Block *block,
   // partition
   DenseMap<int, SetVector<Value>> resultsPerPartition;
   DenseMap<int, SmallVector<OpOperand *>> usesPerPartition;
-  //  SmallVector<OpOperand *> uses;
   auto processResultUses = [&](Value result) {
     for (auto &use : result.getUses()) {
       auto user = use.getOwner();
@@ -488,7 +469,6 @@ bool insertArefs(OpBuilder &builder, scf::ForOp loop, Block *block,
         userPartitions =
             getPartitionOutputs(user->getParentOp())[use.getOperandNumber()];
       }
-      // llvm::errs() << "Xuser: " << *user << "\n";
       assert(userPartitions);
       for (auto id : producedValue.partitions) {
         userPartitions->remove(id);
@@ -498,25 +478,6 @@ bool insertArefs(OpBuilder &builder, scf::ForOp loop, Block *block,
         usesPerPartition[id].push_back(&use);
       }
     }
-#if 0
-    if (isa<RankedTensorType>(result.getType())) {
-      for (auto &use : result.getUses()) {
-        auto userPartitions = getPartitionIds(use.getOwner());
-        if (isa<scf::YieldOp>(use.getOwner())) {
-          userPartitions = getPartitionOutputs(
-              use.getOwner()->getParentOp())[use.getOperandNumber()];
-        }
-        if (userPartitions) {
-          for (auto id : producedValue.partitions) {
-            userPartitions->remove(id);
-          }
-          if (!userPartitions->empty()) {
-            uses.push_back(&use);
-          }
-        }
-      }
-    }
-#endif
   };
 
   processResultUses(producedValue.result);
@@ -541,35 +502,15 @@ bool insertArefs(OpBuilder &builder, scf::ForOp loop, Block *block,
     aref = createAref(builder, producedValue);
   }
 
-  // llvm::errs() << "Xarf: producers: [";
-  // for (auto partition : producedValue.partitions) {
-  //   llvm::errs() << partition << " ";
-  // }
-  // llvm::errs() << "]\n";
   auto staleOps = createArefPut(builder, aref, producedValue);
-  // llvm::errs() << "MOD-01:\n" << aref->getParentOfType<ModuleOp>() << "\n";
 
   for (auto [consumerPartition, results] : resultsPerPartition) {
-    // SmallVector<OpOperand *> consumerUses;
-    // for (auto val : results) {
-    //   for (auto &use : val.getUses()) {
-    //     consumerUses.push_back(&use);
-    //   }
-    // }
     OpBuilder::InsertionGuard g(builder);
     auto earliestUser =
         getEarliestUserInBlock(block, usesPerPartition[consumerPartition]);
     builder.setInsertionPoint(earliestUser);
-    // llvm::errs() << "Xconsumer: " << consumerPartition << "\n";
-    // llvm::errs() << "Xresults: [";
-    // for (auto result : results) {
-    //   llvm::errs() << result << " ";
-    // }
-    // llvm::errs() << "]\n";
-    //    createArefGet(builder, loop, aref, results, consumerPartition, uses);
     createArefGet(builder, loop, aref, results, consumerPartition,
                   usesPerPartition[consumerPartition]);
-    // llvm::errs() << "MOD-02:\n" << aref->getParentOfType<ModuleOp>() << "\n";
   }
 
   for (auto op : staleOps) {
@@ -585,7 +526,6 @@ class NVWSArefInsertion
     : public triton::impl::NVWSInsertArefBase<NVWSArefInsertion> {
 public:
   void runOnFunction(triton::FuncOp func) {
-    // llvm::errs() << "FUNC: " << func.getName() << "\n";
     SmallVector<scf::ForOp> loops;
     func.walk([&](scf::ForOp loop) {
       auto func = loop->getParentOfType<triton::FuncOp>();
@@ -596,7 +536,6 @@ public:
     for (scf::ForOp loop : loops) {
       if (!loop->hasAttr(triton::kWarpSpecializeAttrName))
         continue;
-      // llvm::errs() << "X0-- loop: " << loop << "\n";
 
       loop.walk([&](scf::ForOp forOp) {
         for (auto arg : forOp.getRegionIterArgs()) {
@@ -627,24 +566,19 @@ public:
         }
         // Only handles load ops for now.
         if (isDescLoadAndAlloc<LocalAllocOp>(op->getResult(0)) ||
-            //            isDescLoadAndAlloc<TMEMAllocOp>(op->getResult(0)) ||
             isa<LocalAllocOp>(op)) {
-          // llvm::errs() << "Xop: " << *op << "\n";
           ops.push_back(op);
         }
         return WalkResult::advance();
       });
 
       for (auto op : ops) {
-        // llvm::errs() << "Yop: " << *op << "\n";
         auto producedValues = getProducedValues(op, loop.getBody());
         for (auto producedValue : producedValues) {
           OpBuilder builder(op);
-          // llvm::errs() << "Xop: " << *op << "\n";
           insertArefs(builder, loop, op->getBlock(), producedValue);
         }
       }
-      // llvm::errs() << "X1\n" << loop << "\n";
 
       ops.clear();
       // handle all other ops
@@ -661,12 +595,10 @@ public:
                 TMEMAllocOp>(op)) {
           return WalkResult::advance();
         }
-        // llvm::errs() << "Zop: " << *op << "\n";
         ops.push_back(op);
         return WalkResult::advance();
       });
       for (auto op : ops) {
-        // llvm::errs() << "Aop: " << *op << "\n";
         auto producedValues = getProducedValues(op, loop.getBody());
         for (auto producedValue : producedValues) {
           OpBuilder builder(op);
@@ -679,7 +611,6 @@ public:
 
   void runOnOperation() override {
     getOperation().walk([&](triton::FuncOp func) { runOnFunction(func); });
-    // llvm::errs() << "FINAL:mod\n" << getOperation() << "\n";
   }
 };
 
