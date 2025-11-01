@@ -46,7 +46,6 @@ bool samePartition(Operation *op1, Operation *op2) {
   return *part1 == *part2;
 }
 
-
 SmallVector<ProducedValueInfo> getProducedValues(Operation *op,
                                                  Block *loopBody) {
   SmallVector<ProducedValueInfo> producedValues;
@@ -55,14 +54,14 @@ SmallVector<ProducedValueInfo> getProducedValues(Operation *op,
   if (partitionIds) {
     if (op->getNumRegions() == 0) {
       for (auto result : op->getResults()) {
-        if (isa<AsyncTokenType>(result.getType())) 
+        if (isa<AsyncTokenType>(result.getType()))
           continue;
         producedValues.push_back({*partitionIds, result});
       }
     } else if (op->getNumRegions() > 0) {
       auto partitionOutputs = getPartitionOutputs(op);
       for (auto result : op->getResults()) {
-        if (isa<AsyncTokenType>(result.getType())) 
+        if (isa<AsyncTokenType>(result.getType()))
           continue;
         producedValues.push_back(
             {partitionOutputs[result.getResultNumber()], result});
@@ -361,6 +360,15 @@ getEnterAndExitStageClustersOfUses(const SetVector<Value> &producedResults,
   return std::make_pair(getStageCluster(firstOp), getStageCluster(lastOp));
 }
 
+static Operation *getEarliestUserInBlock(Block *block, ArrayRef<OpOperand *> uses) {
+  OpOperand *use = *llvm::min_element(uses, [block](OpOperand *lhs, OpOperand *rhs) {
+    auto lhsOwner = block->findAncestorOpInBlock(*lhs->getOwner());
+    auto rhsOwner = block->findAncestorOpInBlock(*rhs->getOwner());
+    return lhsOwner->isBeforeInBlock(rhsOwner);
+  });
+  return block->findAncestorOpInBlock(*use->getOwner());
+}
+
 void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
                    const SetVector<Value> &results, int consumerPartition,
                    SmallVector<OpOperand *> &uses) {
@@ -400,6 +408,7 @@ void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
     auto localLoadOp = triton::gpu::createInto<LocalLoadOp>(
         builder, loc, consumerPartitions, stageCluster, result.getType(),
         dataBuf);
+
 #if 1
     for (auto use : uses) {
       auto userPartition = getPartitionIds(use->getOwner());
@@ -460,7 +469,7 @@ void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
 };
 
 bool insertArefs(OpBuilder &builder, scf::ForOp loop,
-                 ProducedValueInfo producedValue) {
+                 Block *block, ProducedValueInfo producedValue) {
   // Collect uses of local_alloc(desc_load()) or desc_load() results by each
   // partition
   DenseMap<int, SetVector<Value>> resultsPerPartition;
@@ -532,13 +541,24 @@ bool insertArefs(OpBuilder &builder, scf::ForOp loop,
   // llvm::errs() << "MOD-01:\n" << aref->getParentOfType<ModuleOp>() << "\n";
 
   for (auto [consumerPartition, results] : resultsPerPartition) {
+    SmallVector<OpOperand *> consumerUses;
+    for (auto val : results) {
+      for (auto &use : val.getUses()) {
+        consumerUses.push_back(&use);
+      }
+    }
+    OpBuilder::InsertionGuard g(builder);
+    auto earliestUser = getEarliestUserInBlock(block, consumerUses);
+    builder.setInsertionPoint(earliestUser);
     // llvm::errs() << "Xconsumer: " << consumerPartition << "\n";
     // llvm::errs() << "Xresults: [";
     // for (auto result : results) {
     //   llvm::errs() << result << " ";
     // }
     // llvm::errs() << "]\n";
-    createArefGet(builder, loop, aref, results, consumerPartition, uses);
+    //    createArefGet(builder, loop, aref, results, consumerPartition, uses);
+    createArefGet(builder, loop, aref, results, consumerPartition,
+                  consumerUses);
     // llvm::errs() << "MOD-02:\n" << aref->getParentOfType<ModuleOp>() << "\n";
   }
 
@@ -576,7 +596,7 @@ public:
             ProducedValueInfo producedValue{producerPartition, arg};
             OpBuilder builder(forOp);
             builder.setInsertionPointToStart(forOp.getBody());
-            insertArefs(builder, loop, producedValue);
+            insertArefs(builder, loop, forOp.getBody(), producedValue);
           }
         }
       });
@@ -611,7 +631,7 @@ public:
         for (auto producedValue : producedValues) {
           OpBuilder builder(op);
           // llvm::errs() << "Xop: " << *op << "\n";
-          insertArefs(builder, loop, producedValue);
+          insertArefs(builder, loop, op->getBlock(), producedValue);
         }
       }
       // llvm::errs() << "X1\n" << loop << "\n";
@@ -641,7 +661,7 @@ public:
         for (auto producedValue : producedValues) {
           OpBuilder builder(op);
           builder.setInsertionPointAfter(op);
-          insertArefs(builder, loop, producedValue);
+          insertArefs(builder, loop, op->getBlock(), producedValue);
         }
       }
     }
