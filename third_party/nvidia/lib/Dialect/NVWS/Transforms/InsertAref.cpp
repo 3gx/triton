@@ -558,7 +558,7 @@ bool insertArefs(OpBuilder &builder, scf::ForOp loop,
     // llvm::errs() << "]\n";
     //    createArefGet(builder, loop, aref, results, consumerPartition, uses);
     createArefGet(builder, loop, aref, results, consumerPartition,
-                  consumerUses);
+                  uses);
     // llvm::errs() << "MOD-02:\n" << aref->getParentOfType<ModuleOp>() << "\n";
   }
 
