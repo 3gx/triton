@@ -269,15 +269,15 @@ getTransitiveConsumers(Operation *op,
                        SetVector<int> const &consumerPartitions) {
   SetVector<Operation *> opConsumers;
   auto isMemDesc = [](auto res) { return isa<MemDescType>(res.getType()); };
-  for (auto user : op->getUsers()) {
-    if (llvm::count_if(user->getResults(), isMemDesc) > 0) {
+  for (auto &use : op->getUses()) {
+    if (llvm::count_if(use.getOwner()->getResults(), isMemDesc) > 0) {
       // Recurse into consumers of memdesc ops, since the liveness of the
       // produced value extends beyond such ops.
-      auto consumers = getTransitiveConsumers(user, consumerPartitions);
+      auto consumers = getTransitiveConsumers(use.getOwner(), consumerPartitions);
       opConsumers.insert(consumers.begin(), consumers.end());
     } else {
-      if (*getPartitionIds(user) == consumerPartitions) {
-        opConsumers.insert(user);
+      if (getPartitionIds(&use) == consumerPartitions) {
+        opConsumers.insert(use.getOwner());
       }
     }
   }

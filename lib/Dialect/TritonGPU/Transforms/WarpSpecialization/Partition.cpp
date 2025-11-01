@@ -249,7 +249,7 @@ SmallVector<SetVector<int>, 4> getPartitionOutputs(Operation *op) {
   return partitionOutputsIds;
 }
 
-SetVector<int> getPartitions(OpOperand *use) {
+SetVector<int> getPartitionIds(OpOperand *use) {
   auto owner = use->getOwner();
   if (isa<scf::YieldOp>(owner)) {
     return getPartitionOutputs(owner->getParentOp())[use->getOperandNumber()];
