@@ -546,9 +546,6 @@ public:
       // desc_load results.
       SmallVector<Operation *> ops;
       loop.walk([&](Operation *op) {
-        if (loop == op) {
-          return WalkResult::advance();
-        }
         if (op->getNumResults() == 0) {
           return WalkResult::advance();
         }
