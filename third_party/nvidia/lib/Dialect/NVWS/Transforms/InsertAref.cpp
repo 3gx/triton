@@ -360,12 +360,14 @@ getEnterAndExitStageClustersOfUses(const SetVector<Value> &producedResults,
   return std::make_pair(getStageCluster(firstOp), getStageCluster(lastOp));
 }
 
-static Operation *getEarliestUserInBlock(Block *block, ArrayRef<OpOperand *> uses) {
-  OpOperand *use = *llvm::min_element(uses, [block](OpOperand *lhs, OpOperand *rhs) {
-    auto lhsOwner = block->findAncestorOpInBlock(*lhs->getOwner());
-    auto rhsOwner = block->findAncestorOpInBlock(*rhs->getOwner());
-    return lhsOwner->isBeforeInBlock(rhsOwner);
-  });
+static Operation *getEarliestUserInBlock(Block *block,
+                                         ArrayRef<OpOperand *> uses) {
+  OpOperand *use =
+      *llvm::min_element(uses, [block](OpOperand *lhs, OpOperand *rhs) {
+        auto lhsOwner = block->findAncestorOpInBlock(*lhs->getOwner());
+        auto rhsOwner = block->findAncestorOpInBlock(*rhs->getOwner());
+        return lhsOwner->isBeforeInBlock(rhsOwner);
+      });
   return block->findAncestorOpInBlock(*use->getOwner());
 }
 
@@ -411,13 +413,16 @@ void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
 
 #if 1
     for (auto use : uses) {
-      auto userPartition = getPartitionIds(use->getOwner());
-      for (auto id : *userPartition) {
-        if (llvm::is_contained(consumerPartitions, id)) {
-          use->set(localLoadOp.getResult());
-        }
+      // auto userPartition = getPartitionIds(use->getOwner());
+      // for (auto id : *userPartition) {
+      //   if (llvm::is_contained(consumerPartitions, id)) {
+      //     use->set(localLoadOp.getResult());
+      //   }
+      // }
+      if (use->get() == result) {
+        assert(isa<RankedTensorType>(use->get().getType()));
+        use->set(localLoadOp.getResult());
       }
-      // use->set(localLoadOp.getResult());
     }
 #else
     result.replaceAllUsesWith(localLoadOp.getResult());
@@ -468,12 +473,13 @@ void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
                                          builder.getArrayAttr(asyncKinds));
 };
 
-bool insertArefs(OpBuilder &builder, scf::ForOp loop,
-                 Block *block, ProducedValueInfo producedValue) {
+bool insertArefs(OpBuilder &builder, scf::ForOp loop, Block *block,
+                 ProducedValueInfo producedValue) {
   // Collect uses of local_alloc(desc_load()) or desc_load() results by each
   // partition
   DenseMap<int, SetVector<Value>> resultsPerPartition;
-  SmallVector<OpOperand *> uses;
+  DenseMap<int, SmallVector<OpOperand *>> usesPerPartition;
+  //  SmallVector<OpOperand *> uses;
   auto processResultUses = [&](Value result) {
     for (auto &use : result.getUses()) {
       auto user = use.getOwner();
@@ -489,8 +495,10 @@ bool insertArefs(OpBuilder &builder, scf::ForOp loop,
       }
       for (auto id : *userPartitions) {
         resultsPerPartition[id].insert(result);
+        usesPerPartition[id].push_back(&use);
       }
     }
+#if 0
     if (isa<RankedTensorType>(result.getType())) {
       for (auto &use : result.getUses()) {
         auto userPartitions = getPartitionIds(use.getOwner());
@@ -508,6 +516,7 @@ bool insertArefs(OpBuilder &builder, scf::ForOp loop,
         }
       }
     }
+#endif
   };
 
   processResultUses(producedValue.result);
@@ -541,14 +550,15 @@ bool insertArefs(OpBuilder &builder, scf::ForOp loop,
   // llvm::errs() << "MOD-01:\n" << aref->getParentOfType<ModuleOp>() << "\n";
 
   for (auto [consumerPartition, results] : resultsPerPartition) {
-    SmallVector<OpOperand *> consumerUses;
-    for (auto val : results) {
-      for (auto &use : val.getUses()) {
-        consumerUses.push_back(&use);
-      }
-    }
+    // SmallVector<OpOperand *> consumerUses;
+    // for (auto val : results) {
+    //   for (auto &use : val.getUses()) {
+    //     consumerUses.push_back(&use);
+    //   }
+    // }
     OpBuilder::InsertionGuard g(builder);
-    auto earliestUser = getEarliestUserInBlock(block, consumerUses);
+    auto earliestUser =
+        getEarliestUserInBlock(block, usesPerPartition[consumerPartition]);
     builder.setInsertionPoint(earliestUser);
     // llvm::errs() << "Xconsumer: " << consumerPartition << "\n";
     // llvm::errs() << "Xresults: [";
@@ -558,7 +568,7 @@ bool insertArefs(OpBuilder &builder, scf::ForOp loop,
     // llvm::errs() << "]\n";
     //    createArefGet(builder, loop, aref, results, consumerPartition, uses);
     createArefGet(builder, loop, aref, results, consumerPartition,
-                  uses);
+                  usesPerPartition[consumerPartition]);
     // llvm::errs() << "MOD-02:\n" << aref->getParentOfType<ModuleOp>() << "\n";
   }
 
