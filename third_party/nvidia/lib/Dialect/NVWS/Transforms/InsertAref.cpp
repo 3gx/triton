@@ -546,15 +546,12 @@ public:
       // desc_load results.
       SmallVector<Operation *> ops;
       loop.walk([&](Operation *op) {
-        if (op->getNumResults() == 0) {
-          return WalkResult::advance();
-        }
         // Only handles load ops for now.
-        if (isDescLoadAndAlloc<LocalAllocOp>(op->getResult(0)) ||
-            isa<LocalAllocOp>(op)) {
+        if (op->getNumResults() > 0 &&
+            (isDescLoadAndAlloc<LocalAllocOp>(op->getResult(0)) ||
+             isa<LocalAllocOp>(op))) {
           ops.push_back(op);
         }
-        return WalkResult::advance();
       });
 
       for (auto op : ops) {
@@ -566,31 +563,28 @@ public:
       }
 
       ops.clear();
-      // handle all other ops
+      // handle all other ops, including register uses of desc_load results.
       loop.walk([&](Operation *op) {
-        if (loop == op) {
-          return WalkResult::advance();
-        }
-        if (op->getNumResults() == 0) {
-          return WalkResult::advance();
-        }
-        if (isDescLoadAndAlloc<LocalAllocOp>(op->getResult(0)) ||
-            isDescLoadAndAlloc<TMEMAllocOp>(op->getResult(0)) ||
-            isa<LocalAllocOp, MMAv5OpInterface, TMEMAllocOp, TMEMStoreOp,
-                TMEMAllocOp>(op)) {
-          return WalkResult::advance();
-        }
-        ops.push_back(op);
-        return WalkResult::advance();
-      });
-      for (auto op : ops) {
+      //   if (op->getNumResults() == 0) {
+      //     return WalkResult::advance();
+      //   }
+      //   if (isDescLoadAndAlloc<LocalAllocOp>(op->getResult(0)) ||
+      //       isDescLoadAndAlloc<TMEMAllocOp>(op->getResult(0)) ||
+      //       isa<LocalAllocOp, MMAv5OpInterface, TMEMAllocOp, TMEMStoreOp,
+      //           TMEMAllocOp>(op)) {
+      //     return WalkResult::advance();
+      //   }
+      //   ops.push_back(op);
+      //   return WalkResult::advance();
+      // });
+      // for (auto op : ops) {
         auto producedValues = getProducedValues(op, loop.getBody());
         for (auto producedValue : producedValues) {
           OpBuilder builder(op);
           builder.setInsertionPointAfter(op);
           insertArefs(builder, loop, op->getBlock(), producedValue);
         }
-      }
+      });
     }
   }
 
