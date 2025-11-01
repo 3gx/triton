@@ -567,8 +567,7 @@ public:
       ops.clear();
       // handle all other ops, including register uses of desc_load results.
       loop.walk([&](Operation *op) {
-        if (isa<LocalAllocOp, MMAv5OpInterface, TMEMAllocOp, TMEMStoreOp,
-                TMEMAllocOp>(op)) {
+        if (isa<MMAv5OpInterface, TMEMAllocOp, TMEMStoreOp>(op)) {
           return WalkResult::advance();
         }
         //   if (op->getNumResults() == 0) {
