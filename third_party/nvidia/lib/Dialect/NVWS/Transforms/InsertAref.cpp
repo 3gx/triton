@@ -439,6 +439,26 @@ void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
       replaceUsesWithLocalLoad(tmemAlloc.getSrc(), stageClusterEnter);
     } else if (isa<RankedTensorType>(result.getType())) {
       replaceUsesWithLocalLoad(result, stageClusterEnter);
+    } else if (isa<FloatType, IntegerType>(result.getType())) {
+      auto mod = result.getParentRegion()->getParentOfType<ModuleOp>();
+      auto nWarps = lookupNumWarps(mod);
+      auto threadsPerWarp =
+          triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
+      int CTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
+      Attribute encoding = getDefaultBlockedEncoding(
+          builder.getContext(), {1}, nWarps, threadsPerWarp, CTAs);
+      auto tensorType = RankedTensorType::get({1}, result.getType(), encoding);
+      auto localLoadOp = triton::gpu::createInto<LocalLoadOp>(
+          builder, loc, consumerPartitions, stageClusterEnter, tensorType,
+          dataBuf);
+      auto scalar = triton::gpu::createInto<triton::UnsplatOp>(
+          builder, loc, consumerPartitions, stageClusterEnter, localLoadOp);
+      for (auto use : uses) {
+        if (use->get() == result) {
+          use->set(scalar);
+        }
+      }
+      exitInsertPointAfter = localLoadOp;
     } else {
       std::string msg = "createArefGet: unsupported produced value type: " +
                         mlir::debugString(result.getType());
