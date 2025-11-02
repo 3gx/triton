@@ -247,6 +247,19 @@ SmallVector<Operation *> createArefPut(OpBuilder &builder, ArefCreateOp aref,
                                             stageCluster, result, dataBuf);
       producerKind = AsyncOp::NONE;
     }
+  } else if (isa<FloatType, IntegerType>(result.getType())) {
+    auto mod = result.getParentRegion()->getParentOfType<ModuleOp>();
+    auto nWarps = lookupNumWarps(mod);
+    auto threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
+    int CTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
+    Attribute encoding = getDefaultBlockedEncoding(
+        builder.getContext(), {1}, nWarps, threadsPerWarp, CTAs);
+    auto tensorType = RankedTensorType::get({1}, result.getType(), encoding);
+    auto splatOp = triton::gpu::createInto<triton::SplatOp>(
+        builder, loc, producerPartitions, stageCluster, tensorType, result);
+    triton::gpu::createInto<LocalStoreOp>(builder, loc, producerPartitions,
+                                          stageCluster, splatOp, dataBuf);
+    producerKind = AsyncOp::NONE;
   } else {
     std::string msg = "createArefPut: unsupported produced value type: " +
                       mlir::debugString(result.getType());
