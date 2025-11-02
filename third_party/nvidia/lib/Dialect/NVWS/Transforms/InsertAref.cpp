@@ -7,6 +7,7 @@
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/OpInterfaces.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
@@ -87,13 +88,13 @@ template <typename AllocOp> auto isGlobalLoadAndAlloc(Value result) {
 ArefCreateOp createAref(OpBuilder &builder, ProducedValueInfo &producedValue) {
   auto result = producedValue.result;
 
-  auto getSmemDescType = [](Value tensorResult) {
-    auto tensorType = cast<RankedTensorType>(tensorResult.getType());
+  auto getSmemDescType = [](RankedTensorType tensorType, Value tensorResult) {
     Attribute SharedMemorySpace =
         SharedMemorySpaceAttr::get(tensorType.getContext());
     Attribute encoding = getSharedEncoding(tensorType);
-    if (auto load =
-            tensorResult.getDefiningOp<triton::DescriptorOpInterface>()) {
+    if (tensorResult &&
+        tensorResult.getDefiningOp<triton::DescriptorOpInterface>()) {
+      auto load = tensorResult.getDefiningOp<triton::DescriptorOpInterface>();
       // A use of TMA which is not immediately consumed by LocalAlloc
       // This case applies, for example, when TMA is followed by SIMT ops
       // or MMAv2 is used.
@@ -110,9 +111,18 @@ ArefCreateOp createAref(OpBuilder &builder, ProducedValueInfo &producedValue) {
     memDescType = dyn_cast<MemDescType>(result.getType());
   } else if (auto opt = isDescLoadAndAlloc<TMEMAllocOp>(result)) {
     auto descLoadResult = opt->first.getSrc();
-    memDescType = getSmemDescType(descLoadResult);
-  } else if (isa<RankedTensorType>(result.getType())) {
-    memDescType = getSmemDescType(result);
+    memDescType = getSmemDescType(descLoadResult.getType(), descLoadResult);
+  } else if (auto tensorType = dyn_cast<RankedTensorType>(result.getType())) {
+    memDescType = getSmemDescType(tensorType, result);
+  } else if (isa<FloatType, IntegerType>(result.getType())) {
+    auto mod = result.getParentRegion()->getParentOfType<ModuleOp>();
+    auto nWarps = lookupNumWarps(mod);
+    auto threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
+    int CTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
+    Attribute encoding = getDefaultBlockedEncoding(
+        builder.getContext(), {1}, nWarps, threadsPerWarp, CTAs);
+    auto tensorType = RankedTensorType::get({1}, result.getType(), encoding);
+    memDescType = getSmemDescType(tensorType, {});
   } else {
     std::string msg = "createAref: unsupported produced value type: " +
                       mlir::debugString(result.getType());
@@ -525,11 +535,10 @@ public:
     });
 
     for (scf::ForOp loop : loops) {
-
-      // Communicate tensor arguments in iter_args from producer partition in
-      // current iteration to consumer partition in previous iteration or
-      // initial value
       loop.walk([&](scf::ForOp forOp) {
+        // Communicate tensor arguments in iter_args from producer partition in
+        // current iteration to consumer partition in previous iteration or
+        // initial value
         for (auto arg : forOp.getRegionIterArgs()) {
           if (isa<RankedTensorType>(arg.getType())) {
             auto producerPartition =
@@ -546,17 +555,17 @@ public:
       // addition to being consumed by local_alloc op, we process
       // local_alloc(desc_load()) first, followed by remaining register uses of
       // desc_load results.
-      SmallVector<Operation *> ops;
+      SmallVector<Operation *> memoryOps;
       loop.walk([&](Operation *op) {
         // Only handles load ops for now.
         if (op->getNumResults() > 0 &&
             (isDescLoadAndAlloc<LocalAllocOp>(op->getResult(0)) ||
              isa<LocalAllocOp>(op))) {
-          ops.push_back(op);
+          memoryOps.push_back(op);
         }
       });
 
-      for (auto op : ops) {
+      for (auto op : memoryOps) {
         auto producedValues = getProducedValues(op, loop.getBody());
         for (auto producedValue : producedValues) {
           OpBuilder builder(op);
@@ -564,26 +573,14 @@ public:
         }
       }
 
-      ops.clear();
-      // handle all other ops, including register uses of desc_load results.
+      // handle non-tmem ops, including register uses of desc_load results.
       loop.walk([&](Operation *op) {
         if (isa<MMAv5OpInterface, TMEMAllocOp, TMEMStoreOp>(op)) {
+          // skip tmem ops
           return WalkResult::advance();
         }
-        //   if (op->getNumResults() == 0) {
-        //     return WalkResult::advance();
-        //   }
-        //   if (isDescLoadAndAlloc<LocalAllocOp>(op->getResult(0)) ||
-        //       isDescLoadAndAlloc<TMEMAllocOp>(op->getResult(0)) ||
-        //       isa<LocalAllocOp, MMAv5OpInterface, TMEMAllocOp, TMEMStoreOp,
-        //           TMEMAllocOp>(op)) {
-        //     return WalkResult::advance();
-        //   }
-        //   ops.push_back(op);
-        //   return WalkResult::advance();
-        // });
-        // for (auto op : ops) {
         auto producedValues = getProducedValues(op, loop.getBody());
+        llvm::errs() << "Xop: " << *op << "\n";
         for (auto producedValue : producedValues) {
           OpBuilder builder(op);
           builder.setInsertionPointAfter(op);
