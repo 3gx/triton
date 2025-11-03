@@ -1001,8 +1001,8 @@ public:
 
     for (auto user : alloc->getUsers()) {
       if (auto store = dyn_cast<ttng::TMEMStoreOp>(user)) {
-	auto storePartition = getPartitionIds(store);
-	assert(storePartition && storePartition->size() == 1);
+        auto storePartition = getPartitionIds(store);
+        assert(storePartition && storePartition->size() == 1);
         auto storeSrc = store.getSrc();
         if (auto storeSrcDef = storeSrc.getDefiningOp()) {
           DominanceInfo dom(storeSrcDef);
@@ -1019,7 +1019,7 @@ public:
             }
             rewriter.eraseOp(store);
             rewriter.replaceOp(alloc, newAlloc);
-	    setPartition(newAlloc, *storePartition);
+            setPartition(newAlloc, *storePartition);
             return success();
           }
         }
@@ -1106,15 +1106,16 @@ void PartitionScheduling::runOnOperation() {
 
       for (auto alloc : tmemAllocToHoist) {
         // TODO: check if hoisting is safe
-
-        if (auto tok = alloc.getToken()) {
+        auto tok = alloc.getToken();
+        if (!tok) {
+          alloc->moveBefore(loop);
+        } else {
           auto tokUsers = tok.getUsers();
           if (tokUsers.empty()) {
             return;
           }
 
           Value lastTok;
-	  int tokPartition;
 
           while (!tokUsers.empty()) {
             auto tokUser = *tokUsers.begin();
@@ -1154,9 +1155,7 @@ void PartitionScheduling::runOnOperation() {
           mlir::replaceAllUsesInRegionWith(tok, loop.getRegionIterArgs().back(),
                                            loop.getRegion());
           appendToForOpYield(loop, {lastTok});
-	  assignSingleRegionOpPartition(loop);
-        } else {
-          alloc->moveBefore(loop);
+          assignSingleRegionOpPartition(loop);
         }
       }
     }
