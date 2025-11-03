@@ -1001,6 +1001,8 @@ public:
 
     for (auto user : alloc->getUsers()) {
       if (auto store = dyn_cast<ttng::TMEMStoreOp>(user)) {
+	auto storePartition = getPartitionIds(store);
+	assert(storePartition && storePartition->size() == 1);
         auto storeSrc = store.getSrc();
         if (auto storeSrcDef = storeSrc.getDefiningOp()) {
           DominanceInfo dom(storeSrcDef);
@@ -1017,6 +1019,7 @@ public:
             }
             rewriter.eraseOp(store);
             rewriter.replaceOp(alloc, newAlloc);
+	    setPartition(newAlloc, *storePartition);
             return success();
           }
         }
@@ -1047,9 +1050,41 @@ struct PartitionScheduling
 } // namespace
 
 void PartitionScheduling::runOnOperation() {
-  MLIRContext *context = &getContext();
   ModuleOp m = getOperation();
 
+  SmallVector<scf::ForOp> loops;
+
+  m.walk([&](scf::ForOp loop) {
+    if (loop->hasAttr(kWarpSpecializeAttrName)) {
+      loops.push_back(loop);
+    }
+  });
+
+  for (auto [idx, loop] : llvm::enumerate(loops)) {
+    if (std::optional<PartitionSet> partitions = getInitialPartitions(loop)) {
+      propagatePartitions(loop, *partitions);
+      optimizePartitions(loop, *partitions);
+      assignRegionBodyPartition(loop, *partitions);
+      if (failed(assignMissingPartitions(loop, *partitions)))
+        return signalPassFailure();
+
+
+      assignRegionOpPartitions(loop);
+      verifyPartitions(loop, *partitions);
+
+      loop->setAttr(
+          kWarpSpecializeTagAttrName,
+          IntegerAttr::get(IntegerType::get(loop.getContext(), 32), idx));
+
+      SmallVector<Attribute> stages;
+      Builder b(loop.getContext());
+      for (Partition &partition : partitions->getPartitions())
+        stages.push_back(b.getI32IntegerAttr(partition.getStage()));
+      loop->setAttr(kPartitionStagesAttrName, b.getArrayAttr(stages));
+    }
+  }
+
+  MLIRContext *context = &getContext();
   OpPassManager pm;
   mlir::RewritePatternSet patterns(context);
   patterns.add<FoldTmemStoreIntoAlloc>(context);
@@ -1057,9 +1092,7 @@ void PartitionScheduling::runOnOperation() {
   if (failed(applyPatternsGreedily(m, std::move(patterns))))
     signalPassFailure();
 
-  SmallVector<scf::ForOp> loops;
-
-  getOperation().walk([&](scf::ForOp loop) {
+  m.walk([&](scf::ForOp loop) {
     if (loop->hasAttr(kWarpSpecializeAttrName)) {
       SmallVector<ttng::TMEMAllocOp> tmemAllocToHoist;
       loop.walk([&](ttng::TMEMAllocOp tmemAlloc) {
@@ -1081,6 +1114,7 @@ void PartitionScheduling::runOnOperation() {
           }
 
           Value lastTok;
+	  int tokPartition;
 
           while (!tokUsers.empty()) {
             auto tokUser = *tokUsers.begin();
@@ -1120,34 +1154,11 @@ void PartitionScheduling::runOnOperation() {
           mlir::replaceAllUsesInRegionWith(tok, loop.getRegionIterArgs().back(),
                                            loop.getRegion());
           appendToForOpYield(loop, {lastTok});
+	  assignSingleRegionOpPartition(loop);
         } else {
           alloc->moveBefore(loop);
         }
       }
-
-      loops.push_back(loop);
     }
   });
-
-  for (auto [idx, loop] : llvm::enumerate(loops)) {
-    if (std::optional<PartitionSet> partitions = getInitialPartitions(loop)) {
-      propagatePartitions(loop, *partitions);
-      optimizePartitions(loop, *partitions);
-      assignRegionBodyPartition(loop, *partitions);
-      if (failed(assignMissingPartitions(loop, *partitions)))
-        return signalPassFailure();
-      assignRegionOpPartitions(loop);
-      verifyPartitions(loop, *partitions);
-
-      loop->setAttr(
-          kWarpSpecializeTagAttrName,
-          IntegerAttr::get(IntegerType::get(loop.getContext(), 32), idx));
-
-      SmallVector<Attribute> stages;
-      Builder b(loop.getContext());
-      for (Partition &partition : partitions->getPartitions())
-        stages.push_back(b.getI32IntegerAttr(partition.getStage()));
-      loop->setAttr(kPartitionStagesAttrName, b.getArrayAttr(stages));
-    }
-  }
 }
