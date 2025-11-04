@@ -509,8 +509,20 @@ LogicalResult assignStagePhase(triton::FuncOp funcOp) {
             !result.use_empty()) {
           auto arg = forOp.getBody()->getTerminator()->getOperand(
               result.getResultNumber());
-          updateOutputWithDefaultPartition(forOp, result.getResultNumber());
-          visitBackwardSlice(forOp, arg, callback, visited);
+          // Check if any users of this scalar result lack ttg.partition.
+          // If so, the scalar is consumed by the root partition outside the
+          // warp-specialized loop, requiring us to assign the default partition
+          // to all operations that compute this result. If all users already
+          // have ttg.partition, the consumer would have the same partition as
+          // the producer, so no action is needed.
+          bool assignDefaultPartition =
+              llvm::any_of(result.getUsers(), [&](Operation *user) {
+                return !hasPartition(user);
+              });
+          if (assignDefaultPartition) {
+            updateOutputWithDefaultPartition(forOp, result.getResultNumber());
+            visitBackwardSlice(forOp, arg, callback, visited);
+          }
         }
       }
     }
