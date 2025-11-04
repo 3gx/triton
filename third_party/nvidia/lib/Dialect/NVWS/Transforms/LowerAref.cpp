@@ -267,9 +267,19 @@ void createTMALoad(triton::nvws::DescriptorLoadOp op, PatternRewriter &rewriter,
       rewriter, op.getLoc(),
       op.getDesc().getType().getBlockType().getEncoding(), op.getIndices());
   for (auto [newIdx, oldIdx] : llvm::zip(indices, op.getIndices())) {
+    // translateTMAIndices may create ops, we need to annotated them
     if (newIdx != oldIdx) {
-      assignStageCluster(newIdx.getDefiningOp(), getPartitionIds(op),
-                         getStageCluster(op), rewriter);
+      auto partitionIds = getPartitionIds(op);
+      auto stageCluster = getStageCluster(op);
+      assignStageCluster(newIdx.getDefiningOp(), partitionIds, stageCluster,
+                         rewriter);
+      for (auto val : newIdx.getDefiningOp()->getOperands()) {
+        if (auto op = val.getDefiningOp()) {
+          if (!hasPartition(op)) {
+            assignStageCluster(op, partitionIds, stageCluster, rewriter);
+          }
+        }
+      }
     }
   }
   auto newLoadOp =
@@ -309,7 +319,8 @@ void lowerTMALoad(ArefPutEnterOp op, Value fullBarrier,
   if (loadOps.empty())
     return;
 
-  Value pred = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
+  auto pred = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
+  assignStageCluster(pred, getPartitionIds(op), getStageCluster(op), rewriter);
   auto expectOp = triton::nvidia_gpu::BarrierExpectOp::create(
       rewriter, loc, fullBarrier, txCount, pred);
   assignStageCluster(expectOp, getPartitionIds(op), getStageCluster(op),
@@ -713,6 +724,8 @@ ExitOp createCombinedArefOps(SmallVector<EnterOp> &enterOps,
 
   builder.setInsertionPointAfter(aref);
   auto zero = arith::ConstantIntOp::create(builder, aref.getLoc(), 0, 32);
+  assignStageCluster(zero, getPartitionIds(firstEnter),
+                     getStageCluster(firstEnter), builder);
 
   if (combinedEnterInsertPoint) {
     // Combined get enter must be placed after combined put enter
@@ -906,6 +919,8 @@ public:
     mlir::RewritePatternSet patterns(context);
     patterns.add<LowerArefCreate>(context);
     GreedyRewriteConfig config;
+    config.enableConstantCSE(false);
+    config.enableFolding(false);
     if (applyPatternsGreedily(m, std::move(patterns), config).failed())
       signalPassFailure();
   }
