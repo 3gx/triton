@@ -1031,6 +1031,34 @@ public:
   }
 };
 
+bool canRemoveTmemStore(ttng::TMEMAllocOp tmemAlloc) {
+  auto tok = tmemAlloc.getToken();
+  if (!tok || !tok.hasOneUse())
+    return false;
+  auto loop = dyn_cast<scf::ForOp>(*tok.getUsers().begin());
+  if (!loop)
+    return false;
+  auto loopTok = loop.getBody()->getArgument(
+      tok.getUses().begin()->getOperandNumber() - 2);
+  if (!loopTok.hasOneUse())
+    return false;
+  auto mma =
+      dyn_cast<nvidia_gpu::MMAv5OpInterface>(*loopTok.getUsers().begin());
+  if (!mma)
+    return false;
+  auto useD = dyn_cast<BlockArgument>(mma.useAccumulator());
+  if (!useD)
+    return false;
+  auto parent = useD.getParentBlock()->getParentOp();
+  if (parent != loop)
+    return false;
+  auto loopInit = loop.getInitArgs()[useD.getArgNumber() - 1];
+  auto val = getBoolFromConstant(loopInit);
+  if (!val)
+    return false;
+  return val.value() == false;
+}
+
 //===----------------------------------------------------------------------===//
 // Pass Definition
 //===----------------------------------------------------------------------===//
@@ -1097,7 +1125,9 @@ void PartitionScheduling::runOnOperation() {
       SmallVector<ttng::TMEMAllocOp> tmemAllocToHoist;
       loop.walk([&](ttng::TMEMAllocOp tmemAlloc) {
         if (!loop.getOps<scf::ForOp>().empty() &&
-            tmemAlloc->getParentOfType<scf::ForOp>() == loop) {
+            tmemAlloc->getParentOfType<scf::ForOp>() == loop &&
+	    tmemAlloc.getSrc() &&
+	    canRemoveTmemStore(tmemAlloc)) {
           // For simplicity, only handle one additional level of hoisting. This
           // is sufficient for a typical persistent kernel whose outermost loop
           // is over output tiles.
