@@ -532,7 +532,8 @@ LogicalResult insertTmemAref(TmemAccessDag &accessDag) {
   auto allocOp = cast<TMEMAllocOp>(rootNode->op);
 
   // do nothing for alloc with src, whose user is in the same partition
-  if (allocOp.getSrc() && !allocOp.getToken() && rootNode->user->partitionId == rootNode->partitionId)
+  if (allocOp.getSrc() && !allocOp.getToken() &&
+      rootNode->user->partitionId == rootNode->partitionId)
     return success();
 
   std::optional<bool> isMultiStaged;
@@ -601,17 +602,15 @@ LogicalResult insertTmemAref(TmemAccessDag &accessDag) {
   if (outerWsLoop) {
     // aref is only used inside ws-loop, so we use the last op to insert
     // matching exit
-    partitionId = node->partitionId;
-    stageCluster = getStageCluster(node->op);
     b.setInsertionPointAfter(node->op);
   } else {
     // aref is used outside ws-loop, find the last point in the same block as
     // create op to have matching exit
-    partitionId = {};
-    stageCluster = {};
     auto op1 = arefOp->getBlock()->findAncestorOpInBlock(*node->op);
     b.setInsertionPointAfter(op1);
   }
+  partitionId = node->partitionId;
+  stageCluster = getStageCluster(node->op);
   state.release(b, node->op->getLoc(), {partitionId, stageCluster});
 
   if (state.kind == TMEMAref::GET) {
@@ -624,7 +623,7 @@ LogicalResult insertTmemAref(TmemAccessDag &accessDag) {
     // since we only have two partition, we just pick the other partition for
     // get
     for (auto partitionId : partitions) {
-      if (outerWsLoop && partitionId != node->partitionId) {
+      if (partitionId != node->partitionId) {
         otherPartitionId = partitionId;
         break;
       }
