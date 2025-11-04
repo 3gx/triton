@@ -226,12 +226,12 @@ static bool accUseFlagSetToFalse(ttng::MMAv5OpInterface mma, scf::ForOp forOp) {
     accUseFlagInit = forOp.getInitArgs()[blockArg.getArgNumber() - 1];
   }
 
-  // if (accUseFlagInit && matchPattern(accUseFlagInit, m_Zero()) &&
-  //     matchPattern(accUseFlag, m_One())) {
-  //   // A simple case for nested loops - the use flag is initialized to false
-  //   // and uncondionally set to true in later iterations
-  //   return true;
-  // }
+  if (accUseFlagInit && matchPattern(accUseFlagInit, m_Zero()) &&
+      matchPattern(accUseFlag, m_One())) {
+    // A simple case for nested loops - the use flag is initialized to false
+    // and uncondionally set to true in later iterations
+    return true;
+  }
 
   // If the accUseFlag is overwritten in the loop, we treat it as a 'false'
   // with condition being ~accUseFlag.
