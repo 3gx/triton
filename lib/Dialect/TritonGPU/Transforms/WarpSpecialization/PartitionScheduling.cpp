@@ -1002,7 +1002,6 @@ public:
     for (auto user : alloc->getUsers()) {
       if (auto store = dyn_cast<ttng::TMEMStoreOp>(user)) {
         auto storePartition = getPartitionIds(store);
-        assert(storePartition && storePartition->size() == 1);
         auto storeSrc = store.getSrc();
         if (auto storeSrcDef = storeSrc.getDefiningOp()) {
           DominanceInfo dom(storeSrcDef);
@@ -1019,7 +1018,9 @@ public:
             }
             rewriter.eraseOp(store);
             rewriter.replaceOp(alloc, newAlloc);
-            setPartition(newAlloc, *storePartition);
+            if (storePartition) {
+              setPartition(newAlloc, *storePartition);
+            }
             return success();
           }
         }
@@ -1068,7 +1069,6 @@ void PartitionScheduling::runOnOperation() {
       if (failed(assignMissingPartitions(loop, *partitions)))
         return signalPassFailure();
 
-
       assignRegionOpPartitions(loop);
       verifyPartitions(loop, *partitions);
 
@@ -1096,16 +1096,17 @@ void PartitionScheduling::runOnOperation() {
     if (loop->hasAttr(kWarpSpecializeAttrName)) {
       SmallVector<ttng::TMEMAllocOp> tmemAllocToHoist;
       loop.walk([&](ttng::TMEMAllocOp tmemAlloc) {
-        if (tmemAlloc->getParentOfType<scf::ForOp>() == loop) {
+        if (!loop.getOps<scf::ForOp>().empty() &&
+            tmemAlloc->getParentOfType<scf::ForOp>() == loop) {
           // For simplicity, only handle one additional level of hoisting. This
           // is sufficient for a typical persistent kernel whose outermost loop
           // is over output tiles.
+          // TODO: check if hoisting is safe
           tmemAllocToHoist.push_back(tmemAlloc);
         }
       });
 
       for (auto alloc : tmemAllocToHoist) {
-        // TODO: check if hoisting is safe
         auto tok = alloc.getToken();
         if (!tok) {
           alloc->moveBefore(loop);
