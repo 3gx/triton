@@ -329,7 +329,8 @@ void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
           }
         }
 
-        assert(!newOperandIndices.empty());
+        if (newOperandIndices.empty())
+          continue;
 
         SmallVector<Value> newYieldOperands;
         for (size_t i : newOperandIndices) {
@@ -435,17 +436,14 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
   SmallVector<Operation *> opsToErase;
   for (auto &op_ : *loop->getBlock()) {
     auto op = &op_;
-    auto wsTag = op->getAttrOfType<IntegerAttr>(kWarpSpecializeTagAttrName);
-    if (!wsTag || wsTag.getInt() != partitions.getTag())
+    if (!hasPartition(op))
       continue;
-    if (auto partitionIds = triton::gpu::getPartitionIds(op);
-        partitionIds && !isa<scf::ForOp>(op)) {
-      cloneOp(op, builders, *partitionIds);
-      opsToErase.push_back(op);
-    } else {
-      assert(loop.getOperation() == op && "Unexpected op");
+    if (op == loop) {
       cloneForOp(loop, builders, partitions);
       opsToErase.push_back(loop);
+    } else {
+      cloneOp(op, builders, *getPartitionIds(op));
+      opsToErase.push_back(op);
     }
   }
 
@@ -496,7 +494,7 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
       auto output = LocalLoadOp::create(topBuilder, ty, tensorResultAllocs[i]);
       LocalDeallocOp::create(topBuilder, tensorResultAllocs[i]);
       res.replaceAllUsesWith(output);
-    } else {
+    } else if (!hasPartition(*res.getUsers().begin())) {
       assert(newResultIndices[i] && "A valid index is expected.");
       res.replaceAllUsesWith(wgOp.getResult(*newResultIndices[i]));
     }
