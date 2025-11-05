@@ -605,7 +605,7 @@ def grouped_matmul_tma_kernel(
     num_tiles = num_m_tiles * num_n_tiles
     start_pid = tl.program_id(axis=0)
 
-    for g in tl.range(group_size, warp_specialize=True):
+    for g in tl.range(group_size): #, warp_specialize=True):
         lda = tl.load(g_lds + g * 3)
         ldb = tl.load(g_lds + g * 3 + 1)
         ldc = tl.load(g_lds + g * 3 + 2)
@@ -634,7 +634,7 @@ def grouped_matmul_tma_kernel(
             block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
         )
 
-        for tile_idx in tl.range(start_pid, num_tiles, NUM_SM):
+        for tile_idx in tl.range(start_pid, num_tiles, NUM_SM, warp_specialize=True):
             tile_m_idx = tile_idx // num_n_tiles
             tile_n_idx = tile_idx % num_n_tiles
             offs_am = tile_m_idx * BLOCK_SIZE_M
