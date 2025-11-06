@@ -459,11 +459,7 @@ bool insertArefs(PartitionBuilder &builder, scf::ForOp loop,
   ArefCreateOp aref;
   {
     OpBuilder::InsertionGuard g(builder);
-    scf::ForOp topLevelFor = loop;
-    while (auto outer = topLevelFor->getParentOfType<scf::ForOp>()) {
-      topLevelFor = outer;
-    }
-    builder.setInsertionPoint(topLevelFor);
+    builder.setInsertionPoint(loop);
     aref = createAref(builder, producedValue);
   }
 
