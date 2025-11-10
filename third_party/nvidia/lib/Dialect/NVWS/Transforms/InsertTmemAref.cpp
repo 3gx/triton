@@ -555,15 +555,32 @@ insertTmemArefImpl(TmemAccessDag::Node *node,
     return insertTmemArefImpl(node->user.get(), node->partitionId, state);
   return node;
 }
+bool haveEnoughTmem(MMAv5OpInterface mmaOp, int usedTmemBlocks) {
+  auto tmemDesc = mmaOp.getAccumulator().getType();
+  auto blockM = tmemDesc.getShape()[0];
+  auto blockN = tmemDesc.getShape()[1];
+  constexpr int numTMEMColumns = 512;
+  constexpr int numTMEMRows = 128;
+  if (usedTmemBlocks + (blockM * blockN * 2) > numTMEMRows * numTMEMColumns) {
+    return false;
+  }
+  if (isa<TCGen5MMAScaledOp>(mmaOp) && blockN == 256) {
+    return false;
+  }
+  return true;
+};
 
-LogicalResult insertTmemAref(TmemAccessDag &accessDag) {
+LogicalResult insertTmemAref(TmemAccessDag &accessDag, int &usedTmemBlocks) {
   auto rootNode = accessDag.getRootNode();
   auto allocOp = cast<TMEMAllocOp>(rootNode->op);
 
   std::optional<bool> isMultiStaged;
   for (auto user : allocOp.getResult().getUsers()) {
     if (auto mmaOp = dyn_cast<MMAv5OpInterface>(user)) {
-      if (auto loop = dyn_cast<scf::ForOp>(user->getParentOp())) {
+      auto loop = user->getParentOfType<scf::ForOp>();
+      while (loop && !loop->hasAttr(triton::kWarpSpecializeAttrName))
+        loop = loop->getParentOfType<scf::ForOp>();
+      if (loop) {
         // Determine if the MMA accumulator can be multibuffered.
         bool accIsMultiBuffered =
             // MMAs in subsequent iterations can be overlapped.
@@ -573,14 +590,22 @@ LogicalResult insertTmemAref(TmemAccessDag &accessDag) {
             isAccMultibufferingPossible(mmaOp, loop) &&
             // The user didn't disable it with a flag.
             !getDisallowAccMultiBuffer(loop);
+
         isMultiStaged = isMultiStaged ? *isMultiStaged && accIsMultiBuffered
                                       : accIsMultiBuffered;
+
+        if (isMultiStaged) {
+          // if isMultiStaged, verify we have enough TMEM blocks for it
+          isMultiStaged = haveEnoughTmem(mmaOp, usedTmemBlocks);
+        }
       }
     }
   }
   auto numStages = isMultiStaged ? (1 + *isMultiStaged) : 1;
   auto arefBufType =
       getArefMultiBufferedType(allocOp.getResult().getType(), numStages);
+  usedTmemBlocks += numStages * allocOp.getType().getShape()[0] *
+                    allocOp.getType().getShape()[1] * numStages;
   OpBuilder b(allocOp);
 
   // alloc can be inside ws-loop, we need to find the entry point for ws-loop
@@ -777,13 +802,14 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
     tmemDags.push_back(TmemAccessDag::build(allocOp));
   });
 
+  int usedTmemBlocks = 0;
   for (auto &accessDag : tmemDags) {
     LLVM_DEBUG({ accessDag.printDag(llvm::dbgs()); });
     auto [hasRootPartition, partitions] = accessDag.collectPartitions();
     assert(partitions.size() <= 2 && "expecting at most 2 partitions");
     auto totalOwners = hasRootPartition + partitions.size();
     if (totalOwners > 1)
-      if (failed(insertTmemAref(accessDag)))
+      if (failed(insertTmemAref(accessDag, usedTmemBlocks)))
         return failure();
   }
 
