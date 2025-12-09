@@ -625,7 +625,7 @@ bool hasProducerConsumerPartitioning(TmemAccessDag &accessDag) {
       ++changePoints;
   }
 
-  return changePoints <= 2;
+  return changePoints == 2;
 }
 
 LogicalResult insertTmemAref(TmemAccessDag &accessDag, int &numTmemBlocks) {
