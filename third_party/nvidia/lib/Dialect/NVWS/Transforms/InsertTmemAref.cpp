@@ -882,7 +882,7 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
   int numTmemBlocks = 0;
   for (auto &accessDag : tmemDags) {
     LLVM_DEBUG({ accessDag.printDag(llvm::dbgs()); });
-    asccessDag.printDag(llvm::errs());
+    accessDag.printDag(llvm::errs());
     auto [hasRootPartition, partitions] = accessDag.collectPartitionsSet();
     assert(partitions.size() <= 2 && "expecting at most 2 partitions");
     auto totalOwners = hasRootPartition + partitions.size();
