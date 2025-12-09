@@ -609,12 +609,12 @@ bool hasProducerConsumerPartitioning(TmemAccessDag &accessDag) {
   // multi-buffering.
 
   auto [hasRootPartition, partitions] = accessDag.collectPartitionsVec();
-  // // llvm::errs() << "partitions: [";
-  // // for (auto p : partitions) {
-  // //   llvm::errs() << "(" << p.second << ", " << p.first << ") ";
-  // // }
-  // // llvm::errs() << "]\n";
-  // // llvm::errs() << "hasRootPartition: " << hasRootPartition << "\n";
+  llvm::errs() << "partitions: [";
+  for (auto p : partitions) {
+    llvm::errs() << "(" << p.second << ", " << p.first << ") ";
+  }
+  llvm::errs() << "]\n";
+  llvm::errs() << "hasRootPartition: " << hasRootPartition << "\n";
 
   // Count partition transitions: producer-consumer pattern has exactly one
   // transition (A->B followed by B->A). Multiple transitions (e.g.,
@@ -632,9 +632,9 @@ bool hasProducerConsumerPartitioning(TmemAccessDag &accessDag) {
 LogicalResult insertTmemAref(TmemAccessDag &accessDag, int &numTmemBlocks) {
   auto rootNode = accessDag.getRootNode();
   auto allocOp = cast<TMEMAllocOp>(rootNode->op);
-  // llvm::errs() << "XXX FuncName: "
-  //              << allocOp->getParentOfType<triton::FuncOp>().getSymName()
-  //              << "\n";
+  llvm::errs() << "XXX FuncName: "
+               << allocOp->getParentOfType<triton::FuncOp>().getSymName()
+               << "\n";
 
   std::optional<bool> isMultiStaged;
   int numTmemBlock = 0;
@@ -656,9 +656,9 @@ LogicalResult insertTmemAref(TmemAccessDag &accessDag, int &numTmemBlocks) {
         if (*isMultiStaged) {
           // if isMultiStaged: verify we have enough TMEM blocks for it
           auto hasEnoughTmem = haveEnoughTmem(mmaOp, numTmemBlocks);
-          // llvm::errs()
-          //     << allocOp->getParentOfType<triton::FuncOp>().getSymName()
-          //     << ": hasEnoughTmem: " << hasEnoughTmem << "\n";
+          llvm::errs()
+              << allocOp->getParentOfType<triton::FuncOp>().getSymName()
+              << ": hasEnoughTmem: " << hasEnoughTmem << "\n";
           isMultiStaged = hasEnoughTmem;
         }
       }
@@ -668,8 +668,8 @@ LogicalResult insertTmemAref(TmemAccessDag &accessDag, int &numTmemBlocks) {
     // if isMultiStaged: verify that partitioner results in producer-consumer
     // pattern for tmem accesses
     auto flag = hasProducerConsumerPartitioning(accessDag);
-    // llvm::errs() << allocOp->getParentOfType<triton::FuncOp>().getSymName()
-    //              << ": hasProducerConsumerPartitioning: " << flag << "\n";
+    llvm::errs() << allocOp->getParentOfType<triton::FuncOp>().getSymName()
+                 << ": hasProducerConsumerPartitioning: " << flag << "\n";
     isMultiStaged =
         *isMultiStaged && hasProducerConsumerPartitioning(accessDag);
   }
@@ -679,7 +679,6 @@ LogicalResult insertTmemAref(TmemAccessDag &accessDag, int &numTmemBlocks) {
   // update numTmemBlocks for the number of TMEM blocks used by the aref buffer
   auto allocShape = allocOp.getType().getShape();
   numTmemBlocks += numStages * allocShape[0] * allocShape[1] * numStages;
-  hasProducerConsumerPartitioning(accessDag);
   auto arefBufType =
       getArefMultiBufferedType(allocOp.getResult().getType(), numStages);
   OpBuilder b(allocOp);
