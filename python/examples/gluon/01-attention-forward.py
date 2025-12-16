@@ -608,6 +608,22 @@ def _subtiled_qk_load(config, s_tmem):
         qks = qks + (s_tmem.slice(i * SIZE, SIZE).load(layout), )
     return _join_n(qks)
 
+@gluon.jit
+def _subtiled_qk_load2(config, s_tmem):
+    SIZE: gl.constexpr = s_tmem.shape[1] // config.SPLIT_QK_LOAD_FACTOR
+    s = s_tmem.slice(0, SIZE)
+    layout: gl.constexpr = get_tmem_reg_layout(gl.float32, s.shape, s.layout, config.num_warps)
+    qks = ()
+    red_total = None
+    for i in gl.static_range(config.SPLIT_QK_LOAD_FACTOR):
+        vals, reds  = s_tmem.slice(i * SIZE, SIZE).load(layout, red_op="max", abs=False, NaN=False)
+        if red_total is None:
+            red_total = reds
+        else:
+            red_total = gl.maximum(red_total, reds)
+        qks = qks + (vals, )
+    return _join_n(qks), red_total
+
 
 @gluon.jit
 def _softmax_inner_loop(tile_id: gl.constexpr, config, prog,  #
@@ -617,13 +633,16 @@ def _softmax_inner_loop(tile_id: gl.constexpr, config, prog,  #
 
     for start_n in range(lo, hi, config.BLOCK_N):
         s_tmem, s_bar, s_consumer = s_consumer.acquire()
-        qk = _subtiled_qk_load(config, s_tmem)
+        #qk = _subtiled_qk_load(config, s_tmem)
+        qk, qk_max = _subtiled_qk_load2(config, s_tmem)
 
         if STAGE == 2:
             col_limit_right = (offs_m - start_n + 1)[:, None]
             qk = _apply_causal_mask(qk, col_limit_right)
 
-        m_ij = gl.maximum(m_i, gl.max(qk, 1) * config.qk_scale)
+        #m_ij = gl.maximum(m_i, gl.max(qk, 1) * config.qk_scale)
+        qk_max = gl.convert_layout(qk_max, m_i.type.layout)
+        m_ij = gl.maximum(m_i, qk_max * config.qk_scale)
         alpha = gl.exp2(m_i - m_ij)
 
         alpha_tmem = _borrow_s_as_alpha(config, s_tmem)
