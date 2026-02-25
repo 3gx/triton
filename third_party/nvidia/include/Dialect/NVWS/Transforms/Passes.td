@@ -187,4 +187,55 @@ def NVWSHoistTmemStore: Pass<"nvws-hoist-tmem-store", "mlir::ModuleOp"> {
   ];
 }
 
+def NVWSLowerArefToSemaphore : Pass<"nvws-lower-aref-to-semaphore", "mlir::ModuleOp"> {
+  let summary = "Convert nvws.aref.* to nvws.semaphore.* ops.";
+  let description = [{
+    Lowers aref operations to semaphore operations. Each aref becomes two
+    semaphores (one initially released, one not). The aref put/get enter/exit
+    ops become semaphore acquire/release pairs. Buffer views are produced by
+    semaphore.buffer. Stage and phase are not assigned by this pass.
+  }];
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+  let options = [
+    Option<"numStages", "num-stages", "int32_t", /*default*/"3",
+           "number of pipeline stages">
+  ];
+}
+
+def NVWSAssignSemaphoreStagePhase : Pass<"nvws-assign-semaphore-stage-phase", "mlir::ModuleOp"> {
+  let summary = "Assign stage/phase to nvws.semaphore.* ops using observation rule.";
+  let description = [{
+    Assigns buffer stage and phase to semaphore ops based on the observation
+    rule: advance %bufId when (was_observed AND is_fresh_write). Groups
+    semaphores by shared buffer and threads stage/phase state through scf
+    control flow.
+  }];
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def NVWSLowerSemaphore : Pass<"nvws-lower-semaphore", "mlir::ModuleOp"> {
+  let summary = "Convert nvws.semaphore.* to ttng.*barrier* ops.";
+  let description = [{
+    Lowers semaphore operations to mbarrier wait/arrive primitives. Each
+    semaphore becomes an mbarrier array and phase bits are derived from
+    MULTIPHASE state.
+  }];
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 #endif // NVWS_PASSES

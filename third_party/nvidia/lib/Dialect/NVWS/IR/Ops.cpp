@@ -181,5 +181,12 @@ void ArefPutExitOp::setStage(Value stage) { getStageMutable().assign(stage); }
 void ArefGetExitOp::setStage(Value stage) { getStageMutable().assign(stage); }
 void ArefGetEnterOp::setStage(Value stage) { getStageMutable().assign(stage); }
 void ArefBufferOp::setStage(Value stage) { getStageMutable().assign(stage); }
+void SemaphoreAcquireOp::setStage(Value stage) {
+  getStageMutable().assign(stage);
+}
+void SemaphoreReleaseOp::setStage(Value stage) {
+  getStageMutable().assign(stage);
+}
+void SemaphoreBufferOp::setStage(Value stage) { getStageMutable().assign(stage); }
 
 } // namespace mlir::triton::nvws
