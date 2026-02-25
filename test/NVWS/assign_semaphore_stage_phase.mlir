@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -split-input-file --allow-unregistered-dialect --nvws-assign-semaphore-stage-phase | FileCheck %s
+// RUN: triton-opt %S/assign_stage_phase.mlir -split-input-file --allow-unregistered-dialect --nvws-lower-aref-to-semaphore --nvws-assign-semaphore-stage-phase | FileCheck %s --check-prefix=ASP-AREF --implicit-check-not=nvws.aref.
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -29,6 +30,56 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     tt.return
   }
 }
+
+// ASP-AREF-LABEL: @two_consumers
+// ASP-AREF-DAG: nvws.semaphore.acquire
+// ASP-AREF-DAG: arith.shli
+// ASP-AREF-DAG: arith.andi
+// ASP-AREF-DAG: ttg.partition.outputs = [
+// ASP-AREF: tt.return
+
+// ASP-AREF-LABEL: @aref_lowering
+// ASP-AREF-DAG: scf.if
+// ASP-AREF-DAG: [#nvws.async_op<tma_load>, #nvws.async_op<none>]
+// ASP-AREF-DAG: [#nvws.async_op<tc5mma>]
+// ASP-AREF-DAG: ttg.partition.outputs = [
+// ASP-AREF: tt.return
+
+// ASP-AREF-LABEL: @warp_specialize_tma_matmul
+// ASP-AREF-DAG: ttng.tc_gen5_mma
+// ASP-AREF-DAG: tt.warp_specialize
+// ASP-AREF-DAG: [#nvws.async_op<tc5mma>]
+// ASP-AREF-DAG: ttng.tmem_load
+// ASP-AREF: tt.return
+
+// ASP-AREF-LABEL: @matmul_tma_acc_with_unconditional_user
+// ASP-AREF-DAG: ttng.tmem_store
+// ASP-AREF-DAG: ttng.tmem_load
+// ASP-AREF-DAG: [#nvws.async_op<none>]
+// ASP-AREF-DAG: [#nvws.async_op<tc5mma>]
+// ASP-AREF: tt.return
+
+// ASP-AREF-LABEL: @assign_stage_buffer
+// ASP-AREF-DAG: scf.if
+// ASP-AREF-DAG: nvws.semaphore.buffer
+// ASP-AREF-DAG: [#nvws.async_op<tc5mma>]
+// ASP-AREF-DAG: ttng.tmem_load
+// ASP-AREF: tt.return
+
+// ASP-AREF-LABEL: @matmul_tma_acc_with_conditional_user
+// ASP-AREF-DAG: scf.if
+// ASP-AREF-DAG: ttng.tmem_load
+// ASP-AREF-DAG: [#nvws.async_op<none>]
+// ASP-AREF-DAG: [#nvws.async_op<tc5mma>]
+// ASP-AREF-DAG: tt.descriptor_store
+// ASP-AREF: tt.return
+
+// ASP-AREF-LABEL: @for_loop_control_operand_ppg
+// ASP-AREF-DAG: tt.load
+// ASP-AREF-DAG: scf.for
+// ASP-AREF-DAG: ttg.partition.outputs = [
+// ASP-AREF-DAG: ttng.tc_gen5_mma
+// ASP-AREF: tt.return
 
 // -----
 

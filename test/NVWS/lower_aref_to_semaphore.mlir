@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -split-input-file --allow-unregistered-dialect --nvws-lower-aref-to-semaphore | FileCheck %s
+// RUN: triton-opt %S/lower_aref.mlir -split-input-file --allow-unregistered-dialect --nvws-lower-aref-to-semaphore | FileCheck %s --check-prefix=L2S-AREF --implicit-check-not=nvws.aref.
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -80,3 +81,59 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     tt.return
   }
 }
+
+// L2S-AREF-LABEL: @two_consumers
+// L2S-AREF-DAG: nvws.semaphore.create
+// L2S-AREF-DAG: nvws.semaphore.acquire
+// L2S-AREF-DAG: nvws.semaphore.buffer
+// L2S-AREF-DAG: nvws.semaphore.release
+// L2S-AREF: tt.return
+
+// L2S-AREF-LABEL: @three_consumers
+// L2S-AREF-DAG: "op_e"
+// L2S-AREF-DAG: "op_f"
+// L2S-AREF-DAG: nvws.semaphore.acquire
+// L2S-AREF: tt.return
+
+// L2S-AREF-LABEL: @reuse_argument
+// L2S-AREF-DAG: "op_a"
+// L2S-AREF-DAG: "op_d"
+// L2S-AREF-DAG: nvws.semaphore.acquire
+// L2S-AREF: tt.return
+
+// L2S-AREF-LABEL: @warp_specialize_tma_matmul
+// L2S-AREF-DAG: nvws.descriptor_load
+// L2S-AREF-DAG: ttng.tc_gen5_mma
+// L2S-AREF-DAG: [#nvws.async_op<tma_load>]
+// L2S-AREF-DAG: [#nvws.async_op<tc5mma>]
+// L2S-AREF: tt.return
+
+// L2S-AREF-LABEL: @load_used_as_reg_and_smem
+// L2S-AREF-DAG: "use1"
+// L2S-AREF-DAG: "use2"
+// L2S-AREF-DAG: nvws.descriptor_load
+// L2S-AREF: tt.return
+
+// L2S-AREF-LABEL: @load_used_as_reg_and_smem_same_partition
+// L2S-AREF-DAG: "use1"
+// L2S-AREF-DAG: "use2"
+// L2S-AREF-DAG: nvws.semaphore.acquire
+// L2S-AREF: tt.return
+
+// L2S-AREF-LABEL: @lower_aref_buffer
+// L2S-AREF-DAG: scf.if
+// L2S-AREF-DAG: ttng.tmem_load
+// L2S-AREF-DAG: nvws.semaphore.release
+// L2S-AREF: tt.return
+
+// L2S-AREF-LABEL: @aref_not_in_loop
+// L2S-AREF-DAG: ttng.tc_gen5_mma
+// L2S-AREF-DAG: [#nvws.async_op<tc5mma>]
+// L2S-AREF-DAG: nvws.semaphore.acquire
+// L2S-AREF: tt.return
+
+// L2S-AREF-LABEL: @load_scale_mma_user
+// L2S-AREF-DAG: ttng.tc_gen5_mma_scaled
+// L2S-AREF-DAG: ttng.tmem_alloc
+// L2S-AREF-DAG: ttng.tmem_load
+// L2S-AREF: tt.return

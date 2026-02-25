@@ -86,6 +86,34 @@ OpT createInto(ImplicitLocOpBuilder &b, PartitionWsTagIds partitionWsTagIds,
   return op;
 }
 
+SmallVector<SetVector<int>, 4> getPartitionOutputsSafe(Operation *op) {
+  SetVector<int> ids = hasPartition(op) ? getPartitionIds(op) : SetVector<int>{};
+  if (ids.empty())
+    ids.insert(0);
+
+  SmallVector<SetVector<int>, 4> outputs =
+      op->hasAttr(kPartitionOutputsAttrName)
+          ? getPartitionOutputs(op)
+          : SmallVector<SetVector<int>, 4>{};
+
+  if (outputs.size() < op->getNumResults())
+    outputs.resize(op->getNumResults(), ids);
+  else if (outputs.size() > op->getNumResults())
+    outputs.resize(op->getNumResults());
+
+  for (auto &outIds : outputs) {
+    if (outIds.empty())
+      outIds = ids;
+  }
+
+  if (outputs.empty()) {
+    outputs.reserve(op->getNumResults());
+    for (unsigned i = 0; i < op->getNumResults(); ++i)
+      outputs.push_back(ids);
+  }
+  return outputs;
+}
+
 SetVector<int> inferPartitionIds(Value value) {
   SetVector<int> ids;
   if (auto defOp = value.getDefiningOp()) {
@@ -95,7 +123,7 @@ SetVector<int> inferPartitionIds(Value value) {
         ids.insert(defIds.begin(), defIds.end());
       }
     } else if (auto pos = findValuePosInRange(defOp->getResults(), value)) {
-      auto outputs = getPartitionOutputs(defOp);
+      auto outputs = getPartitionOutputsSafe(defOp);
       if (*pos < outputs.size()) {
         auto outIds = outputs[*pos];
         ids.insert(outIds.begin(), outIds.end());
@@ -340,7 +368,7 @@ private:
       return;
 
     auto forIds = getPartitionIds(forOp);
-    auto forOutputs = getPartitionOutputs(forOp);
+    auto forOutputs = getPartitionOutputsSafe(forOp);
     for (Value value : newOutputValues) {
       auto ids = inferPartitionIds(value);
       forIds.insert(ids.begin(), ids.end());
@@ -416,7 +444,7 @@ private:
     auto oldIfIds = hasPartition(ifOp) ? std::optional(getPartitionIds(ifOp))
                                        : std::nullopt;
     auto oldIfOutputs = hasPartition(ifOp)
-                            ? std::optional(getPartitionOutputs(ifOp))
+                            ? std::optional(getPartitionOutputsSafe(ifOp))
                             : std::nullopt;
 
     OpBuilder builder(ifOp);
@@ -568,7 +596,7 @@ private:
             setPartition(forOp, forIds);
 
             if (auto pos = findValuePosInRange(forOp.getRegionIterArgs(), stage)) {
-              auto forOutputs = getPartitionOutputs(forOp);
+              auto forOutputs = getPartitionOutputsSafe(forOp);
               if (*pos < forOutputs.size()) {
                 forOutputs[*pos].insert(stageOpIds.begin(), stageOpIds.end());
                 if (*pos + 1 < forOutputs.size()) {
@@ -618,7 +646,15 @@ void updateOutputWithDefaultPartition(Operation *op, int pos) {
   opIds.insert(0);
   setPartition(op, opIds);
 
-  auto opOutputsIds = getPartitionOutputs(op);
+  auto opOutputsIds = getPartitionOutputsSafe(op);
+  auto requiredSize =
+      std::max(static_cast<size_t>(op->getNumResults()), static_cast<size_t>(pos + 1));
+  if (opOutputsIds.size() < requiredSize)
+    opOutputsIds.resize(requiredSize, opIds);
+  for (auto &ids : opOutputsIds) {
+    if (ids.empty())
+      ids = opIds;
+  }
   opOutputsIds[pos].insert(0);
   setPartitionOutputs(op, opOutputsIds);
 }
@@ -761,6 +797,28 @@ LogicalResult assignSemaphoreStagePhase(FuncOp funcOp) {
           result.getResultNumber());
       visitBackwardSlice(forOp, arg, callback, visited);
     }
+  });
+
+  funcOp.walk([&](Operation *op) {
+    if (!isa<scf::ForOp, scf::IfOp>(op) || !hasPartition(op))
+      return;
+
+    auto opIds = getPartitionIds(op);
+    if (opIds.empty())
+      opIds.insert(0);
+
+    auto opOutputs = getPartitionOutputsSafe(op);
+    if (opOutputs.size() < op->getNumResults())
+      opOutputs.resize(op->getNumResults(), opIds);
+
+    for (auto &ids : opOutputs) {
+      if (ids.empty())
+        ids = opIds;
+      opIds.insert(ids.begin(), ids.end());
+    }
+
+    setPartition(op, opIds);
+    setPartitionOutputs(op, opOutputs);
   });
 
   return success();
