@@ -478,7 +478,7 @@ SmallVector<std::pair<std::string, std::function<bool(Edge)>>> heuristics = {
      }},
 
     // merge remaining view op partitions with consumer
-    // as that involves fewer elements being communicated via aref
+    // as that involves fewer elements being communicated via semaphore
     {"view_consumer",
      [](Edge edge) {
        if (!isView(edge.getFromNode())) {
@@ -617,7 +617,7 @@ SmallVector<std::pair<std::string, std::function<bool(Edge)>>> heuristics = {
 
     // merge connected STORE partitions together
     // these are both using tt.descriptor_store and have a dataflow edge
-    // between, so avoid communicating between partitions via aref
+    // between, so avoid communicating between partitions via semaphore
     {"connected_store",
      [](Edge edge) {
        auto from = edge.getFromNode();
@@ -761,7 +761,7 @@ SmallVector<
          }},
 
         // merge TMEM partitions together, if they use the same tmem alloc
-        // aref does not support tmem with more than 2 partitions
+        // semaphore does not support tmem with more than 2 partitions
         // and the tmem_alloc'd memory can maximally be used by an MMA
         // partition and a TMEM partition
         {"tmem",
@@ -1495,7 +1495,7 @@ private:
     visualize(key, "propagate", "propagated", graph.get(), vis_info);
     // Optimization: looks for paths of NONE ops with low cost, from one
     // partition, through another partition, and back to the same partition.
-    // Duplicates these to avoid the aref involved (i.e. assign to both
+    // Duplicates these to avoid the semaphore involved (i.e. assign to both
     // partitions)
     duplicateCheapOps(graph.get(), key, vis_info);
     visualize(key, "final", "final", graph.get(), vis_info);
@@ -1515,7 +1515,7 @@ private:
   void cloneMultiPartitionDataOps(Operation *region) {
     // FIXME: this transformation runs after the partition scheduling is
     // complete It clones "data" ops with multiple partitions assigned, as
-    // insert-aref pass cannot currently handly these. E.g. an op assigned to
+    // insert-semaphore pass cannot currently handle these. E.g. an op assigned to
     // partitions 0,1 will be cloned into two ops, one in partition 0 and the
     // other in partition 1 and all uses are updated correctly.
 
