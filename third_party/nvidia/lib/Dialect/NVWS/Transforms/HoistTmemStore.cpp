@@ -99,7 +99,7 @@ public:
             }
             if (hasPartition(store)) {
               // The alloc op can have multiple partitions at this point. But
-              // aref-tmem-insert requires a single owner, which should be the
+              // insert-tmem-semaphore requires a single owner, which should be the
               // partiton that tmem_store belongs to.
               setPartition(newAlloc, getPartitionIds(store));
             }
@@ -348,7 +348,7 @@ public:
             SetVector<int> mmaPartition;
             mmaPartition.insert(1);
             // tmem store remaining in the outer loop must belong to the MMA
-            // partition. This is required by aref-tmem-insert for correctly
+            // partition. This is required by insert-tmem-semaphore for correctly
             // double buffering this accumulator.
             setPartition(alloc, mmaPartition);
           }

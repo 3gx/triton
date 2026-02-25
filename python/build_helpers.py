@@ -176,7 +176,7 @@ def get_llvm_package_info(helper_args: BuildHelperArgs):
     name = f"llvm-{rev}-{system_suffix}"
     # Create a stable symlink that doesn't include revision
     sym_name = f"llvm-{system_suffix}"
-    url = f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz"
+    url = f"https://oait-cache.sc2-paas.nvidia.com/public/llvm-builds/{name}.tar.gz"
     return Package("llvm", name, url, "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH", sym_name=sym_name)
 
 

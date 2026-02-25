@@ -1,6 +1,7 @@
 #include "Utilities.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Support/DebugStringHelper.h"
 #include "mlir/Transforms/Passes.h"
@@ -22,7 +23,7 @@
 namespace mlir {
 namespace triton {
 
-#define GEN_PASS_DEF_NVWSINSERTAREF
+#define GEN_PASS_DEF_NVWSINSERTSEMAPHORE
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h.inc"
 
 namespace {
@@ -31,6 +32,10 @@ using namespace mlir;
 using namespace triton::gpu;
 using namespace triton::nvidia_gpu;
 using namespace triton::nvws;
+
+// ---------------------------------------------------------------------------
+// Helpers for semaphore insertion
+// ---------------------------------------------------------------------------
 
 struct ProducedValueInfo {
   SetVector<int> partitions;
@@ -44,7 +49,6 @@ SmallVector<ProducedValueInfo> getProducedValues(Operation *op,
   if (!hasPartition(op))
     return {};
 
-  // For ops without regions, all results share the same partition IDs
   auto partitionOutputs = op->getNumRegions() == 0
                               ? SmallVector<SetVector<int>, 4>(
                                     op->getNumResults(), getPartitionIds(op))
@@ -67,15 +71,11 @@ std::optional<std::pair<AllocOp, LoadOp>> isLoadAndAlloc(Value result) {
     return std::nullopt;
   if (auto load = alloc.getSrc().template getDefiningOp<LoadOp>();
       load && getPartitionIds(alloc) == getPartitionIds(load)) {
-    // if alloc and load are in different partitions, they are treated as two
-    // different producer operations.
     return std::make_pair(alloc, load);
   }
   return std::nullopt;
 }
 
-// if result is defined by descriptor_load followed by alloc, return the alloc
-// and the load ops as a pair.
 template <typename AllocOp> auto isDescLoadAndAlloc(Value result) {
   return isLoadAndAlloc<AllocOp, triton::DescriptorOpInterface>(result);
 }
@@ -92,42 +92,6 @@ RankedTensorType getTensorTypeFromScalar(OpBuilder &builder, Value scalar) {
   Attribute encoding = getDefaultBlockedEncoding(builder.getContext(), {1},
                                                  nWarps, threadsPerWarp, CTAs);
   return RankedTensorType::get({1}, scalar.getType(), encoding);
-}
-
-ArefCreateOp createAref(OpBuilder &builder, ProducedValueInfo &producedValue) {
-  auto result = producedValue.result;
-
-  auto getSmemDescType = [](RankedTensorType tensorType, Value tensorResult) {
-    Attribute SharedMemorySpace =
-        SharedMemorySpaceAttr::get(tensorType.getContext());
-    Attribute encoding = tensorResult && tensorResult.getDefiningOp()
-                             ? getSharedEncoding(tensorResult.getDefiningOp())
-                             : getSharedEncoding(tensorType);
-    auto memDescType =
-        MemDescType::get(tensorType.getShape(), tensorType.getElementType(),
-                         encoding, SharedMemorySpace);
-    return memDescType;
-  };
-
-  MemDescType memDescType;
-  if (result.getDefiningOp<LocalAllocOp>()) {
-    memDescType = dyn_cast<MemDescType>(result.getType());
-  } else if (auto tensorType = dyn_cast<RankedTensorType>(result.getType())) {
-    memDescType = getSmemDescType(tensorType, result);
-  } else if (isa<FloatType, IntegerType>(result.getType())) {
-    auto tensorType = getTensorTypeFromScalar(builder, result);
-    memDescType = getSmemDescType(tensorType, Value());
-  } else {
-    std::string msg = "createAref: unsupported produced value type: " +
-                      mlir::debugString(result.getType());
-    llvm::report_fatal_error(msg.c_str());
-  }
-
-  MemDescType arefBufType = getMultiBufferedType(memDescType, 1);
-  assert(isa<SharedMemorySpaceAttr>(arefBufType.getMemorySpace()));
-  auto loc = result.getLoc();
-  auto alloc = triton::nvws::createAlloc(builder, loc, arefBufType, Value());
-  return createArefCreateOp(builder, {arefBufType}, {alloc->getResult(0)}, loc);
 }
 
 int getTxCount(Operation *descOp) {
@@ -196,24 +160,237 @@ StageCluster getStageClusterForProducer(Value producedValue) {
   }
 }
 
-SmallVector<Operation *> createArefPut(OpBuilder &builder, ArefCreateOp aref,
-                                       ProducedValueInfo producedValue) {
+SetVector<Operation *>
+getTransitiveConsumers(Operation *op,
+                       SetVector<int> const &consumerPartitions) {
+  SetVector<Operation *> opConsumers;
+  auto isMemDesc = [](auto res) { return isa<MemDescType>(res.getType()); };
+  for (auto &use : op->getUses()) {
+    if (llvm::count_if(use.getOwner()->getResults(), isMemDesc) > 0) {
+      auto consumers =
+          getTransitiveConsumers(use.getOwner(), consumerPartitions);
+      opConsumers.insert(consumers.begin(), consumers.end());
+    } else {
+      if (getPartitionIds(&use) == consumerPartitions) {
+        opConsumers.insert(use.getOwner());
+        opConsumers.insert(
+            op->getBlock()->findAncestorOpInBlock(*use.getOwner()));
+      }
+    }
+  }
+  return opConsumers;
+}
+
+SmallVector<Operation *>
+getTransitiveConsumers(const SetVector<Value> &results,
+                       SetVector<int> const &consumerPartitions) {
+  SetVector<Operation *> opSet;
+  for (auto result : results) {
+    if (isa<BlockArgument>(result)) {
+      for (auto &use : result.getUses()) {
+        if (getPartitionIds(&use) == consumerPartitions) {
+          opSet.insert(use.getOwner());
+        }
+      }
+    } else {
+      auto consumers =
+          getTransitiveConsumers(result.getDefiningOp(), consumerPartitions);
+      opSet.insert(consumers.begin(), consumers.end());
+    }
+  }
+  return SmallVector<Operation *>{opSet.begin(), opSet.end()};
+}
+
+SmallVector<Attribute> getConsumerAsyncOpKinds(ArrayRef<Operation *> consumers,
+                                               MLIRContext *ctx) {
+  SetVector<AsyncOp> kindSet;
+  for (auto consumer : consumers) {
+    if (isa<scf::ForOp>(consumer) && consumers.size() > 1) {
+      continue;
+    }
+    if (isa<WarpGroupDotOp>(consumer)) {
+      kindSet.insert(AsyncOp::WGMMA);
+    } else if (isa<MMAv5OpInterface>(consumer)) {
+      kindSet.insert(AsyncOp::TC5MMA);
+    } else {
+      kindSet.insert(AsyncOp::NONE);
+    }
+  }
+
+  SmallVector<Attribute> kindAttrs;
+  for (auto kind : kindSet) {
+    kindAttrs.push_back(AsyncOpAttr::get(ctx, kind));
+  }
+
+  return kindAttrs;
+}
+
+std::pair<StageCluster, StageCluster>
+getEnterAndExitStageClustersOfUses(const SetVector<Value> &producedResults,
+                                   std::function<bool(Operation *)> filterUse,
+                                   scf::ForOp forOp) {
+  CoarseSchedule coarseSchedule;
+  if (!forOp || failed(coarseSchedule.deSerialize(forOp)) ||
+      producedResults.empty()) {
+    return std::make_pair(std::nullopt, std::nullopt);
+  }
+
+  SmallVector<Operation *> ops;
+  for (auto res : producedResults) {
+    if (auto blockArg = dyn_cast<BlockArgument>(res)) {
+      assert(producedResults.size() == 1);
+      auto block = blockArg.getOwner();
+      auto forOp = cast<scf::ForOp>(block->getParentOp());
+      auto opnd = forOp.getYieldedValues()[blockArg.getArgNumber() - 1];
+      auto op = opnd.getDefiningOp();
+      auto stageCluster = getStageCluster(op);
+      return std::make_pair(stageCluster, stageCluster);
+    }
+    auto op = res.getDefiningOp();
+    ops.push_back(op);
+  }
+
+  auto firstOp =
+      triton::getFirstUseOfPipelinedOp(ops, forOp, coarseSchedule, filterUse);
+  auto lastOp =
+      triton::getLastUseOfPipelinedOp(ops, forOp, coarseSchedule, filterUse);
+  assert(firstOp && lastOp);
+
+  return std::make_pair(getStageCluster(firstOp), getStageCluster(lastOp));
+}
+
+Operation *getEarliestUserInBlock(Block *block, ArrayRef<OpOperand *> uses) {
+  OpOperand *use =
+      *llvm::min_element(uses, [block](OpOperand *lhs, OpOperand *rhs) {
+        auto lhsOwner = block->findAncestorOpInBlock(*lhs->getOwner());
+        auto rhsOwner = block->findAncestorOpInBlock(*rhs->getOwner());
+        return lhsOwner->isBeforeInBlock(rhsOwner);
+      });
+  return block->findAncestorOpInBlock(*use->getOwner());
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for semaphore lowering
+// ---------------------------------------------------------------------------
+
+static MemDescType getAsMutable(MemDescType type) {
+  return MemDescType::get(type.getShape(), type.getElementType(),
+                          type.getEncoding(), type.getMemorySpace(),
+                          /*mutableMemory=*/true, type.getAllocShape());
+}
+
+static void propagateMutability(Value value) {
+  for (Operation *user : value.getUsers()) {
+    if (user->hasTrait<OpTrait::MemDescViewTrait>()) {
+      user->getResult(0).setType(
+          getAsMutable(cast<MemDescType>(user->getResult(0).getType())));
+      propagateMutability(user->getResult(0));
+    }
+  }
+}
+
+static SmallVector<Type> getMutableBufferTypes(TypeRange bufferTypes) {
+  SmallVector<Type> mutableTypes;
+  mutableTypes.reserve(bufferTypes.size());
+  for (Type type : bufferTypes) {
+    if (auto memTy = dyn_cast<MemDescType>(type)) {
+      mutableTypes.push_back(MemDescType::get(
+          memTy.getShape(), memTy.getElementType(), memTy.getEncoding(),
+          memTy.getMemorySpace(), /*mutableMemory=*/true,
+          memTy.getAllocShape()));
+    } else {
+      mutableTypes.push_back(type);
+    }
+  }
+  return mutableTypes;
+}
+
+static void hoistPoisonOps(triton::FuncOp funcOp) {
+  auto *block = &funcOp.getBody().front();
+  funcOp.walk([&](ub::PoisonOp op) { op->moveBefore(&block->front()); });
+}
+
+// ---------------------------------------------------------------------------
+// New: direct semaphore insertion
+// ---------------------------------------------------------------------------
+
+struct SemaphorePair {
+  Value empty; // semaphore initially released (producer acquires)
+  Value full;  // semaphore initially not released (consumer acquires)
+  Value alloc; // underlying buffer allocation
+};
+
+SemaphorePair createSemaphores(OpBuilder &builder,
+                               ProducedValueInfo &producedValue) {
+  auto result = producedValue.result;
+
+  auto getSmemDescType = [](RankedTensorType tensorType, Value tensorResult) {
+    Attribute SharedMemorySpace =
+        SharedMemorySpaceAttr::get(tensorType.getContext());
+    Attribute encoding = tensorResult && tensorResult.getDefiningOp()
+                             ? getSharedEncoding(tensorResult.getDefiningOp())
+                             : getSharedEncoding(tensorType);
+    return MemDescType::get(tensorType.getShape(), tensorType.getElementType(),
+                            encoding, SharedMemorySpace);
+  };
+
+  MemDescType memDescType;
+  if (result.getDefiningOp<LocalAllocOp>()) {
+    memDescType = dyn_cast<MemDescType>(result.getType());
+  } else if (auto tensorType = dyn_cast<RankedTensorType>(result.getType())) {
+    memDescType = getSmemDescType(tensorType, result);
+  } else if (isa<FloatType, IntegerType>(result.getType())) {
+    auto tensorType = getTensorTypeFromScalar(builder, result);
+    memDescType = getSmemDescType(tensorType, Value());
+  } else {
+    std::string msg = "createSemaphores: unsupported produced value type: " +
+                      mlir::debugString(result.getType());
+    llvm::report_fatal_error(msg.c_str());
+  }
+
+  // Depth=1 at insertion. Phase 2 (LowerSemaphore) handles multi-buffering.
+  MemDescType allocBufType = getMultiBufferedType(memDescType, 1);
+  assert(isa<SharedMemorySpaceAttr>(allocBufType.getMemorySpace()));
+  auto loc = result.getLoc();
+  auto alloc =
+      triton::nvws::createAlloc(builder, loc, allocBufType, Value());
+
+  auto baseTypes =
+      TypeArrayAttr::get(builder.getContext(), {allocBufType});
+  auto depth = getSemaphoreDepth(allocBufType);
+  auto semaTy = SemaphoreType::get(builder.getContext(), baseTypes, depth);
+  auto empty = SemaphoreCreateOp::create(builder, loc, semaTy,
+                                          alloc->getResults(), true);
+  auto full = SemaphoreCreateOp::create(builder, loc, semaTy,
+                                         alloc->getResults(), false);
+  return SemaphorePair{empty, full, alloc->getResult(0)};
+}
+
+SmallVector<Operation *> createSemaphorePut(OpBuilder &builder,
+                                            SemaphorePair &sema,
+                                            ProducedValueInfo producedValue) {
   auto loc = producedValue.result.getLoc();
-  auto arefBufType = cast<MemDescType>(aref.getBuffers()[0].getType());
+  auto allocBufType = cast<MemDescType>(sema.alloc.getType());
   Value result = producedValue.result;
-  Type dataBufType = getBufferViewType(arefBufType, /*mutable*/ true);
+  Type dataBufType = getBufferViewType(allocBufType, /*mutable*/ true);
   StageCluster stageCluster = getStageClusterForProducer(result);
 
-  // elect a partition to put result into aref-buffer
   SetVector<int> producerPartitions;
   producerPartitions.insert(producedValue.partitions.front());
 
-  Type token{builder.getType<AsyncTokenType>()};
-  auto putEnterOp = triton::gpu::createInto<ArefPutEnterOp>(
-      builder, loc, producerPartitions, stageCluster, aref,
-      TypeRange{dataBufType}, token);
-  auto dataBuf = putEnterOp.getBuffers()[0];
+  // Acquire empty semaphore
+  auto acquire = triton::gpu::createInto<SemaphoreAcquireOp>(
+      builder, loc, producerPartitions, stageCluster, sema.empty,
+      builder.getType<AsyncTokenType>());
+  Value token = acquire.getToken();
 
+  // Get buffer view
+  auto bufOp = triton::gpu::createInto<SemaphoreBufferOp>(
+      builder, loc, producerPartitions, stageCluster, sema.empty,
+      TypeRange(getMutableBufferTypes({dataBufType})), token);
+  Value dataBuf = bufOp.getBuffers()[0];
+
+  // Producer logic
   auto producerKind = AsyncOp::NONE;
   SmallVector<Operation *> staleOps;
   if (auto opt = isDescLoadAndAlloc<LocalAllocOp>(result)) {
@@ -251,141 +428,25 @@ SmallVector<Operation *> createArefPut(OpBuilder &builder, ArefCreateOp aref,
                                           stageCluster, splatOp, dataBuf);
     producerKind = AsyncOp::NONE;
   } else {
-    std::string msg = "createArefPut: unsupported produced value type: " +
+    std::string msg = "createSemaphorePut: unsupported produced value type: " +
                       mlir::debugString(result.getType());
     llvm::report_fatal_error(msg.c_str());
   }
 
-  triton::gpu::createInto<ArefPutExitOp>(
-      builder, loc, producerPartitions, stageCluster, aref,
-      putEnterOp.getToken(),
+  // Cross-release: producer releases full semaphore
+  triton::gpu::createInto<SemaphoreReleaseOp>(
+      builder, loc, producerPartitions, stageCluster, sema.full, token,
       builder.getArrayAttr(SmallVector<Attribute>{
-          AsyncOpAttr::get(aref.getContext(), producerKind)}));
+          AsyncOpAttr::get(builder.getContext(), producerKind)}));
 
   return staleOps;
-};
-
-SetVector<Operation *>
-getTransitiveConsumers(Operation *op,
-                       SetVector<int> const &consumerPartitions) {
-  SetVector<Operation *> opConsumers;
-  auto isMemDesc = [](auto res) { return isa<MemDescType>(res.getType()); };
-  for (auto &use : op->getUses()) {
-    if (llvm::count_if(use.getOwner()->getResults(), isMemDesc) > 0) {
-      // Recurse into consumers of memdesc ops, since the liveness of the
-      // produced value extends beyond such ops.
-      auto consumers =
-          getTransitiveConsumers(use.getOwner(), consumerPartitions);
-      opConsumers.insert(consumers.begin(), consumers.end());
-    } else {
-      if (getPartitionIds(&use) == consumerPartitions) {
-        opConsumers.insert(use.getOwner());
-        // If an op is defined before an inner loop and used inside, the loop
-        // itself should be considered as an additional consumer. This is
-        // necessary for persistent attention, where the load of Q is done
-        // before the inner loop.
-        opConsumers.insert(
-            op->getBlock()->findAncestorOpInBlock(*use.getOwner()));
-      }
-    }
-  }
-  return opConsumers;
 }
 
-SmallVector<Operation *>
-getTransitiveConsumers(const SetVector<Value> &results,
-                       SetVector<int> const &consumerPartitions) {
-  SetVector<Operation *> opSet;
-  for (auto result : results) {
-    if (isa<BlockArgument>(result)) {
-      for (auto &use : result.getUses()) {
-        if (getPartitionIds(&use) == consumerPartitions) {
-          opSet.insert(use.getOwner());
-        }
-      }
-    } else {
-      auto consumers =
-          getTransitiveConsumers(result.getDefiningOp(), consumerPartitions);
-      opSet.insert(consumers.begin(), consumers.end());
-    }
-  }
-  return SmallVector<Operation *>{opSet.begin(), opSet.end()};
-}
-
-SmallVector<Attribute> getConsumerAsyncOpKinds(ArrayRef<Operation *> consumers,
-                                               MLIRContext *ctx) {
-  SetVector<AsyncOp> kindSet;
-  for (auto consumer : consumers) {
-    if (isa<scf::ForOp>(consumer) && consumers.size() > 1) {
-      // In this case, a getExit is placed after the consumer loop. The
-      // corresponding async kind attributes should be determined from other
-      // consumer ops in the loop.
-      continue;
-    }
-    if (isa<WarpGroupDotOp>(consumer)) {
-      kindSet.insert(AsyncOp::WGMMA);
-    } else if (isa<MMAv5OpInterface>(consumer)) {
-      kindSet.insert(AsyncOp::TC5MMA);
-    } else {
-      kindSet.insert(AsyncOp::NONE);
-    }
-  }
-
-  SmallVector<Attribute> kindAttrs;
-  for (auto kind : kindSet) {
-    kindAttrs.push_back(AsyncOpAttr::get(ctx, kind));
-  }
-
-  return kindAttrs;
-}
-
-std::pair<StageCluster, StageCluster>
-getEnterAndExitStageClustersOfUses(const SetVector<Value> &producedResults,
-                                   std::function<bool(Operation *)> filterUse,
-                                   scf::ForOp forOp) {
-  CoarseSchedule coarseSchedule;
-  if (!forOp || failed(coarseSchedule.deSerialize(forOp)) ||
-      producedResults.empty()) {
-    return std::make_pair(std::nullopt, std::nullopt);
-  }
-
-  SmallVector<Operation *> ops;
-  for (auto res : producedResults) {
-    if (auto blockArg = dyn_cast<BlockArgument>(res)) {
-      // If the producer is a block argument, this means we need to communicate
-      // iteration arguments from the producer partition in the previous
-      // iteration to the consumer partition in the current iteration. There
-      // must be only one produced result in this case.
-      assert(producedResults.size() == 1);
-      auto block = blockArg.getOwner();
-      auto forOp = cast<scf::ForOp>(block->getParentOp());
-      auto opnd = forOp.getYieldedValues()[blockArg.getArgNumber() - 1];
-      auto op = opnd.getDefiningOp();
-      auto stageCluster = getStageCluster(op);
-      return std::make_pair(stageCluster, stageCluster);
-    }
-    auto op = res.getDefiningOp();
-    ops.push_back(op);
-  }
-
-  auto firstOp =
-      triton::getFirstUseOfPipelinedOp(ops, forOp, coarseSchedule, filterUse);
-  auto lastOp =
-      triton::getLastUseOfPipelinedOp(ops, forOp, coarseSchedule, filterUse);
-  assert(firstOp && lastOp);
-
-  return std::make_pair(getStageCluster(firstOp), getStageCluster(lastOp));
-}
-
-void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
-                   const SetVector<Value> &results, int consumerPartition,
-                   SmallVector<OpOperand *> &uses) {
+void createSemaphoreGet(OpBuilder &builder, scf::ForOp loop,
+                        SemaphorePair &sema, const SetVector<Value> &results,
+                        int consumerPartition,
+                        SmallVector<OpOperand *> &uses) {
   OpBuilder::InsertionGuard g(builder);
-  // The vector "results" contains either
-  // 1. One of local_load(desc_load()) or desc_load()
-  // 2. Both of them
-  // In the second case, we only need to emit one enter / exit since we know
-  // that the two results are used by consumers in the same partition.
   assert(results.size() == 1 || results.size() == 2);
   auto loc = results[0].getLoc();
 
@@ -404,10 +465,6 @@ void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
     }
   };
 
-  // Filter results to include only those defined inside the scheduled loop
-  // (if any). This is done because otherwise the result might not have its
-  // last use (in either direction) inside the scheduled loop and we will not be
-  // able to get `stageClusterEnter` and/or `stageClusterExit`.
   SetVector<Value> resultsInScheduledLoop;
   for (Value v : results) {
     if (Operation *defOp = v.getDefiningOp()) {
@@ -422,22 +479,31 @@ void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
 
   SetVector<int> consumerPartitions;
   consumerPartitions.insert(consumerPartition);
-  auto arefBufType = cast<MemDescType>(aref.getOperand(0).getType());
-  Type bufferType = getBufferViewType(arefBufType, /*mutable*/ false);
-  Type tokenType = builder.getType<AsyncTokenType>();
-  auto getEnterOp = triton::gpu::createInto<ArefGetEnterOp>(
-      builder, loc, consumerPartitions, stageClusterEnter, aref,
-      TypeRange{bufferType}, tokenType);
+  auto allocBufType = cast<MemDescType>(sema.alloc.getType());
+  Type bufferType = getBufferViewType(allocBufType, /*mutable*/ false);
+
+  // Acquire full semaphore
+  auto acquire = triton::gpu::createInto<SemaphoreAcquireOp>(
+      builder, loc, consumerPartitions, stageClusterEnter, sema.full,
+      builder.getType<AsyncTokenType>());
+  Value token = acquire.getToken();
+
+  // Get buffer view
+  auto bufOp = triton::gpu::createInto<SemaphoreBufferOp>(
+      builder, loc, consumerPartitions, stageClusterEnter, sema.full,
+      TypeRange(getMutableBufferTypes({bufferType})), token);
+  Value dataBuf = bufOp.getBuffers()[0];
+  propagateMutability(dataBuf);
 
   auto consumers = getTransitiveConsumers(results, consumerPartitions);
   assert(consumers.size() > 0);
-  auto asyncKinds = getConsumerAsyncOpKinds(consumers, aref.getContext());
-  Value dataBuf = getEnterOp.getBuffers()[0];
-  Value token = getEnterOp.getToken();
+  auto asyncKinds =
+      getConsumerAsyncOpKinds(consumers, builder.getContext());
 
   Operation *exitInsertPointAfter = nullptr;
 
-  auto replaceUsesWithLocalLoad = [&](Value result, StageCluster stageCluster) {
+  auto replaceUsesWithLocalLoad = [&](Value result,
+                                      StageCluster stageCluster) {
     auto localLoadOp = triton::gpu::createInto<LocalLoadOp>(
         builder, loc, consumerPartitions, stageCluster, result.getType(),
         dataBuf);
@@ -448,9 +514,6 @@ void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
       }
     }
     if (dataBuf.hasOneUse()) {
-      // If there is only one consumer for dataBuf, it is localLoadOp created
-      // above, and we hit this code path, the empty barrier can be released
-      // after local load.
       exitInsertPointAfter = localLoadOp;
     }
   };
@@ -476,8 +539,9 @@ void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
       }
       exitInsertPointAfter = localLoadOp;
     } else {
-      std::string msg = "createArefGet: unsupported produced value type: " +
-                        mlir::debugString(result.getType());
+      std::string msg =
+          "createSemaphoreGet: unsupported produced value type: " +
+          mlir::debugString(result.getType());
       llvm::report_fatal_error(msg.c_str());
     }
   }
@@ -489,31 +553,19 @@ void createArefGet(OpBuilder &builder, scf::ForOp loop, ArefCreateOp aref,
 
   builder.setInsertionPointAfter(exitInsertPointAfter);
 
-  triton::gpu::createInto<ArefGetExitOp>(builder, loc, consumerPartitions,
-                                         stageClusterExit, aref, token,
-                                         builder.getArrayAttr(asyncKinds));
-};
-
-Operation *getEarliestUserInBlock(Block *block, ArrayRef<OpOperand *> uses) {
-  OpOperand *use =
-      *llvm::min_element(uses, [block](OpOperand *lhs, OpOperand *rhs) {
-        auto lhsOwner = block->findAncestorOpInBlock(*lhs->getOwner());
-        auto rhsOwner = block->findAncestorOpInBlock(*rhs->getOwner());
-        return lhsOwner->isBeforeInBlock(rhsOwner);
-      });
-  return block->findAncestorOpInBlock(*use->getOwner());
+  // Cross-release: consumer releases empty semaphore
+  triton::gpu::createInto<SemaphoreReleaseOp>(
+      builder, loc, consumerPartitions, stageClusterExit, sema.empty, token,
+      builder.getArrayAttr(asyncKinds));
 }
 
-bool insertArefs(OpBuilder &builder, scf::ForOp loop, Block *block,
-                 ProducedValueInfo producedValue) {
-  // Collect uses of local_alloc(desc_load()) or desc_load() results by each
-  // partition
+bool insertSemaphores(OpBuilder &builder, scf::ForOp loop, Block *block,
+                      ProducedValueInfo producedValue) {
   DenseMap<int, SetVector<Value>> resultsPerPartition;
   DenseMap<int, SmallVector<OpOperand *>> usesPerPartition;
   auto processResultUses = [&](Value result) {
     for (auto &use : result.getUses()) {
       auto user = use.getOwner();
-      // if use is outside ttg.ws, it may not have partition ids, skip it
       if (!hasPartition(user))
         continue;
       auto userPartitions = getPartitionIds(&use);
@@ -530,7 +582,6 @@ bool insertArefs(OpBuilder &builder, scf::ForOp loop, Block *block,
   processResultUses(producedValue.result);
 
   if (auto opt = isDescLoadAndAlloc<LocalAllocOp>(producedValue.result)) {
-    // Process the register use as well
     auto alloc = opt->first;
     processResultUses(alloc.getSrc());
   }
@@ -539,23 +590,23 @@ bool insertArefs(OpBuilder &builder, scf::ForOp loop, Block *block,
     return false;
   }
 
-  ArefCreateOp aref;
+  SemaphorePair sema;
   {
     OpBuilder::InsertionGuard g(builder);
     auto wsLoop = getOuterWSLoop(loop);
     builder.setInsertionPoint(wsLoop);
-    aref = createAref(builder, producedValue);
+    sema = createSemaphores(builder, producedValue);
   }
 
-  auto staleOps = createArefPut(builder, aref, producedValue);
+  auto staleOps = createSemaphorePut(builder, sema, producedValue);
 
   for (auto [consumerPartition, results] : resultsPerPartition) {
     OpBuilder::InsertionGuard g(builder);
     auto earliestUser =
         getEarliestUserInBlock(block, usesPerPartition[consumerPartition]);
     builder.setInsertionPoint(earliestUser);
-    createArefGet(builder, loop, aref, results, consumerPartition,
-                  usesPerPartition[consumerPartition]);
+    createSemaphoreGet(builder, loop, sema, results, consumerPartition,
+                       usesPerPartition[consumerPartition]);
   }
 
   for (auto op : staleOps) {
@@ -567,22 +618,23 @@ bool insertArefs(OpBuilder &builder, scf::ForOp loop, Block *block,
 
 } // namespace
 
-class NVWSArefInsertion
-    : public triton::impl::NVWSInsertArefBase<NVWSArefInsertion> {
+// ---------------------------------------------------------------------------
+// Pass class
+// ---------------------------------------------------------------------------
+
+class NVWSInsertSemaphore
+    : public triton::impl::NVWSInsertSemaphoreBase<NVWSInsertSemaphore> {
 public:
   void runOnFunction(triton::FuncOp func) {
     SmallVector<scf::ForOp> loops;
     func.walk([&](scf::ForOp loop) {
-      auto func = loop->getParentOfType<triton::FuncOp>();
       if (loop->hasAttr(triton::kWarpSpecializeAttrName) && hasPartition(loop))
         loops.push_back(loop);
     });
 
     for (scf::ForOp loop : loops) {
+      // Communicate iter_args across partitions
       loop.walk([&](scf::ForOp forOp) {
-        // Communicate tensor arguments in iter_args from producer partition in
-        // current iteration to consumer partition in previous iteration or
-        // initial value
         for (auto arg : forOp.getRegionIterArgs()) {
           if (isa<RankedTensorType, FloatType, IntegerType>(arg.getType())) {
             auto producerPartition =
@@ -590,15 +642,12 @@ public:
             ProducedValueInfo producedValue{producerPartition, arg};
             OpBuilder builder(forOp);
             builder.setInsertionPointToStart(forOp.getBody());
-            insertArefs(builder, loop, forOp.getBody(), producedValue);
+            insertSemaphores(builder, loop, forOp.getBody(), producedValue);
           }
         }
       });
 
-      // To handle cases where desc_load result in registers is used as is in
-      // addition to being consumed by local_alloc op, we process
-      // local_alloc(desc_load()) first, followed by remaining register uses of
-      // desc_load results.
+      // Process memory ops first (desc_load+alloc patterns)
       SmallVector<Operation *> memoryOps;
       loop.walk([&](Operation *op) {
         if (op->getNumResults() > 0 &&
@@ -612,11 +661,11 @@ public:
         auto producedValues = getProducedValues(op, loop.getBody());
         for (auto producedValue : producedValues) {
           OpBuilder builder(op);
-          insertArefs(builder, loop, op->getBlock(), producedValue);
+          insertSemaphores(builder, loop, op->getBlock(), producedValue);
         }
       }
 
-      // handle non-tmem ops in the loop, including uses of desc_load results.
+      // Handle non-tmem ops including desc_load register uses
       loop.walk([&](Operation *op) {
         if (op == loop || isa<MMAv5OpInterface, TMEMAllocOp, TMEMStoreOp>(op)) {
           return WalkResult::advance();
@@ -625,15 +674,19 @@ public:
         for (auto producedValue : producedValues) {
           OpBuilder builder(op);
           builder.setInsertionPointAfter(op);
-          insertArefs(builder, loop, op->getBlock(), producedValue);
+          insertSemaphores(builder, loop, op->getBlock(), producedValue);
         }
         return WalkResult::advance();
       });
     }
+
+    // Hoist poison ops to function entry
+    hoistPoisonOps(func);
   }
 
   void runOnOperation() override {
-    getOperation().walk([&](triton::FuncOp func) { runOnFunction(func); });
+    getOperation().walk(
+        [&](triton::FuncOp func) { runOnFunction(func); });
   }
 };
 
