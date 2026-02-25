@@ -41,6 +41,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
 
 using namespace mlir::triton;
@@ -750,7 +751,7 @@ LogicalResult assignSemaphorePhase(FuncOp funcOp) {
 }
 
 LogicalResult assignSemaphoreStagePhase(FuncOp funcOp) {
-  DenseMap<Value, SmallVector<SemaphoreCreateOp>> bufferGroups;
+  llvm::MapVector<Value, SmallVector<SemaphoreCreateOp>> bufferGroups;
   funcOp.walk([&](SemaphoreCreateOp op) {
     if (op.getBuffers().empty())
       return;
