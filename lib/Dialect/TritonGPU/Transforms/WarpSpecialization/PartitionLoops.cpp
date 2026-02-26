@@ -1,6 +1,5 @@
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/Pass/Pass.h"
@@ -141,37 +140,10 @@ void mapRange(ValueRange fromRange, ValueRange toRange, IRMapping &mapping) {
   }
 }
 
-bool isDefinedInBlockTree(Value value, Block *rootBlock) {
-  if (auto blockArg = dyn_cast<BlockArgument>(value)) {
-    Block *owner = blockArg.getOwner();
-    if (owner == rootBlock)
-      return true;
-    if (Operation *parentOp = owner->getParentOp())
-      return rootBlock->findAncestorOpInBlock(*parentOp) != nullptr;
-    return false;
-  }
-  Operation *defOp = value.getDefiningOp();
-  if (!defOp)
-    return false;
-  return defOp->getBlock() == rootBlock ||
-         rootBlock->findAncestorOpInBlock(*defOp) != nullptr;
-}
-
-Value mapValueForPartition(WarpGroupBuilder &builder, Value value,
-                           Block *rootBlock, Location loc) {
-  if (builder.mapping.contains(value))
-    return builder.mapping.lookup(value);
-  if (!isDefinedInBlockTree(value, rootBlock))
-    return value;
-  return ub::PoisonOp::create(builder, loc, value.getType());
-}
-
-void cloneOpsInBlock(Block *block, Block *rootBlock,
-                     SmallVector<WarpGroupBuilder> &builders,
+void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
                      const PartitionSet &partitions);
 
-void cloneForOp(scf::ForOp forOp, Block *rootBlock,
-                SmallVector<WarpGroupBuilder> &builders,
+void cloneForOp(scf::ForOp forOp, SmallVector<WarpGroupBuilder> &builders,
                 const PartitionSet &partitions) {
   auto forOpPartitions = getPartitionIds(forOp);
 
@@ -181,16 +153,12 @@ void cloneForOp(scf::ForOp forOp, Block *rootBlock,
     auto partition = partitions.getPartition(i);
     auto [newLoopIndices, _] =
         getLoopVarIndicesToKeep(forOp, partition, partitions);
-    auto lb = mapValueForPartition(b, forOp.getLowerBound(), rootBlock,
-                                   forOp.getLoc());
-    auto ub = mapValueForPartition(b, forOp.getUpperBound(), rootBlock,
-                                   forOp.getLoc());
-    auto step = mapValueForPartition(b, forOp.getStep(), rootBlock,
-                                     forOp.getLoc());
+    auto lb = b.mapping.lookupOrDefault(forOp.getLowerBound());
+    auto ub = b.mapping.lookupOrDefault(forOp.getUpperBound());
+    auto step = b.mapping.lookupOrDefault(forOp.getStep());
     SmallVector<Value> initArgs;
     for (auto idx : newLoopIndices) {
-      initArgs.push_back(mapValueForPartition(b, forOp.getInitArgs()[idx],
-                                              rootBlock, forOp.getLoc()));
+      initArgs.push_back(b.mapping.lookupOrDefault(forOp.getInitArgs()[idx]));
     }
     auto newForOp =
         scf::ForOp::create(b, forOp.getLoc(), lb, ub, step, initArgs);
@@ -212,7 +180,7 @@ void cloneForOp(scf::ForOp forOp, Block *rootBlock,
     b.setInsertionPointToStart(newForOp.getBody());
   }
 
-  cloneOpsInBlock(forOp.getBody(), rootBlock, builders, partitions);
+  cloneOpsInBlock(forOp.getBody(), builders, partitions);
 
   for (auto [i, newForOp] : llvm::zip(forOpPartitions, newForOps)) {
     builders[i].setInsertionPointAfter(newForOp);
@@ -221,16 +189,14 @@ void cloneForOp(scf::ForOp forOp, Block *rootBlock,
   }
 }
 
-void cloneIfOp(scf::IfOp ifOp, Block *rootBlock,
-               SmallVector<WarpGroupBuilder> &builders,
+void cloneIfOp(scf::IfOp ifOp, SmallVector<WarpGroupBuilder> &builders,
                const PartitionSet &partitions) {
   auto partitionIndices = getPartitionIds(ifOp);
 
   SmallVector<scf::IfOp> newIfOps;
   for (size_t idx : partitionIndices) {
     auto &b = builders[idx];
-    auto cond =
-        mapValueForPartition(b, ifOp.getCondition(), rootBlock, ifOp.getLoc());
+    auto cond = b.mapping.lookupOrDefault(ifOp.getCondition());
     SmallVector<Type> newIfResultTypes;
     SmallVector<int> newIfResultIndices;
     for (auto pos = 0; pos < ifOp.getResultTypes().size(); ++pos) {
@@ -256,13 +222,13 @@ void cloneIfOp(scf::IfOp ifOp, Block *rootBlock,
     b.setInsertionPointToStart(newIfOp.thenBlock());
   }
 
-  cloneOpsInBlock(ifOp.thenBlock(), rootBlock, builders, partitions);
+  cloneOpsInBlock(ifOp.thenBlock(), builders, partitions);
 
   if (auto elseBlock = ifOp.elseBlock()) {
     for (auto [idx, newIfOp] : llvm::zip(partitionIndices, newIfOps)) {
       builders[idx].setInsertionPointToStart(newIfOp.elseBlock());
     }
-    cloneOpsInBlock(elseBlock, rootBlock, builders, partitions);
+    cloneOpsInBlock(elseBlock, builders, partitions);
   }
 
   for (auto [idx, newIfOp] : llvm::zip(partitionIndices, newIfOps)) {
@@ -270,7 +236,7 @@ void cloneIfOp(scf::IfOp ifOp, Block *rootBlock,
   }
 }
 
-void cloneReduceOp(triton::ReduceOp reduceOp, Block *rootBlock,
+void cloneReduceOp(triton::ReduceOp reduceOp,
                    SmallVector<WarpGroupBuilder> &builders,
                    const PartitionSet &partitions) {
   auto partitionIndices = getPartitionIds(reduceOp);
@@ -281,8 +247,7 @@ void cloneReduceOp(triton::ReduceOp reduceOp, Block *rootBlock,
 
     SmallVector<Value> srcs;
     for (auto src : reduceOp.getSrcs()) {
-      srcs.push_back(
-          mapValueForPartition(b, src, rootBlock, reduceOp.getLoc()));
+      srcs.push_back(b.mapping.lookupOrDefault(src));
     }
     auto axis = reduceOp.getAxis();
     auto newReduceOp =
@@ -305,15 +270,14 @@ void cloneReduceOp(triton::ReduceOp reduceOp, Block *rootBlock,
     b.setInsertionPointToStart(block);
   }
 
-  cloneOpsInBlock(reduceOp.getBody(), rootBlock, builders, partitions);
+  cloneOpsInBlock(reduceOp.getBody(), builders, partitions);
 
   for (auto [idx, newReduceOp] : llvm::zip(partitionIndices, newReduceOps)) {
     builders[idx].setInsertionPointAfter(newReduceOp);
   }
 }
 
-void cloneOp(Operation *op, Block *rootBlock,
-             SmallVector<WarpGroupBuilder> &builders,
+void cloneOp(Operation *op, SmallVector<WarpGroupBuilder> &builders,
              const SetVector<int> &partitionIndices) {
   if (op->getNumRegions() != 0) {
     llvm::report_fatal_error(
@@ -323,31 +287,21 @@ void cloneOp(Operation *op, Block *rootBlock,
   for (size_t idx : partitionIndices) {
     auto &builder = builders[idx];
     auto newOp = builder.clone(*op, builder.mapping);
-    {
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPoint(newOp);
-      for (auto [operandIdx, oldOperand] : llvm::enumerate(op->getOperands())) {
-        auto mappedValue = mapValueForPartition(builder, oldOperand, rootBlock,
-                                                op->getLoc());
-        newOp->setOperand(operandIdx, mappedValue);
-      }
-    }
     mapRange(op->getResults(), newOp->getResults(), builder.mapping);
   }
 }
 
-void cloneOpsInBlock(Block *block, Block *rootBlock,
-                     SmallVector<WarpGroupBuilder> &builders,
+void cloneOpsInBlock(Block *block, SmallVector<WarpGroupBuilder> &builders,
                      const PartitionSet &partitions) {
   for (auto &op_ : *block) {
     auto op = &op_;
 
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-      cloneForOp(forOp, rootBlock, builders, partitions);
+      cloneForOp(forOp, builders, partitions);
     } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-      cloneIfOp(ifOp, rootBlock, builders, partitions);
+      cloneIfOp(ifOp, builders, partitions);
     } else if (auto reduceOp = dyn_cast<triton::ReduceOp>(op)) {
-      cloneReduceOp(reduceOp, rootBlock, builders, partitions);
+      cloneReduceOp(reduceOp, builders, partitions);
     } else if (auto yieldOp = dyn_cast<scf::YieldOp>(op)) {
       if (yieldOp.getOperands().empty()) {
         continue;
@@ -380,19 +334,8 @@ void cloneOpsInBlock(Block *block, Block *rootBlock,
 
         SmallVector<Value> newYieldOperands;
         for (size_t i : newOperandIndices) {
-          Value oldYieldOperand = yieldOp.getOperand(i);
-          if (builder.mapping.contains(oldYieldOperand)) {
-            newYieldOperands.push_back(builder.mapping.lookup(oldYieldOperand));
-            continue;
-          }
-          if (auto forOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp())) {
-            Value iterArg = forOp.getRegionIterArgs()[i];
-            newYieldOperands.push_back(mapValueForPartition(
-                builder, iterArg, rootBlock, yieldOp.getLoc()));
-            continue;
-          }
-          newYieldOperands.push_back(mapValueForPartition(
-              builder, oldYieldOperand, rootBlock, yieldOp.getLoc()));
+          newYieldOperands.push_back(
+              builder.mapping.lookupOrDefault(yieldOp.getOperand(i)));
         }
 
         scf::YieldOp::create(builder, op->getLoc(), newYieldOperands);
@@ -400,7 +343,7 @@ void cloneOpsInBlock(Block *block, Block *rootBlock,
     } else {
       assert(hasPartition(op));
       auto partitionIndices = getPartitionIds(op);
-      cloneOp(op, rootBlock, builders, partitionIndices);
+      cloneOp(op, builders, partitionIndices);
     }
   }
 }
@@ -491,14 +434,14 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     auto op = &op_;
     if (!hasPartition(op))
       continue;
-    auto wsTag = getWarpSpecializeTag(op);
-    if (wsTag && *wsTag != partitions.getTag())
+    assert(hasWarpSpecializeTag(op));
+    if (*getWarpSpecializeTag(op) != partitions.getTag())
       continue;
     if (op == loop) {
-      cloneForOp(loop, loop.getBody(), builders, partitions);
+      cloneForOp(loop, builders, partitions);
       opsToErase.push_back(loop);
     } else {
-      cloneOp(op, loop->getBlock(), builders, getPartitionIds(op));
+      cloneOp(op, builders, getPartitionIds(op));
       opsToErase.push_back(op);
     }
   }
@@ -562,13 +505,8 @@ LogicalResult triton::gpu::partitionLoop(scf::ForOp loop) {
     }
   }
 
-  for (auto op : llvm::reverse(opsToErase)) {
-    // Partitioned scalar defs can be shared with non-partitioned users in the
-    // root block. Keep those producers alive if uses remain after cloning.
-    if (!op->use_empty())
-      continue;
+  for (auto op : llvm::reverse(opsToErase))
     op->erase();
-  }
 
   return success();
 }

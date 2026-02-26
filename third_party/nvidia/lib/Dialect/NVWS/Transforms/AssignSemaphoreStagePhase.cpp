@@ -587,6 +587,16 @@ private:
     });
   }
 
+  bool isInsideWarpSpecializeLoop(Operation *op) {
+    for (Operation *parent = op->getParentOp(); parent;
+         parent = parent->getParentOp()) {
+      if (auto forOp = dyn_cast<scf::ForOp>(parent))
+        if (forOp->hasAttr(kWarpSpecializeAttrName))
+          return true;
+    }
+    return false;
+  }
+
   PartitionWsTagIds getGroupInfo(Operation *anchor) {
     std::optional<SetVector<int>> ids;
     if (!groupPartitionIds.empty())
@@ -594,7 +604,12 @@ private:
     else if (hasPartition(anchor))
       ids = getPartitionIds(anchor);
     auto info = getPartitionWsTagIds(anchor, ids);
-    if (!info.wsTag && groupWsTags.size() == 1)
+    // Ops outside ws loop bodies must have explicit ws-tags for
+    // PartitionLoops. If the anchor doesn't have one (e.g. semaphore.create
+    // at function scope), infer from the group. Ops inside ws loop bodies
+    // inherit the tag from the enclosing loop and must NOT get explicit tags.
+    if (!info.wsTag && !isInsideWarpSpecializeLoop(anchor) &&
+        groupWsTags.size() == 1)
       info.wsTag = *groupWsTags.begin();
     return info;
   }
