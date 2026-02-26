@@ -4,11 +4,25 @@
 **Checkpoint:** Full pipeline works. All lit tests pass. User runs pytest.
 **This is the ONLY phase that modifies existing files.**
 
+## Prologue: Plan correction (2026-02-26)
+
+During implementation we found a coverage gap: per-pass semaphore lit tests
+did not catch a `PartitionLoops` failure mode (`ttg.partition`/`ttg.warp_specialize.tag`
+invariant break) that appeared only in integrated pipelines.
+
+To preserve existing AREF regression coverage and avoid churn in legacy tests,
+we keep `test/NVWS/lower_aref.mlir` and `test/NVWS/assign_stage_phase.mlir`
+unchanged. Instead, we add semaphore integration tests that cover the same
+end-to-end path and explicitly include `-tritongpu-partition-loops`.
+
+This prologue supersedes the earlier "rewrite existing AREF tests" requirement
+in this document.
+
 ## What this phase does
 
 1. Replace `createNVWSLowerAref` in `AutomaticWarpSpecialization.cpp` with the 3 new passes
-2. Rewrite `lower_aref.mlir` and `assign_stage_phase.mlir` tests
-3. Add end-to-end standalone test
+2. Keep legacy AREF lit tests unchanged
+3. Add semaphore end-to-end/integration tests (including `partition-loops`)
 
 ## 1. Pipeline change
 
@@ -136,8 +150,8 @@ All 10 tests must pass on Hopper/Blackwell. The assistant does NOT run pytest.
 | File | Change |
 |------|--------|
 | `lib/Dialect/TritonGPU/Transforms/WarpSpecialization/AutomaticWarpSpecialization.cpp` | Replace line 73 with 3 new passes |
-| `test/NVWS/lower_aref.mlir` | Rewrite RUN line + all CHECK lines |
-| `test/NVWS/assign_stage_phase.mlir` | Rewrite RUN line + convert inputs + rewrite CHECK lines |
+| `test/NVWS/aref_to_mbarrier_via_semaphore.mlir` | Add end-to-end semaphore pipeline checks |
+| `test/NVWS/semaphore_partition_loops.mlir` | Add integration regression for `partition-loops` failure mode |
 
 ## 9. Optional cleanup (future)
 

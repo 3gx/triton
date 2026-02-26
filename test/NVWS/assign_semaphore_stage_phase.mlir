@@ -174,11 +174,11 @@ module attributes {"ttg.num-warps" = 4 : i32} {
       // CHECK: [[PSHIFT:%.*]] = arith.shli [[C1P]], [[STAGE]] {ttg.partition = array<i32: 0>} : i32
       // CHECK: [[PE_NEW:%.*]] = arith.xori [[PE]], [[PSHIFT]] {ttg.partition = array<i32: 0>} : i32
       // stage advancement
-      // CHECK: [[C3:%.*]] = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 3 : i32
-      // CHECK: [[NEXT:%.*]] = arith.addi [[STAGE]], {{%.*}} {ttg.partition = array<i32: 0, 1, 2>} : i32
-      // CHECK: [[WRAP:%.*]] = arith.cmpi eq, [[NEXT]], [[C3]] {ttg.partition = array<i32: 0, 1, 2>} : i32
-      // CHECK: [[WRAPPED:%.*]] = arith.select [[WRAP]], {{%.*}}, [[NEXT]] {ttg.partition = array<i32: 0, 1, 2>} : i32
-      // CHECK: [[ADV_STAGE:%.*]] = arith.select {{%.*}}, [[WRAPPED]], [[STAGE]] {ttg.partition = array<i32: 0, 1, 2>} : i32
+      // CHECK: [[C3:%.*]] = arith.constant {ttg.partition = array<i32: 0, 1, 2>{{.*}}} 3 : i32
+      // CHECK: [[NEXT:%.*]] = arith.addi [[STAGE]], {{%.*}} {ttg.partition = array<i32: 0, 1, 2>{{.*}}} : i32
+      // CHECK: [[WRAP:%.*]] = arith.cmpi eq, [[NEXT]], [[C3]] {ttg.partition = array<i32: 0, 1, 2>{{.*}}} : i32
+      // CHECK: [[WRAPPED:%.*]] = arith.select [[WRAP]], {{%.*}}, [[NEXT]] {ttg.partition = array<i32: 0, 1, 2>{{.*}}} : i32
+      // CHECK: [[ADV_STAGE:%.*]] = arith.select {{%.*}}, [[WRAPPED]], [[STAGE]] {ttg.partition = array<i32: 0, 1, 2>{{.*}}} : i32
       // CHECK: nvws.semaphore.release [[FULL]][[[STAGE]]], [[PTOK]] [#nvws.async_op<none>] {ttg.partition = array<i32: 0>}
       %buffers, %token = nvws.aref.put.enter %1[%c0_i32, %c0_i32] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]> -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 1x1>, !ttg.async.token
       ttg.local_store %2, %buffers {ttg.partition = array<i32: 0>} : tensor<1xi32, #blocked> -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 1x1>
@@ -860,7 +860,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         // CHECK: nvws.semaphore.release [[AB_EMPTY]][{{%.*}}], [[ABTOK_C]] [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>}
         nvws.aref.get.exit %18, %token_15 [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf8E4M3FN, #shared, #smem, mutable>]>, !ttg.async.token
         nvws.aref.get.exit %16, %token_11 [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf8E4M3FN, #shared, #smem, mutable>]>, !ttg.async.token
-        // CHECK: scf.yield {ttg.partition = array<i32: 0, 1, 2>} {{%.*}}, [[ABSTAGE_P]], {{%.*}}, {{%.*}}, {{%.*}}, [[ABPHASE_P_OUT]], [[ABPHASE_C_OUT]]
+        // CHECK: scf.yield {ttg.partition = array<i32: 0, 1, 2>{{.*}}} {{%.*}}, [[ABSTAGE_P]], {{%.*}}, {{%.*}}, {{%.*}}, [[ABPHASE_P_OUT]], [[ABPHASE_C_OUT]]
         scf.yield %true : i1
       } {tt.scheduled_max_stage = 2 : i32, ttg.partition = array<i32: 1, 2>, ttg.partition.outputs = [array<i32: 1>]}
       // CHECK: nvws.semaphore.release [[ACC_EMPTY]][{{%.*}}], [[ATOK1]] [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>}

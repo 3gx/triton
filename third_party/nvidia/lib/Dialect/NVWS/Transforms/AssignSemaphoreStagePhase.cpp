@@ -511,6 +511,7 @@ private:
 
       ImplicitLocOpBuilder b(op.getLoc(), &op);
       b.setInsertionPointAfter(&op);
+
       auto info = getGroupInfo(&op);
 
       if (access == AccessKind::Observation) {
@@ -549,6 +550,17 @@ private:
   }
 
   void collectGroupPartitionIds() {
+    auto inferWsTag = [](Operation *op) -> std::optional<int> {
+      if (auto wsTag = getWarpSpecializeTag(op))
+        return wsTag;
+      for (Operation *parent = op->getParentOp(); parent;
+           parent = parent->getParentOp()) {
+        if (auto wsTag = getWarpSpecializeTag(parent))
+          return wsTag;
+      }
+      return std::nullopt;
+    };
+
     funcOp.walk([&](Operation *op) {
       if (!hasPartition(op))
         return;
@@ -570,6 +582,8 @@ private:
         return;
       auto ids = getPartitionIds(op);
       groupPartitionIds.insert(ids.begin(), ids.end());
+      if (auto wsTag = inferWsTag(op))
+        groupWsTags.insert(*wsTag);
     });
   }
 
@@ -577,7 +591,12 @@ private:
     std::optional<SetVector<int>> ids;
     if (!groupPartitionIds.empty())
       ids = groupPartitionIds;
-    return getPartitionWsTagIds(anchor, ids);
+    else if (hasPartition(anchor))
+      ids = getPartitionIds(anchor);
+    auto info = getPartitionWsTagIds(anchor, ids);
+    if (!info.wsTag && groupWsTags.size() == 1)
+      info.wsTag = *groupWsTags.begin();
+    return info;
   }
 
   void propagateStage(Value token, Value stage, DenseSet<Operation *> &visited) {
@@ -633,6 +652,7 @@ private:
   SmallVector<SemaphoreCreateOp> semaphores;
   DenseSet<Value> semaphoreValues;
   SetVector<int> groupPartitionIds;
+  SetVector<int> groupWsTags;
   int depth = 1;
 
   DenseMap<Value, bool> tokenMemo;
