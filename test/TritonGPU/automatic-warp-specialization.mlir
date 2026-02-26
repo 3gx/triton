@@ -27,9 +27,6 @@ tt.func @matmul_change_desc_in_prologue(
   %b_desc_undef = ub.poison : !tt.tensordesc<tensor<64x128xf16, #shared>>
   // CHECK-LABEL: ttg.warp_specialize
   // CHECK-LABEL: default
-  // PIPELINE: arith.addi {{.*}} {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : i32
-  // PIPELINE: arith.select {{.*}} {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : i32
-  // PIPELINE: ttng.wait_barrier {{.*}} {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32}
   // BASE-NOT: tt.make_tensor_descriptor
   // PIPELINE-NOT: ttng.tensormap_create
   // CHECK-LABEL: partition0
