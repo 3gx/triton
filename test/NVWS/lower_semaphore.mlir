@@ -133,6 +133,43 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     tt.return
   }
 
+  // CHECK-LABEL: @wgmma_pending_count
+  // Tests that async_ops=[wgmma, none] is supported by pending-count init
+  // and lowers to two arrives.
+  tt.func @wgmma_pending_count() {
+    %c0_i32 = arith.constant 0 : i32
+    %c0_phase = arith.constant 0 : i32
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
+    // CHECK: [[MBAR_WGMMA:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64
+    // CHECK: [[WGMMA_SLICE:%.*]] = ttg.memdesc_index [[MBAR_WGMMA]][{{%.*}}]
+    // CHECK: ttng.init_barrier [[WGMMA_SLICE]], 2
+    %sem = nvws.semaphore.create %buf true : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>], 1>
+    %tok = nvws.semaphore.acquire %sem[%c0_i32, %c0_phase] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>], 1> -> !ttg.async.token
+    // CHECK-COUNT-2: ttng.arrive_barrier {{%.*}}, 1 {ttg.partition = array<i32: 0>}
+    nvws.semaphore.release %sem[%c0_i32], %tok [#nvws.async_op<wgmma>, #nvws.async_op<none>] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>], 1>, !ttg.async.token
+    ttg.local_dealloc %buf : !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
+    tt.return
+  }
+
+  // CHECK-LABEL: @tmem_copy_pending_count
+  // Tests that async_ops=[tmem_copy, none] is supported by pending-count init
+  // and lowers to tc_gen5_commit + arrive_barrier.
+  tt.func @tmem_copy_pending_count() {
+    %c0_i32 = arith.constant 0 : i32
+    %c0_phase = arith.constant 0 : i32
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
+    // CHECK: [[MBAR_TMEM:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64
+    // CHECK: [[TMEM_SLICE:%.*]] = ttg.memdesc_index [[MBAR_TMEM]][{{%.*}}]
+    // CHECK: ttng.init_barrier [[TMEM_SLICE]], 2
+    %sem = nvws.semaphore.create %buf true : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>], 1>
+    %tok = nvws.semaphore.acquire %sem[%c0_i32, %c0_phase] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>], 1> -> !ttg.async.token
+    // CHECK: ttng.tc_gen5_commit {{%.*}} {ttg.partition = array<i32: 0>}
+    // CHECK: ttng.arrive_barrier {{%.*}}, 1 {ttg.partition = array<i32: 0>}
+    nvws.semaphore.release %sem[%c0_i32], %tok [#nvws.async_op<tmem_copy>, #nvws.async_op<none>] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>], 1>, !ttg.async.token
+    ttg.local_dealloc %buf : !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
+    tt.return
+  }
+
   // CHECK-LABEL: @fence_needed
   // Tests that async_op<none> inserts fence + arrive_barrier,
   // while async_op<tc5mma> uses tc_gen5_commit (no fence)

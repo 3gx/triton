@@ -112,6 +112,8 @@ int getPendingCount(SemaphoreCreateOp op) {
       case AsyncOp::TC5MMA:
       case AsyncOp::TMALoad:
       case AsyncOp::NONE:
+      case AsyncOp::WGMMA:
+      case AsyncOp::TMEMCopy:
         count += 1;
         break;
       default:
