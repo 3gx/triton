@@ -88,6 +88,8 @@ void init_triton_nvidia_passes_nvws(py::module &&m) {
                      mlir::triton::createNVWSAssignStagePhase);
   ADD_PASS_WRAPPER_0("add_assign_semaphore_stage_phase",
                      mlir::triton::createNVWSAssignSemaphoreStagePhase);
+  ADD_PASS_WRAPPER_0("add_lower_semaphore",
+                     mlir::triton::createNVWSLowerSemaphore);
   ADD_PASS_WRAPPER_0("add_insert_tmem_aref",
                      mlir::triton::createNVWSInsertTmemAref);
 }
