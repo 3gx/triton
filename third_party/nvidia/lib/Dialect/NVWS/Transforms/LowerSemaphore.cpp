@@ -39,6 +39,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/ErrorHandling.h"
 
@@ -234,14 +235,71 @@ void rewriteRelease(
   }
 }
 
+void replaceValueUsesAndPropagateType(OpBuilder &builder, Value oldVal,
+                                      Value newVal) {
+  OpBuilder::InsertionGuard guard(builder);
+  SmallVector<Operation *> opsToDelete;
+  SmallVector<OpOperand *> operandsToReplace;
+
+  for (OpOperand &use : llvm::make_early_inc_range(oldVal.getUses())) {
+    if (!use.getOwner()->hasTrait<OpTrait::MemDescViewTrait>()) {
+      operandsToReplace.push_back(&use);
+      continue;
+    }
+
+    Operation *user = use.getOwner();
+    builder.setInsertionPoint(user);
+    Value replacement;
+    if (auto subview = dyn_cast<MemDescIndexOp>(user)) {
+      auto oldType = subview.getType();
+      bool isMutable = cast<MemDescType>(newVal.getType()).getMutableMemory();
+      auto newDstType =
+          MemDescType::get(oldType.getShape(), oldType.getElementType(),
+                           oldType.getEncoding(), oldType.getMemorySpace(),
+                           isMutable);
+      replacement = MemDescIndexOp::create(builder, subview.getLoc(), newDstType,
+                                           newVal, subview.getIndex());
+    } else if (auto subslice = dyn_cast<MemDescSubsliceOp>(user)) {
+      auto oldType = subslice.getType();
+      bool isMutable = cast<MemDescType>(newVal.getType()).getMutableMemory();
+      auto newDstType = MemDescType::get(
+          oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
+          oldType.getMemorySpace(), isMutable, oldType.getAllocShape());
+      replacement = MemDescSubsliceOp::create(builder, subslice.getLoc(),
+                                              newDstType, newVal,
+                                              subslice.getOffsets());
+    } else if (auto trans = dyn_cast<MemDescTransOp>(user)) {
+      replacement = MemDescTransOp::create(builder, trans.getLoc(), newVal,
+                                           trans.getOrder());
+    } else if (auto reshape = dyn_cast<MemDescReshapeOp>(user)) {
+      replacement = MemDescReshapeOp::create(builder, reshape.getLoc(), newVal,
+                                             reshape.getType().getShape());
+    } else {
+      llvm_unreachable("unhandled memdesc view op");
+    }
+
+    replacement.getDefiningOp()->setAttrs(user->getAttrs());
+    replaceValueUsesAndPropagateType(builder, user->getResult(0), replacement);
+    opsToDelete.push_back(user);
+  }
+
+  for (OpOperand *operand : operandsToReplace)
+    operand->set(newVal);
+  for (Operation *op : opsToDelete)
+    op->erase();
+}
+
 void rewriteBuffer(SemaphoreBufferOp op, PatternRewriter &rewriter,
                    ArrayRef<Value> buffers) {
   auto loc = op.getLoc();
-  rewriter.setInsertionPointAfter(op);
   auto partitionWsTagIds = getPartitionWsTagIds(op);
   auto stageCluster = getStageCluster(op);
 
   for (auto [i, buffer] : llvm::enumerate(buffers)) {
+    // replacement helper may erase ops adjacent to this insertion point,
+    // so refresh it for each buffer result before creating new view ops.
+    rewriter.setInsertionPointAfter(op);
+
     auto memDesc = cast<MemDescType>(buffer.getType());
     if (isa<TensorMemoryScalesEncodingAttr>(memDesc.getEncoding())) {
       op.getBuffers()[i].replaceAllUsesWith(buffer);
@@ -249,6 +307,7 @@ void rewriteBuffer(SemaphoreBufferOp op, PatternRewriter &rewriter,
     }
 
     auto shape = memDesc.getShape();
+    assert(shape.size() > 1 && "expected multi-buffered semaphore buffer");
     SmallVector<int64_t> viewShape(shape.begin() + 1, shape.end());
     auto viewType = MemDescType::get(viewShape, memDesc.getElementType(),
                                      memDesc.getEncoding(),
@@ -256,7 +315,7 @@ void rewriteBuffer(SemaphoreBufferOp op, PatternRewriter &rewriter,
                                      /*mutableMemory=*/true);
     auto view = MemDescIndexOp::create(rewriter, loc, viewType, buffer, op.getStage());
     assignStageCluster(view, partitionWsTagIds, stageCluster, rewriter);
-    op.getBuffers()[i].replaceAllUsesWith(view);
+    replaceValueUsesAndPropagateType(rewriter, op.getBuffers()[i], view);
   }
 }
 
@@ -289,10 +348,25 @@ void handleTMALoads(SemaphoreCreateOp op, PatternRewriter &rewriter, Value mbars
     if (loadOps.empty())
       continue;
 
+    SmallVector<Operation *> sortedLoadOps(loadOps.begin(), loadOps.end());
+    bool sameBlock =
+        llvm::all_of(sortedLoadOps, [&](Operation *op) {
+          return op->getBlock() == sortedLoadOps.front()->getBlock();
+        });
+    if (sameBlock) {
+      llvm::sort(sortedLoadOps, [](Operation *lhs, Operation *rhs) {
+        return lhs->isBeforeInBlock(rhs);
+      });
+    } else {
+      SetVector<Operation *> opSet(sortedLoadOps.begin(), sortedLoadOps.end());
+      auto topo = topologicalSort(opSet);
+      sortedLoadOps.assign(topo.begin(), topo.end());
+    }
+
     auto partitionWsTagIds = getPartitionWsTagIds(releaseOp);
     auto stageCluster = getStageCluster(releaseOp);
 
-    rewriter.setInsertionPoint(loadOps.front());
+    rewriter.setInsertionPoint(sortedLoadOps.front());
     auto mbar = createSingleBufferView(rewriter, mbars, releaseOp.getStage());
     assignStageCluster(mbar.getDefiningOp(), partitionWsTagIds, stageCluster,
                        rewriter);
@@ -304,7 +378,7 @@ void handleTMALoads(SemaphoreCreateOp op, PatternRewriter &rewriter, Value mbars
         BarrierExpectOp::create(rewriter, op.getLoc(), mbar, txCount, pred);
     assignStageCluster(expectOp, partitionWsTagIds, stageCluster, rewriter);
 
-    for (Operation *loadOp : loadOps) {
+    for (Operation *loadOp : sortedLoadOps) {
       rewriter.setInsertionPoint(loadOp);
       if (auto descLoad = dyn_cast<triton::nvws::DescriptorLoadOp>(loadOp)) {
         auto newOp = AsyncTMACopyGlobalToLocalOp::create(
