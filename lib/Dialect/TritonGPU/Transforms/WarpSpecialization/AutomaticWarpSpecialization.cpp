@@ -70,7 +70,9 @@ void AutomaticWarpSpecialization::runOnOperation() {
   // pm.addPass(arith::createIntRangeOptimizationsPass());
   pm.addPass(createSCCPPass());
   pm.addPass(createCSEPass());
-  pm.addPass(createNVWSLowerAref({numStages}));
+  pm.addPass(createNVWSLowerArefToSemaphore({numStages}));
+  pm.addPass(createNVWSAssignSemaphoreStagePhase());
+  pm.addPass(createNVWSLowerSemaphore());
   pm.addPass(createTritonGPUPartitionLoops());
   pm.addPass(createNVWSLowerWarpGroup());
   pm.addPass(createTritonGPUScheduleLoops());

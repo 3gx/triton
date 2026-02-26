@@ -16,7 +16,8 @@
 module attributes {"ttg.num-warps" = 4 : i32} {
   // ASSIGN-LABEL: sym_name = "partition_loops_ws_tag_regression"
   // ASSIGN: "arith.constant"() <{value = true}> {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32}
-  // ASSIGN: "scf.if"
+  // ASSIGN: "scf.if"(%{{.*}})
+  // ASSIGN: "scf.yield"(%{{.*}}) {ttg.partition = array<i32: 0, 1>}
   // ASSIGN-NOT: "arith.constant"() <{value = true}> {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32}
   tt.func @partition_loops_ws_tag_regression(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
     %c0_i32 = arith.constant 0 : i32
