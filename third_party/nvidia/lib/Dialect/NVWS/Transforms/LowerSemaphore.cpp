@@ -21,24 +21,29 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include "Utilities.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/PartitionBuilder.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -88,6 +93,170 @@ SmallVector<AsyncOp> castAsyncOpAttrs(ArrayAttr opAttrs) {
   for (auto asyncKind : opAttrs)
     kinds.push_back(cast<AsyncOpAttr>(asyncKind).getValue());
   return kinds;
+}
+
+bool isOperandPipelineable(Value v, scf::ForOp forOp) {
+  auto isPipelineable = [](Operation *op) {
+    return isa<SemaphoreAcquireOp, SemaphoreBufferOp>(op);
+  };
+
+  Operation *foundDef = nullptr;
+  return triton::nvidia_gpu::isOperandPipelineableBase(v, forOp, foundDef,
+                                                       isPipelineable);
+}
+
+void setIsAsync(triton::nvidia_gpu::MMAv5OpInterface mmaOp,
+                unsigned defaultNumStages) {
+  bool isAsync = true;
+  auto forOp = mmaOp->getParentOfType<scf::ForOp>();
+  if (!forOp)
+    return;
+
+  unsigned numStages = getNumStagesOrDefault(forOp, defaultNumStages);
+  if (numStages <= 1)
+    return;
+
+  if (auto scaledOp = dyn_cast<triton::nvidia_gpu::TCGen5MMAScaledOp>(
+          mmaOp.getOperation())) {
+    if (!triton::nvidia_gpu::areScalesPipelineable(scaledOp, forOp))
+      isAsync = false;
+    if (!isOperandPipelineable(scaledOp.getAScale(), forOp) ||
+        !isOperandPipelineable(scaledOp.getBScale(), forOp)) {
+      isAsync = false;
+    }
+  }
+  mmaOp.setIsAsync(isAsync);
+}
+
+DenseSet<MMAv5OpInterface> getAsyncMMAv5Consumers(Value semaphore) {
+  DenseSet<MMAv5OpInterface> mmav5Ops;
+  for (Operation *semaUser : semaphore.getUsers()) {
+    auto acquireOp = dyn_cast<SemaphoreAcquireOp>(semaUser);
+    if (!acquireOp)
+      continue;
+    if (hasPartition(acquireOp) && getPartitionIds(acquireOp).front() == 0) {
+      // Ignore MMAv5 ops in the default partition. They are not warp
+      // specialized.
+      continue;
+    }
+
+    for (Operation *tokUser : acquireOp.getToken().getUsers()) {
+      auto bufferOp = dyn_cast<SemaphoreBufferOp>(tokUser);
+      if (!bufferOp)
+        continue;
+
+      for (Operation *consumer : bufferOp->getUsers()) {
+        if (auto mmav5 = dyn_cast<MMAv5OpInterface>(consumer)) {
+          mmav5Ops.insert(mmav5);
+        } else if (auto forOp = consumer->getParentOfType<scf::ForOp>()) {
+          auto users =
+              getTopLevelUsersInLoop(consumer, forOp, [](Operation *user) {
+                return isa<MMAv5OpInterface>(user);
+              });
+          for (auto user : users)
+            mmav5Ops.insert(cast<MMAv5OpInterface>(user));
+        }
+      }
+    }
+  }
+  return mmav5Ops;
+}
+
+bool hasProducerLoad(SemaphoreCreateOp semaOp) {
+  for (Operation *user : semaOp->getUsers()) {
+    auto releaseOp = dyn_cast<SemaphoreReleaseOp>(user);
+    if (!releaseOp)
+      continue;
+    auto asyncKinds = castAsyncOpAttrs(releaseOp.getAsyncOps());
+    if (llvm::any_of(asyncKinds, [](AsyncOp kind) {
+          return kind == AsyncOp::TMALoad || kind == AsyncOp::CpAsync;
+        })) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void multiBufferSemaphore(ModuleOp module, int numStages) {
+  if (numStages <= 1)
+    return;
+
+  llvm::DenseMap<Value, SmallVector<SemaphoreCreateOp>> bufferGroups;
+  module.walk([&](SemaphoreCreateOp semaOp) {
+    if (semaOp.getBuffers().empty())
+      return;
+    bufferGroups[semaOp.getBuffers().front()].push_back(semaOp);
+  });
+
+  SetVector<Operation *> staleAllocs;
+  for (auto &it : bufferGroups) {
+    auto &semas = it.second;
+    if (semas.empty())
+      continue;
+    if (!llvm::any_of(semas, hasProducerLoad))
+      continue;
+
+    bool eligible = true;
+    for (Value opnd : semas.front().getBuffers()) {
+      if (!opnd.getDefiningOp() || isa<TMEMAllocOp>(opnd.getDefiningOp()))
+        eligible = false;
+    }
+    if (!eligible)
+      continue;
+
+    OpBuilder builder(semas.front());
+    SmallVector<Value> newBuffers;
+    SmallVector<Type> newBufferTypes;
+    newBuffers.reserve(semas.front().getBuffers().size());
+    newBufferTypes.reserve(semas.front().getBuffers().size());
+
+    for (Value opnd : semas.front().getBuffers()) {
+      auto oldAlloc = opnd.getDefiningOp();
+      auto oldBufType = cast<MemDescType>(opnd.getType());
+      auto newBufType =
+          getMultiBufferedType(getBufferViewType(oldBufType, true), numStages);
+      Operation *newAlloc =
+          triton::nvws::createAlloc(builder, oldAlloc->getLoc(), newBufType,
+                                    Value());
+      newBuffers.push_back(newAlloc->getResult(0));
+      newBufferTypes.push_back(newBufType);
+      oldAlloc->replaceAllUsesWith(newAlloc);
+      staleAllocs.insert(oldAlloc);
+    }
+
+    for (SemaphoreCreateOp semaOp : semas) {
+      OpBuilder semaBuilder(semaOp);
+      auto semaTy = SemaphoreType::get(
+          semaBuilder.getContext(),
+          TypeArrayAttr::get(semaBuilder.getContext(), newBufferTypes),
+          numStages);
+      auto newSema =
+          SemaphoreCreateOp::create(semaBuilder, semaOp.getLoc(), semaTy,
+                                    newBuffers, semaOp.getIsReleased());
+      newSema->setAttrs(semaOp->getAttrs());
+      semaOp.getResult().replaceAllUsesWith(newSema.getResult());
+      semaOp.erase();
+    }
+  }
+
+  for (Operation *alloc : staleAllocs)
+    alloc->erase();
+}
+
+bool requiresAssignSemaphoreStagePhase(ModuleOp module) {
+  bool needsAssign = false;
+  module.walk([&](Operation *op) {
+    if (needsAssign)
+      return;
+    if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(op)) {
+      needsAssign = !acquireOp.getStage() || !acquireOp.getPhase();
+    } else if (auto releaseOp = dyn_cast<SemaphoreReleaseOp>(op)) {
+      needsAssign = !releaseOp.getStage();
+    } else if (auto bufferOp = dyn_cast<SemaphoreBufferOp>(op)) {
+      needsAssign = !bufferOp.getStage();
+    }
+  });
+  return needsAssign;
 }
 
 int getPendingCount(SemaphoreCreateOp op) {
@@ -406,12 +575,31 @@ class LowerSemaphoreCreate : public OpRewritePattern<SemaphoreCreateOp> {
 public:
   LowerSemaphoreCreate(
       MLIRContext *ctx,
-      const llvm::DenseMap<Operation *, bool> &hasAsyncPeerBySema)
+      const llvm::DenseMap<Operation *, bool> &hasAsyncPeerBySema,
+      unsigned defaultNumStages, bool enableAsyncMarking)
       : OpRewritePattern<SemaphoreCreateOp>(ctx),
-        hasAsyncPeerBySema(hasAsyncPeerBySema) {}
+        hasAsyncPeerBySema(hasAsyncPeerBySema),
+        defaultNumStages(defaultNumStages),
+        enableAsyncMarking(enableAsyncMarking) {}
 
   LogicalResult matchAndRewrite(SemaphoreCreateOp op,
                                 PatternRewriter &rewriter) const override {
+    if (enableAsyncMarking) {
+      for (Operation *user : op->getUsers()) {
+        auto releaseOp = dyn_cast<SemaphoreReleaseOp>(user);
+        if (!releaseOp)
+          continue;
+        auto kinds = castAsyncOpAttrs(releaseOp.getAsyncOps());
+        if (llvm::any_of(kinds, [](AsyncOp kind) {
+              return kind == AsyncOp::TMALoad || kind == AsyncOp::CpAsync;
+            })) {
+          for (auto mma : getAsyncMMAv5Consumers(op.getResult()))
+            setIsAsync(mma, defaultNumStages);
+          break;
+        }
+      }
+    }
+
     auto mbars = createAndInitMbar(op, rewriter);
     SmallVector<Value> buffers(op.getBuffers().begin(), op.getBuffers().end());
 
@@ -478,6 +666,8 @@ public:
 
 private:
   const llvm::DenseMap<Operation *, bool> &hasAsyncPeerBySema;
+  unsigned defaultNumStages;
+  bool enableAsyncMarking;
 };
 
 class NVWSLowerSemaphore
@@ -489,6 +679,15 @@ public:
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
+
+    bool phase2Mode = requiresAssignSemaphoreStagePhase(m);
+    if (phase2Mode) {
+      multiBufferSemaphore(m, numStages);
+      OpPassManager pm("builtin.module");
+      pm.addPass(createNVWSAssignSemaphoreStagePhase());
+      if (failed(runPipeline(pm, m)))
+        return signalPassFailure();
+    }
 
     // Precompute cross-semaphore async relationships before any rewrite:
     //
@@ -547,7 +746,8 @@ public:
     RewritePatternSet patterns(context);
     // Pass precomputed peer information into the pattern so each semaphore can
     // make a stable fence decision even after peers are rewritten/erased.
-    patterns.add<LowerSemaphoreCreate>(context, hasAsyncPeerBySema);
+    patterns.add<LowerSemaphoreCreate>(context, hasAsyncPeerBySema, numStages,
+                                       phase2Mode);
     GreedyRewriteConfig config;
     config.enableConstantCSE(false);
     config.enableFolding(false);

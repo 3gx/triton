@@ -52,6 +52,7 @@ def NVWS_SemaphoreCreateOp : NVWS_Op<"semaphore.create", [
   let assemblyFormat = [{
     $buffers $is_released attr-dict `:` type($result)
   }];
+  let hasVerifier = 1;
 }
 
 def NVWS_SemaphoreAcquireOp : NVWS_Op<"semaphore.acquire", [
@@ -89,6 +90,7 @@ def NVWS_SemaphoreReleaseOp : NVWS_Op<"semaphore.release", [
       build($_builder, $_state, semaphore, token, Value(), async_ops);
     }]>
   ];
+  let hasVerifier = 1;
 }
 
 def NVWS_SemaphoreBufferOp : NVWS_Op<"semaphore.buffer", [

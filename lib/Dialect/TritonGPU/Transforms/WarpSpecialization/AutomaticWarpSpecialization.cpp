@@ -63,16 +63,14 @@ void AutomaticWarpSpecialization::runOnOperation() {
   OpPassManager pm;
   pm.addPass(createTritonGPUPartitionScheduling());
   pm.addPass(createNVWSHoistTmemStore());
-  pm.addPass(createNVWSInsertAref());
-  pm.addPass(createNVWSInsertTmemAref());
+  pm.addPass(createNVWSInsertSemaphore());
+  pm.addPass(createNVWSInsertTmemSemaphore());
   // `int-range-optimizations` and SCCP are good at cleaning up loop arithmetic.
   // FIXME: Re-enable integer range analysis once it is fixed.
   // pm.addPass(arith::createIntRangeOptimizationsPass());
   pm.addPass(createSCCPPass());
   pm.addPass(createCSEPass());
-  pm.addPass(createNVWSLowerArefToSemaphore({numStages}));
-  pm.addPass(createNVWSAssignSemaphoreStagePhase());
-  pm.addPass(createNVWSLowerSemaphore());
+  pm.addPass(createNVWSLowerSemaphore({numStages}));
   pm.addPass(createTritonGPUPartitionLoops());
   pm.addPass(createNVWSLowerWarpGroup());
   pm.addPass(createTritonGPUScheduleLoops());

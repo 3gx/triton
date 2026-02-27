@@ -7,6 +7,7 @@
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVectorExtras.h"
 
@@ -39,6 +40,60 @@ LogicalResult ArefCreateOp::verify() {
   }
   if (!llvm::all_equal(dims))
     return emitError("Leading dims of sliced aref inputs don't match.");
+
+  return success();
+}
+
+static LogicalResult verifyNoDuplicateAsyncOps(Operation *op,
+                                               ArrayAttr asyncOps) {
+  llvm::DenseSet<AsyncOp> seen;
+  for (Attribute attr : asyncOps) {
+    auto asyncAttr = dyn_cast<AsyncOpAttr>(attr);
+    if (!asyncAttr)
+      return op->emitError("async_ops must be an array of #nvws.async_op");
+    if (!seen.insert(asyncAttr.getValue()).second)
+      return op->emitError("async_ops contains duplicate async kind");
+  }
+  return success();
+}
+
+static int getSemaphoreDepthFromBaseType(Type type) {
+  auto memTy = dyn_cast<triton::gpu::MemDescType>(type);
+  if (!memTy)
+    return -1;
+  if (isa<triton::nvidia_gpu::TensorMemoryScalesEncodingAttr>(
+          memTy.getEncoding()))
+    return 1;
+  auto shape = memTy.getShape();
+  if (shape.empty())
+    return -1;
+  return shape.front();
+}
+
+LogicalResult SemaphoreReleaseOp::verify() {
+  return verifyNoDuplicateAsyncOps(getOperation(), getAsyncOps());
+}
+
+LogicalResult SemaphoreCreateOp::verify() {
+  auto semTy = getType();
+  int numStages = semTy.getNumStages() > 0 ? semTy.getNumStages() : 1;
+
+  for (Type baseTy : semTy.getBaseType()) {
+    int depth = getSemaphoreDepthFromBaseType(baseTy);
+    if (depth >= 0 && depth != 1 && depth != numStages) {
+      return emitError("semaphore baseType depth (")
+             << depth << ") must match numStages (" << numStages << ")";
+    }
+  }
+
+  for (Operation *user : getResult().getUsers()) {
+    auto releaseOp = dyn_cast<SemaphoreReleaseOp>(user);
+    if (!releaseOp)
+      continue;
+
+    if (failed(verifyNoDuplicateAsyncOps(releaseOp, releaseOp.getAsyncOps())))
+      return failure();
+  }
 
   return success();
 }

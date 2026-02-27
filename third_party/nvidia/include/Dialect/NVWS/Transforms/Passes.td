@@ -131,6 +131,38 @@ def NVWSInsertTmemAref: Pass<"nvws-insert-tmem-aref", "mlir::ModuleOp"> {
   ];
 }
 
+def NVWSInsertSemaphore: Pass<"nvws-insert-semaphore", "mlir::ModuleOp"> {
+  let summary = "Insert semaphore ops between producer and consumer partitions.";
+
+  let description = [{
+    Inserts synchronization directly as semaphore operations for SMEM
+    producer/consumer communication.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def NVWSInsertTmemSemaphore: Pass<"nvws-insert-tmem-semaphore", "mlir::ModuleOp"> {
+  let summary = "Insert TMEM semaphore ops for ownership transfer.";
+
+  let description = [{
+    Inserts synchronization directly as semaphore operations for TMEM ownership
+    transfer between partitions.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def NVWSHoistTmemStore: Pass<"nvws-hoist-tmem-store", "mlir::ModuleOp"> {
   let summary = "Hoist tmem store before the inner loop to the top level if possible.";
 
@@ -235,6 +267,10 @@ def NVWSLowerSemaphore : Pass<"nvws-lower-semaphore", "mlir::ModuleOp"> {
     "mlir::triton::TritonDialect",
     "mlir::triton::gpu::TritonGPUDialect",
     "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+  let options = [
+    Option<"numStages", "num-stages", "int32_t", /*default*/"3",
+           "number of pipeline stages">
   ];
 }
 
