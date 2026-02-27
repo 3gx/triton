@@ -161,7 +161,8 @@ struct AssignSemaphoreStagePhase {
     for (auto &op : *block) {
       if (getAcquireOp(&op) ||
           isGroupBuffer(dyn_cast<SemaphoreBufferOp>(op), token) ||
-          (isInPartition(&op) && classifyAccess(&op) != AccessKind::None))
+          (token && isInPartition(&op) &&
+           classifyAccess(&op) != AccessKind::None))
         return true;
       if (auto forOp = dyn_cast<scf::ForOp>(op)) {
         Value newTok;
