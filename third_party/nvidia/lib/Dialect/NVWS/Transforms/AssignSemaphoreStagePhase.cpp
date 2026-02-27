@@ -21,7 +21,6 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include "SemaphoreUtilities.h"
 #include "Utilities.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -33,7 +32,6 @@
 #include "mlir/Support/LogicalResult.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
-#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/PartitionBuilder.h"
@@ -57,245 +55,80 @@ namespace triton {
 
 namespace {
 
-struct PartitionWsTagIds {
-  std::optional<int> wsTag;
-  std::optional<SetVector<int>> partitionIds;
-  StageCluster stageCluster;
-};
+// ---------------------------------------------------------------------------
+// Per-partition processing, exactly like aref AssignStagePhase<T>.
+// State = {stage, wasObserved, phase, token} per semaphore per partition.
+// Each (semaphore, partition) pair gets its own iter_args through loops/ifs.
+// ---------------------------------------------------------------------------
 
-PartitionWsTagIds
-getPartitionWsTagIds(Operation *op,
-                     std::optional<SetVector<int>> partitionIds = std::nullopt) {
-  PartitionWsTagIds ids;
-  ids.partitionIds = partitionIds;
-  if (!ids.partitionIds && hasPartition(op))
-    ids.partitionIds = getPartitionIds(op);
-  if (auto wsTag = getWarpSpecializeTag(op))
-    ids.wsTag = *wsTag;
-  ids.stageCluster = getStageCluster(op);
-  return ids;
-}
+enum class AccessKind { None, Observation, FreshWrite, FreshWriteMMA };
 
-template <typename OpT, typename... Args>
-OpT createInto(ImplicitLocOpBuilder &b, PartitionWsTagIds partitionWsTagIds,
-               Args &&...args) {
-  auto op = triton::gpu::createInto<OpT>(
-      b, b.getLoc(), partitionWsTagIds.partitionIds,
-      partitionWsTagIds.stageCluster, std::forward<Args>(args)...);
-  if (partitionWsTagIds.partitionIds && partitionWsTagIds.wsTag)
-    setWarpSpecializeTag(op, *partitionWsTagIds.wsTag);
-  return op;
-}
-
-SmallVector<SetVector<int>, 4> getPartitionOutputsSafe(Operation *op) {
-  SetVector<int> ids = hasPartition(op) ? getPartitionIds(op) : SetVector<int>{};
-  if (ids.empty())
-    ids.insert(0);
-
-  SmallVector<SetVector<int>, 4> outputs =
-      op->hasAttr(kPartitionOutputsAttrName)
-          ? getPartitionOutputs(op)
-          : SmallVector<SetVector<int>, 4>{};
-
-  if (outputs.size() < op->getNumResults())
-    outputs.resize(op->getNumResults(), ids);
-  else if (outputs.size() > op->getNumResults())
-    outputs.resize(op->getNumResults());
-
-  for (auto &outIds : outputs) {
-    if (outIds.empty())
-      outIds = ids;
-  }
-
-  if (outputs.empty()) {
-    outputs.reserve(op->getNumResults());
-    for (unsigned i = 0; i < op->getNumResults(); ++i)
-      outputs.push_back(ids);
-  }
-  return outputs;
-}
-
-SetVector<int> inferPartitionIds(Value value) {
-  SetVector<int> ids;
-  if (auto defOp = value.getDefiningOp()) {
-    if (defOp->getNumRegions() == 0) {
-      if (hasPartition(defOp)) {
-        auto defIds = getPartitionIds(defOp);
-        ids.insert(defIds.begin(), defIds.end());
-      }
-    } else if (auto pos = findValuePosInRange(defOp->getResults(), value)) {
-      auto outputs = getPartitionOutputsSafe(defOp);
-      if (*pos < outputs.size()) {
-        auto outIds = outputs[*pos];
-        ids.insert(outIds.begin(), outIds.end());
-      }
-    }
-  } else {
-    for (Operation *user : value.getUsers()) {
-      if (isa<scf::YieldOp>(user))
-        continue;
-      if (hasPartition(user)) {
-        auto userIds = getPartitionIds(user);
-        ids.insert(userIds.begin(), userIds.end());
-      }
-    }
-  }
-  return ids;
-}
-
-class AssignSemaphoreStage {
-public:
+struct AssignSemaphoreStagePhase {
   struct State {
     Value stage;
     Value wasObserved;
+    Value phase;
+    Value token;
   };
 
-  enum class AccessKind {
-    None,
-    Observation,
-    FreshWrite,
-    FreshWriteMMA,
-  };
+  Value semaphore;
+  int partitionId;
+  int depth;
+  DenseMap<std::pair<Operation *, Value>, int> tokToStagePosMap;
 
-  AssignSemaphoreStage(FuncOp funcOp, ArrayRef<SemaphoreCreateOp> semaphores)
-      : funcOp(funcOp), semaphores(semaphores.begin(), semaphores.end()) {
-    for (auto sema : this->semaphores)
-      semaphoreValues.insert(sema.getResult());
+  AssignSemaphoreStagePhase(Value semaphore, int partitionId, int depth)
+      : semaphore(semaphore), partitionId(partitionId), depth(depth) {}
 
-    auto semaType = cast<SemaphoreType>(this->semaphores.front().getType());
-    depth = std::max(1, semaType.getNumStages());
+  // --- Op matching ---------------------------------------------------------
 
-    collectGroupPartitionIds();
-  }
-
-  LogicalResult run() {
-    if (semaphores.empty())
-      return success();
-
-    ImplicitLocOpBuilder b(semaphores.front().getLoc(), semaphores.front());
-    b.setInsertionPointAfter(semaphores.front());
-
-    auto info = getGroupInfo(semaphores.front().getOperation());
-    auto stage0 = createInto<arith::ConstantIntOp>(b, info, 0, 32);
-    auto observed0 = createInto<arith::ConstantIntOp>(b, info, 0, 1);
-
-    State state{stage0, observed0};
-    auto *entry = &funcOp.getBody().front();
-    assignStateInBlock(entry, state);
-
-    DenseSet<Operation *> visited;
-    SmallVector<SemaphoreAcquireOp> acquireOps;
-    funcOp.walk([&](SemaphoreAcquireOp acquireOp) {
-      if (isGroupSemaphore(acquireOp.getSemaphore()))
-        acquireOps.push_back(acquireOp);
-    });
-    for (auto acquireOp : acquireOps)
-      propagateStage(acquireOp.getToken(), acquireOp.getStage(), visited);
-
-    return success();
-  }
-
-private:
-  bool isGroupSemaphore(Value semaphore) const {
-    return semaphoreValues.contains(semaphore);
-  }
-
-  bool isGroupToken(Value token) {
-    if (!isa<AsyncTokenType>(token.getType()))
-      return false;
-    if (auto it = tokenMemo.find(token); it != tokenMemo.end())
-      return it->second;
-    if (!tokenVisited.insert(token).second)
-      return false;
-
-    bool result = false;
-    if (auto acquireOp = token.getDefiningOp<SemaphoreAcquireOp>()) {
-      result = isGroupSemaphore(acquireOp.getSemaphore());
-    } else if (auto blockArg = dyn_cast<BlockArgument>(token)) {
-      if (auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp())) {
-        if (auto pos = findValuePosInRange(forOp.getRegionIterArgs(), token))
-          result = isGroupToken(forOp.getInitArgs()[*pos]);
-      }
-    } else if (auto *defOp = token.getDefiningOp()) {
-      if (auto forOp = dyn_cast<scf::ForOp>(defOp)) {
-        unsigned idx = cast<OpResult>(token).getResultNumber();
-        if (idx < forOp.getYieldedValues().size())
-          result = isGroupToken(forOp.getYieldedValues()[idx]);
-      } else if (auto ifOp = dyn_cast<scf::IfOp>(defOp)) {
-        unsigned idx = cast<OpResult>(token).getResultNumber();
-        if (idx < ifOp.thenYield()->getNumOperands())
-          result = isGroupToken(ifOp.thenYield()->getOperand(idx));
-        if (!result && ifOp.elseBlock() &&
-            idx < ifOp.elseYield()->getNumOperands()) {
-          result = isGroupToken(ifOp.elseYield()->getOperand(idx));
-        }
+  SemaphoreAcquireOp getAcquireOp(Operation *op) {
+    if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(op)) {
+      if (acquireOp.getSemaphore() == semaphore) {
+        if (!hasPartition(op) ||
+            llvm::is_contained(getPartitionIds(op), partitionId))
+          return acquireOp;
       }
     }
+    return {};
+  }
 
-    tokenVisited.erase(token);
-    tokenMemo[token] = result;
-    return result;
+  bool isGroupBuffer(SemaphoreBufferOp bufOp, Value token) {
+    if (!bufOp)
+      return false;
+    if (bufOp.getSemaphore() != this->semaphore)
+      return false;
+    return token == bufOp.getToken();
   }
 
   bool isGroupView(Value bufferView) {
     if (!isa<MemDescType>(bufferView.getType()))
       return false;
-    if (auto it = viewMemo.find(bufferView); it != viewMemo.end())
-      return it->second;
-    if (!viewVisited.insert(bufferView).second)
-      return false;
-
-    bool result = false;
-    if (auto semaBuffer = bufferView.getDefiningOp<SemaphoreBufferOp>()) {
-      result = isGroupSemaphore(semaBuffer.getSemaphore());
-    } else if (auto blockArg = dyn_cast<BlockArgument>(bufferView)) {
-      if (auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp())) {
-        if (auto pos = findValuePosInRange(forOp.getRegionIterArgs(), bufferView))
-          result = isGroupView(forOp.getInitArgs()[*pos]);
-      }
+    if (auto semaBuffer = bufferView.getDefiningOp<SemaphoreBufferOp>())
+      return semaBuffer.getSemaphore() == this->semaphore;
+    if (auto blockArg = dyn_cast<BlockArgument>(bufferView)) {
+      if (auto forOp =
+              dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp()))
+        if (auto pos =
+                findValuePosInRange(forOp.getRegionIterArgs(), bufferView))
+          return isGroupView(forOp.getInitArgs()[*pos]);
     } else if (auto *defOp = bufferView.getDefiningOp()) {
-      if (defOp->hasTrait<OpTrait::MemDescViewTrait>()) {
-        for (Value operand : defOp->getOperands()) {
-          if (!isa<MemDescType>(operand.getType()))
-            continue;
-          if (isGroupView(operand)) {
-            result = true;
-            break;
-          }
-        }
-      } else if (auto forOp = dyn_cast<scf::ForOp>(defOp)) {
-        unsigned idx = cast<OpResult>(bufferView).getResultNumber();
-        if (idx < forOp.getYieldedValues().size())
-          result = isGroupView(forOp.getYieldedValues()[idx]);
-      } else if (auto ifOp = dyn_cast<scf::IfOp>(defOp)) {
-        unsigned idx = cast<OpResult>(bufferView).getResultNumber();
-        if (idx < ifOp.thenYield()->getNumOperands())
-          result = isGroupView(ifOp.thenYield()->getOperand(idx));
-        if (!result && ifOp.elseBlock() &&
-            idx < ifOp.elseYield()->getNumOperands()) {
-          result = isGroupView(ifOp.elseYield()->getOperand(idx));
-        }
-      }
+      if (defOp->hasTrait<OpTrait::MemDescViewTrait>())
+        for (Value operand : defOp->getOperands())
+          if (isa<MemDescType>(operand.getType()) && isGroupView(operand))
+            return true;
     }
-
-    viewVisited.erase(bufferView);
-    viewMemo[bufferView] = result;
-    return result;
+    return false;
   }
 
+  // --- Access classification -----------------------------------------------
+
   AccessKind classifyAccess(Operation *op) {
-    if (auto loadOp = dyn_cast<LocalLoadOp>(op)) {
-      if (isGroupView(loadOp.getSrc()))
-        return AccessKind::Observation;
-      return AccessKind::None;
-    }
-
-    if (auto loadOp = dyn_cast<TMEMLoadOp>(op)) {
-      if (isGroupView(loadOp.getSrc()))
-        return AccessKind::Observation;
-      return AccessKind::None;
-    }
-
+    if (auto loadOp = dyn_cast<LocalLoadOp>(op))
+      return isGroupView(loadOp.getSrc()) ? AccessKind::Observation
+                                          : AccessKind::None;
+    if (auto loadOp = dyn_cast<TMEMLoadOp>(op))
+      return isGroupView(loadOp.getSrc()) ? AccessKind::Observation
+                                          : AccessKind::None;
     if (auto mmaOp = dyn_cast<MMAv5OpInterface>(op)) {
       if (isGroupView(mmaOp.getAccumulator()))
         return AccessKind::FreshWriteMMA;
@@ -303,394 +136,428 @@ private:
         return AccessKind::Observation;
       return AccessKind::None;
     }
-
-    if (auto storeOp = dyn_cast<LocalStoreOp>(op)) {
-      if (isGroupView(storeOp.getDst()))
-        return AccessKind::FreshWrite;
-      return AccessKind::None;
-    }
-
-    if (auto descLoad = dyn_cast<DescriptorLoadOp>(op)) {
-      if (isGroupView(descLoad.getResult()))
-        return AccessKind::FreshWrite;
-      return AccessKind::None;
-    }
-
-    if (auto descGather = dyn_cast<DescriptorGatherOp>(op)) {
-      if (isGroupView(descGather.getResult()))
-        return AccessKind::FreshWrite;
-      return AccessKind::None;
-    }
-
-    if (auto storeOp = dyn_cast<TMEMStoreOp>(op)) {
-      if (isGroupView(storeOp.getDst()))
-        return AccessKind::FreshWrite;
-      return AccessKind::None;
-    }
-
+    if (auto storeOp = dyn_cast<LocalStoreOp>(op))
+      return isGroupView(storeOp.getDst()) ? AccessKind::FreshWrite
+                                           : AccessKind::None;
+    if (auto descLoad = dyn_cast<DescriptorLoadOp>(op))
+      return isGroupView(descLoad.getResult()) ? AccessKind::FreshWrite
+                                               : AccessKind::None;
+    if (auto descGather = dyn_cast<DescriptorGatherOp>(op))
+      return isGroupView(descGather.getResult()) ? AccessKind::FreshWrite
+                                                 : AccessKind::None;
+    if (auto storeOp = dyn_cast<TMEMStoreOp>(op))
+      return isGroupView(storeOp.getDst()) ? AccessKind::FreshWrite
+                                           : AccessKind::None;
     return AccessKind::None;
   }
 
-  bool hasGroupUseInBlock(Block *block) {
-    for (Operation &op : *block) {
-      if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(op)) {
-        if (isGroupSemaphore(acquireOp.getSemaphore()))
-          return true;
-      }
-      if (auto releaseOp = dyn_cast<SemaphoreReleaseOp>(op)) {
-        if (isGroupSemaphore(releaseOp.getSemaphore()))
-          return true;
-      }
-      if (auto bufferOp = dyn_cast<SemaphoreBufferOp>(op)) {
-        if (isGroupSemaphore(bufferOp.getSemaphore()))
-          return true;
-      }
+  bool isInPartition(Operation *op) {
+    return !hasPartition(op) ||
+           llvm::is_contained(getPartitionIds(op), partitionId);
+  }
 
-      if (classifyAccess(&op) != AccessKind::None)
+  // --- Block analysis ------------------------------------------------------
+
+  bool analyzeUseInBlock(Block *block, Value token) {
+    for (auto &op : *block) {
+      if (getAcquireOp(&op) ||
+          isGroupBuffer(dyn_cast<SemaphoreBufferOp>(op), token) ||
+          (isInPartition(&op) && classifyAccess(&op) != AccessKind::None))
         return true;
-
       if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-        if (hasGroupUseInBlock(forOp.getBody()))
+        Value newTok;
+        if (auto pos = findValuePosInRange(forOp.getInitArgs(), token))
+          newTok = forOp.getRegionIterArgs()[*pos];
+        if (analyzeUseInBlock(forOp.getBody(), newTok))
           return true;
-      }
-      if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-        if (hasGroupUseInBlock(ifOp.thenBlock()))
+      } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+        if (analyzeUseInBlock(ifOp.thenBlock(), token))
           return true;
-        if (ifOp.elseBlock() && hasGroupUseInBlock(ifOp.elseBlock()))
+        if (ifOp.elseBlock() && analyzeUseInBlock(ifOp.elseBlock(), token))
           return true;
       }
     }
     return false;
   }
 
-  void appendLoopPartitionOutputs(scf::ForOp forOp,
-                                  ArrayRef<Value> newOutputValues) {
-    if (!hasPartition(forOp))
-      return;
-
-    auto forIds = getPartitionIds(forOp);
-    auto forOutputs = getPartitionOutputsSafe(forOp);
-    for (Value value : newOutputValues) {
-      auto ids = inferPartitionIds(value);
-      forIds.insert(ids.begin(), ids.end());
-      forOutputs.push_back(ids);
-    }
-    setPartition(forOp, forIds);
-    setPartitionOutputs(forOp, forOutputs);
-  }
-
-  void appendIfPartitionOutputs(scf::IfOp ifOp, SetVector<int> ifIds,
-                                SmallVector<SetVector<int>, 4> ifOutputs,
-                                State thenState, State elseState) {
-    SetVector<int> stageIds = inferPartitionIds(thenState.stage);
-    auto elseStageIds = inferPartitionIds(elseState.stage);
-    stageIds.insert(elseStageIds.begin(), elseStageIds.end());
-
-    SetVector<int> observedIds = inferPartitionIds(thenState.wasObserved);
-    auto elseObservedIds = inferPartitionIds(elseState.wasObserved);
-    observedIds.insert(elseObservedIds.begin(), elseObservedIds.end());
-
-    ifIds.insert(stageIds.begin(), stageIds.end());
-    ifIds.insert(observedIds.begin(), observedIds.end());
-
-    ifOutputs.push_back(stageIds);
-    ifOutputs.push_back(observedIds);
-
-    setPartition(ifOp, ifIds);
-    setPartitionOutputs(ifOp, ifOutputs);
-  }
+  // --- Control-flow threading (verbatim aref pattern) ----------------------
 
   void assignStateInForOp(scf::ForOp forOp, State &state) {
-    if (!hasGroupUseInBlock(forOp.getBody()))
+    Value newTok;
+    if (auto pos = findValuePosInRange(forOp.getInitArgs(), state.token))
+      newTok = forOp.getRegionIterArgs()[*pos];
+    if (!analyzeUseInBlock(forOp.getBody(), newTok))
       return;
+
+    SmallVector<Value> extraIterArgs{state.stage, state.wasObserved,
+                                     state.phase};
+    SmallVector<Value *> stateRefs{&state.stage, &state.wasObserved,
+                                   &state.phase};
+    llvm::MapVector<int, Value *> tokenRefs;
+
+    if (auto pos = findValuePosInRange(forOp.getInitArgs(), state.token)) {
+      tokenRefs[*pos] = &state.token;
+      state.token = forOp.getRegionIterArgs()[*pos];
+    }
 
     OpBuilder builder(forOp);
     size_t nArgs = forOp.getRegionIterArgs().size();
-    forOp = addIterArgsToLoop(builder, forOp, {state.stage, state.wasObserved});
 
-    for (size_t idx = 0; idx < nArgs; ++idx) {
-      Value initArg = forOp.getInitArgs()[idx];
-      if (!isGroupToken(initArg))
-        continue;
-      Value iterTok = forOp.getRegionIterArgs()[idx];
-      tokToStagePosMap[{forOp.getOperation(), iterTok}] = nArgs;
+    assert(hasPartition(forOp));
+    auto forOpIds = getPartitionIds(forOp);
+    auto forOpOutputsIds = getPartitionOutputs(forOp);
+    forOp = addIterArgsToLoop(builder, forOp, extraIterArgs);
+
+    for (size_t idx = nArgs; idx < forOp.getRegionIterArgs().size(); ++idx)
+      *stateRefs[idx - nArgs] = forOp.getRegionIterArgs()[idx];
+
+    auto stateInBlock = assignStateInBlock(forOp.getBody(), state);
+
+    SmallVector<Value> extraYieldArgs{stateInBlock.stage,
+                                      stateInBlock.wasObserved,
+                                      stateInBlock.phase};
+    appendToForOpYield(forOp, extraYieldArgs);
+    tokToStagePosMap[{forOp, state.token}] = nArgs;
+    tokToStagePosMap[{forOp.getBody()->getTerminator(), stateInBlock.token}] =
+        nArgs;
+
+    // Partition annotation — verbatim from aref
+    for (auto arg : extraYieldArgs) {
+      SetVector<int> argIds;
+      if (auto defOp = arg.getDefiningOp()) {
+        if (defOp->getNumRegions() == 0) {
+          if (hasPartition(defOp))
+            argIds = getPartitionIds(defOp);
+        } else {
+          auto pos = findValuePosInRange(defOp->getResults(), arg);
+          if (pos) {
+            auto outputs = getPartitionOutputs(defOp);
+            if (*pos < outputs.size())
+              argIds = outputs[*pos];
+          }
+        }
+      } else {
+        for (auto user : arg.getUsers()) {
+          if (isa<scf::YieldOp>(user))
+            continue;
+          if (hasPartition(user)) {
+            auto ids = getPartitionIds(user);
+            argIds.insert(ids.begin(), ids.end());
+          }
+        }
+      }
+      if (argIds.empty())
+        argIds = forOpIds;
+      forOpIds.insert(argIds.begin(), argIds.end());
+      forOpOutputsIds.push_back(argIds);
     }
+    setPartition(forOp, forOpIds);
+    setPartitionOutputs(forOp, forOpOutputsIds);
 
-    State loopState{forOp.getRegionIterArgs()[nArgs],
-                    forOp.getRegionIterArgs()[nArgs + 1]};
-    loopState = assignStateInBlock(forOp.getBody(), loopState);
-
-    appendToForOpYield(forOp, {loopState.stage, loopState.wasObserved});
-
-    auto *yieldOp = forOp.getBody()->getTerminator();
-    for (size_t idx = 0; idx < nArgs; ++idx) {
-      Value initArg = forOp.getInitArgs()[idx];
-      if (!isGroupToken(initArg))
-        continue;
-      tokToStagePosMap[{yieldOp, yieldOp->getOperand(idx)}] = nArgs;
-    }
-
-    appendLoopPartitionOutputs(forOp, {loopState.stage, loopState.wasObserved});
-
-    state.stage = forOp.getResult(nArgs);
-    state.wasObserved = forOp.getResult(nArgs + 1);
+    for (size_t idx = nArgs; idx < forOp.getRegionIterArgs().size(); ++idx)
+      *stateRefs[idx - nArgs] = forOp.getResult(idx);
+    for (auto [idx, tokenRef] : tokenRefs)
+      *tokenRef = forOp.getResult(idx);
   }
 
   void assignStateInIfOp(scf::IfOp ifOp, State &state) {
-    bool useThen = hasGroupUseInBlock(ifOp.thenBlock());
-    bool useElse = ifOp.elseBlock() ? hasGroupUseInBlock(ifOp.elseBlock()) : false;
-    if (!useThen && !useElse)
+    auto useInThen = analyzeUseInBlock(ifOp.thenBlock(), state.token);
+    auto useInElse =
+        ifOp.elseBlock() ? analyzeUseInBlock(ifOp.elseBlock(), state.token)
+                         : false;
+    if (!useInThen && !useInElse)
       return;
 
-    auto oldIfIds = hasPartition(ifOp) ? std::optional(getPartitionIds(ifOp))
-                                       : std::nullopt;
-    auto oldIfOutputs = hasPartition(ifOp)
-                            ? std::optional(getPartitionOutputsSafe(ifOp))
-                            : std::nullopt;
+    SmallVector<Type> extraIfResults{state.stage.getType(),
+                                     state.wasObserved.getType(),
+                                     state.phase.getType()};
+    SmallVector<Value *> stateRefs{&state.stage, &state.wasObserved,
+                                   &state.phase};
 
     OpBuilder builder(ifOp);
-    size_t nResults = ifOp.getNumResults();
-    auto newIfOp = replaceIfOpWithNewSignature(
-        builder, ifOp, TypeRange{state.stage.getType(), state.wasObserved.getType()});
+    size_t nResults = ifOp.getResults().size();
+    auto newIfOp = replaceIfOpWithNewSignature(builder, ifOp, extraIfResults);
 
-    State thenState =
-        useThen ? assignStateInBlock(newIfOp.thenBlock(), state) : state;
-    State elseState =
-        (newIfOp.elseBlock() && useElse)
-            ? assignStateInBlock(newIfOp.elseBlock(), state)
-            : state;
+    auto thenState = assignStateInBlock(newIfOp.thenBlock(), state);
+    auto elseState = newIfOp.elseBlock()
+                         ? assignStateInBlock(newIfOp.elseBlock(), state)
+                         : state;
 
-    auto thenYield = newIfOp.thenYield();
-    auto elseYield = newIfOp.elseYield();
+    auto thenYieldOp = newIfOp.thenYield();
+    auto elseYieldOp = newIfOp.elseYield();
 
-    size_t stagePos = thenYield.getNumOperands();
-    for (Value value : thenYield->getOperands()) {
-      if (isGroupToken(value))
-        tokToStagePosMap[{thenYield.getOperation(), value}] = stagePos;
-    }
-    for (Value value : elseYield->getOperands()) {
-      if (isGroupToken(value))
-        tokToStagePosMap[{elseYield.getOperation(), value}] = stagePos;
-    }
+    llvm::MapVector<int, Value *> tokenRefs;
+    if (auto pos =
+            findValuePosInRange(thenYieldOp->getOperands(), state.token))
+      tokenRefs[*pos] = &state.token;
+    if (auto pos =
+            findValuePosInRange(elseYieldOp->getOperands(), state.token))
+      tokenRefs[*pos] = &state.token;
 
-    thenYield->insertOperands(thenYield.getNumOperands(),
-                              {thenState.stage, thenState.wasObserved});
-    elseYield->insertOperands(elseYield.getNumOperands(),
-                              {elseState.stage, elseState.wasObserved});
+    tokToStagePosMap[{newIfOp.thenYield(), thenState.token}] =
+        thenYieldOp.getNumOperands();
+    tokToStagePosMap[{newIfOp.elseYield(), elseState.token}] =
+        elseYieldOp.getNumOperands();
 
+    thenYieldOp->insertOperands(thenYieldOp.getNumOperands(), thenState.stage);
+    elseYieldOp->insertOperands(elseYieldOp.getNumOperands(), elseState.stage);
+    thenYieldOp->insertOperands(thenYieldOp.getNumOperands(),
+                                thenState.wasObserved);
+    elseYieldOp->insertOperands(elseYieldOp.getNumOperands(),
+                                elseState.wasObserved);
+    thenYieldOp->insertOperands(thenYieldOp.getNumOperands(), thenState.phase);
+    elseYieldOp->insertOperands(elseYieldOp.getNumOperands(), elseState.phase);
+
+    // Partition annotation — verbatim from aref. NEVER widen ifOpIds.
+    assert(hasPartition(ifOp));
+    auto ifOpIds = getPartitionIds(ifOp);
+    auto ifOpOutputsIds = getPartitionOutputs(ifOp);
     ifOp.erase();
 
-    if (oldIfIds && oldIfOutputs)
-      appendIfPartitionOutputs(newIfOp, *oldIfIds, *oldIfOutputs, thenState,
-                               elseState);
+    SetVector<int> stageIds;
+    for (auto arg : {thenState.stage, elseState.stage})
+      if (auto defOp = arg.getDefiningOp())
+        if (hasPartition(defOp)) {
+          auto argIds = getPartitionIds(defOp);
+          stageIds.insert(argIds.begin(), argIds.end());
+        }
+    SetVector<int> observedIds;
+    for (auto arg : {thenState.wasObserved, elseState.wasObserved})
+      if (auto defOp = arg.getDefiningOp())
+        if (hasPartition(defOp)) {
+          auto argIds = getPartitionIds(defOp);
+          observedIds.insert(argIds.begin(), argIds.end());
+        }
+    SetVector<int> phaseIds;
+    for (auto arg : {thenState.phase, elseState.phase})
+      if (auto defOp = arg.getDefiningOp())
+        if (hasPartition(defOp)) {
+          auto argIds = getPartitionIds(defOp);
+          phaseIds.insert(argIds.begin(), argIds.end());
+        }
 
-    state.stage = newIfOp.getResult(nResults);
-    state.wasObserved = newIfOp.getResult(nResults + 1);
+    if (stageIds.empty()) stageIds = ifOpIds;
+    if (observedIds.empty()) observedIds = ifOpIds;
+    if (phaseIds.empty()) phaseIds = ifOpIds;
+
+    ifOpOutputsIds.push_back(stageIds);
+    ifOpOutputsIds.push_back(observedIds);
+    ifOpOutputsIds.push_back(phaseIds);
+    setPartition(newIfOp, ifOpIds);
+    setPartitionOutputs(newIfOp, ifOpOutputsIds);
+
+    for (size_t idx = nResults; idx < newIfOp.getResults().size(); ++idx)
+      *stateRefs[idx - nResults] = newIfOp.getResult(idx);
+    for (auto [idx, tokenRef] : tokenRefs)
+      *tokenRef = newIfOp.getResult(idx);
   }
 
+  // --- Main block walk -----------------------------------------------------
+
   State assignStateInBlock(Block *block, State state) {
-    for (Operation &op : llvm::make_early_inc_range(*block)) {
-      if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(op)) {
-        if (isGroupSemaphore(acquireOp.getSemaphore()))
-          acquireOp.getStageMutable().assign(state.stage);
+    for (auto &op : llvm::make_early_inc_range(*block)) {
+      // Phase trigger: SemaphoreAcquireOp
+      if (auto acquireOp = getAcquireOp(&op)) {
+        acquireOp.getStageMutable().assign(state.stage);
+        acquireOp.getPhaseMutable().assign(state.phase);
+
+        ImplicitLocOpBuilder b(acquireOp.getLoc(), acquireOp);
+        b.setInsertionPointAfter(acquireOp);
+        std::optional<SetVector<int>> pids;
+        if (hasPartition(&op))
+          pids = getPartitionIds(&op);
+        auto wsTag = getWarpSpecializeTag(&op);
+        auto stageCluster = getStageCluster(&op);
+        auto createOp = [&](auto opTy, auto... args) {
+          using ty = decltype(opTy);
+          auto created = triton::gpu::createInto<ty>(
+              b, b.getLoc(), pids, stageCluster,
+              std::forward<decltype(args)>(args)...);
+          if (wsTag)
+            setWarpSpecializeTag(created, *wsTag);
+          return created;
+        };
+
+        auto c1 = createOp(arith::ConstantIntOp{}, 1, 32);
+        auto phaseBit = createOp(arith::ShLIOp{}, c1, state.stage);
+        state.phase = createOp(arith::XOrIOp{}, state.phase, phaseBit);
+        state.token = acquireOp.getToken();
+        continue;
       }
 
+      // Control flow
       if (auto forOp = dyn_cast<scf::ForOp>(op)) {
         assignStateInForOp(forOp, state);
         continue;
       }
-
       if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
         assignStateInIfOp(ifOp, state);
         continue;
       }
 
+      // Stage trigger: data access ops (only for current partition)
+      if (!isInPartition(&op))
+        continue;
       auto access = classifyAccess(&op);
       if (access == AccessKind::None)
         continue;
 
       ImplicitLocOpBuilder b(op.getLoc(), &op);
       b.setInsertionPointAfter(&op);
-
-      auto info = getGroupInfo(&op);
+      std::optional<SetVector<int>> pids;
+      if (hasPartition(&op))
+        pids = getPartitionIds(&op);
+      auto wsTag = getWarpSpecializeTag(&op);
+      auto stageCluster = getStageCluster(&op);
+      auto createOp = [&](auto opTy, auto... args) {
+        using ty = decltype(opTy);
+        auto created = triton::gpu::createInto<ty>(
+            b, b.getLoc(), pids, stageCluster,
+            std::forward<decltype(args)>(args)...);
+        if (wsTag)
+          setWarpSpecializeTag(created, *wsTag);
+        return created;
+      };
 
       if (access == AccessKind::Observation) {
-        state.wasObserved = createInto<arith::ConstantIntOp>(b, info, 1, 1);
+        state.wasObserved = createOp(arith::ConstantIntOp{}, 1, 1);
         continue;
       }
 
       Value isFresh;
       if (access == AccessKind::FreshWrite) {
-        isFresh = createInto<arith::ConstantIntOp>(b, info, 1, 1);
+        isFresh = createOp(arith::ConstantIntOp{}, 1, 1);
       } else {
         auto mmaOp = cast<MMAv5OpInterface>(&op);
-        auto c1 = createInto<arith::ConstantIntOp>(b, info, 1, 1);
-        isFresh = createInto<arith::XOrIOp>(b, info, mmaOp.useAccumulator(), c1);
+        auto c1 = createOp(arith::ConstantIntOp{}, 1, 1);
+        isFresh = createOp(arith::XOrIOp{}, mmaOp.useAccumulator(), c1);
       }
 
-      auto shouldAdvance = createInto<arith::AndIOp>(b, info, state.wasObserved,
-                                                     isFresh);
-      auto c1_i32 = createInto<arith::ConstantIntOp>(b, info, 1, 32);
-      auto c0_i32 = createInto<arith::ConstantIntOp>(b, info, 0, 32);
-      auto cDepth = createInto<arith::ConstantIntOp>(b, info, depth, 32);
-      auto cFalse = createInto<arith::ConstantIntOp>(b, info, 0, 1);
+      auto shouldAdvance =
+          createOp(arith::AndIOp{}, state.wasObserved, isFresh);
+      auto c1_i32 = createOp(arith::ConstantIntOp{}, 1, 32);
+      auto c0_i32 = createOp(arith::ConstantIntOp{}, 0, 32);
+      auto cDepth = createOp(arith::ConstantIntOp{}, depth, 32);
+      auto cFalse = createOp(arith::ConstantIntOp{}, 0, 1);
 
-      auto next = createInto<arith::AddIOp>(b, info, state.stage, c1_i32);
-      auto wrap = createInto<arith::CmpIOp>(
-          b, info, arith::CmpIPredicate::eq, next, cDepth);
-      auto wrapped = createInto<arith::SelectOp>(b, info, wrap, c0_i32, next);
+      auto next = createOp(arith::AddIOp{}, state.stage, c1_i32);
+      auto wrap =
+          createOp(arith::CmpIOp{}, arith::CmpIPredicate::eq, next, cDepth);
+      auto wrapped = createOp(arith::SelectOp{}, wrap, c0_i32, next);
 
       state.stage =
-          createInto<arith::SelectOp>(b, info, shouldAdvance, wrapped, state.stage);
-      state.wasObserved = createInto<arith::SelectOp>(
-          b, info, shouldAdvance, cFalse, state.wasObserved);
+          createOp(arith::SelectOp{}, shouldAdvance, wrapped, state.stage);
+      state.wasObserved =
+          createOp(arith::SelectOp{}, shouldAdvance, cFalse, state.wasObserved);
     }
 
     return state;
   }
 
-  void collectGroupPartitionIds() {
-    auto inferWsTag = [](Operation *op) -> std::optional<int> {
-      if (auto wsTag = getWarpSpecializeTag(op))
-        return wsTag;
-      for (Operation *parent = op->getParentOp(); parent;
-           parent = parent->getParentOp()) {
-        if (auto wsTag = getWarpSpecializeTag(parent))
-          return wsTag;
-      }
-      return std::nullopt;
-    };
+  // --- Token-chain propagation (from aref) ---------------------------------
 
-    funcOp.walk([&](Operation *op) {
-      if (!hasPartition(op))
-        return;
-
-      bool include = false;
-      if (auto semaCreate = dyn_cast<SemaphoreCreateOp>(op)) {
-        include = isGroupSemaphore(semaCreate.getResult());
-      } else if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(op)) {
-        include = isGroupSemaphore(acquireOp.getSemaphore());
-      } else if (auto releaseOp = dyn_cast<SemaphoreReleaseOp>(op)) {
-        include = isGroupSemaphore(releaseOp.getSemaphore());
-      } else if (auto bufferOp = dyn_cast<SemaphoreBufferOp>(op)) {
-        include = isGroupSemaphore(bufferOp.getSemaphore());
-      } else {
-        include = classifyAccess(op) != AccessKind::None;
-      }
-
-      if (!include)
-        return;
-      auto ids = getPartitionIds(op);
-      groupPartitionIds.insert(ids.begin(), ids.end());
-      if (auto wsTag = inferWsTag(op))
-        groupWsTags.insert(*wsTag);
-    });
-  }
-
-  bool isInsideWarpSpecializeLoop(Operation *op) {
-    for (Operation *parent = op->getParentOp(); parent;
-         parent = parent->getParentOp()) {
-      if (auto forOp = dyn_cast<scf::ForOp>(parent))
-        if (forOp->hasAttr(kWarpSpecializeAttrName))
-          return true;
-    }
-    return false;
-  }
-
-  PartitionWsTagIds getGroupInfo(Operation *anchor) {
-    std::optional<SetVector<int>> ids;
-    if (!groupPartitionIds.empty())
-      ids = groupPartitionIds;
-    else if (hasPartition(anchor))
-      ids = getPartitionIds(anchor);
-    auto info = getPartitionWsTagIds(anchor, ids);
-    // Ops outside ws loop bodies must have explicit ws-tags for
-    // PartitionLoops. If the anchor doesn't have one (e.g. semaphore.create
-    // at function scope), infer from the group. Ops inside ws loop bodies
-    // inherit the tag from the enclosing loop and must NOT get explicit tags.
-    if (!info.wsTag && !isInsideWarpSpecializeLoop(anchor) &&
-        groupWsTags.size() == 1)
-      info.wsTag = *groupWsTags.begin();
-    return info;
-  }
-
-  void propagateStage(Value token, Value stage, DenseSet<Operation *> &visited) {
+  void propagateStage(Value token, Value stage,
+                      DenseSet<Operation *> &visited) {
     for (auto &tokUse : token.getUses()) {
-      auto *owner = tokUse.getOwner();
-      if (!visited.insert(owner).second)
+      auto owner = tokUse.getOwner();
+      if (visited.contains(owner))
         continue;
-
+      visited.insert(owner);
       if (auto stageOp = dyn_cast<ArefStageInterface>(owner)) {
-        if (auto blockArg = dyn_cast<BlockArgument>(stage)) {
-          auto forOp =
-              dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
-          if (forOp && hasPartition(stageOp) && hasPartition(forOp)) {
-            auto stageOpIds = getPartitionIds(stageOp);
-            auto forIds = getPartitionIds(forOp);
-            forIds.insert(stageOpIds.begin(), stageOpIds.end());
-            setPartition(forOp, forIds);
+        if (auto blk = dyn_cast<BlockArgument>(stage)) {
+          assert(hasPartition(stageOp));
+          auto stageOpIds = getPartitionIds(stageOp);
+          auto forOp = cast<scf::ForOp>(blk.getOwner()->getParentOp());
+          auto pos = findValuePosInRange(forOp.getRegionIterArgs(), stage);
+          assert(pos);
 
-            if (auto pos = findValuePosInRange(forOp.getRegionIterArgs(), stage)) {
-              auto forOutputs = getPartitionOutputsSafe(forOp);
-              if (*pos < forOutputs.size()) {
-                forOutputs[*pos].insert(stageOpIds.begin(), stageOpIds.end());
-                if (*pos + 1 < forOutputs.size()) {
-                  forOutputs[*pos + 1].insert(stageOpIds.begin(),
-                                              stageOpIds.end());
-                }
-                setPartitionOutputs(forOp, forOutputs);
-              }
-            }
+          assert(hasPartition(forOp));
+          auto forOpIds = getPartitionIds(forOp);
+          forOpIds.insert(stageOpIds.begin(), stageOpIds.end());
+          setPartition(forOp, forOpIds);
+
+          auto forOpOutputsIds = getPartitionOutputs(forOp);
+          // Update all 3 state positions: stage, wasObserved, phase
+          for (int off = 0; off < 3; ++off) {
+            if (*pos + off < forOpOutputsIds.size())
+              forOpOutputsIds[*pos + off].insert(stageOpIds.begin(),
+                                                 stageOpIds.end());
           }
+          setPartitionOutputs(forOp, forOpOutputsIds);
         }
         stageOp.setStage(stage);
       } else if (auto forOp = dyn_cast<scf::ForOp>(owner)) {
         auto tokPos = tokUse.getOperandNumber() - forOp.getNumControlOperands();
         auto iterTok = forOp.getRegionIterArg(tokPos);
-        auto it = tokToStagePosMap.find({forOp.getOperation(), iterTok});
+        auto it = tokToStagePosMap.find({forOp, iterTok});
         if (it == tokToStagePosMap.end())
           continue;
         propagateStage(iterTok, forOp.getRegionIterArgs()[it->second], visited);
       } else if (auto yieldOp = dyn_cast<scf::YieldOp>(owner)) {
-        auto tokPos = tokUse.getOperandNumber();
-        auto it = tokToStagePosMap.find({yieldOp.getOperation(), token});
+        auto it = tokToStagePosMap.find({yieldOp, token});
         if (it == tokToStagePosMap.end())
           continue;
-        auto *parentOp = yieldOp->getParentOp();
-        propagateStage(parentOp->getResult(tokPos),
+        auto parentOp = yieldOp->getParentOp();
+        propagateStage(parentOp->getResult(tokUse.getOperandNumber()),
                        parentOp->getResult(it->second), visited);
       }
     }
   }
 
-  FuncOp funcOp;
-  SmallVector<SemaphoreCreateOp> semaphores;
-  DenseSet<Value> semaphoreValues;
-  SetVector<int> groupPartitionIds;
-  SetVector<int> groupWsTags;
-  int depth = 1;
+  // --- Entry point (per semaphore, like aref per aref) ---------------------
 
-  DenseMap<Value, bool> tokenMemo;
-  DenseSet<Value> tokenVisited;
-  DenseMap<Value, bool> viewMemo;
-  DenseSet<Value> viewVisited;
-  DenseMap<std::pair<Operation *, Value>, int> tokToStagePosMap;
+  static LogicalResult run(SemaphoreCreateOp semaOp) {
+    auto semaType = cast<SemaphoreType>(semaOp.getType());
+    int depth = std::max(1, semaType.getNumStages());
+
+    std::set<int> partitionIds;
+    for (auto user : semaOp->getUsers()) {
+      if (isa<SemaphoreAcquireOp>(user) && hasPartition(user)) {
+        auto ids = getPartitionIds(user);
+        partitionIds.insert(ids.begin(), ids.end());
+      }
+    }
+    if (partitionIds.empty())
+      partitionIds.insert({0, 0});
+
+    ImplicitLocOpBuilder b(semaOp.getLoc(), semaOp);
+    b.setInsertionPointAfter(semaOp);
+
+    State initState;
+    initState.stage = arith::ConstantIntOp::create(b, 0, 32);
+    initState.wasObserved = arith::ConstantIntOp::create(b, 0, 1);
+    uint32_t initPhase = semaOp.getIsReleased() ? 0xFFFFFFFFu : 0x00000000u;
+    initState.phase =
+        arith::ConstantIntOp::create(b, static_cast<int64_t>(initPhase), 32);
+
+    for (auto pid : partitionIds) {
+      AssignSemaphoreStagePhase impl(semaOp.getResult(), pid, depth);
+      impl.assignStateInBlock(semaOp->getBlock(), initState);
+
+      for (auto user : semaOp->getUsers())
+        if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user);
+            acquireOp && (!hasPartition(acquireOp) ||
+                          getPartitionIds(acquireOp).front() == pid)) {
+          DenseSet<Operation *> visited;
+          impl.propagateStage(acquireOp.getToken(), acquireOp.getStage(),
+                              visited);
+        }
+    }
+
+    return success();
+  }
 };
+
+// ---------------------------------------------------------------------------
+// Backward-slice partition logic — verbatim from AssignStagePhase.cpp
+// ---------------------------------------------------------------------------
 
 void updateOutputWithDefaultPartition(Operation *op, int pos) {
   auto opIds = getPartitionIds(op);
   opIds.insert(0);
   setPartition(op, opIds);
 
-  auto opOutputsIds = getPartitionOutputsSafe(op);
-  auto requiredSize =
-      std::max(static_cast<size_t>(op->getNumResults()), static_cast<size_t>(pos + 1));
-  if (opOutputsIds.size() < requiredSize)
-    opOutputsIds.resize(requiredSize, opIds);
-  for (auto &ids : opOutputsIds) {
-    if (ids.empty())
-      ids = opIds;
-  }
+  auto opOutputsIds = getPartitionOutputs(op);
   opOutputsIds[pos].insert(0);
   setPartitionOutputs(op, opOutputsIds);
 }
@@ -702,19 +569,18 @@ void visitBackwardSlice(scf::ForOp wsLoop, Value value,
     return;
 
   if (auto blockArg = dyn_cast<BlockArgument>(value)) {
-    if (auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp())) {
+    if (auto forOp =
+            dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp())) {
       if (forOp->hasAttr(kWarpSpecializeAttrName))
         return;
       auto pos = findValuePosInRange(forOp.getRegionIterArgs(), value);
-      if (!pos)
-        return;
+      assert(pos);
       visitBackwardSlice(wsLoop, forOp.getInitArgs()[*pos], callback, visited);
     }
   } else if (auto defOp = value.getDefiningOp();
              isa<scf::IfOp, scf::ForOp>(defOp)) {
     auto pos = findValuePosInRange(defOp->getResults(), value);
-    if (!pos)
-      return;
+    assert(pos);
     updateOutputWithDefaultPartition(defOp, *pos);
     if (auto ifOp = dyn_cast<scf::IfOp>(defOp)) {
       visitBackwardSlice(wsLoop, ifOp.thenYield()->getOperand(*pos), callback,
@@ -731,80 +597,28 @@ void visitBackwardSlice(scf::ForOp wsLoop, Value value,
       for (int idx = 0; idx < forOp.getNumControlOperands(); ++idx)
         visitBackwardSlice(wsLoop, forOp.getOperand(idx), callback, visited);
     }
-  } else if (auto *defOp = value.getDefiningOp();
-             defOp && wsLoop.getBody()->findAncestorOpInBlock(*defOp)) {
+  } else if (wsLoop.getBody()->findAncestorOpInBlock(*defOp)) {
     callback(defOp);
-    for (Value operand : defOp->getOperands())
+    for (auto operand : defOp->getOperands())
       visitBackwardSlice(wsLoop, operand, callback, visited);
   }
 }
 
-LogicalResult assignSemaphorePhase(FuncOp funcOp) {
-  auto initPhase = [](ImplicitLocOpBuilder &b, Operation *op) -> Value {
-    auto sema = cast<SemaphoreCreateOp>(op);
-    uint32_t init = sema.getIsReleased() ? 0xFFFFFFFFu : 0x00000000u;
-    auto info = getPartitionWsTagIds(op);
-    return createInto<arith::ConstantIntOp>(b, info, static_cast<int64_t>(init),
-                                            32);
-  };
+// ---------------------------------------------------------------------------
+// Main entry point
+// ---------------------------------------------------------------------------
 
-  auto updatePhase = [](ImplicitLocOpBuilder &b, Value phase,
-                        Operation *op) -> Value {
-    auto acquireOp = cast<SemaphoreAcquireOp>(op);
-    acquireOp.getPhaseMutable().assign(phase);
-
-    auto info = getPartitionWsTagIds(op);
-    auto c1 = createInto<arith::ConstantIntOp>(b, info, 1, 32);
-    auto phaseBit = createInto<arith::ShLIOp>(b, info, c1, acquireOp.getStage());
-    return createInto<arith::XOrIOp>(b, info, phase, phaseBit);
-  };
-
-  SmallVector<WarpGroupOp> wgOps;
-  funcOp.walk([&](WarpGroupOp wgOp) { wgOps.push_back(wgOp); });
-
-  if (!wgOps.empty()) {
-    for (auto wgOp : wgOps)
-      ThreadValue<SemaphoreAcquireOp>::run(wgOp, initPhase, updatePhase);
-    return success();
-  }
-
-  ThreadValue<SemaphoreAcquireOp> threadValue{updatePhase};
-  auto *entry = &funcOp.getBody().front();
-  auto useSet = threadValue.analyzeUseInBlock(entry, {});
-
-  ThreadValue<SemaphoreAcquireOp>::ValueMap valueMap;
-  for (auto key : useSet) {
-    if (auto *def = key.getDefiningOp()) {
-      ImplicitLocOpBuilder b(key.getLoc(), def);
-      b.setInsertionPointAfter(def);
-      valueMap[key] = initPhase(b, def);
-    }
-  }
-
-  threadValue.assignValueInBlock(entry, valueMap);
-  return success();
-}
-
-LogicalResult assignSemaphoreStagePhase(FuncOp funcOp) {
-  llvm::MapVector<Value, SmallVector<SemaphoreCreateOp>> bufferGroups;
-  funcOp.walk([&](SemaphoreCreateOp op) {
-    if (op.getBuffers().empty())
-      return;
-    bufferGroups[op.getBuffers()[0]].push_back(op);
-  });
-
-  for (auto &it : bufferGroups) {
-    AssignSemaphoreStage assignStage(funcOp, it.second);
-    if (failed(assignStage.run()))
+LogicalResult assignSemaphoreStagePhase(triton::FuncOp funcOp) {
+  SmallVector<SemaphoreCreateOp> semaOps;
+  funcOp.walk([&](SemaphoreCreateOp op) { semaOps.push_back(op); });
+  for (auto semaOp : semaOps) {
+    if (failed(AssignSemaphoreStagePhase::run(semaOp)))
       return failure();
   }
 
-  if (failed(assignSemaphorePhase(funcOp)))
-    return failure();
-
   auto callback = [&](Operation *op) {
-    if (!isa<scf::YieldOp, scf::IfOp, scf::ForOp, triton::ReduceOp>(op) &&
-        hasPartition(op)) {
+    if (!isa<scf::YieldOp, scf::IfOp, scf::ForOp, triton::ReduceOp>(op)) {
+      assert(hasPartition(op));
       auto partitionIds = getPartitionIds(op);
       partitionIds.insert(0);
       setPartition(op, partitionIds);
@@ -813,67 +627,42 @@ LogicalResult assignSemaphoreStagePhase(FuncOp funcOp) {
 
   funcOp.walk([&](scf::ForOp forOp) {
     DenseSet<Value> visited;
-    if (!forOp->hasAttr(kWarpSpecializeAttrName))
-      return;
-
-    for (auto result : forOp.getResults()) {
-      if (!isa<IntegerType, FloatType>(result.getType()) || result.use_empty())
-        continue;
-
-      bool assignDefaultPartition =
-          llvm::any_of(result.getUsers(), [&](Operation *user) {
-            return !hasPartition(user) ||
-                   (isa<scf::ForOp>(user) && hasWarpSpecializeTag(user));
-          });
-      if (!assignDefaultPartition)
-        continue;
-
-      updateOutputWithDefaultPartition(forOp, result.getResultNumber());
-      auto arg = forOp.getBody()->getTerminator()->getOperand(
-          result.getResultNumber());
-      visitBackwardSlice(forOp, arg, callback, visited);
+    if (forOp->hasAttr(kWarpSpecializeAttrName)) {
+      for (auto result : forOp.getResults()) {
+        if (isa<IntegerType, FloatType>(result.getType()) &&
+            !result.use_empty()) {
+          auto arg = forOp.getBody()->getTerminator()->getOperand(
+              result.getResultNumber());
+          bool assignDefaultPartition =
+              llvm::any_of(result.getUsers(), [&](Operation *user) {
+                return !hasPartition(user) ||
+                       (isa<scf::ForOp>(user) && hasWarpSpecializeTag(user));
+              });
+          if (assignDefaultPartition) {
+            updateOutputWithDefaultPartition(forOp, result.getResultNumber());
+            visitBackwardSlice(forOp, arg, callback, visited);
+          }
+        }
+      }
     }
   });
-
-  funcOp.walk([&](Operation *op) {
-    if (!isa<scf::ForOp, scf::IfOp>(op) || !hasPartition(op))
-      return;
-
-    auto opIds = getPartitionIds(op);
-    if (opIds.empty())
-      opIds.insert(0);
-
-    auto opOutputs = getPartitionOutputsSafe(op);
-    if (opOutputs.size() < op->getNumResults())
-      opOutputs.resize(op->getNumResults(), opIds);
-
-    for (auto &ids : opOutputs) {
-      if (ids.empty())
-        ids = opIds;
-      opIds.insert(ids.begin(), ids.end());
-    }
-
-    setPartition(op, opIds);
-    setPartitionOutputs(op, opOutputs);
-  });
-
   return success();
 }
+
+} // anonymous namespace
 
 class NVWSAssignSemaphoreStagePhase
     : public impl::NVWSAssignSemaphoreStagePhaseBase<
           NVWSAssignSemaphoreStagePhase> {
 public:
   void runOnOperation() override {
-    ModuleOp moduleOp = getOperation();
-    moduleOp.walk([&](FuncOp funcOp) {
+    mlir::ModuleOp m = getOperation();
+    m.walk([&](triton::FuncOp funcOp) {
       if (failed(assignSemaphoreStagePhase(funcOp)))
         signalPassFailure();
     });
   }
 };
-
-} // namespace
 
 } // namespace triton
 } // namespace mlir

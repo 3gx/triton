@@ -462,6 +462,10 @@ public:
     OpBuilder b(op);
     auto replToken =
         ub::PoisonOp::create(b, op.getLoc(), b.getType<AsyncTokenType>());
+    // Poison tokens may be yielded by ws-loops and PartitionLoops requires
+    // all ops to carry partition annotations.  Copy from the semaphore.
+    if (hasPartition(op))
+      setPartition(replToken, getPartitionIds(op));
     for (Operation *candidate : sorted) {
       if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(candidate))
         acquireOp.getToken().replaceAllUsesWith(replToken);
