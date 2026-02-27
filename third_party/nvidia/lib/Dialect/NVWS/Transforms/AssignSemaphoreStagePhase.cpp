@@ -477,12 +477,9 @@ struct AssignSemaphoreStagePhase {
           setPartition(forOp, forOpIds);
 
           auto forOpOutputsIds = getPartitionOutputs(forOp);
-          // Update all 3 state positions: stage, wasObserved, phase
-          for (int off = 0; off < 3; ++off) {
-            if (*pos + off < forOpOutputsIds.size())
-              forOpOutputsIds[*pos + off].insert(stageOpIds.begin(),
-                                                 stageOpIds.end());
-          }
+          // Token-chain propagation only constrains the stage lane.
+          if (*pos < forOpOutputsIds.size())
+            forOpOutputsIds[*pos].insert(stageOpIds.begin(), stageOpIds.end());
           setPartitionOutputs(forOp, forOpOutputsIds);
         }
         stageOp.setStage(stage);
@@ -604,6 +601,182 @@ void visitBackwardSlice(scf::ForOp wsLoop, Value value,
   }
 }
 
+SmallVector<SetVector<int>, 4> getPartitionOutputsSafe(Operation *op) {
+  SetVector<int> ids = hasPartition(op) ? getPartitionIds(op) : SetVector<int>{};
+  if (ids.empty())
+    ids.insert(0);
+
+  SmallVector<SetVector<int>, 4> outputs =
+      op->hasAttr(kPartitionOutputsAttrName)
+          ? getPartitionOutputs(op)
+          : SmallVector<SetVector<int>, 4>{};
+
+  if (outputs.size() < op->getNumResults())
+    outputs.resize(op->getNumResults(), ids);
+  else if (outputs.size() > op->getNumResults())
+    outputs.resize(op->getNumResults());
+
+  for (auto &outIds : outputs) {
+    if (outIds.empty())
+      outIds = ids;
+  }
+
+  return outputs;
+}
+
+SetVector<int> getValuePartitionIdsForOutput(Value value,
+                                             SetVector<int> fallbackIds) {
+  SetVector<int> ids;
+  if (auto defOp = value.getDefiningOp()) {
+    if (hasPartition(defOp)) {
+      if (defOp->getNumRegions() == 0) {
+        ids = getPartitionIds(defOp);
+      } else if (auto pos = findValuePosInRange(defOp->getResults(), value)) {
+        auto outputs = getPartitionOutputsSafe(defOp);
+        if (*pos < outputs.size())
+          ids = outputs[*pos];
+      }
+    }
+  } else {
+    for (auto user : value.getUsers()) {
+      if (isa<scf::YieldOp>(user) || !hasPartition(user))
+        continue;
+      auto userIds = getPartitionIds(user);
+      ids.insert(userIds.begin(), userIds.end());
+    }
+  }
+  if (ids.empty())
+    ids = fallbackIds;
+  return ids;
+}
+
+void widenValueProducerPartitionImpl(Value value,
+                                     const SetVector<int> &requiredIds,
+                                     DenseSet<Value> &visited) {
+  if (!visited.insert(value).second)
+    return;
+
+  auto defOp = value.getDefiningOp();
+  if (!defOp || !hasPartition(defOp))
+    return;
+
+  bool changed = false;
+
+  auto defOpIds = getPartitionIds(defOp);
+  size_t beforeOpIds = defOpIds.size();
+  defOpIds.insert(requiredIds.begin(), requiredIds.end());
+  if (defOpIds.size() != beforeOpIds) {
+    llvm::errs() << "[assign-sema-debug] widen op " << defOp->getName()
+                 << " at " << defOp->getLoc() << "\n";
+    setPartition(defOp, defOpIds);
+    changed = true;
+  }
+
+  if (defOp->getNumRegions() != 0) {
+    auto pos = findValuePosInRange(defOp->getResults(), value);
+    if (pos) {
+      auto outputs = getPartitionOutputsSafe(defOp);
+      size_t beforeOutIds = outputs[*pos].size();
+      outputs[*pos].insert(requiredIds.begin(), requiredIds.end());
+      if (outputs[*pos].size() != beforeOutIds || changed)
+        setPartitionOutputs(defOp, outputs);
+    }
+  }
+
+  for (Value operand : defOp->getOperands()) {
+    if (auto operandDefOp = operand.getDefiningOp();
+        operandDefOp && operandDefOp->getNumRegions() != 0)
+      continue;
+    widenValueProducerPartitionImpl(operand, requiredIds, visited);
+  }
+}
+
+void widenValueProducerPartition(Value value, const SetVector<int> &requiredIds) {
+  DenseSet<Value> visited;
+  widenValueProducerPartitionImpl(value, requiredIds, visited);
+}
+
+void widenForOpOutputsFromIterArgUsers(scf::ForOp forOp) {
+  if (!hasPartition(forOp) || !forOp->hasAttr(kPartitionOutputsAttrName) ||
+      !hasWarpSpecializeTag(forOp))
+    return;
+
+  auto forOpOutputsIds = getPartitionOutputs(forOp);
+  bool changed = false;
+  for (size_t idx = 0; idx < forOp.getNumResults(); ++idx) {
+    auto ids = forOpOutputsIds[idx];
+    for (Operation *user : forOp.getRegionIterArg(idx).getUsers()) {
+      if (isa<scf::YieldOp>(user) || !hasPartition(user))
+        continue;
+      auto userIds = getPartitionIds(user);
+      ids.insert(userIds.begin(), userIds.end());
+    }
+    if (ids.size() != forOpOutputsIds[idx].size()) {
+      forOpOutputsIds[idx] = ids;
+      changed = true;
+    }
+  }
+  if (changed)
+    setPartitionOutputs(forOp, forOpOutputsIds);
+}
+
+void alignForOpYieldValuePartitions(scf::ForOp forOp) {
+  auto forOpOutputsIds = getPartitionOutputsSafe(forOp);
+  auto yieldOp = forOp.getBody()->getTerminator();
+  size_t n = std::min<size_t>(forOpOutputsIds.size(), yieldOp->getNumOperands());
+  for (size_t idx = 0; idx < n; ++idx) {
+    auto val = yieldOp->getOperand(idx);
+    if (!isa<IntegerType, FloatType, IndexType>(val.getType()))
+      continue;
+    if (auto defOp = val.getDefiningOp(); defOp && hasPartition(defOp)) {
+      auto have = getPartitionIds(defOp);
+      llvm::errs() << "[align-for-scan] loop " << forOp.getLoc() << " idx "
+                   << idx << " def " << defOp->getName() << " at "
+                   << defOp->getLoc() << " have={";
+      for (auto id : have)
+        llvm::errs() << id << ",";
+      llvm::errs() << "} want={";
+      for (auto id : forOpOutputsIds[idx])
+        llvm::errs() << id << ",";
+      llvm::errs() << "}\n";
+      bool needWiden = llvm::any_of(forOpOutputsIds[idx], [&](int id) {
+        return !have.contains(id);
+      });
+      if (needWiden) {
+        llvm::errs() << "[align-for-debug] loop " << forOp.getLoc() << " idx "
+                     << idx << " def " << defOp->getName() << " at "
+                     << defOp->getLoc() << "\n";
+      }
+    }
+    widenValueProducerPartition(val, forOpOutputsIds[idx]);
+  }
+}
+
+void alignIfOpYieldValuePartitions(scf::IfOp ifOp) {
+  auto ifOpOutputsIds = getPartitionOutputsSafe(ifOp);
+
+  auto thenYield = ifOp.thenYield();
+  size_t nThen =
+      std::min<size_t>(ifOpOutputsIds.size(), thenYield->getNumOperands());
+  for (size_t idx = 0; idx < nThen; ++idx) {
+    auto val = thenYield->getOperand(idx);
+    if (!isa<IntegerType, FloatType, IndexType>(val.getType()))
+      continue;
+    widenValueProducerPartition(val, ifOpOutputsIds[idx]);
+  }
+
+  if (auto elseYield = ifOp.elseYield()) {
+    size_t nElse =
+        std::min<size_t>(ifOpOutputsIds.size(), elseYield->getNumOperands());
+    for (size_t idx = 0; idx < nElse; ++idx) {
+      auto val = elseYield->getOperand(idx);
+      if (!isa<IntegerType, FloatType, IndexType>(val.getType()))
+        continue;
+      widenValueProducerPartition(val, ifOpOutputsIds[idx]);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -646,6 +819,73 @@ LogicalResult assignSemaphoreStagePhase(triton::FuncOp funcOp) {
       }
     }
   });
+
+  auto normalizeControlFlowPartitions = [&]() {
+    funcOp.walk([&](Operation *op) {
+      if (!isa<scf::ForOp, scf::IfOp>(op) || !hasPartition(op))
+        return;
+
+    auto opIds = getPartitionIds(op);
+    if (opIds.empty())
+      opIds.insert(0);
+
+    auto opOutputs = getPartitionOutputsSafe(op);
+    if (opOutputs.size() < op->getNumResults())
+      opOutputs.resize(op->getNumResults(), opIds);
+
+    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      auto yieldOp = forOp.getBody()->getTerminator();
+      size_t n = std::min<size_t>(opOutputs.size(), yieldOp->getNumOperands());
+      for (size_t idx = 0; idx < n; ++idx) {
+        SetVector<int> fallback = opOutputs[idx].empty() ? opIds : opOutputs[idx];
+        opOutputs[idx] =
+            getValuePartitionIdsForOutput(yieldOp->getOperand(idx), fallback);
+      }
+    } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      auto thenYield = ifOp.thenYield();
+      auto elseYield = ifOp.elseYield();
+      size_t n = std::min<size_t>(opOutputs.size(), thenYield->getNumOperands());
+      for (size_t idx = 0; idx < n; ++idx) {
+        SetVector<int> fallback = opOutputs[idx].empty() ? opIds : opOutputs[idx];
+        auto ids =
+            getValuePartitionIdsForOutput(thenYield->getOperand(idx), fallback);
+        if (elseYield && idx < elseYield->getNumOperands()) {
+          auto elseIds =
+              getValuePartitionIdsForOutput(elseYield->getOperand(idx), fallback);
+          ids.insert(elseIds.begin(), elseIds.end());
+        }
+        opOutputs[idx] = ids;
+      }
+    }
+
+    for (auto &ids : opOutputs) {
+      if (ids.empty())
+        ids = opIds;
+      opIds.insert(ids.begin(), ids.end());
+    }
+
+    op->walk([&](Operation *nested) {
+      if (nested == op || !hasPartition(nested))
+        return;
+      auto nestedIds = getPartitionIds(nested);
+      opIds.insert(nestedIds.begin(), nestedIds.end());
+    });
+
+      setPartition(op, opIds);
+      setPartitionOutputs(op, opOutputs);
+    });
+  };
+
+  normalizeControlFlowPartitions();
+  funcOp.walk([&](scf::ForOp forOp) { widenForOpOutputsFromIterArgUsers(forOp); });
+  funcOp.walk([&](scf::ForOp forOp) {
+    llvm::errs() << "[for-loop-debug] " << forOp.getLoc()
+                 << " outputs_attr=" << forOp->hasAttr(kPartitionOutputsAttrName)
+                 << "\n";
+    alignForOpYieldValuePartitions(forOp);
+  });
+  funcOp.walk([&](scf::IfOp ifOp) { alignIfOpYieldValuePartitions(ifOp); });
+  normalizeControlFlowPartitions();
   return success();
 }
 
