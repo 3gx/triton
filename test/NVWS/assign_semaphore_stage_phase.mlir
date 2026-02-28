@@ -10,9 +10,6 @@
 
 
 
-
-
-
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
@@ -23,29 +20,31 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   tt.func @assign_stage_basic(%lb: i32, %ub: i32, %step: i32) {
     %buf = ttg.local_alloc : () -> !ttg.memdesc<2x1xi32, #shared, #smem, mutable>
     // CHECK: [[SEM:%.*]] = nvws.semaphore.create %{{.*}} true
-    // CHECK: [[CM1:%.*]] = arith.constant -1 : i32
     // CHECK: [[C0:%.*]] = arith.constant 0 : i32
-    // CHECK: [[FALSE:%.*]] = arith.constant false
+    // CHECK: [[CM1:%.*]] = arith.constant -1 : i32
     %sem = nvws.semaphore.create %buf true : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>], 2>
 
-    // CHECK: [[LOOP:%.*]]:3 = scf.for {{.*}} iter_args([[STAGE:%.*]] = [[C0]], [[OBS:%.*]] = [[FALSE]], [[PHASE:%.*]] = [[CM1]]) -> (i32, i1, i32)
+    // CHECK: [[LOOP:%.*]]:2 = scf.for {{.*}} iter_args([[STAGE:%.*]] = [[C0]], [[PHASE:%.*]] = [[CM1]]) -> (i32, i32)
     scf.for %i = %lb to %ub step %step : i32 {
-      // CHECK: [[TOK:%.*]] = nvws.semaphore.acquire [[SEM]][[[STAGE]], [[PHASE]]]
-      // CHECK: [[C1:%.*]] = arith.constant 1 : i32
-      // CHECK: [[SHIFT:%.*]] = arith.shli [[C1]], [[STAGE]] : i32
-      // CHECK: [[PHASE_NEW:%.*]] = arith.xori [[PHASE]], [[SHIFT]] : i32
-      %tok = nvws.semaphore.acquire %sem : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>], 2> -> !ttg.async.token
-      %view = nvws.semaphore.buffer %sem, %tok : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>], 2>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 2x1>
-      %val = ttg.local_load %view : !ttg.memdesc<1xi32, #shared, #smem, mutable, 2x1> -> !elt
-      ttg.local_store %val, %view : !elt -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 2x1>
-      // CHECK: [[NEXT:%.*]] = arith.addi [[STAGE]], {{%.*}} : i32
-      // CHECK: [[WRAP:%.*]] = arith.cmpi eq, [[NEXT]], {{%.*}} : i32
-      // CHECK: [[WRAPPED:%.*]] = arith.select [[WRAP]], {{%.*}}, [[NEXT]] : i32
-      // CHECK: [[NEW_STAGE:%.*]] = arith.select {{%.*}}, [[WRAPPED]], [[STAGE]] : i32
-      // CHECK: nvws.semaphore.release [[SEM]][[[STAGE]]], [[TOK]] [#nvws.async_op<none>]
-      nvws.semaphore.release %sem, %tok [#nvws.async_op<none>] : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>], 2>, !ttg.async.token
-      // CHECK: scf.yield [[NEW_STAGE]], {{%.*}}, [[PHASE_NEW]] : i32, i1, i32
-    }
+      // CHECK: [[RAWSTAGE:%.*]] = arith.andi [[STAGE]], {{%.*}}
+      // CHECK: [[TOK:%.*]] = nvws.semaphore.acquire [[SEM]][[[RAWSTAGE]], [[PHASE]]]
+      // CHECK: [[C1:%.*]] = arith.constant {{.*}} 1 : i32
+      // CHECK: [[SHIFT:%.*]] = arith.shli [[C1]], [[RAWSTAGE]]
+      // CHECK: [[PHASE_NEW:%.*]] = arith.xori [[PHASE]], [[SHIFT]]
+      %tok = nvws.semaphore.acquire %sem {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>], 2> -> !ttg.async.token
+      %view = nvws.semaphore.buffer %sem, %tok {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>], 2>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 2x1>
+      %val = ttg.local_load %view {ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi32, #shared, #smem, mutable, 2x1> -> !elt
+      ttg.local_store %val, %view {ttg.partition = array<i32: 0>} : !elt -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 2x1>
+      // stage advancement: extract wasObserved from bit 31, compute shouldAdvance, wrap stage
+      // CHECK: [[NEXT:%.*]] = arith.addi {{%.*}}, {{%.*}}
+      // CHECK: [[WRAP:%.*]] = arith.cmpi eq, [[NEXT]], {{%.*}}
+      // CHECK: [[WRAPPED:%.*]] = arith.select [[WRAP]], {{%.*}}, [[NEXT]]
+      // CHECK: [[ADV_STAGE:%.*]] = arith.select {{%.*}}, [[WRAPPED]], {{%.*}}
+      // CHECK: [[NEW_STAGE:%.*]] = arith.select {{%.*}}, [[ADV_STAGE]], {{%.*}}
+      // CHECK: nvws.semaphore.release [[SEM]][[[RAWSTAGE]]], [[TOK]] [#nvws.async_op<none>]
+      nvws.semaphore.release %sem, %tok [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>], 2>, !ttg.async.token
+      // CHECK: scf.yield {{.*}} [[NEW_STAGE]], [[PHASE_NEW]] : i32, i32
+    } {ttg.partition = array<i32: 0>, ttg.partition.stages = [0 : i32], ttg.warp_specialize.tag = 0 : i32}
 
     ttg.local_dealloc %buf : !ttg.memdesc<2x1xi32, #shared, #smem, mutable>
     tt.return
