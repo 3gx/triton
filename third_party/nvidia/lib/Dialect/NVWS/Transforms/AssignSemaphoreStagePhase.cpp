@@ -218,33 +218,26 @@ struct AssignSemaphoreStagePhase {
     tokToStagePosMap[{forOp.getBody()->getTerminator(), stateInBlock.token}] =
         nArgs;
 
-    // Partition annotation — verbatim from aref
+    // Partition annotation — match aref AssignStagePhase
     for (auto arg : extraYieldArgs) {
       SetVector<int> argIds;
       if (auto defOp = arg.getDefiningOp()) {
         if (defOp->getNumRegions() == 0) {
-          if (hasPartition(defOp))
-            argIds = getPartitionIds(defOp);
+          assert(hasPartition(defOp));
+          argIds = getPartitionIds(defOp);
         } else {
           auto pos = findValuePosInRange(defOp->getResults(), arg);
-          if (pos) {
-            auto outputs = getPartitionOutputs(defOp);
-            if (*pos < outputs.size())
-              argIds = outputs[*pos];
-          }
+          argIds = getPartitionOutputs(defOp)[*pos];
         }
       } else {
         for (auto user : arg.getUsers()) {
           if (isa<scf::YieldOp>(user))
             continue;
-          if (hasPartition(user)) {
-            auto ids = getPartitionIds(user);
-            argIds.insert(ids.begin(), ids.end());
-          }
+          assert(hasPartition(user));
+          auto ids = getPartitionIds(user);
+          argIds.insert(ids.begin(), ids.end());
         }
       }
-      if (argIds.empty())
-        argIds = forOpIds;
       forOpIds.insert(argIds.begin(), argIds.end());
       forOpOutputsIds.push_back(argIds);
     }
@@ -307,22 +300,16 @@ struct AssignSemaphoreStagePhase {
 
     SetVector<int> stageIds;
     for (auto arg : {thenState.stage, elseState.stage})
-      if (auto defOp = arg.getDefiningOp())
-        if (hasPartition(defOp)) {
-          auto argIds = getPartitionIds(defOp);
-          stageIds.insert(argIds.begin(), argIds.end());
-        }
+      if (auto defOp = arg.getDefiningOp()) {
+        auto argIds = getPartitionIds(defOp);
+        stageIds.insert(argIds.begin(), argIds.end());
+      }
     SetVector<int> phaseIds;
     for (auto arg : {thenState.phase, elseState.phase})
-      if (auto defOp = arg.getDefiningOp())
-        if (hasPartition(defOp)) {
-          auto argIds = getPartitionIds(defOp);
-          phaseIds.insert(argIds.begin(), argIds.end());
-        }
-
-    if (stageIds.empty()) stageIds = ifOpIds;
-    if (phaseIds.empty()) phaseIds = ifOpIds;
-
+      if (auto defOp = arg.getDefiningOp()) {
+        auto argIds = getPartitionIds(defOp);
+        phaseIds.insert(argIds.begin(), argIds.end());
+      }
     ifOpOutputsIds.push_back(stageIds);
     ifOpOutputsIds.push_back(phaseIds);
     setPartition(newIfOp, ifOpIds);
@@ -486,17 +473,13 @@ struct AssignSemaphoreStagePhase {
       } else if (auto forOp = dyn_cast<scf::ForOp>(owner)) {
         auto tokPos = tokUse.getOperandNumber() - forOp.getNumControlOperands();
         auto iterTok = forOp.getRegionIterArg(tokPos);
-        auto it = tokToStagePosMap.find({forOp, iterTok});
-        if (it == tokToStagePosMap.end())
-          continue;
-        propagateStage(iterTok, forOp.getRegionIterArgs()[it->second], visited);
+        auto stagePos = tokToStagePosMap.at({forOp, iterTok});
+        propagateStage(iterTok, forOp.getRegionIterArgs()[stagePos], visited);
       } else if (auto yieldOp = dyn_cast<scf::YieldOp>(owner)) {
-        auto it = tokToStagePosMap.find({yieldOp, token});
-        if (it == tokToStagePosMap.end())
-          continue;
+        auto stagePos = tokToStagePosMap.at({yieldOp, token});
         auto parentOp = yieldOp->getParentOp();
         propagateStage(parentOp->getResult(tokUse.getOperandNumber()),
-                       parentOp->getResult(it->second), visited);
+                       parentOp->getResult(stagePos), visited);
       }
     }
   }
