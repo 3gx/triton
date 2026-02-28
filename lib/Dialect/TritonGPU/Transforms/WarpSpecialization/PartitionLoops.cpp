@@ -542,4 +542,64 @@ void PartitionLoops::runOnOperation() {
     if (failed(partitionLoop(loop)))
       return signalPassFailure();
   }
+
+  // Remove loop-invariant iter_args: if yield operand == iter_arg (block
+  // arg), the value never changes across iterations. Replace uses with
+  // the init value and rebuild the loop without those iter_args.
+  getOperation().walk([&](scf::ForOp forOp) {
+    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+    SmallVector<unsigned> toRemove;
+    for (unsigned i = 0; i < forOp.getNumRegionIterArgs(); ++i) {
+      if (yieldOp.getOperand(i) == forOp.getRegionIterArg(i))
+        toRemove.push_back(i);
+    }
+    if (toRemove.empty())
+      return;
+
+    DenseSet<unsigned> removeSet(toRemove.begin(), toRemove.end());
+
+    // Replace uses with init values
+    for (unsigned i : toRemove) {
+      auto initVal = forOp.getInitArgs()[i];
+      forOp.getRegionIterArg(i).replaceAllUsesWith(initVal);
+      forOp.getResult(i).replaceAllUsesWith(initVal);
+    }
+
+    // Build new init args
+    SmallVector<Value> newInitArgs;
+    for (unsigned i = 0; i < forOp.getNumRegionIterArgs(); ++i)
+      if (!removeSet.count(i))
+        newInitArgs.push_back(forOp.getInitArgs()[i]);
+
+    // Remove yield operands and block args in reverse (before rebuilding)
+    auto yieldOp2 = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+    for (int j = toRemove.size() - 1; j >= 0; --j) {
+      yieldOp2->eraseOperand(toRemove[j]);
+      forOp.getBody()->eraseArgument(
+          toRemove[j] + forOp.getNumInductionVars());
+    }
+
+    // Rebuild loop with fewer init args (to match result count)
+    OpBuilder builder(forOp);
+    auto newForOp = scf::ForOp::create(builder, forOp.getLoc(),
+                                       forOp.getLowerBound(),
+                                       forOp.getUpperBound(),
+                                       forOp.getStep(), newInitArgs);
+    newForOp->setAttrs(forOp->getAttrs());
+    newForOp.getBody()->erase();
+    newForOp.getRegion().getBlocks().splice(
+        newForOp.getRegion().getBlocks().begin(),
+        forOp.getRegion().getBlocks());
+
+    // Remap kept results
+    unsigned newIdx = 0;
+    for (unsigned i = 0; i < forOp.getNumResults(); ++i) {
+      if (!removeSet.count(i)) {
+        forOp.getResult(i).replaceAllUsesWith(newForOp.getResult(newIdx));
+        newIdx++;
+      }
+    }
+
+    forOp.erase();
+  });
 }
