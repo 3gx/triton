@@ -39,6 +39,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
 
@@ -119,6 +120,44 @@ struct AssignSemaphoreStagePhase {
     return false;
   }
 
+  bool isTokenView(Value bufferView, Value token,
+                   DenseSet<Value> &visitedViews) {
+    if (!visitedViews.insert(bufferView).second)
+      return false;
+    if (!isa<MemDescType>(bufferView.getType()))
+      return false;
+    if (auto semaBuffer = bufferView.getDefiningOp<SemaphoreBufferOp>())
+      return semaBuffer.getSemaphore() == this->semaphore &&
+             semaBuffer.getToken() == token;
+    if (auto blockArg = dyn_cast<BlockArgument>(bufferView)) {
+      if (auto forOp =
+              dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp()))
+        if (auto pos =
+                findValuePosInRange(forOp.getRegionIterArgs(), bufferView))
+          return isTokenView(forOp.getInitArgs()[*pos], token, visitedViews);
+      return false;
+    }
+
+    auto *defOp = bufferView.getDefiningOp();
+    if (!defOp)
+      return false;
+
+    if (defOp->hasTrait<OpTrait::MemDescViewTrait>()) {
+      for (Value operand : defOp->getOperands())
+        if (isa<MemDescType>(operand.getType()) &&
+            isTokenView(operand, token, visitedViews))
+          return true;
+      return false;
+    }
+
+    return false;
+  }
+
+  bool isTokenView(Value bufferView, Value token) {
+    DenseSet<Value> visitedViews;
+    return isTokenView(bufferView, token, visitedViews);
+  }
+
   // --- Access classification -----------------------------------------------
 
   AccessKind classifyAccess(Operation *op) {
@@ -150,6 +189,38 @@ struct AssignSemaphoreStagePhase {
     return AccessKind::None;
   }
 
+  AccessKind classifyAccessForToken(Operation *op, Value token) {
+    if (!token || !isInPartition(op))
+      return AccessKind::None;
+    if (auto loadOp = dyn_cast<LocalLoadOp>(op))
+      return isTokenView(loadOp.getSrc(), token) ? AccessKind::Observation
+                                                 : AccessKind::None;
+    if (auto loadOp = dyn_cast<TMEMLoadOp>(op))
+      return isTokenView(loadOp.getSrc(), token) ? AccessKind::Observation
+                                                 : AccessKind::None;
+    if (auto mmaOp = dyn_cast<MMAv5OpInterface>(op)) {
+      if (isTokenView(mmaOp.getAccumulator(), token))
+        return AccessKind::FreshWriteMMA;
+      if (isTokenView(mmaOp.getA(), token) || isTokenView(mmaOp.getB(), token))
+        return AccessKind::Observation;
+      return AccessKind::None;
+    }
+    if (auto storeOp = dyn_cast<LocalStoreOp>(op))
+      return isTokenView(storeOp.getDst(), token) ? AccessKind::FreshWrite
+                                                  : AccessKind::None;
+    if (auto descLoad = dyn_cast<DescriptorLoadOp>(op))
+      return isTokenView(descLoad.getResult(), token) ? AccessKind::FreshWrite
+                                                      : AccessKind::None;
+    if (auto descGather = dyn_cast<DescriptorGatherOp>(op))
+      return isTokenView(descGather.getResult(), token)
+                 ? AccessKind::FreshWrite
+                 : AccessKind::None;
+    if (auto storeOp = dyn_cast<TMEMStoreOp>(op))
+      return isTokenView(storeOp.getDst(), token) ? AccessKind::FreshWrite
+                                                  : AccessKind::None;
+    return AccessKind::None;
+  }
+
   bool isInPartition(Operation *op) {
     return !hasPartition(op) ||
            llvm::is_contained(getPartitionIds(op), partitionId);
@@ -176,6 +247,50 @@ struct AssignSemaphoreStagePhase {
         if (ifOp.elseBlock() && analyzeUseInBlock(ifOp.elseBlock(), token))
           return true;
       }
+    }
+    return false;
+  }
+
+  bool isFirstUseFreshWriteAfterAcquire(SemaphoreAcquireOp acquireOp) {
+    auto isTokenViewOp = [&](Operation *op, Value token) {
+      if (auto semaBuffer = dyn_cast<SemaphoreBufferOp>(op))
+        return semaBuffer.getSemaphore() == semaphore &&
+               semaBuffer.getToken() == token;
+      if (!op->hasTrait<OpTrait::MemDescViewTrait>())
+        return false;
+      for (Value operand : op->getOperands())
+        if (isa<MemDescType>(operand.getType()) &&
+            isTokenView(operand, token))
+          return true;
+      return false;
+    };
+
+    auto usesTokenView = [&](Operation *op, Value token) {
+      for (Value operand : op->getOperands())
+        if (isa<MemDescType>(operand.getType()) &&
+            isTokenView(operand, token))
+          return true;
+      return false;
+    };
+
+    auto token = acquireOp.getToken();
+    auto it = std::next(Block::iterator(acquireOp.getOperation()));
+    auto end = acquireOp->getBlock()->end();
+    for (; it != end; ++it) {
+      Operation *op = &*it;
+      if (isa<SemaphoreAcquireOp>(op))
+        return false;
+      if (isa<scf::ForOp, scf::IfOp>(op))
+        return false;
+      if (isTokenViewOp(op, token))
+        continue;
+      auto access = classifyAccessForToken(op, token);
+      if (access == AccessKind::FreshWrite)
+        return true;
+      if (access != AccessKind::None)
+        return false;
+      if (usesTokenView(op, token))
+        return false;
     }
     return false;
   }
@@ -238,6 +353,8 @@ struct AssignSemaphoreStagePhase {
           argIds.insert(ids.begin(), ids.end());
         }
       }
+      if (argIds.empty())
+        argIds.insert(partitionId);
       forOpIds.insert(argIds.begin(), argIds.end());
       forOpOutputsIds.push_back(argIds);
     }
@@ -299,17 +416,42 @@ struct AssignSemaphoreStagePhase {
     ifOp.erase();
 
     SetVector<int> stageIds;
-    for (auto arg : {thenState.stage, elseState.stage})
+    auto collectIds = [&](Value arg, SetVector<int> &ids) {
       if (auto defOp = arg.getDefiningOp()) {
-        auto argIds = getPartitionIds(defOp);
-        stageIds.insert(argIds.begin(), argIds.end());
+        if (!hasPartition(defOp))
+          return;
+        if (defOp->getNumRegions() == 0) {
+          auto argIds = getPartitionIds(defOp);
+          ids.insert(argIds.begin(), argIds.end());
+        } else if (auto pos = findValuePosInRange(defOp->getResults(), arg)) {
+          auto outputs = getPartitionOutputs(defOp);
+          if (*pos < outputs.size()) {
+            auto argIds = outputs[*pos];
+            ids.insert(argIds.begin(), argIds.end());
+          }
+        }
+      } else {
+        for (auto user : arg.getUsers()) {
+          if (isa<scf::YieldOp>(user) || !hasPartition(user))
+            continue;
+          auto argIds = getPartitionIds(user);
+          ids.insert(argIds.begin(), argIds.end());
+        }
       }
+    };
+    for (auto arg : {thenState.stage, elseState.stage})
+      collectIds(arg, stageIds);
     SetVector<int> phaseIds;
     for (auto arg : {thenState.phase, elseState.phase})
-      if (auto defOp = arg.getDefiningOp()) {
-        auto argIds = getPartitionIds(defOp);
-        phaseIds.insert(argIds.begin(), argIds.end());
-      }
+      collectIds(arg, phaseIds);
+    if (stageIds.empty())
+      stageIds.insert(ifOpIds.begin(), ifOpIds.end());
+    if (phaseIds.empty())
+      phaseIds.insert(ifOpIds.begin(), ifOpIds.end());
+    if (stageIds.empty())
+      stageIds.insert(partitionId);
+    if (phaseIds.empty())
+      phaseIds.insert(partitionId);
     ifOpOutputsIds.push_back(stageIds);
     ifOpOutputsIds.push_back(phaseIds);
     setPartition(newIfOp, ifOpIds);
@@ -347,12 +489,29 @@ struct AssignSemaphoreStagePhase {
         auto stageMask =
             createOp(arith::ConstantIntOp{}, 0x7FFFFFFF, 32);
         auto rawStage = createOp(arith::AndIOp{}, state.stage, stageMask);
-        acquireOp.getStageMutable().assign(rawStage);
+        Value acquireStage = rawStage;
+        if (isFirstUseFreshWriteAfterAcquire(acquireOp)) {
+          auto c31 = createOp(arith::ConstantIntOp{}, 31, 32);
+          auto wasObsBit = createOp(arith::ShRUIOp{}, state.stage, c31);
+          auto wasObs =
+              createOp(arith::TruncIOp{}, b.getI1Type(), wasObsBit);
+          auto c1 = createOp(arith::ConstantIntOp{}, 1, 32);
+          auto c0 = createOp(arith::ConstantIntOp{}, 0, 32);
+          auto cDepth = createOp(arith::ConstantIntOp{}, depth, 32);
+          auto next = createOp(arith::AddIOp{}, rawStage, c1);
+          auto wrap =
+              createOp(arith::CmpIOp{}, arith::CmpIPredicate::eq, next, cDepth);
+          auto wrapped = createOp(arith::SelectOp{}, wrap, c0, next);
+          acquireStage = createOp(arith::SelectOp{}, wasObs, wrapped, rawStage);
+          state.stage =
+              createOp(arith::SelectOp{}, wasObs, acquireStage, state.stage);
+        }
+        acquireOp.getStageMutable().assign(acquireStage);
         acquireOp.getPhaseMutable().assign(state.phase);
 
         b.setInsertionPointAfter(acquireOp);
         auto c1 = createOp(arith::ConstantIntOp{}, 1, 32);
-        auto phaseBit = createOp(arith::ShLIOp{}, c1, rawStage);
+        auto phaseBit = createOp(arith::ShLIOp{}, c1, acquireStage);
         state.phase = createOp(arith::XOrIOp{}, state.phase, phaseBit);
         state.token = acquireOp.getToken();
         continue;
