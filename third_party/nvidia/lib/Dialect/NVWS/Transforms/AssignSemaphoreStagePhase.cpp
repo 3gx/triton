@@ -675,9 +675,21 @@ void visitBackwardSlice(scf::ForOp wsLoop, Value value,
 LogicalResult assignSemaphoreStagePhase(triton::FuncOp funcOp) {
   SmallVector<SemaphoreCreateOp> semaOps;
   funcOp.walk([&](SemaphoreCreateOp op) { semaOps.push_back(op); });
+
+  // Keep processing order deterministic and scoped by backing buffer.
+  llvm::MapVector<Value, SmallVector<SemaphoreCreateOp>> semaGroups;
   for (auto semaOp : semaOps) {
-    if (failed(AssignSemaphoreStagePhase::run(semaOp)))
-      return failure();
+    auto buffers = semaOp.getBuffers();
+    if (buffers.empty())
+      continue;
+    semaGroups[buffers.front()].push_back(semaOp);
+  }
+
+  for (auto &it : semaGroups) {
+    for (auto semaOp : it.second) {
+      if (failed(AssignSemaphoreStagePhase::run(semaOp)))
+        return failure();
+    }
   }
 
   auto callback = [&](Operation *op) {
