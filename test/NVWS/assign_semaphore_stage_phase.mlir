@@ -27,18 +27,18 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     // CHECK: [[LOOP:%.*]]:2 = scf.for {{.*}} iter_args([[STAGE:%.*]] = [[C1_INIT]], [[PHASE:%.*]] = [[C0_INIT]]) -> (i32, i32)
     scf.for %i = %lb to %ub step %step : i32 {
       // Phase flip BEFORE acquire
-      // CHECK: [[C1:%.*]] = arith.constant {{.*}} 1 : i32
-      // CHECK: [[SHIFT:%.*]] = arith.shli [[C1]], [[STAGE]]
-      // CHECK: [[PHASE_NEW:%.*]] = arith.xori [[PHASE]], [[SHIFT]]
-      // CHECK: [[TOK:%.*]] = nvws.semaphore.acquire [[SEM]][[[STAGE]], [[PHASE_NEW]]]
+      // CHECK: [[C1:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+      // CHECK: [[SHIFT:%.*]] = arith.shli [[C1]], [[STAGE]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[PHASE_NEW:%.*]] = arith.xori [[PHASE]], [[SHIFT]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[TOK:%.*]] = nvws.semaphore.acquire [[SEM]][[[STAGE]], [[PHASE_NEW]]] {ttg.partition = array<i32: 0>}
       %tok = nvws.semaphore.acquire %sem {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>], 2> -> !ttg.async.token
-      // CHECK: nvws.semaphore.buffer [[SEM]][[[STAGE]]], [[TOK]] {ttg.partition = array<i32: 0>}
+      // CHECK: [[BUF:%.*]] = nvws.semaphore.buffer [[SEM]][[[STAGE]]], [[TOK]] {ttg.partition = array<i32: 0>}
       %view = nvws.semaphore.buffer %sem, %tok {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>], 2>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 2x1>
       %val = ttg.local_load %view {ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi32, #shared, #smem, mutable, 2x1> -> !elt
       ttg.local_store %val, %view {ttg.partition = array<i32: 0>} : !elt -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 2x1>
-      // CHECK: nvws.semaphore.release [[SEM]][[[STAGE]]], [[TOK]] [#nvws.async_op<none>]
+      // CHECK: nvws.semaphore.release [[SEM]][[[STAGE]]], [[TOK]] [#nvws.async_op<none>] {ttg.partition = array<i32: 0>}
       nvws.semaphore.release %sem, %tok [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>], 2>, !ttg.async.token
-      // CHECK: scf.yield {{.*}} [[STAGE]], [[PHASE_NEW]] : i32, i32
+      // CHECK: scf.yield {ttg.partition = array<i32: 0>} [[STAGE]], [[PHASE_NEW]] : i32, i32
     } {ttg.partition = array<i32: 0>, ttg.partition.stages = [0 : i32], ttg.warp_specialize.tag = 0 : i32}
 
     ttg.local_dealloc %buf : !ttg.memdesc<2x1xi32, #shared, #smem, mutable>
@@ -73,21 +73,26 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     %sem1 = nvws.semaphore.create %buf false : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>], 2>
 
     // Stage advance: addi/cmpi/select wrapping at 2
-    // CHECK: [[NEXT:%.*]] = arith.addi [[S_INIT]], {{%.*}} : i32
-    // CHECK: [[WRAP:%.*]] = arith.cmpi eq, [[NEXT]], {{%.*}} : i32
-    // CHECK: [[ADV:%.*]] = arith.select [[WRAP]], {{%.*}}, [[NEXT]] : i32
+    // CHECK: [[STEP:%.*]] = arith.constant 1 : i32
+    // CHECK: [[ZERO:%.*]] = arith.constant 0 : i32
+    // CHECK: [[DEPTH:%.*]] = arith.constant 2 : i32
+    // CHECK: [[NEXT:%.*]] = arith.addi [[S_INIT]], [[STEP]] : i32
+    // CHECK: [[WRAP:%.*]] = arith.cmpi eq, [[NEXT]], [[DEPTH]] : i32
+    // CHECK: [[ADV:%.*]] = arith.select [[WRAP]], [[ZERO]], [[NEXT]] : i32
     // Phase flip sem0 (isReleased=true, init=0), then acquire
-    // CHECK: [[SH0:%.*]] = arith.shli {{%.*}}, [[ADV]] : i32
+    // CHECK: [[C1_0:%.*]] = arith.constant 1 : i32
+    // CHECK: [[SH0:%.*]] = arith.shli [[C1_0]], [[ADV]] : i32
     // CHECK: [[PE_NEW:%.*]] = arith.xori [[PE_INIT]], [[SH0]] : i32
     // CHECK: [[TOK0:%.*]] = nvws.semaphore.acquire [[SEM0]][[[ADV]], [[PE_NEW]]]
     // Phase flip sem1 (isReleased=false, init=-1), then acquire
-    // CHECK: [[SH1:%.*]] = arith.shli {{%.*}}, [[ADV]] : i32
+    // CHECK: [[C1_1:%.*]] = arith.constant 1 : i32
+    // CHECK: [[SH1:%.*]] = arith.shli [[C1_1]], [[ADV]] : i32
     // CHECK: [[PF_NEW:%.*]] = arith.xori [[PF_INIT]], [[SH1]] : i32
     // CHECK: [[TOK1:%.*]] = nvws.semaphore.acquire [[SEM1]][[[ADV]], [[PF_NEW]]]
     %tok0 = nvws.semaphore.acquire %sem0 : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>], 2> -> !ttg.async.token
     %tok1 = nvws.semaphore.acquire %sem1 : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>], 2> -> !ttg.async.token
 
-    // CHECK: nvws.semaphore.buffer [[SEM0]][[[ADV]]], [[TOK0]]
+    // CHECK: [[BUF0:%.*]] = nvws.semaphore.buffer [[SEM0]][[[ADV]]], [[TOK0]]
     %view0 = nvws.semaphore.buffer %sem0, %tok0 : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>], 2>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 2x1>
     %v = arith.constant dense<0> : !elt
     ttg.local_store %v, %view0 : !elt -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 2x1>
@@ -121,16 +126,19 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     // CHECK: scf.for {{.*}} iter_args([[STAGE:%.*]] = [[C1_INIT]], [[PHASE:%.*]] = [[C0_INIT]]) -> (i32, i32)
     scf.for %i = %lb to %ub step %step : i32 {
       // Stage advance: addi/cmpi/select
-      // CHECK: [[NEXT:%.*]] = arith.addi [[STAGE]], {{%.*}} {ttg.partition = array<i32: 0>} : i32
-      // CHECK: [[WRAP:%.*]] = arith.cmpi eq, [[NEXT]], {{%.*}} {ttg.partition = array<i32: 0>} : i32
-      // CHECK: [[NEW_STAGE:%.*]] = arith.select [[WRAP]], {{%.*}}, [[NEXT]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[STEP:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+      // CHECK: [[ZERO:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 0 : i32
+      // CHECK: [[DEPTH:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 2 : i32
+      // CHECK: [[NEXT:%.*]] = arith.addi [[STAGE]], [[STEP]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[WRAP:%.*]] = arith.cmpi eq, [[NEXT]], [[DEPTH]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[NEW_STAGE:%.*]] = arith.select [[WRAP]], [[ZERO]], [[NEXT]] {ttg.partition = array<i32: 0>} : i32
       // Phase flip BEFORE acquire
       // CHECK: [[C1:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
       // CHECK: [[SHIFT:%.*]] = arith.shli [[C1]], [[NEW_STAGE]] {ttg.partition = array<i32: 0>} : i32
       // CHECK: [[PHASE_NEW:%.*]] = arith.xori [[PHASE]], [[SHIFT]] {ttg.partition = array<i32: 0>} : i32
       // CHECK: [[TOK:%.*]] = nvws.semaphore.acquire [[SEM]][[[NEW_STAGE]], [[PHASE_NEW]]] {ttg.partition = array<i32: 0>}
       %tok = nvws.semaphore.acquire %sem {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>], 2> -> !ttg.async.token
-      // CHECK: nvws.semaphore.buffer [[SEM]][[[NEW_STAGE]]], [[TOK]] {ttg.partition = array<i32: 0>}
+      // CHECK: [[BUF:%.*]] = nvws.semaphore.buffer [[SEM]][[[NEW_STAGE]]], [[TOK]] {ttg.partition = array<i32: 0>}
       %view = nvws.semaphore.buffer %sem, %tok {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>], 2>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 2x1>
 
       // scf.if with NO results (no stage/phase threading through if)
@@ -173,15 +181,18 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     scf.for %arg3 = %arg0 to %arg1 step %arg2  : i32 {
       %2 = "op_a"() {ttg.partition = array<i32: 0>} : () -> tensor<1xi32, #blocked>
       // Stage advance: addi/cmpi/select wrapping at 3
+      // CHECK: [[STEP:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+      // CHECK: [[ZERO:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 0 : i32
       // CHECK: [[C3:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 3 : i32
-      // CHECK: [[NEXT:%.*]] = arith.addi [[STAGE]], {{%.*}} {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[NEXT:%.*]] = arith.addi [[STAGE]], [[STEP]] {ttg.partition = array<i32: 0>} : i32
       // CHECK: [[WRAP:%.*]] = arith.cmpi eq, [[NEXT]], [[C3]] {ttg.partition = array<i32: 0>} : i32
-      // CHECK: [[NEW_STAGE:%.*]] = arith.select [[WRAP]], {{%.*}}, [[NEXT]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[NEW_STAGE:%.*]] = arith.select [[WRAP]], [[ZERO]], [[NEXT]] {ttg.partition = array<i32: 0>} : i32
       // Phase flip EMPTY (isReleased=true, init=0), then acquire
-      // CHECK: [[PSHIFT:%.*]] = arith.shli {{%.*}}, [[NEW_STAGE]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[PC1:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+      // CHECK: [[PSHIFT:%.*]] = arith.shli [[PC1]], [[NEW_STAGE]] {ttg.partition = array<i32: 0>} : i32
       // CHECK: [[PE_NEW:%.*]] = arith.xori [[PE]], [[PSHIFT]] {ttg.partition = array<i32: 0>} : i32
       // CHECK: [[PTOK:%.*]] = nvws.semaphore.acquire [[EMPTY]][[[NEW_STAGE]], [[PE_NEW]]] {ttg.partition = array<i32: 0>}
-      // CHECK: nvws.semaphore.buffer [[EMPTY]][[[NEW_STAGE]]], [[PTOK]] {ttg.partition = array<i32: 0>}
+      // CHECK: [[PBUF:%.*]] = nvws.semaphore.buffer [[EMPTY]][[[NEW_STAGE]]], [[PTOK]] {ttg.partition = array<i32: 0>}
       // CHECK: nvws.semaphore.release [[FULL]][[[NEW_STAGE]]], [[PTOK]] [#nvws.async_op<none>] {ttg.partition = array<i32: 0>}
       %token = nvws.semaphore.acquire %empty {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>], 3> -> !ttg.async.token
       %buffers = nvws.semaphore.buffer %empty, %token {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>], 3>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 1x1>
@@ -189,10 +200,11 @@ module attributes {"ttg.num-warps" = 4 : i32} {
       nvws.semaphore.release %full, %token [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>], 3>, !ttg.async.token
 
       // Consumer1: phase flip FULL, then acquire
-      // CHECK: [[GSHIFT1:%.*]] = arith.shli {{%.*}}, [[NEW_STAGE]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[GC1_1:%.*]] = arith.constant {ttg.partition = array<i32: 1>} 1 : i32
+      // CHECK: [[GSHIFT1:%.*]] = arith.shli [[GC1_1]], [[NEW_STAGE]] {ttg.partition = array<i32: 1>} : i32
       // CHECK: [[PF1_NEW:%.*]] = arith.xori [[PF1]], [[GSHIFT1]] {ttg.partition = array<i32: 1>} : i32
       // CHECK: [[GTOK1:%.*]] = nvws.semaphore.acquire [[FULL]][[[NEW_STAGE]], [[PF1_NEW]]] {ttg.partition = array<i32: 1>}
-      // CHECK: nvws.semaphore.buffer [[FULL]][[[NEW_STAGE]]], [[GTOK1]] {ttg.partition = array<i32: 1>}
+      // CHECK: [[GBUF1:%.*]] = nvws.semaphore.buffer [[FULL]][[[NEW_STAGE]]], [[GTOK1]] {ttg.partition = array<i32: 1>}
       // CHECK: nvws.semaphore.release [[EMPTY]][[[NEW_STAGE]]], [[GTOK1]] [#nvws.async_op<none>] {ttg.partition = array<i32: 1>}
       %token_1 = nvws.semaphore.acquire %full {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>], 3> -> !ttg.async.token
       %buffers_0 = nvws.semaphore.buffer %full, %token_1 {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>], 3>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 1x1>
@@ -201,10 +213,11 @@ module attributes {"ttg.num-warps" = 4 : i32} {
       "op_b"(%3) {ttg.partition = array<i32: 1>} : (tensor<1xi32, #blocked>) -> ()
 
       // Consumer2: phase flip FULL, then acquire
-      // CHECK: [[GSHIFT2:%.*]] = arith.shli {{%.*}}, [[NEW_STAGE]] {ttg.partition = array<i32: 2>} : i32
+      // CHECK: [[GC1_2:%.*]] = arith.constant {ttg.partition = array<i32: 2>} 1 : i32
+      // CHECK: [[GSHIFT2:%.*]] = arith.shli [[GC1_2]], [[NEW_STAGE]] {ttg.partition = array<i32: 2>} : i32
       // CHECK: [[PF2_NEW:%.*]] = arith.xori [[PF2]], [[GSHIFT2]] {ttg.partition = array<i32: 2>} : i32
       // CHECK: [[GTOK2:%.*]] = nvws.semaphore.acquire [[FULL]][[[NEW_STAGE]], [[PF2_NEW]]] {ttg.partition = array<i32: 2>}
-      // CHECK: nvws.semaphore.buffer [[FULL]][[[NEW_STAGE]]], [[GTOK2]] {ttg.partition = array<i32: 2>}
+      // CHECK: [[GBUF2:%.*]] = nvws.semaphore.buffer [[FULL]][[[NEW_STAGE]]], [[GTOK2]] {ttg.partition = array<i32: 2>}
       // CHECK: nvws.semaphore.release [[EMPTY]][[[NEW_STAGE]]], [[GTOK2]] [#nvws.async_op<none>] {ttg.partition = array<i32: 2>}
       %token_3 = nvws.semaphore.acquire %full {ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>], 3> -> !ttg.async.token
       %buffers_2 = nvws.semaphore.buffer %full, %token_3 {ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>], 3>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 1x1>
@@ -256,11 +269,12 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
     // CHECK: [[LOOP:%.*]]:6 = scf.for {{.*}} iter_args([[S0:%.*]] = [[S0_INIT]], [[PE0:%.*]] = [[PE0_INIT]], [[PF0:%.*]] = [[PF0_INIT]], [[S1:%.*]] = [[S1_INIT]], [[PE1:%.*]] = [[PE1_INIT]], [[PF1:%.*]] = [[PF1_INIT]]) -> (i32, i32, i32, i32, i32, i32)
     scf.for %i = %lb to %ub step %c1_i32 : i32{
       // Group0 producer: phase flip pe0 BEFORE acquire E0
-      // CHECK: [[PSH0:%.*]] = arith.shli {{%.*}}, [[S0]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[PC1_P0:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+      // CHECK: [[PSH0:%.*]] = arith.shli [[PC1_P0]], [[S0]] {ttg.partition = array<i32: 0>} : i32
       // CHECK: [[PE0_NEW:%.*]] = arith.xori [[PE0]], [[PSH0]] {ttg.partition = array<i32: 0>} : i32
       // CHECK: [[PTOK0:%.*]] = nvws.semaphore.acquire [[E0]][[[S0]], [[PE0_NEW]]] {ttg.partition = array<i32: 0>}
       %ptok0 = nvws.semaphore.acquire %empty0 {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>, !ttg.memdesc<3x16x32xf16, #shared0, #smem>], 3> -> !ttg.async.token
-      // CHECK: nvws.semaphore.buffer [[E0]][[[S0]]], [[PTOK0]] {ttg.partition = array<i32: 0>}
+      // CHECK: [[PBUF0:%.*]] = nvws.semaphore.buffer [[E0]][[[S0]]], [[PTOK0]] {ttg.partition = array<i32: 0>}
       %1:2 = nvws.semaphore.buffer %empty0, %ptok0 {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>, !ttg.memdesc<3x16x32xf16, #shared0, #smem>], 3>, !ttg.async.token -> !ttg.memdesc<64x16xf16, #shared0, #smem, mutable>, !ttg.memdesc<16x32xf16, #shared0, #smem, mutable>
       "op1"(%1#0) {ttg.partition = array<i32: 0>}: (!ttg.memdesc<64x16xf16, #shared0, #smem, mutable>) -> ()
       "op2"(%1#1)  {ttg.partition = array<i32: 0>} : (!ttg.memdesc<16x32xf16, #shared0, #smem, mutable>) -> ()
@@ -268,11 +282,12 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
       nvws.semaphore.release %full0, %ptok0 [#nvws.async_op<tma_load>, #nvws.async_op<none>] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>, !ttg.memdesc<3x16x32xf16, #shared0, #smem>], 3>, !ttg.async.token
 
       // Group0 consumer: phase flip pf0 BEFORE acquire F0
-      // CHECK: [[GSH0:%.*]] = arith.shli {{%.*}}, [[S0]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[GC1_C0:%.*]] = arith.constant {ttg.partition = array<i32: 1>} 1 : i32
+      // CHECK: [[GSH0:%.*]] = arith.shli [[GC1_C0]], [[S0]] {ttg.partition = array<i32: 1>} : i32
       // CHECK: [[PF0_NEW:%.*]] = arith.xori [[PF0]], [[GSH0]] {ttg.partition = array<i32: 1>} : i32
       // CHECK: [[GTOK0:%.*]] = nvws.semaphore.acquire [[F0]][[[S0]], [[PF0_NEW]]] {ttg.partition = array<i32: 1>}
       %gtok0 = nvws.semaphore.acquire %full0 {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>, !ttg.memdesc<3x16x32xf16, #shared0, #smem>], 3> -> !ttg.async.token
-      // CHECK: nvws.semaphore.buffer [[F0]][[[S0]]], [[GTOK0]] {ttg.partition = array<i32: 1>}
+      // CHECK: [[GBUF0:%.*]] = nvws.semaphore.buffer [[F0]][[[S0]]], [[GTOK0]] {ttg.partition = array<i32: 1>}
       %2:2 = nvws.semaphore.buffer %full0, %gtok0 {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>, !ttg.memdesc<3x16x32xf16, #shared0, #smem>], 3>, !ttg.async.token -> !ttg.memdesc<64x16xf16, #shared0, #smem, mutable>, !ttg.memdesc<16x32xf16, #shared0, #smem, mutable>
       "op3"(%2#0, %2#1) {ttg.partition = array<i32: 1>}: (!ttg.memdesc<64x16xf16, #shared0, #smem, mutable>, !ttg.memdesc<16x32xf16, #shared0, #smem, mutable>) -> ()
       // CHECK: nvws.semaphore.release [[E0]][[[S0]]], [[GTOK0]] [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>}
@@ -291,18 +306,20 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
       // CHECK: scf.yield {ttg.partition = array<i32: 0, 1>} [[S1]], [[PE1]], [[PF1]] : i32, i32, i32
       // CHECK: } else {
       // Phase flip pe1 BEFORE acquire E1
-      // CHECK: arith.shli {{%.*}}, [[S1]] {ttg.partition = array<i32: 0>}
-      // CHECK: arith.xori {{%.*}}, {{%.*}} {ttg.partition = array<i32: 0>}
-      // CHECK: nvws.semaphore.acquire [[E1]][[[S1]], {{%.*}}] {ttg.partition = array<i32: 0>}
-      // CHECK: nvws.semaphore.buffer [[E1]][[[S1]]], {{%.*}} {ttg.partition = array<i32: 0>}
-      // CHECK: nvws.semaphore.release [[F1]][[[S1]]], {{%.*}} [#nvws.async_op<none>] {ttg.partition = array<i32: 0>}
+      // CHECK: [[EC1_P1:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+      // CHECK: [[ESH_P1:%.*]] = arith.shli [[EC1_P1]], [[S1]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[PE1_NEW:%.*]] = arith.xori [[PE1]], [[ESH_P1]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[ETOK_P1:%.*]] = nvws.semaphore.acquire [[E1]][[[S1]], [[PE1_NEW]]] {ttg.partition = array<i32: 0>}
+      // CHECK: [[EBUF_P1:%.*]] = nvws.semaphore.buffer [[E1]][[[S1]]], [[ETOK_P1]] {ttg.partition = array<i32: 0>}
+      // CHECK: nvws.semaphore.release [[F1]][[[S1]]], [[ETOK_P1]] [#nvws.async_op<none>] {ttg.partition = array<i32: 0>}
       // Phase flip pf1 BEFORE acquire F1
-      // CHECK: arith.shli {{%.*}}, [[S1]] {ttg.partition = array<i32: 1>}
-      // CHECK: arith.xori {{%.*}}, {{%.*}} {ttg.partition = array<i32: 1>}
-      // CHECK: nvws.semaphore.acquire [[F1]][[[S1]], {{%.*}}] {ttg.partition = array<i32: 1>}
-      // CHECK: nvws.semaphore.buffer [[F1]][[[S1]]], {{%.*}} {ttg.partition = array<i32: 1>}
-      // CHECK: nvws.semaphore.release [[E1]][[[S1]]], {{%.*}} [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>}
-      // CHECK: scf.yield {ttg.partition = array<i32: 0, 1>} [[S1]], {{%.*}}, {{%.*}} : i32, i32, i32
+      // CHECK: [[FC1_C1:%.*]] = arith.constant {ttg.partition = array<i32: 1>} 1 : i32
+      // CHECK: [[FSH_C1:%.*]] = arith.shli [[FC1_C1]], [[S1]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[PF1_NEW:%.*]] = arith.xori [[PF1]], [[FSH_C1]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[FTOK_C1:%.*]] = nvws.semaphore.acquire [[F1]][[[S1]], [[PF1_NEW]]] {ttg.partition = array<i32: 1>}
+      // CHECK: [[FBUF_C1:%.*]] = nvws.semaphore.buffer [[F1]][[[S1]]], [[FTOK_C1]] {ttg.partition = array<i32: 1>}
+      // CHECK: nvws.semaphore.release [[E1]][[[S1]]], [[FTOK_C1]] [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>}
+      // CHECK: scf.yield {ttg.partition = array<i32: 0, 1>} [[S1]], [[PE1_NEW]], [[PF1_NEW]] : i32, i32, i32
       // CHECK-NEXT: } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0, 1>, array<i32: 0>, array<i32: 1>]}
       } {ttg.partition = array<i32: 0, 1>}
 
@@ -346,9 +363,15 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK: [[PE_INIT:%.*]] = arith.constant 0 : i32
     // CHECK: [[PF_INIT:%.*]] = arith.constant -1 : i32
     // Pre-loop: stage advance, phase flip, acquire EMPTY
-    // CHECK: [[PRE_STAGE:%.*]] = arith.select {{%.*}}, {{%.*}}, {{%.*}} : i32
-    // CHECK: arith.shli {{%.*}}, [[PRE_STAGE]] : i32
-    // CHECK: [[PE_PRE:%.*]] = arith.xori [[PE_INIT]], {{%.*}} : i32
+    // CHECK: [[SA_STEP:%.*]] = arith.constant 1 : i32
+    // CHECK: [[SA_ZERO:%.*]] = arith.constant 0 : i32
+    // CHECK: [[SA_DEPTH:%.*]] = arith.constant 1 : i32
+    // CHECK: [[SA_ADD:%.*]] = arith.addi [[S_INIT]], [[SA_STEP]] : i32
+    // CHECK: [[SA_CMP:%.*]] = arith.cmpi eq, [[SA_ADD]], [[SA_DEPTH]] : i32
+    // CHECK: [[PRE_STAGE:%.*]] = arith.select [[SA_CMP]], [[SA_ZERO]], [[SA_ADD]] : i32
+    // CHECK: [[PE_C1:%.*]] = arith.constant 1 : i32
+    // CHECK: [[PE_SH:%.*]] = arith.shli [[PE_C1]], [[PRE_STAGE]] : i32
+    // CHECK: [[PE_PRE:%.*]] = arith.xori [[PE_INIT]], [[PE_SH]] : i32
     // CHECK: [[TOK0:%.*]] = nvws.semaphore.acquire [[EMPTY]][[[PRE_STAGE]], [[PE_PRE]]]
     %empty = nvws.semaphore.create %result true : !nvws.semaphore<[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 1>
     %full = nvws.semaphore.create %result false : !nvws.semaphore<[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 1>
@@ -374,8 +397,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // Post-loop: release FULL, phase flip pf, acquire FULL, tmem_load, release EMPTY
     // CHECK: nvws.semaphore.release [[FULL]][[[PRE_STAGE]]], [[TOK0]] [#nvws.async_op<tc5mma>]
     nvws.semaphore.release %full, %token [#nvws.async_op<tc5mma>] : !nvws.semaphore<[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 1>, !ttg.async.token
-    // CHECK: arith.shli {{%.*}}, [[PRE_STAGE]] : i32
-    // CHECK: [[PF_POST:%.*]] = arith.xori [[PF_INIT]], {{%.*}} : i32
+    // CHECK: [[PF_C1:%.*]] = arith.constant 1 : i32
+    // CHECK: [[PF_SH:%.*]] = arith.shli [[PF_C1]], [[PRE_STAGE]] : i32
+    // CHECK: [[PF_POST:%.*]] = arith.xori [[PF_INIT]], [[PF_SH]] : i32
     // CHECK: [[TOK1:%.*]] = nvws.semaphore.acquire [[FULL]][[[PRE_STAGE]], [[PF_POST]]]
     %token_1 = nvws.semaphore.acquire %full : !nvws.semaphore<[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 1> -> !ttg.async.token
     %buffers_0 = nvws.semaphore.buffer %full, %token_1 : !nvws.semaphore<[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 1>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
@@ -398,12 +422,22 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %result = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create %{{.*}} true : <[!ttg.memdesc<2x128x128xf32
     // CHECK: [[FULL:%.*]] = nvws.semaphore.create %{{.*}} false : <[!ttg.memdesc<2x128x128xf32
-    // Pre-loop: stage advance, phase flip, acquire EMPTY
-    // CHECK: [[PRE_STAGE:%.*]] = arith.select {{%.*}}, {{%.*}}, {{%.*}} : i32
-    // CHECK: arith.shli {{%.*}}, [[PRE_STAGE]] : i32
-    // CHECK: arith.xori {{%.*}}, {{%.*}} : i32
-    // CHECK: arith.shli {{%.*}}, [[PRE_STAGE]] : i32
-    // CHECK: [[PE_PRE:%.*]] = arith.xori {{%.*}}, {{%.*}} : i32
+    // Pre-loop: stage advance, phase flips, acquire EMPTY
+    // CHECK: [[S_INIT:%.*]] = arith.constant 1 : i32
+    // CHECK: [[PE_INIT:%.*]] = arith.constant 0 : i32
+    // CHECK: [[PF_INIT:%.*]] = arith.constant -1 : i32
+    // CHECK: [[SA_STEP:%.*]] = arith.constant 1 : i32
+    // CHECK: [[SA_ZERO:%.*]] = arith.constant 0 : i32
+    // CHECK: [[SA_DEPTH:%.*]] = arith.constant 2 : i32
+    // CHECK: [[SA_ADD:%.*]] = arith.addi [[S_INIT]], [[SA_STEP]] : i32
+    // CHECK: [[SA_CMP:%.*]] = arith.cmpi eq, [[SA_ADD]], [[SA_DEPTH]] : i32
+    // CHECK: [[PRE_STAGE:%.*]] = arith.select [[SA_CMP]], [[SA_ZERO]], [[SA_ADD]] : i32
+    // CHECK: [[PF1_C1:%.*]] = arith.constant 1 : i32
+    // CHECK: [[PF1_SH:%.*]] = arith.shli [[PF1_C1]], [[PRE_STAGE]] : i32
+    // CHECK: [[PF1_OUT:%.*]] = arith.xori [[PE_INIT]], [[PF1_SH]] : i32
+    // CHECK: [[PE1_C1:%.*]] = arith.constant 1 : i32
+    // CHECK: [[PE1_SH:%.*]] = arith.shli [[PE1_C1]], [[PRE_STAGE]] : i32
+    // CHECK: [[PE_PRE:%.*]] = arith.xori [[PE_INIT]], [[PE1_SH]] : i32
     // CHECK: [[PRETOK:%.*]] = nvws.semaphore.acquire [[EMPTY]][[[PRE_STAGE]], [[PE_PRE]]]
     %empty = nvws.semaphore.create %result true : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>
     %full = nvws.semaphore.create %result false : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>
@@ -411,7 +445,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %buffers = nvws.semaphore.buffer %empty, %token : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
     %1 = nvws.semaphore.buffer %empty, %token : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
     %2 = ttng.tmem_store %cst_0, %1[], %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
-    // CHECK: [[FOR:%.*]]:4 = scf.for {{.*}} iter_args([[FTOK:%.*]] = [[PRETOK]], [[FSTAGE:%.*]] = [[PRE_STAGE]], [[FPE:%.*]] = {{%.*}}, [[FPF:%.*]] = {{%.*}}) -> (!ttg.async.token, i32, i32, i32)
+    // CHECK: [[FOR:%.*]]:4 = scf.for {{.*}} iter_args([[FTOK:%.*]] = [[PRETOK]], [[FSTAGE:%.*]] = [[PRE_STAGE]], [[FPE:%.*]] = [[PF1_OUT]], [[FPF:%.*]] = [[PF_INIT]]) -> (!ttg.async.token, i32, i32, i32)
     %3 = scf.for %arg2 = %c0_i32 to %c32_i32 step %c1_i32 iter_args(%arg3 = %token) -> (!ttg.async.token)  : i32 {
       %4:3 = "get_offsets"(%arg2) {ttg.partition = array<i32: 2>} : (i32) -> (i32, i32, i32)
       %5 = tt.descriptor_load %arg0[%4#0, %4#2] {ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked1>
@@ -425,8 +459,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       nvws.semaphore.release %full, %arg3 [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>, !ttg.async.token
 
       // Consumer: phase flip BEFORE acquire FULL
-      // CHECK: arith.shli {{%.*}}, [[FSTAGE]] {ttg.partition = array<i32: 0>} : i32
-      // CHECK: [[FPF_NEW:%.*]] = arith.xori [[FPF]], {{%.*}} {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[GC1:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+      // CHECK: [[GSH:%.*]] = arith.shli [[GC1]], [[FSTAGE]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[FPF_NEW:%.*]] = arith.xori [[FPF]], [[GSH]] {ttg.partition = array<i32: 0>} : i32
       // CHECK: [[GTOK:%.*]] = nvws.semaphore.acquire [[FULL]][[[FSTAGE]], [[FPF_NEW]]] {ttg.partition = array<i32: 0>}
       %token_2 = nvws.semaphore.acquire %full {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2> -> !ttg.async.token
       %buffers_1 = nvws.semaphore.buffer %full, %token_2 {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
@@ -438,9 +473,15 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       "acc_user"(%result_3) {ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> ()
 
       // Stage advance, phase flip, re-acquire EMPTY
-      // CHECK: [[NEXT_STAGE:%.*]] = arith.select {{%.*}}, {{%.*}}, {{%.*}} {ttg.partition = array<i32: 0, 1>}
-      // CHECK: arith.shli {{%.*}}, [[NEXT_STAGE]] {ttg.partition = array<i32: 1>} : i32
-      // CHECK: [[FPE_NEW:%.*]] = arith.xori [[FPE]], {{%.*}} {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[NSA_STEP:%.*]] = arith.constant {ttg.partition = array<i32: 0, 1>} 1 : i32
+      // CHECK: [[NSA_ZERO:%.*]] = arith.constant {ttg.partition = array<i32: 0, 1>} 0 : i32
+      // CHECK: [[NSA_DEPTH:%.*]] = arith.constant {ttg.partition = array<i32: 0, 1>} 2 : i32
+      // CHECK: [[NSA_ADD:%.*]] = arith.addi [[FSTAGE]], [[NSA_STEP]] {ttg.partition = array<i32: 0, 1>} : i32
+      // CHECK: [[NSA_CMP:%.*]] = arith.cmpi eq, [[NSA_ADD]], [[NSA_DEPTH]] {ttg.partition = array<i32: 0, 1>} : i32
+      // CHECK: [[NEXT_STAGE:%.*]] = arith.select [[NSA_CMP]], [[NSA_ZERO]], [[NSA_ADD]] {ttg.partition = array<i32: 0, 1>}
+      // CHECK: [[PC1:%.*]] = arith.constant {ttg.partition = array<i32: 1>} 1 : i32
+      // CHECK: [[PSH:%.*]] = arith.shli [[PC1]], [[NEXT_STAGE]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[FPE_NEW:%.*]] = arith.xori [[FPE]], [[PSH]] {ttg.partition = array<i32: 1>} : i32
       // CHECK: [[PTOK:%.*]] = nvws.semaphore.acquire [[EMPTY]][[[NEXT_STAGE]], [[FPE_NEW]]] {ttg.partition = array<i32: 1>}
       %token_6 = nvws.semaphore.acquire %empty {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2> -> !ttg.async.token
       %buffers_5 = nvws.semaphore.buffer %empty, %token_6 {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
@@ -477,10 +518,22 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %result = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create %{{.*}} true : <[!ttg.memdesc<2x128x128xf32
     // CHECK: [[FULL:%.*]] = nvws.semaphore.create %{{.*}} false : <[!ttg.memdesc<2x128x128xf32
-    // Pre-loop: stage advance, phase flip, acquire EMPTY
-    // CHECK: [[PRE_STAGE:%.*]] = arith.select {{%.*}}, {{%.*}}, {{%.*}} : i32
-    // CHECK: arith.xori {{%.*}}, {{%.*}} : i32
-    // CHECK: [[PE_PRE:%.*]] = arith.xori {{%.*}}, {{%.*}} : i32
+    // Pre-loop: stage advance, phase flips, acquire EMPTY
+    // CHECK: [[S_INIT:%.*]] = arith.constant 1 : i32
+    // CHECK: [[PE_INIT:%.*]] = arith.constant 0 : i32
+    // CHECK: [[PF_INIT:%.*]] = arith.constant -1 : i32
+    // CHECK: [[SA_STEP:%.*]] = arith.constant 1 : i32
+    // CHECK: [[SA_ZERO:%.*]] = arith.constant 0 : i32
+    // CHECK: [[SA_DEPTH:%.*]] = arith.constant 2 : i32
+    // CHECK: [[SA_ADD:%.*]] = arith.addi [[S_INIT]], [[SA_STEP]] : i32
+    // CHECK: [[SA_CMP:%.*]] = arith.cmpi eq, [[SA_ADD]], [[SA_DEPTH]] : i32
+    // CHECK: [[PRE_STAGE:%.*]] = arith.select [[SA_CMP]], [[SA_ZERO]], [[SA_ADD]] : i32
+    // CHECK: [[PF1_C1:%.*]] = arith.constant 1 : i32
+    // CHECK: [[PF1_SH:%.*]] = arith.shli [[PF1_C1]], [[PRE_STAGE]] : i32
+    // CHECK: [[PF1_OUT:%.*]] = arith.xori [[PE_INIT]], [[PF1_SH]] : i32
+    // CHECK: [[PE1_C1:%.*]] = arith.constant 1 : i32
+    // CHECK: [[PE1_SH:%.*]] = arith.shli [[PE1_C1]], [[PRE_STAGE]] : i32
+    // CHECK: [[PE_PRE:%.*]] = arith.xori [[PE_INIT]], [[PE1_SH]] : i32
     // CHECK: [[PRETOK:%.*]] = nvws.semaphore.acquire [[EMPTY]][[[PRE_STAGE]], [[PE_PRE]]]
     %empty = nvws.semaphore.create %result true : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>
     %full = nvws.semaphore.create %result false : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>
@@ -488,7 +541,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %buffers = nvws.semaphore.buffer %empty, %token : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
     %1 = nvws.semaphore.buffer %empty, %token : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
     %2 = ttng.tmem_store %cst_0, %1[], %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
-    // CHECK: [[FOR:%.*]]:4 = scf.for {{.*}} iter_args([[FTOK:%.*]] = [[PRETOK]], [[FSTAGE:%.*]] = [[PRE_STAGE]], [[FPE:%.*]] = {{%.*}}, [[FPF:%.*]] = {{%.*}}) -> (!ttg.async.token, i32, i32, i32)
+    // CHECK: [[FOR:%.*]]:4 = scf.for {{.*}} iter_args([[FTOK:%.*]] = [[PRETOK]], [[FSTAGE:%.*]] = [[PRE_STAGE]], [[FPE:%.*]] = [[PF1_OUT]], [[FPF:%.*]] = [[PF_INIT]]) -> (!ttg.async.token, i32, i32, i32)
     %3 = scf.for %arg2 = %c0_i32 to %c32_i32 step %c1_i32 iter_args(%arg3 = %token) -> (!ttg.async.token)  : i32 {
       %4:3 = "get_offsets"(%arg2) {ttg.partition = array<i32: 2>} : (i32) -> (i32, i32, i32)
       %5 = tt.descriptor_load %arg0[%4#0, %4#2] {ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked1>
@@ -504,8 +557,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
         // CHECK: nvws.semaphore.release [[FULL]][[[FSTAGE]]], [[FTOK]] [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>}
         nvws.semaphore.release %full, %arg3 [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>, !ttg.async.token
         // Phase flip BEFORE acquire FULL
-        // CHECK: arith.shli {{%.*}}, [[FSTAGE]] {ttg.partition = array<i32: 0>} : i32
-        // CHECK: [[FPF_T:%.*]] = arith.xori [[FPF]], {{%.*}} {ttg.partition = array<i32: 0>} : i32
+        // CHECK: [[GC1:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+        // CHECK: [[GSH:%.*]] = arith.shli [[GC1]], [[FSTAGE]] {ttg.partition = array<i32: 0>} : i32
+        // CHECK: [[FPF_T:%.*]] = arith.xori [[FPF]], [[GSH]] {ttg.partition = array<i32: 0>} : i32
         // CHECK: [[GTOK:%.*]] = nvws.semaphore.acquire [[FULL]][[[FSTAGE]], [[FPF_T]]] {ttg.partition = array<i32: 0>}
         %token_2 = nvws.semaphore.acquire %full {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2> -> !ttg.async.token
         %buffers_1 = nvws.semaphore.buffer %full, %token_2 {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
@@ -516,8 +570,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
         nvws.semaphore.release %empty, %token_2 [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>, !ttg.async.token
         "acc_user"(%result_3) {ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> ()
         // Phase flip BEFORE re-acquire EMPTY
-        // CHECK: arith.shli {{%.*}}, [[FSTAGE]] {ttg.partition = array<i32: 1>} : i32
-        // CHECK: [[FPE_T:%.*]] = arith.xori [[FPE]], {{%.*}} {ttg.partition = array<i32: 1>} : i32
+        // CHECK: [[PC1:%.*]] = arith.constant {ttg.partition = array<i32: 1>} 1 : i32
+        // CHECK: [[PSH:%.*]] = arith.shli [[PC1]], [[FSTAGE]] {ttg.partition = array<i32: 1>} : i32
+        // CHECK: [[FPE_T:%.*]] = arith.xori [[FPE]], [[PSH]] {ttg.partition = array<i32: 1>} : i32
         // CHECK: [[PTOK:%.*]] = nvws.semaphore.acquire [[EMPTY]][[[FSTAGE]], [[FPE_T]]] {ttg.partition = array<i32: 1>}
         %token_6 = nvws.semaphore.acquire %empty {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2> -> !ttg.async.token
         %buffers_5 = nvws.semaphore.buffer %empty, %token_6 {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
@@ -767,17 +822,29 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %result = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create %{{.*}} true : <[!ttg.memdesc<2x128x128xf32
     // CHECK: [[FULL:%.*]] = nvws.semaphore.create %{{.*}} false : <[!ttg.memdesc<2x128x128xf32
-    // Pre-loop: stage advance, phase flip, acquire EMPTY
-    // CHECK: [[PRE_STAGE:%.*]] = arith.select {{%.*}}, {{%.*}}, {{%.*}} : i32
-    // CHECK: arith.xori {{%.*}}, {{%.*}} : i32
-    // CHECK: [[PE_PRE:%.*]] = arith.xori {{%.*}}, {{%.*}} : i32
+    // Pre-loop: stage advance, phase flips, acquire EMPTY
+    // CHECK: [[S_INIT:%.*]] = arith.constant 1 : i32
+    // CHECK: [[PE_INIT:%.*]] = arith.constant 0 : i32
+    // CHECK: [[PF_INIT:%.*]] = arith.constant -1 : i32
+    // CHECK: [[SA_STEP:%.*]] = arith.constant 1 : i32
+    // CHECK: [[SA_ZERO:%.*]] = arith.constant 0 : i32
+    // CHECK: [[SA_DEPTH:%.*]] = arith.constant 2 : i32
+    // CHECK: [[SA_ADD:%.*]] = arith.addi [[S_INIT]], [[SA_STEP]] : i32
+    // CHECK: [[SA_CMP:%.*]] = arith.cmpi eq, [[SA_ADD]], [[SA_DEPTH]] : i32
+    // CHECK: [[PRE_STAGE:%.*]] = arith.select [[SA_CMP]], [[SA_ZERO]], [[SA_ADD]] : i32
+    // CHECK: [[PF1_C1:%.*]] = arith.constant 1 : i32
+    // CHECK: [[PF1_SH:%.*]] = arith.shli [[PF1_C1]], [[PRE_STAGE]] : i32
+    // CHECK: [[PF1_OUT:%.*]] = arith.xori [[PE_INIT]], [[PF1_SH]] : i32
+    // CHECK: [[PE1_C1:%.*]] = arith.constant 1 : i32
+    // CHECK: [[PE1_SH:%.*]] = arith.shli [[PE1_C1]], [[PRE_STAGE]] : i32
+    // CHECK: [[PE_PRE:%.*]] = arith.xori [[PE_INIT]], [[PE1_SH]] : i32
     // CHECK: [[PRETOK:%.*]] = nvws.semaphore.acquire [[EMPTY]][[[PRE_STAGE]], [[PE_PRE]]]
     %empty = nvws.semaphore.create %result true : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>
     %full = nvws.semaphore.create %result false : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>
     %token = nvws.semaphore.acquire %empty : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2> -> !ttg.async.token
     %1 = nvws.semaphore.buffer %empty, %token : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
     %2 = ttng.tmem_store %cst_0, %1[], %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
-    // CHECK: [[FOR:%.*]]:4 = scf.for {{.*}} iter_args([[FTOK:%.*]] = [[PRETOK]], [[FSTAGE:%.*]] = [[PRE_STAGE]], [[FPE:%.*]] = {{%.*}}, [[FPF:%.*]] = {{%.*}}) -> (!ttg.async.token, i32, i32, i32)
+    // CHECK: [[FOR:%.*]]:4 = scf.for {{.*}} iter_args([[FTOK:%.*]] = [[PRETOK]], [[FSTAGE:%.*]] = [[PRE_STAGE]], [[FPE:%.*]] = [[PF1_OUT]], [[FPF:%.*]] = [[PF_INIT]]) -> (!ttg.async.token, i32, i32, i32)
     %3 = scf.for %arg2 = %c0_i32 to %c32_i32 step %c1_i32 iter_args(%arg3 = %token) -> (!ttg.async.token)  : i32 {
       %4:3 = "get_offsets"(%arg2) {ttg.partition = array<i32: 2>} : (i32) -> (i32, i32, i32)
       %5 = tt.descriptor_load %arg0[%4#0, %4#2] {ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked1>
@@ -791,10 +858,11 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       %11 = arith.cmpi eq, %arg2, %c0_i32 {ttg.partition = array<i32: 1>} : i32
       // CHECK: [[IF:%.*]]:4 = scf.if
       %12 = scf.if %11 -> (!ttg.async.token) {
-        // CHECK: nvws.semaphore.release [[FULL]][{{%.*}}], {{%.*}} [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>}
+        // CHECK: nvws.semaphore.release [[FULL]][[[FSTAGE]]], [[FTOK]] [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>}
         nvws.semaphore.release %full, %arg3 [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>, !ttg.async.token
         // Phase flip BEFORE acquire FULL
-        // CHECK: [[GSH:%.*]] = arith.shli {{%.*}}, [[FSTAGE]] {ttg.partition = array<i32: 0>} : i32
+        // CHECK: [[GC1:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+        // CHECK: [[GSH:%.*]] = arith.shli [[GC1]], [[FSTAGE]] {ttg.partition = array<i32: 0>} : i32
         // CHECK: [[GP_OUT:%.*]] = arith.xori [[FPF]], [[GSH]] {ttg.partition = array<i32: 0>} : i32
         // CHECK: [[GTOK:%.*]] = nvws.semaphore.acquire [[FULL]][[[FSTAGE]], [[GP_OUT]]] {ttg.partition = array<i32: 0>}
         %token_2 = nvws.semaphore.acquire %full {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2> -> !ttg.async.token
@@ -805,7 +873,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
         nvws.semaphore.release %empty, %token_2 [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2>, !ttg.async.token
         "acc_user"(%result_3) {ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> ()
         // Phase flip BEFORE re-acquire EMPTY
-        // CHECK: [[PSH:%.*]] = arith.shli {{%.*}}, [[FSTAGE]] {ttg.partition = array<i32: 1>} : i32
+        // CHECK: [[PC1:%.*]] = arith.constant {ttg.partition = array<i32: 1>} 1 : i32
+        // CHECK: [[PSH:%.*]] = arith.shli [[PC1]], [[FSTAGE]] {ttg.partition = array<i32: 1>} : i32
         // CHECK: [[PP_OUT:%.*]] = arith.xori [[FPE]], [[PSH]] {ttg.partition = array<i32: 1>} : i32
         // CHECK: [[PTOK:%.*]] = nvws.semaphore.acquire [[EMPTY]][[[FSTAGE]], [[PP_OUT]]] {ttg.partition = array<i32: 1>}
         %token_6 = nvws.semaphore.acquire %empty {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 2> -> !ttg.async.token
@@ -1007,18 +1076,22 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create {{.*}} true : <[!ttg.memdesc<1x128x128xf32
     // CHECK: [[FULL:%.*]] = nvws.semaphore.create {{.*}} false : <[!ttg.memdesc<1x128x128xf32
     // CHECK: [[S0:%.*]] = arith.constant 0 : i32
+    // CHECK: [[PE_INIT:%.*]] = arith.constant 0 : i32
+    // CHECK: [[PF_INIT:%.*]] = arith.constant -1 : i32
     // Pre-loop: phase flips for both sems, BEFORE acquire EMPTY
-    // CHECK: arith.shli {{%.*}}, [[S0]] : i32
-    // CHECK: arith.xori {{%.*}}, {{%.*}} : i32
-    // CHECK: arith.shli {{%.*}}, [[S0]] : i32
-    // CHECK: [[P0_OUT:%.*]] = arith.xori {{%.*}}, {{%.*}} : i32
+    // CHECK: [[PF1_C1:%.*]] = arith.constant 1 : i32
+    // CHECK: [[PF1_SH:%.*]] = arith.shli [[PF1_C1]], [[S0]] : i32
+    // CHECK: [[PF1_OUT:%.*]] = arith.xori [[PE_INIT]], [[PF1_SH]] : i32
+    // CHECK: [[PE1_C1:%.*]] = arith.constant 1 : i32
+    // CHECK: [[PE1_SH:%.*]] = arith.shli [[PE1_C1]], [[S0]] : i32
+    // CHECK: [[P0_OUT:%.*]] = arith.xori [[PE_INIT]], [[PE1_SH]] : i32
     // CHECK: [[TOK0:%.*]] = nvws.semaphore.acquire [[EMPTY]][[[S0]], [[P0_OUT]]]
     // CHECK: nvws.semaphore.buffer [[EMPTY]][[[S0]]], [[TOK0]]
     %empty = nvws.semaphore.create %arefBuf true : !nvws.semaphore<[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 1>
     %full = nvws.semaphore.create %arefBuf false : !nvws.semaphore<[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 1>
     %tok = nvws.semaphore.acquire %empty : !nvws.semaphore<[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 1> -> !ttg.async.token
     %_0 = nvws.semaphore.buffer %empty, %tok : !nvws.semaphore<[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 1>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-    // CHECK: [[FOR0:%.*]]:4 = scf.for {{.*}} iter_args({{.*}}) -> (!ttg.async.token, i32, i32, i32)
+    // CHECK: [[FOR0:%.*]]:4 = scf.for {{.*}} iter_args([[F0TOK:%.*]] = [[TOK0]], [[F0STAGE:%.*]] = [[S0]], [[F0PE:%.*]] = [[PF1_OUT]], [[F0PF:%.*]] = [[PF_INIT]]) -> (!ttg.async.token, i32, i32, i32)
     %tok0 = scf.for %iv0 = %lb to %ub step %step iter_args(%tok1 = %tok) -> (!ttg.async.token) : i32 {
       %ptrub = tt.addptr %ptr0, %iv0 {ttg.partition = array<i32: 1, 2>} : !tt.ptr<i32>, i32
       %ub1 = tt.load %ptrub {ttg.partition = array<i32: 1, 2>} : !tt.ptr<i32>
@@ -1038,8 +1111,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // CHECK: nvws.semaphore.release [[FULL]][[[FOR1]]#1], [[FOR1]]#0 [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 2>}
       nvws.semaphore.release %full, %tok5 [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 1>, !ttg.async.token
       // Phase flip BEFORE acquire FULL
-      // CHECK: [[SH1:%.*]] = arith.shli {{%.*}}, [[FOR1]]#1 {ttg.partition = array<i32: 0, 1>} : i32
-      // CHECK: [[P1_OUT:%.*]] = arith.xori {{%.*}}, [[SH1]] {ttg.partition = array<i32: 0, 1>} : i32
+      // CHECK: [[GC1:%.*]] = arith.constant {ttg.partition = array<i32: 0, 1>} 1 : i32
+      // CHECK: [[SH1:%.*]] = arith.shli [[GC1]], [[FOR1]]#1 {ttg.partition = array<i32: 0, 1>} : i32
+      // CHECK: [[P1_OUT:%.*]] = arith.xori [[F0PF]], [[SH1]] {ttg.partition = array<i32: 0, 1>} : i32
       // CHECK: [[TOK1:%.*]] = nvws.semaphore.acquire [[FULL]][[[FOR1]]#1, [[P1_OUT]]] {ttg.partition = array<i32: 1>}
       // CHECK: nvws.semaphore.buffer [[FULL]][[[FOR1]]#1], [[TOK1]] {ttg.partition = array<i32: 1>}
       %token_2 = nvws.semaphore.acquire %full {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 1> -> !ttg.async.token
@@ -1047,8 +1121,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // CHECK: nvws.semaphore.release [[EMPTY]][[[FOR1]]#1], [[TOK1]] [#nvws.async_op<none>] {ttg.partition = array<i32: 1>}
       nvws.semaphore.release %empty, %token_2 [#nvws.async_op<none>] {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 1>, !ttg.async.token
       // Phase flip BEFORE re-acquire EMPTY
-      // CHECK: [[SH2:%.*]] = arith.shli {{%.*}}, [[FOR1]]#1 {ttg.partition = array<i32: 2>} : i32
-      // CHECK: [[P2_OUT:%.*]] = arith.xori {{%.*}}, [[SH2]] {ttg.partition = array<i32: 2>} : i32
+      // CHECK: [[PC1:%.*]] = arith.constant {ttg.partition = array<i32: 2>} 1 : i32
+      // CHECK: [[SH2:%.*]] = arith.shli [[PC1]], [[FOR1]]#1 {ttg.partition = array<i32: 2>} : i32
+      // CHECK: [[P2_OUT:%.*]] = arith.xori [[F0PE]], [[SH2]] {ttg.partition = array<i32: 2>} : i32
       // CHECK: [[TOK2:%.*]] = nvws.semaphore.acquire [[EMPTY]][[[FOR1]]#1, [[P2_OUT]]] {ttg.partition = array<i32: 2>}
       // CHECK: nvws.semaphore.buffer [[EMPTY]][[[FOR1]]#1], [[TOK2]] {ttg.partition = array<i32: 2>}
       %tok6 = nvws.semaphore.acquire %empty {ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>], 1> -> !ttg.async.token
@@ -1059,10 +1134,12 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK: } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.outputs = [array<i32: 2>, array<i32: 0, 1, 2>, array<i32: 2>, array<i32: 0, 1>]}
     // CHECK: nvws.semaphore.release [[FULL]][[[FOR0]]#1], [[FOR0]]#0 [#nvws.async_op<tc5mma>]
     // Post-loop: phase flips for both sems, BEFORE acquire FULL
-    // CHECK: arith.shli {{%.*}}, [[FOR0]]#1 : i32
-    // CHECK: arith.xori {{%.*}}, {{%.*}} : i32
-    // CHECK: arith.shli {{%.*}}, [[FOR0]]#1 : i32
-    // CHECK: [[P_END:%.*]] = arith.xori {{%.*}}, {{%.*}} : i32
+    // CHECK: [[POST_C1A:%.*]] = arith.constant 1 : i32
+    // CHECK: [[POST_SHA:%.*]] = arith.shli [[POST_C1A]], [[FOR0]]#1 : i32
+    // CHECK: arith.xori [[PF_INIT]], [[POST_SHA]] : i32
+    // CHECK: [[POST_C1B:%.*]] = arith.constant 1 : i32
+    // CHECK: [[POST_SHB:%.*]] = arith.shli [[POST_C1B]], [[FOR0]]#1 : i32
+    // CHECK: [[P_END:%.*]] = arith.xori [[FOR0]]#3, [[POST_SHB]] : i32
     // CHECK: [[TOK_END:%.*]] = nvws.semaphore.acquire [[FULL]][[[FOR0]]#1, [[P_END]]]
     // CHECK: nvws.semaphore.buffer [[FULL]][[[FOR0]]#1], [[TOK_END]]
     // CHECK: nvws.semaphore.release [[EMPTY]][[[FOR0]]#1], [[TOK_END]] [#nvws.async_op<none>]
