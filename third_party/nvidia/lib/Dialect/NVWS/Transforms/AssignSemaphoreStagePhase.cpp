@@ -733,18 +733,17 @@ struct AssignSemaphoreStagePhase {
           acquireOp.getStageMutable().assign(acquireStage);
           state.token = acquireOp.getToken();
         } else {
-          // PhaseOnly: read stage from acquire (set by StageOnly loop),
-          // assign and advance phase.
+          // PhaseOnly: advance phase BEFORE acquire, assign new phase.
+          // b is already positioned before acquireOp (line 680).
           auto semaIdx = getSemaphoreIndex(acquireOp.getSemaphore());
           assert(semaIdx && "acquire op must reference a group semaphore");
           Value &semaPhase = state.phases[*semaIdx];
-          acquireOp.getPhaseMutable().assign(semaPhase);
 
-          b.setInsertionPointAfter(acquireOp);
           Value acquireStage = acquireOp.getStage();
           auto c1 = createOp(arith::ConstantIntOp{}, 1, 32);
           auto phaseBit = createOp(arith::ShLIOp{}, c1, acquireStage);
           semaPhase = createOp(arith::XOrIOp{}, semaPhase, phaseBit);
+          acquireOp.getPhaseMutable().assign(semaPhase);
         }
         continue;
       }
@@ -843,11 +842,13 @@ struct AssignSemaphoreStagePhase {
     b.setInsertionPointAfter(lastSemaOp);
 
     State initState;
-    initState.stage = arith::ConstantIntOp::create(b, 0, 32);
-    // Per-semaphore initial phases.
+    initState.stage = arith::ConstantIntOp::create(b, depth - 1, 32);
+    // Per-semaphore initial phases (swapped so flip-before-acquire is correct).
+    // isReleased=true  → 0: first flip sets bit to 1 → acquire succeeds.
+    // isReleased=false → -1: first flip clears bit to 0 → acquire blocks.
     for (auto semaOp : semaOps) {
       uint32_t initPhase =
-          semaOp.getIsReleased() ? 0xFFFFFFFFu : 0x00000000u;
+          semaOp.getIsReleased() ? 0x00000000u : 0xFFFFFFFFu;
       initState.phases.push_back(
           arith::ConstantIntOp::create(b, static_cast<int64_t>(initPhase), 32));
     }
