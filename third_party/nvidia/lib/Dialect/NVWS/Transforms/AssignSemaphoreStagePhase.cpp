@@ -75,6 +75,8 @@ struct AssignSemaphoreStagePhase {
   int partitionId;
   int depth;
   DenseMap<std::pair<Operation *, Value>, int> tokToStagePosMap;
+  DenseMap<Value, bool> viewMemo;
+  DenseSet<Value> viewVisited;
 
   AssignSemaphoreStagePhase(Value semaphore, int partitionId, int depth)
       : semaphore(semaphore), partitionId(partitionId), depth(depth) {}
@@ -103,21 +105,48 @@ struct AssignSemaphoreStagePhase {
   bool isGroupView(Value bufferView) {
     if (!isa<MemDescType>(bufferView.getType()))
       return false;
-    if (auto semaBuffer = bufferView.getDefiningOp<SemaphoreBufferOp>())
-      return semaBuffer.getSemaphore() == this->semaphore;
-    if (auto blockArg = dyn_cast<BlockArgument>(bufferView)) {
+    if (auto it = viewMemo.find(bufferView); it != viewMemo.end())
+      return it->second;
+    if (!viewVisited.insert(bufferView).second)
+      return false;
+
+    bool result = false;
+    if (auto semaBuffer = bufferView.getDefiningOp<SemaphoreBufferOp>()) {
+      result = semaBuffer.getSemaphore() == this->semaphore;
+    } else if (auto blockArg = dyn_cast<BlockArgument>(bufferView)) {
       if (auto forOp =
-              dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp()))
+              dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp())) {
         if (auto pos =
                 findValuePosInRange(forOp.getRegionIterArgs(), bufferView))
-          return isGroupView(forOp.getInitArgs()[*pos]);
+          result = isGroupView(forOp.getInitArgs()[*pos]);
+      }
     } else if (auto *defOp = bufferView.getDefiningOp()) {
-      if (defOp->hasTrait<OpTrait::MemDescViewTrait>())
-        for (Value operand : defOp->getOperands())
-          if (isa<MemDescType>(operand.getType()) && isGroupView(operand))
-            return true;
+      if (defOp->hasTrait<OpTrait::MemDescViewTrait>()) {
+        for (Value operand : defOp->getOperands()) {
+          if (!isa<MemDescType>(operand.getType()))
+            continue;
+          if (isGroupView(operand)) {
+            result = true;
+            break;
+          }
+        }
+      } else if (auto forOp = dyn_cast<scf::ForOp>(defOp)) {
+        unsigned idx = cast<OpResult>(bufferView).getResultNumber();
+        if (idx < forOp.getYieldedValues().size())
+          result = isGroupView(forOp.getYieldedValues()[idx]);
+      } else if (auto ifOp = dyn_cast<scf::IfOp>(defOp)) {
+        unsigned idx = cast<OpResult>(bufferView).getResultNumber();
+        if (idx < ifOp.thenYield()->getNumOperands())
+          result = isGroupView(ifOp.thenYield()->getOperand(idx));
+        if (!result && ifOp.elseBlock() &&
+            idx < ifOp.elseYield()->getNumOperands())
+          result = isGroupView(ifOp.elseYield()->getOperand(idx));
+      }
     }
-    return false;
+
+    viewVisited.erase(bufferView);
+    viewMemo[bufferView] = result;
+    return result;
   }
 
   bool isTokenView(Value bufferView, Value token,
@@ -131,10 +160,11 @@ struct AssignSemaphoreStagePhase {
              semaBuffer.getToken() == token;
     if (auto blockArg = dyn_cast<BlockArgument>(bufferView)) {
       if (auto forOp =
-              dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp()))
+              dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp())) {
         if (auto pos =
                 findValuePosInRange(forOp.getRegionIterArgs(), bufferView))
           return isTokenView(forOp.getInitArgs()[*pos], token, visitedViews);
+      }
       return false;
     }
 
@@ -143,10 +173,29 @@ struct AssignSemaphoreStagePhase {
       return false;
 
     if (defOp->hasTrait<OpTrait::MemDescViewTrait>()) {
-      for (Value operand : defOp->getOperands())
-        if (isa<MemDescType>(operand.getType()) &&
-            isTokenView(operand, token, visitedViews))
+      for (Value operand : defOp->getOperands()) {
+        if (!isa<MemDescType>(operand.getType()))
+          continue;
+        if (isTokenView(operand, token, visitedViews))
           return true;
+      }
+      return false;
+    }
+
+    if (auto forOp = dyn_cast<scf::ForOp>(defOp)) {
+      unsigned idx = cast<OpResult>(bufferView).getResultNumber();
+      if (idx < forOp.getYieldedValues().size())
+        return isTokenView(forOp.getYieldedValues()[idx], token, visitedViews);
+      return false;
+    }
+    if (auto ifOp = dyn_cast<scf::IfOp>(defOp)) {
+      unsigned idx = cast<OpResult>(bufferView).getResultNumber();
+      if (idx < ifOp.thenYield()->getNumOperands() &&
+          isTokenView(ifOp.thenYield()->getOperand(idx), token, visitedViews))
+        return true;
+      if (ifOp.elseBlock() && idx < ifOp.elseYield()->getNumOperands() &&
+          isTokenView(ifOp.elseYield()->getOperand(idx), token, visitedViews))
+        return true;
       return false;
     }
 
