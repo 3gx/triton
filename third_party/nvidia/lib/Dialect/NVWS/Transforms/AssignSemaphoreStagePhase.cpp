@@ -261,6 +261,12 @@ struct AssignSemaphoreStagePhase {
     if (auto descGather = dyn_cast<DescriptorGatherOp>(op))
       return isGroupView(descGather.getResult()) ? AccessKind::FreshWrite
                                                  : AccessKind::None;
+    if (auto descLoad = dyn_cast<nvws::DescriptorLoadOp>(op))
+      return isGroupView(descLoad.getResult()) ? AccessKind::FreshWrite
+                                               : AccessKind::None;
+    if (auto descGather = dyn_cast<nvws::DescriptorGatherOp>(op))
+      return isGroupView(descGather.getResult()) ? AccessKind::FreshWrite
+                                                 : AccessKind::None;
     if (auto storeOp = dyn_cast<TMEMStoreOp>(op))
       return isGroupView(storeOp.getDst()) ? AccessKind::FreshWrite
                                            : AccessKind::None;
@@ -290,6 +296,13 @@ struct AssignSemaphoreStagePhase {
       return isTokenView(descLoad.getResult(), token) ? AccessKind::FreshWrite
                                                       : AccessKind::None;
     if (auto descGather = dyn_cast<DescriptorGatherOp>(op))
+      return isTokenView(descGather.getResult(), token)
+                 ? AccessKind::FreshWrite
+                 : AccessKind::None;
+    if (auto descLoad = dyn_cast<nvws::DescriptorLoadOp>(op))
+      return isTokenView(descLoad.getResult(), token) ? AccessKind::FreshWrite
+                                                      : AccessKind::None;
+    if (auto descGather = dyn_cast<nvws::DescriptorGatherOp>(op))
       return isTokenView(descGather.getResult(), token)
                  ? AccessKind::FreshWrite
                  : AccessKind::None;
@@ -354,14 +367,11 @@ struct AssignSemaphoreStagePhase {
   // a FreshWrite. Does not recurse further into nested for/if.
   bool isFirstUseFreshWriteInBlock(Block *block, Value token) {
     for (auto &op : *block) {
-      if (isa<SemaphoreAcquireOp>(&op))
-        return false;
-      if (isa<scf::ForOp, scf::IfOp>(&op))
-        return false;
       if (isTokenViewOp(&op, token))
         continue;
       auto access = classifyAccessForToken(&op, token);
-      if (access == AccessKind::FreshWrite)
+      if (access == AccessKind::FreshWrite ||
+          access == AccessKind::FreshWriteMMA)
         return true;
       if (access != AccessKind::None)
         return false;
@@ -374,22 +384,31 @@ struct AssignSemaphoreStagePhase {
   bool isFirstUseFreshWriteAfterAcquire(SemaphoreAcquireOp acquireOp) {
     auto token = acquireOp.getToken();
     auto it = std::next(Block::iterator(acquireOp.getOperation()));
-    auto end = acquireOp->getBlock()->end();
+    auto *block = acquireOp->getBlock();
+    auto end = block->end();
     for (; it != end; ++it) {
       Operation *op = &*it;
-      if (isa<SemaphoreAcquireOp>(op))
-        return false;
-      if (isa<scf::ForOp, scf::IfOp>(op))
-        return false;
       if (isTokenViewOp(op, token))
         continue;
       auto access = classifyAccessForToken(op, token);
-      if (access == AccessKind::FreshWrite)
+      if (access == AccessKind::FreshWrite ||
+          access == AccessKind::FreshWriteMMA)
         return true;
       if (access != AccessKind::None)
         return false;
       if (usesTokenView(op, token))
         return false;
+    }
+    // If we reached end of a for-loop body without finding a use, the token
+    // may be carried to the next iteration via yield/iter_args. Check if the
+    // first use at the TOP of the loop body is a FreshWrite.
+    if (auto forOp =
+            dyn_cast<scf::ForOp>(block->getParentOp())) {
+      auto yieldOp = cast<scf::YieldOp>(block->getTerminator());
+      if (auto pos = findValuePosInRange(yieldOp.getOperands(), token)) {
+        Value iterArgToken = forOp.getRegionIterArgs()[*pos];
+        return isFirstUseFreshWriteInBlock(block, iterArgToken);
+      }
     }
     return false;
   }
