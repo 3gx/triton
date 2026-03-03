@@ -66,30 +66,41 @@ enum class AccessKind { None, Observation, FreshWrite, FreshWriteMMA };
 
 struct AssignSemaphoreStagePhase {
   struct State {
-    Value stage; // stage index
-    Value phase;
+    Value stage;                // shared stage index (one per buffer group)
+    SmallVector<Value> phases;  // phases[i] = phase for groupSemaphoresList[i]
     Value token;
   };
 
-  DenseSet<Value> groupSemaphores;
+  SmallVector<Value> groupSemaphoresList;  // stable ordering
+  DenseSet<Value> groupSemaphoresSet;      // O(1) lookup
   int partitionId;
   int depth;
   DenseMap<std::pair<Operation *, Value>, int> tokToStagePosMap;
+  DenseMap<std::pair<Operation *, Value>, int> tokToNumPhasesMap;
   DenseMap<Value, bool> viewMemo;
   DenseSet<Value> viewVisited;
 
   AssignSemaphoreStagePhase(ArrayRef<SemaphoreCreateOp> semaOps, int partitionId,
                             int depth)
       : partitionId(partitionId), depth(depth) {
-    for (auto semaOp : semaOps)
-      groupSemaphores.insert(semaOp.getResult());
+    for (auto semaOp : semaOps) {
+      groupSemaphoresList.push_back(semaOp.getResult());
+      groupSemaphoresSet.insert(semaOp.getResult());
+    }
   }
 
   bool isGroupSemaphore(Value semaphore) const {
-    return groupSemaphores.contains(semaphore);
+    return groupSemaphoresSet.contains(semaphore);
   }
 
-  bool isMultiSemaphoreGroup() const { return groupSemaphores.size() > 1; }
+  bool isMultiSemaphoreGroup() const { return groupSemaphoresList.size() > 1; }
+
+  std::optional<int> getSemaphoreIndex(Value semaphore) const {
+    for (int i = 0; i < (int)groupSemaphoresList.size(); ++i)
+      if (groupSemaphoresList[i] == semaphore)
+        return i;
+    return {};
+  }
 
   // --- Op matching ---------------------------------------------------------
 
@@ -310,28 +321,47 @@ struct AssignSemaphoreStagePhase {
     return false;
   }
 
-  bool isFirstUseFreshWriteAfterAcquire(SemaphoreAcquireOp acquireOp) {
-    auto isTokenViewOp = [&](Operation *op, Value token) {
-      if (auto semaBuffer = dyn_cast<SemaphoreBufferOp>(op))
-        return isGroupSemaphore(semaBuffer.getSemaphore()) &&
-               semaBuffer.getToken() == token;
-      if (!op->hasTrait<OpTrait::MemDescViewTrait>())
+  bool isTokenViewOp(Operation *op, Value token) {
+    if (auto semaBuffer = dyn_cast<SemaphoreBufferOp>(op))
+      return isGroupSemaphore(semaBuffer.getSemaphore()) &&
+             semaBuffer.getToken() == token;
+    if (!op->hasTrait<OpTrait::MemDescViewTrait>())
+      return false;
+    for (Value operand : op->getOperands())
+      if (isa<MemDescType>(operand.getType()) && isTokenView(operand, token))
+        return true;
+    return false;
+  }
+
+  bool usesTokenView(Operation *op, Value token) {
+    for (Value operand : op->getOperands())
+      if (isa<MemDescType>(operand.getType()) && isTokenView(operand, token))
+        return true;
+    return false;
+  }
+
+  // Scan a block from start looking for the first access. Returns true if it's
+  // a FreshWrite. Does not recurse further into nested for/if.
+  bool isFirstUseFreshWriteInBlock(Block *block, Value token) {
+    for (auto &op : *block) {
+      if (isa<SemaphoreAcquireOp>(&op))
         return false;
-      for (Value operand : op->getOperands())
-        if (isa<MemDescType>(operand.getType()) &&
-            isTokenView(operand, token))
-          return true;
-      return false;
-    };
+      if (isa<scf::ForOp, scf::IfOp>(&op))
+        return false;
+      if (isTokenViewOp(&op, token))
+        continue;
+      auto access = classifyAccessForToken(&op, token);
+      if (access == AccessKind::FreshWrite)
+        return true;
+      if (access != AccessKind::None)
+        return false;
+      if (usesTokenView(&op, token))
+        return false;
+    }
+    return false;
+  }
 
-    auto usesTokenView = [&](Operation *op, Value token) {
-      for (Value operand : op->getOperands())
-        if (isa<MemDescType>(operand.getType()) &&
-            isTokenView(operand, token))
-          return true;
-      return false;
-    };
-
+  bool isFirstUseFreshWriteAfterAcquire(SemaphoreAcquireOp acquireOp) {
     auto token = acquireOp.getToken();
     auto it = std::next(Block::iterator(acquireOp.getOperation()));
     auto end = acquireOp->getBlock()->end();
@@ -354,7 +384,62 @@ struct AssignSemaphoreStagePhase {
     return false;
   }
 
-  // --- Control-flow threading (verbatim aref pattern) ----------------------
+  // --- Control-flow threading -----------------------------------------------
+
+  // Collect which semaphore indices have acquire ops in a block (recursive).
+  void collectSemaphoresUsedInBlock(Block *block, DenseSet<int> &usedIndices) {
+    for (auto &op : *block) {
+      if (auto acquireOp = getAcquireOp(&op)) {
+        if (auto idx = getSemaphoreIndex(acquireOp.getSemaphore()))
+          usedIndices.insert(*idx);
+      }
+      if (auto forOp = dyn_cast<scf::ForOp>(op))
+        collectSemaphoresUsedInBlock(forOp.getBody(), usedIndices);
+      else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+        collectSemaphoresUsedInBlock(ifOp.thenBlock(), usedIndices);
+        if (ifOp.elseBlock())
+          collectSemaphoresUsedInBlock(ifOp.elseBlock(), usedIndices);
+      }
+    }
+  }
+
+  // Get sorted list of semaphore indices that have acquire ops in a block.
+  SmallVector<int> getSortedUsedIndices(Block *block) {
+    DenseSet<int> usedSemaIndices;
+    collectSemaphoresUsedInBlock(block, usedSemaIndices);
+    SmallVector<int> sorted(usedSemaIndices.begin(), usedSemaIndices.end());
+    llvm::sort(sorted);
+    return sorted;
+  }
+
+  // Infer partition IDs for a yield argument value.
+  SetVector<int> inferPartitionIds(Value arg) {
+    SetVector<int> argIds;
+    if (auto defOp = arg.getDefiningOp()) {
+      if (defOp->getNumRegions() == 0) {
+        if (hasPartition(defOp))
+          argIds = getPartitionIds(defOp);
+      } else if (auto pos = findValuePosInRange(defOp->getResults(), arg)) {
+        if (hasPartition(defOp)) {
+          auto outputs = getPartitionOutputs(defOp);
+          if (*pos < outputs.size())
+            argIds = outputs[*pos];
+        }
+      }
+    } else {
+      for (auto user : arg.getUsers()) {
+        if (isa<scf::YieldOp>(user))
+          continue;
+        if (hasPartition(user)) {
+          auto ids = getPartitionIds(user);
+          argIds.insert(ids.begin(), ids.end());
+        }
+      }
+    }
+    if (argIds.empty())
+      argIds.insert(partitionId);
+    return argIds;
+  }
 
   void assignStateInForOp(scf::ForOp forOp, State &state) {
     Value newTok;
@@ -363,10 +448,19 @@ struct AssignSemaphoreStagePhase {
     if (!analyzeUseInBlock(forOp.getBody(), newTok))
       return;
 
-    SmallVector<Value> extraIterArgs{state.stage, state.phase};
-    SmallVector<Value *> stateRefs{&state.stage, &state.phase};
-    llvm::MapVector<int, Value *> tokenRefs;
+    auto sortedUsedIndices = getSortedUsedIndices(forOp.getBody());
 
+    // Build extra iter args: stage + phase for each used semaphore
+    SmallVector<Value> extraIterArgs;
+    SmallVector<Value *> stateRefs;
+    extraIterArgs.push_back(state.stage);
+    stateRefs.push_back(&state.stage);
+    for (int idx : sortedUsedIndices) {
+      extraIterArgs.push_back(state.phases[idx]);
+      stateRefs.push_back(&state.phases[idx]);
+    }
+
+    llvm::MapVector<int, Value *> tokenRefs;
     if (auto pos = findValuePosInRange(forOp.getInitArgs(), state.token)) {
       tokenRefs[*pos] = &state.token;
       state.token = forOp.getRegionIterArgs()[*pos];
@@ -380,63 +474,64 @@ struct AssignSemaphoreStagePhase {
     auto forOpOutputsIds = getPartitionOutputs(forOp);
     forOp = addIterArgsToLoop(builder, forOp, extraIterArgs);
 
-    for (size_t idx = nArgs; idx < forOp.getRegionIterArgs().size(); ++idx)
-      *stateRefs[idx - nArgs] = forOp.getRegionIterArgs()[idx];
+    for (size_t i = 0; i < stateRefs.size(); ++i)
+      *stateRefs[i] = forOp.getRegionIterArgs()[nArgs + i];
 
     auto stateInBlock = assignStateInBlock(forOp.getBody(), state);
 
-    SmallVector<Value> extraYieldArgs{stateInBlock.stage,
-                                      stateInBlock.phase};
+    // Build yield args matching iter args order
+    SmallVector<Value> extraYieldArgs;
+    extraYieldArgs.push_back(stateInBlock.stage);
+    for (int idx : sortedUsedIndices)
+      extraYieldArgs.push_back(stateInBlock.phases[idx]);
+
     appendToForOpYield(forOp, extraYieldArgs);
     tokToStagePosMap[{forOp, state.token}] = nArgs;
     tokToStagePosMap[{forOp.getBody()->getTerminator(), stateInBlock.token}] =
         nArgs;
+    tokToNumPhasesMap[{forOp, state.token}] = sortedUsedIndices.size();
+    tokToNumPhasesMap[{forOp.getBody()->getTerminator(), stateInBlock.token}] =
+        sortedUsedIndices.size();
 
-    // Partition annotation — match aref AssignStagePhase
+    // Partition annotations
     for (auto arg : extraYieldArgs) {
-      SetVector<int> argIds;
-      if (auto defOp = arg.getDefiningOp()) {
-        if (defOp->getNumRegions() == 0) {
-          assert(hasPartition(defOp));
-          argIds = getPartitionIds(defOp);
-        } else {
-          auto pos = findValuePosInRange(defOp->getResults(), arg);
-          argIds = getPartitionOutputs(defOp)[*pos];
-        }
-      } else {
-        for (auto user : arg.getUsers()) {
-          if (isa<scf::YieldOp>(user))
-            continue;
-          assert(hasPartition(user));
-          auto ids = getPartitionIds(user);
-          argIds.insert(ids.begin(), ids.end());
-        }
-      }
-      if (argIds.empty())
-        argIds.insert(partitionId);
+      auto argIds = inferPartitionIds(arg);
       forOpIds.insert(argIds.begin(), argIds.end());
       forOpOutputsIds.push_back(argIds);
     }
     setPartition(forOp, forOpIds);
     setPartitionOutputs(forOp, forOpOutputsIds);
 
-    for (size_t idx = nArgs; idx < forOp.getRegionIterArgs().size(); ++idx)
-      *stateRefs[idx - nArgs] = forOp.getResult(idx);
+    for (size_t i = 0; i < stateRefs.size(); ++i)
+      *stateRefs[i] = forOp.getResult(nArgs + i);
     for (auto [idx, tokenRef] : tokenRefs)
       *tokenRef = forOp.getResult(idx);
   }
 
   void assignStateInIfOp(scf::IfOp ifOp, State &state) {
-    auto useInThen = analyzeUseInBlock(ifOp.thenBlock(), state.token);
-    auto useInElse =
-        ifOp.elseBlock() ? analyzeUseInBlock(ifOp.elseBlock(), state.token)
-                         : false;
-    if (!useInThen && !useInElse)
+    // Only thread state through if-ops that contain acquire ops.
+    // Stage/phase only change at acquire sites, so if-ops with only buffer
+    // accesses (no acquires) don't need state threaded through them.
+    DenseSet<int> usedSemaIndices;
+    collectSemaphoresUsedInBlock(ifOp.thenBlock(), usedSemaIndices);
+    if (ifOp.elseBlock())
+      collectSemaphoresUsedInBlock(ifOp.elseBlock(), usedSemaIndices);
+    if (usedSemaIndices.empty())
       return;
 
-    SmallVector<Type> extraIfResults{state.stage.getType(),
-                                     state.phase.getType()};
-    SmallVector<Value *> stateRefs{&state.stage, &state.phase};
+    SmallVector<int> sortedUsedIndices(usedSemaIndices.begin(),
+                                       usedSemaIndices.end());
+    llvm::sort(sortedUsedIndices);
+
+    // Build extra result types: stage + phases for used semaphores
+    SmallVector<Type> extraIfResults;
+    SmallVector<Value *> stateRefs;
+    extraIfResults.push_back(state.stage.getType());
+    stateRefs.push_back(&state.stage);
+    for (int idx : sortedUsedIndices) {
+      extraIfResults.push_back(state.phases[idx].getType());
+      stateRefs.push_back(&state.phases[idx]);
+    }
 
     OpBuilder builder(ifOp);
     size_t nResults = ifOp.getResults().size();
@@ -463,61 +558,46 @@ struct AssignSemaphoreStagePhase {
     tokToStagePosMap[{newIfOp.elseYield(), elseState.token}] =
         elseYieldOp.getNumOperands();
 
+    // Insert stage yield args
     thenYieldOp->insertOperands(thenYieldOp.getNumOperands(), thenState.stage);
     elseYieldOp->insertOperands(elseYieldOp.getNumOperands(), elseState.stage);
-    thenYieldOp->insertOperands(thenYieldOp.getNumOperands(), thenState.phase);
-    elseYieldOp->insertOperands(elseYieldOp.getNumOperands(), elseState.phase);
+    // Insert per-semaphore phase yield args
+    for (int idx : sortedUsedIndices) {
+      thenYieldOp->insertOperands(thenYieldOp.getNumOperands(),
+                                  thenState.phases[idx]);
+      elseYieldOp->insertOperands(elseYieldOp.getNumOperands(),
+                                  elseState.phases[idx]);
+    }
 
-    // Partition annotation — verbatim from aref. NEVER widen ifOpIds.
+    // Partition annotations — NEVER widen ifOpIds
     assert(hasPartition(ifOp));
     auto ifOpIds = getPartitionIds(ifOp);
     auto ifOpOutputsIds = getPartitionOutputs(ifOp);
     ifOp.erase();
 
+    // Stage partition IDs
     SetVector<int> stageIds;
-    auto collectIds = [&](Value arg, SetVector<int> &ids) {
-      if (auto defOp = arg.getDefiningOp()) {
-        if (!hasPartition(defOp))
-          return;
-        if (defOp->getNumRegions() == 0) {
-          auto argIds = getPartitionIds(defOp);
-          ids.insert(argIds.begin(), argIds.end());
-        } else if (auto pos = findValuePosInRange(defOp->getResults(), arg)) {
-          auto outputs = getPartitionOutputs(defOp);
-          if (*pos < outputs.size()) {
-            auto argIds = outputs[*pos];
-            ids.insert(argIds.begin(), argIds.end());
-          }
-        }
-      } else {
-        for (auto user : arg.getUsers()) {
-          if (isa<scf::YieldOp>(user) || !hasPartition(user))
-            continue;
-          auto argIds = getPartitionIds(user);
-          ids.insert(argIds.begin(), argIds.end());
-        }
-      }
-    };
-    for (auto arg : {thenState.stage, elseState.stage})
-      collectIds(arg, stageIds);
-    SetVector<int> phaseIds;
-    for (auto arg : {thenState.phase, elseState.phase})
-      collectIds(arg, phaseIds);
-    if (stageIds.empty())
-      stageIds.insert(ifOpIds.begin(), ifOpIds.end());
-    if (phaseIds.empty())
-      phaseIds.insert(ifOpIds.begin(), ifOpIds.end());
-    if (stageIds.empty())
-      stageIds.insert(partitionId);
-    if (phaseIds.empty())
-      phaseIds.insert(partitionId);
+    for (auto arg : {thenState.stage, elseState.stage}) {
+      auto ids = inferPartitionIds(arg);
+      stageIds.insert(ids.begin(), ids.end());
+    }
     ifOpOutputsIds.push_back(stageIds);
-    ifOpOutputsIds.push_back(phaseIds);
+
+    // Per-semaphore phase partition IDs
+    for (int idx : sortedUsedIndices) {
+      SetVector<int> phaseIds;
+      for (auto arg : {thenState.phases[idx], elseState.phases[idx]}) {
+        auto ids = inferPartitionIds(arg);
+        phaseIds.insert(ids.begin(), ids.end());
+      }
+      ifOpOutputsIds.push_back(phaseIds);
+    }
+
     setPartition(newIfOp, ifOpIds);
     setPartitionOutputs(newIfOp, ifOpOutputsIds);
 
-    for (size_t idx = nResults; idx < newIfOp.getResults().size(); ++idx)
-      *stateRefs[idx - nResults] = newIfOp.getResult(idx);
+    for (size_t i = 0; i < stateRefs.size(); ++i)
+      *stateRefs[i] = newIfOp.getResult(nResults + i);
     for (auto [idx, tokenRef] : tokenRefs)
       *tokenRef = newIfOp.getResult(idx);
   }
@@ -558,12 +638,17 @@ struct AssignSemaphoreStagePhase {
         }
         state.stage = acquireStage;
         acquireOp.getStageMutable().assign(acquireStage);
-        acquireOp.getPhaseMutable().assign(state.phase);
+
+        // Per-semaphore phase: look up and update only this semaphore's phase
+        auto semaIdx = getSemaphoreIndex(acquireOp.getSemaphore());
+        assert(semaIdx && "acquire op must reference a group semaphore");
+        Value &semaPhase = state.phases[*semaIdx];
+        acquireOp.getPhaseMutable().assign(semaPhase);
 
         b.setInsertionPointAfter(acquireOp);
         auto c1 = createOp(arith::ConstantIntOp{}, 1, 32);
         auto phaseBit = createOp(arith::ShLIOp{}, c1, acquireStage);
-        state.phase = createOp(arith::XOrIOp{}, state.phase, phaseBit);
+        semaPhase = createOp(arith::XOrIOp{}, semaPhase, phaseBit);
         state.token = acquireOp.getToken();
         continue;
       }
@@ -617,10 +702,16 @@ struct AssignSemaphoreStagePhase {
           setPartition(forOp, forOpIds);
 
           auto forOpOutputsIds = getPartitionOutputs(forOp);
-          forOpOutputsIds[*pos + 0].insert(stageOpIds.begin(),
-                                           stageOpIds.end());
-          forOpOutputsIds[*pos + 1].insert(stageOpIds.begin(),
-                                           stageOpIds.end());
+          // Widen stage slot and all phase slots that follow
+          forOpOutputsIds[*pos].insert(stageOpIds.begin(), stageOpIds.end());
+          int numPhases = (int)groupSemaphoresList.size();
+          auto numIt = tokToNumPhasesMap.find({forOp, blk});
+          if (numIt != tokToNumPhasesMap.end())
+            numPhases = numIt->second;
+          for (int k = 1;
+               k <= numPhases && (*pos + k) < (int)forOpOutputsIds.size(); ++k)
+            forOpOutputsIds[*pos + k].insert(stageOpIds.begin(),
+                                             stageOpIds.end());
           setPartitionOutputs(forOp, forOpOutputsIds);
         }
         stageOp.setStage(stage);
@@ -642,12 +733,13 @@ struct AssignSemaphoreStagePhase {
     }
   }
 
-  // --- Entry point (per semaphore, like aref per aref) ---------------------
+  // --- Entry point (per buffer group) --------------------------------------
 
   static LogicalResult run(ArrayRef<SemaphoreCreateOp> semaOps) {
     if (semaOps.empty())
       return success();
     auto firstSemaOp = semaOps.front();
+    auto lastSemaOp = semaOps.back();
     int depth = 1;
     for (auto semaOp : semaOps)
       depth = std::max(depth, cast<SemaphoreType>(semaOp.getType()).getNumStages());
@@ -665,15 +757,19 @@ struct AssignSemaphoreStagePhase {
     if (partitionIds.empty())
       partitionIds.insert(0);
 
-    ImplicitLocOpBuilder b(firstSemaOp.getLoc(), firstSemaOp);
-    b.setInsertionPointAfter(firstSemaOp);
+    // Insert after the last semaOp so all semaphores are defined
+    ImplicitLocOpBuilder b(lastSemaOp.getLoc(), lastSemaOp);
+    b.setInsertionPointAfter(lastSemaOp);
 
     State initState;
     initState.stage = arith::ConstantIntOp::create(b, 0, 32);
-    uint32_t initPhase =
-        firstSemaOp.getIsReleased() ? 0xFFFFFFFFu : 0x00000000u;
-    initState.phase =
-        arith::ConstantIntOp::create(b, static_cast<int64_t>(initPhase), 32);
+    // Per-semaphore initial phases
+    for (auto semaOp : semaOps) {
+      uint32_t initPhase =
+          semaOp.getIsReleased() ? 0xFFFFFFFFu : 0x00000000u;
+      initState.phases.push_back(
+          arith::ConstantIntOp::create(b, static_cast<int64_t>(initPhase), 32));
+    }
 
     for (auto pid : partitionIds) {
       AssignSemaphoreStagePhase impl(semaOps, pid, depth);
@@ -693,13 +789,15 @@ struct AssignSemaphoreStagePhase {
       }
     }
 
-    for (auto semaOp : semaOps) {
+    // Fallback: patch any missing stage/phase with per-semaphore init values
+    for (size_t semaIdx = 0; semaIdx < semaOps.size(); ++semaIdx) {
+      auto semaOp = semaOps[semaIdx];
       for (auto user : semaOp->getUsers()) {
         if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user)) {
           if (!acquireOp.getStage())
             acquireOp.getStageMutable().assign(initState.stage);
           if (!acquireOp.getPhase())
-            acquireOp.getPhaseMutable().assign(initState.phase);
+            acquireOp.getPhaseMutable().assign(initState.phases[semaIdx]);
         }
         if (auto stageOp = dyn_cast<ArefStageInterface>(user))
           if (!stageOp.getStage())
