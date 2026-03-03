@@ -842,7 +842,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %28 = arith.muli %25, %c128_i32 {ttg.partition = array<i32: 0, 2>} : i32
       %29 = arith.muli %27, %c128_i32 {ttg.partition = array<i32: 0, 2>} : i32
       // ACC stage advance: addi/cmpi/select wrapping at 1
-      // CHECK: [[ASTAGE0:%.*]] = arith.select {{%.*}}, {{%.*}}, {{%.*}} {ttg.partition = array<i32: 0, 1>} : i32
+      // CHECK: [[ASTAGE_NEXT:%.*]] = arith.addi {{%.*}}, {{%.*}} {ttg.partition = array<i32: 0, 1>} : i32
+      // CHECK: [[ASTAGE_WRAP:%.*]] = arith.cmpi eq, [[ASTAGE_NEXT]], {{%.*}} {ttg.partition = array<i32: 0, 1>} : i32
+      // CHECK: [[ASTAGE0:%.*]] = arith.select [[ASTAGE_WRAP]], {{%.*}}, [[ASTAGE_NEXT]] {ttg.partition = array<i32: 0, 1>} : i32
       // Phase flip BEFORE acquire ACC_EMPTY
       // CHECK: [[ASHIFT0:%.*]] = arith.shli {{%.*}}, [[ASTAGE0]] {ttg.partition = array<i32: 0>} : i32
       // CHECK: [[APHASE0_OUT:%.*]] = arith.xori {{%.*}}, [[ASHIFT0]] {ttg.partition = array<i32: 0>} : i32
