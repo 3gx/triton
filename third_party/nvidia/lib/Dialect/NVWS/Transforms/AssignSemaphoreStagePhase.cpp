@@ -71,21 +71,31 @@ struct AssignSemaphoreStagePhase {
     Value token;
   };
 
-  Value semaphore;
+  DenseSet<Value> groupSemaphores;
   int partitionId;
   int depth;
   DenseMap<std::pair<Operation *, Value>, int> tokToStagePosMap;
   DenseMap<Value, bool> viewMemo;
   DenseSet<Value> viewVisited;
 
-  AssignSemaphoreStagePhase(Value semaphore, int partitionId, int depth)
-      : semaphore(semaphore), partitionId(partitionId), depth(depth) {}
+  AssignSemaphoreStagePhase(ArrayRef<SemaphoreCreateOp> semaOps, int partitionId,
+                            int depth)
+      : partitionId(partitionId), depth(depth) {
+    for (auto semaOp : semaOps)
+      groupSemaphores.insert(semaOp.getResult());
+  }
+
+  bool isGroupSemaphore(Value semaphore) const {
+    return groupSemaphores.contains(semaphore);
+  }
+
+  bool isMultiSemaphoreGroup() const { return groupSemaphores.size() > 1; }
 
   // --- Op matching ---------------------------------------------------------
 
   SemaphoreAcquireOp getAcquireOp(Operation *op) {
     if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(op)) {
-      if (acquireOp.getSemaphore() == semaphore) {
+      if (isGroupSemaphore(acquireOp.getSemaphore())) {
         if (!hasPartition(op) ||
             llvm::is_contained(getPartitionIds(op), partitionId))
           return acquireOp;
@@ -97,7 +107,7 @@ struct AssignSemaphoreStagePhase {
   bool isGroupBuffer(SemaphoreBufferOp bufOp, Value token) {
     if (!bufOp)
       return false;
-    if (bufOp.getSemaphore() != this->semaphore)
+    if (!isGroupSemaphore(bufOp.getSemaphore()))
       return false;
     return token == bufOp.getToken();
   }
@@ -112,7 +122,7 @@ struct AssignSemaphoreStagePhase {
 
     bool result = false;
     if (auto semaBuffer = bufferView.getDefiningOp<SemaphoreBufferOp>()) {
-      result = semaBuffer.getSemaphore() == this->semaphore;
+      result = isGroupSemaphore(semaBuffer.getSemaphore());
     } else if (auto blockArg = dyn_cast<BlockArgument>(bufferView)) {
       if (auto forOp =
               dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp())) {
@@ -156,7 +166,7 @@ struct AssignSemaphoreStagePhase {
     if (!isa<MemDescType>(bufferView.getType()))
       return false;
     if (auto semaBuffer = bufferView.getDefiningOp<SemaphoreBufferOp>())
-      return semaBuffer.getSemaphore() == this->semaphore &&
+      return isGroupSemaphore(semaBuffer.getSemaphore()) &&
              semaBuffer.getToken() == token;
     if (auto blockArg = dyn_cast<BlockArgument>(bufferView)) {
       if (auto forOp =
@@ -303,7 +313,7 @@ struct AssignSemaphoreStagePhase {
   bool isFirstUseFreshWriteAfterAcquire(SemaphoreAcquireOp acquireOp) {
     auto isTokenViewOp = [&](Operation *op, Value token) {
       if (auto semaBuffer = dyn_cast<SemaphoreBufferOp>(op))
-        return semaBuffer.getSemaphore() == semaphore &&
+        return isGroupSemaphore(semaBuffer.getSemaphore()) &&
                semaBuffer.getToken() == token;
       if (!op->hasTrait<OpTrait::MemDescViewTrait>())
         return false;
@@ -560,10 +570,20 @@ struct AssignSemaphoreStagePhase {
 
       // Control flow
       if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+        if (isMultiSemaphoreGroup()) {
+          assignStateInBlock(forOp.getBody(), state);
+          continue;
+        }
         assignStateInForOp(forOp, state);
         continue;
       }
       if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+        if (isMultiSemaphoreGroup()) {
+          assignStateInBlock(ifOp.thenBlock(), state);
+          if (ifOp.elseBlock())
+            assignStateInBlock(ifOp.elseBlock(), state);
+          continue;
+        }
         assignStateInIfOp(ifOp, state);
         continue;
       }
@@ -607,54 +627,84 @@ struct AssignSemaphoreStagePhase {
       } else if (auto forOp = dyn_cast<scf::ForOp>(owner)) {
         auto tokPos = tokUse.getOperandNumber() - forOp.getNumControlOperands();
         auto iterTok = forOp.getRegionIterArg(tokPos);
-        auto stagePos = tokToStagePosMap.at({forOp, iterTok});
-        propagateStage(iterTok, forOp.getRegionIterArgs()[stagePos], visited);
+        auto it = tokToStagePosMap.find({forOp, iterTok});
+        if (it == tokToStagePosMap.end())
+          continue;
+        propagateStage(iterTok, forOp.getRegionIterArgs()[it->second], visited);
       } else if (auto yieldOp = dyn_cast<scf::YieldOp>(owner)) {
-        auto stagePos = tokToStagePosMap.at({yieldOp, token});
+        auto it = tokToStagePosMap.find({yieldOp, token});
+        if (it == tokToStagePosMap.end())
+          continue;
         auto parentOp = yieldOp->getParentOp();
         propagateStage(parentOp->getResult(tokUse.getOperandNumber()),
-                       parentOp->getResult(stagePos), visited);
+                       parentOp->getResult(it->second), visited);
       }
     }
   }
 
   // --- Entry point (per semaphore, like aref per aref) ---------------------
 
-  static LogicalResult run(SemaphoreCreateOp semaOp) {
-    auto semaType = cast<SemaphoreType>(semaOp.getType());
-    int depth = std::max(1, semaType.getNumStages());
+  static LogicalResult run(ArrayRef<SemaphoreCreateOp> semaOps) {
+    if (semaOps.empty())
+      return success();
+    auto firstSemaOp = semaOps.front();
+    int depth = 1;
+    for (auto semaOp : semaOps)
+      depth = std::max(depth, cast<SemaphoreType>(semaOp.getType()).getNumStages());
+    depth = std::max(depth, 1);
 
     std::set<int> partitionIds;
-    for (auto user : semaOp->getUsers()) {
-      if (isa<SemaphoreAcquireOp>(user) && hasPartition(user)) {
-        auto ids = getPartitionIds(user);
-        partitionIds.insert(ids.begin(), ids.end());
+    for (auto semaOp : semaOps) {
+      for (auto user : semaOp->getUsers()) {
+        if (isa<SemaphoreAcquireOp>(user) && hasPartition(user)) {
+          auto ids = getPartitionIds(user);
+          partitionIds.insert(ids.begin(), ids.end());
+        }
       }
     }
     if (partitionIds.empty())
-      partitionIds.insert({0, 0});
+      partitionIds.insert(0);
 
-    ImplicitLocOpBuilder b(semaOp.getLoc(), semaOp);
-    b.setInsertionPointAfter(semaOp);
+    ImplicitLocOpBuilder b(firstSemaOp.getLoc(), firstSemaOp);
+    b.setInsertionPointAfter(firstSemaOp);
 
     State initState;
     initState.stage = arith::ConstantIntOp::create(b, 0, 32);
-    uint32_t initPhase = semaOp.getIsReleased() ? 0xFFFFFFFFu : 0x00000000u;
+    uint32_t initPhase =
+        firstSemaOp.getIsReleased() ? 0xFFFFFFFFu : 0x00000000u;
     initState.phase =
         arith::ConstantIntOp::create(b, static_cast<int64_t>(initPhase), 32);
 
     for (auto pid : partitionIds) {
-      AssignSemaphoreStagePhase impl(semaOp.getResult(), pid, depth);
-      impl.assignStateInBlock(semaOp->getBlock(), initState);
+      AssignSemaphoreStagePhase impl(semaOps, pid, depth);
+      impl.assignStateInBlock(firstSemaOp->getBlock(), initState);
 
-      for (auto user : semaOp->getUsers())
-        if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user);
-            acquireOp && (!hasPartition(acquireOp) ||
-                          getPartitionIds(acquireOp).front() == pid)) {
-          DenseSet<Operation *> visited;
-          impl.propagateStage(acquireOp.getToken(), acquireOp.getStage(),
-                              visited);
+      for (auto semaOp : semaOps) {
+        for (auto user : semaOp->getUsers()) {
+          if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user);
+              acquireOp && (!hasPartition(acquireOp) ||
+                            llvm::is_contained(getPartitionIds(acquireOp),
+                                               pid))) {
+            DenseSet<Operation *> visited;
+            impl.propagateStage(acquireOp.getToken(), acquireOp.getStage(),
+                                visited);
+          }
         }
+      }
+    }
+
+    for (auto semaOp : semaOps) {
+      for (auto user : semaOp->getUsers()) {
+        if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user)) {
+          if (!acquireOp.getStage())
+            acquireOp.getStageMutable().assign(initState.stage);
+          if (!acquireOp.getPhase())
+            acquireOp.getPhaseMutable().assign(initState.phase);
+        }
+        if (auto stageOp = dyn_cast<ArefStageInterface>(user))
+          if (!stageOp.getStage())
+            stageOp.setStage(initState.stage);
+      }
     }
 
     return success();
@@ -735,10 +785,8 @@ LogicalResult assignSemaphoreStagePhase(triton::FuncOp funcOp) {
   }
 
   for (auto &it : semaGroups) {
-    for (auto semaOp : it.second) {
-      if (failed(AssignSemaphoreStagePhase::run(semaOp)))
-        return failure();
-    }
+    if (failed(AssignSemaphoreStagePhase::run(it.second)))
+      return failure();
   }
 
   auto callback = [&](Operation *op) {
