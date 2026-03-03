@@ -886,19 +886,20 @@ struct AssignSemaphoreStagePhase {
       impl.assignStateInBlock(firstSemaOp->getBlock(), initState);
     }
 
-    // Fallback: patch any missing stage/phase with per-semaphore init values.
+    // Verify: all acquires must have stage/phase assigned by the main walk.
+    // All release/buffer ops must have stage set via propagateStage.
     for (size_t semaIdx = 0; semaIdx < semaOps.size(); ++semaIdx) {
       auto semaOp = semaOps[semaIdx];
       for (auto user : semaOp->getUsers()) {
         if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user)) {
-          if (!acquireOp.getStage())
-            acquireOp.getStageMutable().assign(initState.stage);
-          if (!acquireOp.getPhase())
-            acquireOp.getPhaseMutable().assign(initState.phases[semaIdx]);
+          assert(acquireOp.getStage() &&
+                 "acquire missing stage after assign-semaphore-stage-phase");
+          assert(acquireOp.getPhase() &&
+                 "acquire missing phase after assign-semaphore-stage-phase");
         }
         if (auto stageOp = dyn_cast<ArefStageInterface>(user))
-          if (!stageOp.getStage())
-            stageOp.setStage(initState.stage);
+          assert(stageOp.getStage() &&
+                 "release/buffer missing stage after propagation");
       }
     }
 
