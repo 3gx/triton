@@ -58,7 +58,7 @@ namespace {
 
 // ---------------------------------------------------------------------------
 // Per-partition processing, exactly like aref AssignStagePhase<T>.
-// State = {stage, wasObserved, phase, token} per semaphore per partition.
+// State = {stage, phase, token} per semaphore per partition.
 // Each (semaphore, partition) pair gets its own iter_args through loops/ifs.
 // ---------------------------------------------------------------------------
 
@@ -66,7 +66,7 @@ enum class AccessKind { None, Observation, FreshWrite, FreshWriteMMA };
 
 struct AssignSemaphoreStagePhase {
   struct State {
-    Value stage; // bits 0-30: stage index, bit 31: wasObserved
+    Value stage; // stage index
     Value phase;
     Value token;
   };
@@ -485,16 +485,9 @@ struct AssignSemaphoreStagePhase {
           return created;
         };
 
-        // Extract raw stage (bits 0-30) BEFORE acquireOp for dominance
-        auto stageMask =
-            createOp(arith::ConstantIntOp{}, 0x7FFFFFFF, 32);
-        auto rawStage = createOp(arith::AndIOp{}, state.stage, stageMask);
+        Value rawStage = state.stage;
         Value acquireStage = rawStage;
         if (isFirstUseFreshWriteAfterAcquire(acquireOp)) {
-          auto c31 = createOp(arith::ConstantIntOp{}, 31, 32);
-          auto wasObsBit = createOp(arith::ShRUIOp{}, state.stage, c31);
-          auto wasObs =
-              createOp(arith::TruncIOp{}, b.getI1Type(), wasObsBit);
           auto c1 = createOp(arith::ConstantIntOp{}, 1, 32);
           auto c0 = createOp(arith::ConstantIntOp{}, 0, 32);
           auto cDepth = createOp(arith::ConstantIntOp{}, depth, 32);
@@ -502,10 +495,9 @@ struct AssignSemaphoreStagePhase {
           auto wrap =
               createOp(arith::CmpIOp{}, arith::CmpIPredicate::eq, next, cDepth);
           auto wrapped = createOp(arith::SelectOp{}, wrap, c0, next);
-          acquireStage = createOp(arith::SelectOp{}, wasObs, wrapped, rawStage);
-          state.stage =
-              createOp(arith::SelectOp{}, wasObs, acquireStage, state.stage);
+          acquireStage = wrapped;
         }
+        state.stage = acquireStage;
         acquireOp.getStageMutable().assign(acquireStage);
         acquireOp.getPhaseMutable().assign(state.phase);
 
@@ -527,73 +519,7 @@ struct AssignSemaphoreStagePhase {
         continue;
       }
 
-      // Stage trigger: data access ops (only for current partition)
-      if (!isInPartition(&op))
-        continue;
-      auto access = classifyAccess(&op);
-      if (access == AccessKind::None)
-        continue;
-
-      ImplicitLocOpBuilder b(op.getLoc(), &op);
-      b.setInsertionPointAfter(&op);
-      std::optional<SetVector<int>> pids;
-      if (hasPartition(&op))
-        pids = getPartitionIds(&op);
-      auto wsTag = getWarpSpecializeTag(&op);
-      auto stageCluster = getStageCluster(&op);
-      auto createOp = [&](auto opTy, auto... args) {
-        using ty = decltype(opTy);
-        auto created = triton::gpu::createInto<ty>(
-            b, b.getLoc(), pids, stageCluster,
-            std::forward<decltype(args)>(args)...);
-        if (wsTag)
-          setWarpSpecializeTag(created, *wsTag);
-        return created;
-      };
-
-      if (access == AccessKind::Observation) {
-        auto bit31 = createOp(arith::ConstantIntOp{},
-                              static_cast<int64_t>(1u << 31), 32);
-        state.stage = createOp(arith::OrIOp{}, state.stage, bit31);
-        continue;
-      }
-
-      Value isFresh;
-      if (access == AccessKind::FreshWrite) {
-        isFresh = createOp(arith::ConstantIntOp{}, 1, 1);
-      } else {
-        auto mmaOp = cast<MMAv5OpInterface>(&op);
-        auto c1 = createOp(arith::ConstantIntOp{}, 1, 1);
-        isFresh = createOp(arith::XOrIOp{}, mmaOp.useAccumulator(), c1);
-      }
-
-      // Extract wasObserved from bit 31 of packed stage
-      auto c31 = createOp(arith::ConstantIntOp{}, 31, 32);
-      auto wasObsBit = createOp(arith::ShRUIOp{}, state.stage, c31);
-      auto wasObs_i1 =
-          createOp(arith::TruncIOp{}, b.getI1Type(), wasObsBit);
-
-      auto shouldAdvance =
-          createOp(arith::AndIOp{}, wasObs_i1, isFresh);
-      auto c1_i32 = createOp(arith::ConstantIntOp{}, 1, 32);
-      auto c0_i32 = createOp(arith::ConstantIntOp{}, 0, 32);
-      auto cDepth = createOp(arith::ConstantIntOp{}, depth, 32);
-
-      // Compute new raw stage (bits 0-30 only)
-      auto stageMask =
-          createOp(arith::ConstantIntOp{}, 0x7FFFFFFF, 32);
-      auto rawStage = createOp(arith::AndIOp{}, state.stage, stageMask);
-      auto next = createOp(arith::AddIOp{}, rawStage, c1_i32);
-      auto wrap =
-          createOp(arith::CmpIOp{}, arith::CmpIPredicate::eq, next, cDepth);
-      auto wrapped = createOp(arith::SelectOp{}, wrap, c0_i32, next);
-      auto newRawStage =
-          createOp(arith::SelectOp{}, shouldAdvance, wrapped, rawStage);
-
-      // When shouldAdvance: newRawStage has bit 31=0 (wasObserved cleared)
-      // When !shouldAdvance: keep packed stage as-is (preserves bit 31)
-      state.stage =
-          createOp(arith::SelectOp{}, shouldAdvance, newRawStage, state.stage);
+      // No post-access stage mutation. Stage updates are acquire-site only.
     }
 
     return state;
@@ -663,7 +589,7 @@ struct AssignSemaphoreStagePhase {
     b.setInsertionPointAfter(semaOp);
 
     State initState;
-    initState.stage = arith::ConstantIntOp::create(b, 0, 32); // bit 31=0 (not observed)
+    initState.stage = arith::ConstantIntOp::create(b, 0, 32);
     uint32_t initPhase = semaOp.getIsReleased() ? 0xFFFFFFFFu : 0x00000000u;
     initState.phase =
         arith::ConstantIntOp::create(b, static_cast<int64_t>(initPhase), 32);
