@@ -623,3 +623,79 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     tt.return
   }
 }
+
+// -----
+// Phase2Mode: 1 producer + 2 consumers in different partitions.
+// Tests pending count (EMPTY mbar init=2 for 2 consumer releases),
+// stage/phase assignment with 3 partitions, no multi-buffering (no TMA load).
+// Ported from lower_aref.mlir @reuse_argument.
+
+#blocked4 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared4 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem4 = #ttg.shared_memory
+!elt4 = tensor<1xi32, #blocked4>
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @reuse_argument
+  tt.func @reuse_argument(%arg0: i32, %arg1: i32, %arg2: i32) {
+    %cst = arith.constant dense<1> : !elt4
+    // Buffer alloc (depth=1, no multi-buffering since no TMA producer)
+    // CHECK: [[BUF:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32,
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>
+    // EMPTY mbar: init_barrier with pending count = 2 (two consumer releases)
+    // CHECK: [[MBAR_E:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64,
+    // CHECK: [[ESLICE:%.*]] = ttg.memdesc_index [[MBAR_E]]
+    // CHECK: ttng.init_barrier [[ESLICE]], 2
+    // FULL mbar: init_barrier with pending count = 1 (one producer release)
+    // CHECK: [[MBAR_F:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64,
+    // CHECK: [[FSLICE:%.*]] = ttg.memdesc_index [[MBAR_F]]
+    // CHECK: ttng.init_barrier [[FSLICE]], 1
+    %empty = nvws.semaphore.create %alloc true : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>], 1>
+    %full = nvws.semaphore.create %alloc false : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>], 1>
+    // CHECK: scf.for {{.*}} iter_args({{.*}}) -> (tensor<1xi32, #blocked{{.*}}>, i32, i32, i32, i32)
+    scf.for %arg3 = %arg0 to %arg1 step %arg2 iter_args(%arg5 = %cst) -> (!elt4) : i32 {
+      // Producer (partition 0): wait EMPTY, local_store, arrive FULL
+      // CHECK: ttng.wait_barrier {{.*}} {ttg.partition = array<i32: 0>}
+      // CHECK: [[PBUF:%.*]] = ttg.memdesc_index [[BUF]][{{.*}}] {ttg.partition = array<i32: 0>}
+      // CHECK: ttg.local_store {{.*}}, [[PBUF]] {ttg.partition = array<i32: 0>}
+      // CHECK: ttng.arrive_barrier {{.*}}, 1 {ttg.partition = array<i32: 0>}
+      // CHECK: "op_a"
+      %ptok = nvws.semaphore.acquire %empty {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>], 1> -> !ttg.async.token
+      %pbuf = nvws.semaphore.buffer %empty, %ptok {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>], 1>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared4, #smem4, mutable>
+      ttg.local_store %arg5, %pbuf {ttg.partition = array<i32: 0>} : !elt4 -> !ttg.memdesc<1xi32, #shared4, #smem4, mutable>
+      nvws.semaphore.release %full, %ptok [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>], 1>, !ttg.async.token
+      %5 = "op_a"() {ttg.partition = array<i32: 0>} : () -> !elt4
+      // Consumer 1 (partition 1): wait FULL, local_load, arrive EMPTY
+      // CHECK: ttng.wait_barrier {{.*}} {ttg.partition = array<i32: 1>}
+      // CHECK: [[CBUF1:%.*]] = ttg.memdesc_index [[BUF]][{{.*}}] {ttg.partition = array<i32: 1>}
+      // CHECK: ttg.local_load [[CBUF1]] {ttg.partition = array<i32: 1>}
+      // CHECK: ttng.arrive_barrier {{.*}}, 1 {ttg.partition = array<i32: 1>}
+      // CHECK: "op_d"
+      %gtok1 = nvws.semaphore.acquire %full {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>], 1> -> !ttg.async.token
+      %gbuf1 = nvws.semaphore.buffer %full, %gtok1 {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>], 1>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared4, #smem4, mutable>
+      %8 = ttg.local_load %gbuf1 {ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi32, #shared4, #smem4, mutable> -> !elt4
+      nvws.semaphore.release %empty, %gtok1 [#nvws.async_op<none>] {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>], 1>, !ttg.async.token
+      "op_d"(%8) {ttg.partition = array<i32: 1>} : (!elt4) -> ()
+      // Consumer 2 (partition 2): wait FULL, local_load, arrive EMPTY
+      // CHECK: ttng.wait_barrier {{.*}} {ttg.partition = array<i32: 2>}
+      // CHECK: [[CBUF2:%.*]] = ttg.memdesc_index [[BUF]][{{.*}}] {ttg.partition = array<i32: 2>}
+      // CHECK: ttg.local_load [[CBUF2]] {ttg.partition = array<i32: 2>}
+      // CHECK: ttng.arrive_barrier {{.*}}, 1 {ttg.partition = array<i32: 2>}
+      // CHECK: "op_d"
+      %gtok2 = nvws.semaphore.acquire %full {ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>], 1> -> !ttg.async.token
+      %gbuf2 = nvws.semaphore.buffer %full, %gtok2 {ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>], 1>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared4, #smem4, mutable>
+      %11 = ttg.local_load %gbuf2 {ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi32, #shared4, #smem4, mutable> -> !elt4
+      nvws.semaphore.release %empty, %gtok2 [#nvws.async_op<none>] {ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>], 1>, !ttg.async.token
+      "op_d"(%11) {ttg.partition = array<i32: 2>} : (!elt4) -> ()
+      scf.yield %5 : !elt4
+    } {ttg.partition.stages = [1 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.outputs = [array<i32: 0>], tt.warp_specialize}
+    // Cleanup
+    // CHECK: ttng.inval_barrier
+    // CHECK: ttg.local_dealloc [[MBAR_E]]
+    // CHECK: ttng.inval_barrier
+    // CHECK: ttg.local_dealloc [[MBAR_F]]
+    // CHECK: ttg.local_dealloc [[BUF]]
+    ttg.local_dealloc %alloc : !ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>
+    tt.return
+  }
+}
