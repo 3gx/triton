@@ -329,7 +329,7 @@ void combineSemaphores(scf::ForOp loop) {
   }
 
   // 3. Combine each group with size > 1.
-  for (auto &acquireGroup : llvm::make_second_range(groups)) {
+  for (auto &[key, acquireGroup] : groups) {
     if (acquireGroup.size() <= 1)
       continue;
 
@@ -400,14 +400,25 @@ void combineSemaphores(scf::ForOp loop) {
       }
     }
 
-    // Mutable versions for SemaphoreBufferOp results.
-    SmallVector<Type> mutableBufTypes;
-    for (Type t : allBufTypes) {
-      auto memTy = cast<MemDescType>(t);
-      mutableBufTypes.push_back(
-          MemDescType::get(memTy.getShape(), memTy.getElementType(),
-                           memTy.getEncoding(), memTy.getMemorySpace(),
-                           /*mutableMemory=*/true, memTy.getAllocShape()));
+    // Collect buffer result types from individual consumer buffer ops (NOT
+    // from the alloc types, which may have a multi-buffer dimension).
+    SmallVector<Type> consBufResultTypes;
+    for (auto consBuf : consBufferOps) {
+      for (auto res : consBuf.getBuffers())
+        consBufResultTypes.push_back(res.getType());
+    }
+    SmallVector<Type> prodBufResultTypes;
+    for (auto &pair : pairs) {
+      for (Operation *user : pair.empty->getUsers()) {
+        if (auto acq = dyn_cast<SemaphoreAcquireOp>(user)) {
+          for (Operation *tokUser : acq.getToken().getUsers()) {
+            if (auto bufOp = dyn_cast<SemaphoreBufferOp>(tokUser)) {
+              for (auto res : bufOp.getBuffers())
+                prodBufResultTypes.push_back(res.getType());
+            }
+          }
+        }
+      }
     }
 
     // Insert combined creates after the last old SemaphoreCreateOp.
@@ -428,10 +439,14 @@ void combineSemaphores(scf::ForOp loop) {
 
     OpBuilder builder(lastCreate);
     builder.setInsertionPointAfter(lastCreate);
-    auto combinedFull = SemaphoreCreateOp::create(
-        builder, lastCreate->getLoc(), combinedType, allBufs, /*isReleased=*/false);
+    // EMPTY must appear before FULL in IR so that the greedy rewriter
+    // processes FULL first.  handleTMALoads on the FULL semaphore follows
+    // the producer-release token chain through the EMPTY semaphore's
+    // acquire/buffer ops; those must still be live at that point.
     auto combinedEmpty = SemaphoreCreateOp::create(
         builder, lastCreate->getLoc(), combinedType, allBufs, /*isReleased=*/true);
+    auto combinedFull = SemaphoreCreateOp::create(
+        builder, lastCreate->getLoc(), combinedType, allBufs, /*isReleased=*/false);
 
     // moveUserAfter: ensure buffer consumers appear after the combined op.
     std::function<void(Operation *, Operation *)> moveUserAfter =
@@ -467,7 +482,7 @@ void combineSemaphores(scf::ForOp loop) {
     builder.setInsertionPointAfter(combinedConsAcquire);
     auto combinedConsBuf = SemaphoreBufferOp::create(
         builder, firstConsAcquire.getLoc(), combinedFull,
-        TypeRange(mutableBufTypes), combinedConsAcquire.getToken());
+        TypeRange(consBufResultTypes), combinedConsAcquire.getToken());
     assignStageCluster(combinedConsBuf, consPartition, consStage, builder);
 
     // Replace buffer results with positional indexing.
@@ -535,7 +550,7 @@ void combineSemaphores(scf::ForOp loop) {
     builder.setInsertionPointAfter(combinedProdAcquire);
     auto combinedProdBuf = SemaphoreBufferOp::create(
         builder, firstProdAcquire.getLoc(), combinedEmpty,
-        TypeRange(mutableBufTypes), combinedProdAcquire.getToken());
+        TypeRange(prodBufResultTypes), combinedProdAcquire.getToken());
     assignStageCluster(combinedProdBuf, prodPartition, prodStage, builder);
 
     bufOffset = 0;

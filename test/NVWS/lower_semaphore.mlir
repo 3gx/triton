@@ -534,3 +534,92 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     tt.return
   }
 }
+
+// -----
+// Phase2Mode combine test: two separate SMEM semaphore pairs feeding the same
+// tc_gen5_mma consumer → combined into 1 pair.  Verifies: 2 mbar arrays
+// (not 4), barrier_expect 32768 (16384+16384), both async_tma_copy to same mbar,
+// tc_gen5_mma with is_async, tc_gen5_commit on consumer release.
+
+#shared3 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared4 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem3 = #ttg.shared_memory
+#tmem3 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @combine_two_tma_loads
+  tt.func @combine_two_tma_loads(%desc_a: !tt.tensordesc<tensor<128x64xf16, #shared3>>, %desc_b: !tt.tensordesc<tensor<128x64xf16, #shared3>>, %lb: i32, %ub: i32, %step: i32) {
+    %true = arith.constant true
+    // Two allocs multi-buffered to 3x
+    // CHECK: [[ALLOC_A:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<3x128x64xf16,
+    // CHECK: [[ALLOC_B:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<3x128x64xf16,
+    %alloc_a = ttg.local_alloc : () -> !ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>
+    %alloc_b = ttg.local_alloc : () -> !ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>
+    %result, %token = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem3, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    // Combined: only 2 mbar arrays (EMPTY + FULL), 3 slots each
+    // CHECK: [[MBAR_E:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<3x1xi64,
+    // CHECK: ttng.init_barrier {{.*}}, 1
+    // CHECK: ttng.init_barrier {{.*}}, 1
+    // CHECK: ttng.init_barrier {{.*}}, 1
+    // CHECK: [[MBAR_F:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<3x1xi64,
+    // CHECK: ttng.init_barrier {{.*}}, 1
+    // CHECK: ttng.init_barrier {{.*}}, 1
+    // CHECK: ttng.init_barrier {{.*}}, 1
+    %empty_a = nvws.semaphore.create %alloc_a true : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>], 1>
+    %full_a = nvws.semaphore.create %alloc_a false : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>], 1>
+    %empty_b = nvws.semaphore.create %alloc_b true : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>], 1>
+    %full_b = nvws.semaphore.create %alloc_b false : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>], 1>
+    // Stage/phase iter_args: 1 shared stage + 1 producer phase + 1 consumer phase = 4 iter_args (+ acc token)
+    // CHECK: scf.for {{.*}} iter_args({{.*}}) -> (!ttg.async.token, i32, i32, i32)
+    %0 = scf.for %iv = %lb to %ub step %step iter_args(%acc = %token) -> (!ttg.async.token) : i32 {
+      // Producer: wait EMPTY mbar, get both buffer views, TMA loads, barrier_expect with summed TX
+      // CHECK: ttng.wait_barrier {{.*}} {ttg.partition = array<i32: 0>}
+      // CHECK: [[PBUF_B:%.*]] = ttg.memdesc_index [[ALLOC_B]][{{.*}}] {ttg.partition = array<i32: 0>}
+      // CHECK: [[PBUF_A:%.*]] = ttg.memdesc_index [[ALLOC_A]][{{.*}}] {ttg.partition = array<i32: 0>}
+      // CHECK: [[TMA_MBAR:%.*]] = ttg.memdesc_index [[MBAR_F]][{{.*}}] {ttg.partition = array<i32: 0>}
+      // CHECK: [[TMA_PRED:%.*]] = arith.constant {ttg.partition = array<i32: 0>} true
+      // CHECK: ttng.barrier_expect [[TMA_MBAR]], 32768 {ttg.partition = array<i32: 0>}, [[TMA_PRED]]
+      // CHECK: ttng.async_tma_copy_global_to_local %arg0[{{.*}}] [[PBUF_A]], [[TMA_MBAR]], [[TMA_PRED]] {ttg.partition = array<i32: 0>}
+      // CHECK: ttng.async_tma_copy_global_to_local %arg1[{{.*}}] [[PBUF_B]], [[TMA_MBAR]], [[TMA_PRED]] {ttg.partition = array<i32: 0>}
+      %tok_a = nvws.semaphore.acquire %empty_a {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>], 1> -> !ttg.async.token
+      %buf_a = nvws.semaphore.buffer %empty_a, %tok_a {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>], 1>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
+      nvws.descriptor_load %desc_a[%iv, %iv] 16384 %buf_a {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16, #shared3>>, i32, i32, !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
+      nvws.semaphore.release %full_a, %tok_a [#nvws.async_op<tma_load>] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>], 1>, !ttg.async.token
+      %tok_b = nvws.semaphore.acquire %empty_b {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>], 1> -> !ttg.async.token
+      %buf_b = nvws.semaphore.buffer %empty_b, %tok_b {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>], 1>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
+      nvws.descriptor_load %desc_b[%iv, %iv] 16384 %buf_b {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16, #shared3>>, i32, i32, !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
+      nvws.semaphore.release %full_b, %tok_b [#nvws.async_op<tma_load>] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>], 1>, !ttg.async.token
+      // Consumer: wait FULL mbar, get both buffer views, MMA
+      // CHECK: ttng.wait_barrier {{.*}} {ttg.partition = array<i32: 1>}
+      // CHECK: [[CBUF_B:%.*]] = ttg.memdesc_index [[ALLOC_B]][{{.*}}] {ttg.partition = array<i32: 1>}
+      // CHECK: [[CBUF_A:%.*]] = ttg.memdesc_index [[ALLOC_A]][{{.*}}] {ttg.partition = array<i32: 1>}
+      // CHECK: [[RHS:%.*]] = ttg.memdesc_trans [[CBUF_B]] {{{.*}}ttg.partition = array<i32: 1>}
+      // CHECK: ttng.tc_gen5_mma [[CBUF_A]], [[RHS]], {{.*}} {is_async, ttg.partition = array<i32: 1>}
+      %tok_ca = nvws.semaphore.acquire %full_a {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>], 1> -> !ttg.async.token
+      %cbuf_a = nvws.semaphore.buffer %full_a, %tok_ca {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>], 1>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
+      %tok_cb = nvws.semaphore.acquire %full_b {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>], 1> -> !ttg.async.token
+      %cbuf_b = nvws.semaphore.buffer %full_b, %tok_cb {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>], 1>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
+      %rhs = ttg.memdesc_trans %cbuf_b {order = array<i32: 1, 0>, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable> -> !ttg.memdesc<64x128xf16, #shared4, #smem3, mutable>
+      %mma = ttng.tc_gen5_mma %cbuf_a, %rhs, %result[%acc], %true, %true {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>, !ttg.memdesc<64x128xf16, #shared4, #smem3, mutable>, !ttg.memdesc<128x128xf32, #tmem3, #ttng.tensor_memory, mutable>
+      // Consumer release: tc_gen5_commit (from tc5mma async_op)
+      // CHECK: ttng.tc_gen5_commit {{.*}} {ttg.partition = array<i32: 1>}
+      nvws.semaphore.release %empty_a, %tok_ca [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>], 1>, !ttg.async.token
+      nvws.semaphore.release %empty_b, %tok_cb [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>], 1>, !ttg.async.token
+      scf.yield {ttg.partition = array<i32: 0, 1>} %mma : !ttg.async.token
+    } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 1>], tt.warp_specialize}
+    // Cleanup: 3 inval + dealloc per mbar, then buffer deallocs
+    // CHECK: ttng.inval_barrier
+    // CHECK: ttng.inval_barrier
+    // CHECK: ttng.inval_barrier
+    // CHECK: ttg.local_dealloc [[MBAR_E]]
+    // CHECK: ttng.inval_barrier
+    // CHECK: ttng.inval_barrier
+    // CHECK: ttng.inval_barrier
+    // CHECK: ttg.local_dealloc [[MBAR_F]]
+    // CHECK: ttg.local_dealloc [[ALLOC_A]]
+    // CHECK: ttg.local_dealloc [[ALLOC_B]]
+    ttg.local_dealloc %alloc_a : !ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>
+    ttg.local_dealloc %alloc_b : !ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>
+    tt.return
+  }
+}
