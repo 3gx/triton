@@ -27,6 +27,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/PassManager.h"
@@ -241,6 +242,345 @@ void multiBufferSemaphore(ModuleOp module, int numStages) {
 
   for (Operation *alloc : staleAllocs)
     alloc->erase();
+}
+
+// ---------------------------------------------------------------------------
+// combineSemaphores: coalesce multiple semaphore pairs that feed the same
+// dominant consumer in a warp-specialize for-loop.  Mirrors combineArefs()
+// in LowerArefToSemaphore.cpp:337-420.
+// ---------------------------------------------------------------------------
+
+SmallVector<Operation *> findSharedMemorySinkOps(Value value) {
+  SmallVector<Operation *> sinkOps;
+  for (Operation *user : value.getUsers()) {
+    if (isa<MMAv5OpInterface, LocalLoadOp>(user)) {
+      sinkOps.push_back(user);
+    } else if (user->hasTrait<OpTrait::MemDescViewTrait>()) {
+      auto rec = findSharedMemorySinkOps(user->getResult(0));
+      sinkOps.insert(sinkOps.end(), rec.begin(), rec.end());
+    }
+  }
+  return sinkOps;
+}
+
+// 2-hop traversal: acquireOp → token → SemaphoreBufferOp → buffer results
+// → findSharedMemorySinkOps → findNearestCommonDominator.
+Operation *getDominantConsumer(SemaphoreAcquireOp acquireOp, Block &container,
+                               DominanceInfo &domInfo) {
+  SmallVector<Operation *> sinkOps;
+  for (Operation *tokUser : acquireOp.getToken().getUsers()) {
+    auto bufferOp = dyn_cast<SemaphoreBufferOp>(tokUser);
+    if (!bufferOp)
+      continue;
+    for (Value buf : bufferOp.getBuffers()) {
+      auto ops = findSharedMemorySinkOps(buf);
+      sinkOps.insert(sinkOps.end(), ops.begin(), ops.end());
+    }
+  }
+  if (sinkOps.empty())
+    return nullptr;
+  Operation *liveBeforeOp = findNearestCommonDominator(sinkOps, domInfo);
+  return container.findAncestorOpInBlock(*liveBeforeOp);
+}
+
+// Acquire-token lineage: consumer acquires FULL; consumer release targets
+// EMPTY (cross-release).  Follow consumer acquire → token →
+// SemaphoreReleaseOp → getSemaphore() → the EMPTY SemaphoreCreateOp.
+SemaphoreCreateOp getPartnerSemaphore(SemaphoreAcquireOp consumerAcquire) {
+  for (Operation *tokUser : consumerAcquire.getToken().getUsers()) {
+    if (auto releaseOp = dyn_cast<SemaphoreReleaseOp>(tokUser))
+      return releaseOp.getSemaphore().getDefiningOp<SemaphoreCreateOp>();
+  }
+  return nullptr;
+}
+
+void combineSemaphores(scf::ForOp loop) {
+  // 1. Find consumer acquire ops (consumer = acquires FULL semaphore,
+  //    isReleased == false).  Skip TMEM.
+  SmallVector<SemaphoreAcquireOp> consumerAcquires;
+  for (auto acquireOp : loop.getOps<SemaphoreAcquireOp>()) {
+    auto semaCreate =
+        acquireOp.getSemaphore().getDefiningOp<SemaphoreCreateOp>();
+    if (!semaCreate || semaCreate.getIsReleased())
+      continue;
+    bool isTMEM = false;
+    for (Value buf : semaCreate.getBuffers()) {
+      if (buf.getDefiningOp() && isa<TMEMAllocOp>(buf.getDefiningOp()))
+        isTMEM = true;
+    }
+    if (isTMEM)
+      continue;
+    consumerAcquires.push_back(acquireOp);
+  }
+
+  // 2. Group by (dominant consumer, partition ID).
+  DominanceInfo domInfo(loop);
+  llvm::DenseMap<std::pair<Operation *, int>, SmallVector<SemaphoreAcquireOp>>
+      groups;
+  for (auto acquireOp : consumerAcquires) {
+    auto liveBeforeOp =
+        getDominantConsumer(acquireOp, *loop.getBody(), domInfo);
+    if (!liveBeforeOp)
+      continue;
+    assert(hasPartition(acquireOp));
+    auto partitionIds = getPartitionIds(acquireOp);
+    assert(partitionIds.size() == 1);
+    groups[{liveBeforeOp, partitionIds.front()}].push_back(acquireOp);
+  }
+
+  // 3. Combine each group with size > 1.
+  for (auto &acquireGroup : llvm::make_second_range(groups)) {
+    if (acquireGroup.size() <= 1)
+      continue;
+
+    // --- Step A: discover EMPTY/FULL pairs ---------------------------------
+    struct SemaPair {
+      SemaphoreCreateOp empty; // producer acquires (isReleased=true)
+      SemaphoreCreateOp full;  // consumer acquires (isReleased=false)
+    };
+    SmallVector<SemaPair> pairs;
+
+    // Collect per-acquire consumer ops in order matching pairs.
+    SmallVector<SemaphoreBufferOp> consBufferOps;
+    SmallVector<SemaphoreReleaseOp> consReleaseOps;
+
+    SmallVector<int> producerPartitionIds;
+    bool valid = true;
+    for (auto consAcquire : acquireGroup) {
+      auto fullSema =
+          consAcquire.getSemaphore().getDefiningOp<SemaphoreCreateOp>();
+      auto emptySema = getPartnerSemaphore(consAcquire);
+      if (!fullSema || !emptySema) {
+        valid = false;
+        break;
+      }
+      pairs.push_back({emptySema, fullSema});
+
+      // Collect the single consumer buffer & release for this acquire.
+      SemaphoreBufferOp consBuf = nullptr;
+      SemaphoreReleaseOp consRel = nullptr;
+      for (Operation *tokUser : consAcquire.getToken().getUsers()) {
+        if (auto b = dyn_cast<SemaphoreBufferOp>(tokUser))
+          consBuf = b;
+        if (auto r = dyn_cast<SemaphoreReleaseOp>(tokUser))
+          consRel = r;
+      }
+      if (!consBuf || !consRel) {
+        valid = false;
+        break;
+      }
+      consBufferOps.push_back(consBuf);
+      consReleaseOps.push_back(consRel);
+
+      // Collect producer partition IDs from EMPTY semaphore users.
+      for (Operation *user : emptySema->getUsers()) {
+        if (auto prodAcquire = dyn_cast<SemaphoreAcquireOp>(user)) {
+          if (hasPartition(prodAcquire))
+            producerPartitionIds.push_back(
+                getPartitionIds(prodAcquire).front());
+        }
+      }
+    }
+    if (!valid)
+      continue;
+
+    // All producers must be in the same partition.
+    if (llvm::any_of(producerPartitionIds, [&](int id) {
+          return id != producerPartitionIds[0];
+        }))
+      continue;
+
+    // --- Step B: build combined SemaphoreCreateOps -------------------------
+    SmallVector<Value> allBufs;
+    SmallVector<Type> allBufTypes;
+    for (auto &pair : pairs) {
+      for (Value buf : pair.full.getBuffers()) {
+        allBufs.push_back(buf);
+        allBufTypes.push_back(buf.getType());
+      }
+    }
+
+    // Mutable versions for SemaphoreBufferOp results.
+    SmallVector<Type> mutableBufTypes;
+    for (Type t : allBufTypes) {
+      auto memTy = cast<MemDescType>(t);
+      mutableBufTypes.push_back(
+          MemDescType::get(memTy.getShape(), memTy.getElementType(),
+                           memTy.getEncoding(), memTy.getMemorySpace(),
+                           /*mutableMemory=*/true, memTy.getAllocShape()));
+    }
+
+    // Insert combined creates after the last old SemaphoreCreateOp.
+    SmallVector<SemaphoreCreateOp> allCreates;
+    for (auto &pair : pairs) {
+      allCreates.push_back(pair.empty);
+      allCreates.push_back(pair.full);
+    }
+    auto lastCreate = *llvm::max_element(allCreates, [](auto a, auto b) {
+      assert(a->getBlock() == b->getBlock());
+      return a->isBeforeInBlock(b);
+    });
+
+    auto *ctx = loop->getContext();
+    int depth = pairs[0].full.getType().getNumStages();
+    auto combinedType = SemaphoreType::get(
+        ctx, TypeArrayAttr::get(ctx, allBufTypes), depth);
+
+    OpBuilder builder(lastCreate);
+    builder.setInsertionPointAfter(lastCreate);
+    auto combinedFull = SemaphoreCreateOp::create(
+        builder, lastCreate->getLoc(), combinedType, allBufs, /*isReleased=*/false);
+    auto combinedEmpty = SemaphoreCreateOp::create(
+        builder, lastCreate->getLoc(), combinedType, allBufs, /*isReleased=*/true);
+
+    // moveUserAfter: ensure buffer consumers appear after the combined op.
+    std::function<void(Operation *, Operation *)> moveUserAfter =
+        [&](Operation *op, Operation *target) {
+          auto *curBlock = target->getBlock();
+          for (auto *user : op->getUsers()) {
+            auto *userOp = curBlock->findAncestorOpInBlock(*user);
+            if (userOp && userOp->isBeforeInBlock(target)) {
+              userOp->moveAfter(target);
+              moveUserAfter(userOp, userOp);
+            }
+          }
+        };
+
+    // --- Step C: replace consumer-side ops ---------------------------------
+    auto firstConsAcquire =
+        *llvm::min_element(acquireGroup, [](auto a, auto b) {
+          return a->isBeforeInBlock(b);
+        });
+    auto lastConsRelease =
+        *llvm::max_element(consReleaseOps, [](auto a, auto b) {
+          return a->isBeforeInBlock(b);
+        });
+    auto consPartition = getPartitionWsTagIds(firstConsAcquire);
+    auto consStage = getStageCluster(firstConsAcquire);
+
+    builder.setInsertionPoint(firstConsAcquire);
+    auto combinedConsAcquire = SemaphoreAcquireOp::create(
+        builder, firstConsAcquire.getLoc(), combinedFull,
+        builder.getType<AsyncTokenType>());
+    assignStageCluster(combinedConsAcquire, consPartition, consStage, builder);
+
+    builder.setInsertionPointAfter(combinedConsAcquire);
+    auto combinedConsBuf = SemaphoreBufferOp::create(
+        builder, firstConsAcquire.getLoc(), combinedFull,
+        TypeRange(mutableBufTypes), combinedConsAcquire.getToken());
+    assignStageCluster(combinedConsBuf, consPartition, consStage, builder);
+
+    // Replace buffer results with positional indexing.
+    int bufOffset = 0;
+    for (auto consBufferOp : consBufferOps) {
+      moveUserAfter(consBufferOp, combinedConsBuf);
+      for (auto [j, oldBuf] : llvm::enumerate(consBufferOp.getBuffers()))
+        oldBuf.replaceAllUsesWith(combinedConsBuf.getBuffers()[bufOffset + j]);
+      bufOffset += consBufferOp.getBuffers().size();
+    }
+
+    // Combined consumer release (cross-release: targets combinedEmpty).
+    llvm::SmallSetVector<Attribute, 5> consAsyncOpsSet;
+    for (auto relOp : consReleaseOps)
+      consAsyncOpsSet.insert(relOp.getAsyncOps().begin(),
+                             relOp.getAsyncOps().end());
+
+    builder.setInsertionPoint(lastConsRelease);
+    auto combinedConsRelease = SemaphoreReleaseOp::create(
+        builder, lastConsRelease.getLoc(), combinedEmpty,
+        combinedConsAcquire.getToken(),
+        builder.getArrayAttr(
+            SmallVector<Attribute>(consAsyncOpsSet.begin(),
+                                  consAsyncOpsSet.end())));
+    assignStageCluster(combinedConsRelease,
+                       getPartitionWsTagIds(lastConsRelease),
+                       getStageCluster(lastConsRelease), builder);
+
+    // --- Step D: replace producer-side ops ---------------------------------
+    SmallVector<SemaphoreAcquireOp> prodAcquireOps;
+    SmallVector<SemaphoreBufferOp> prodBufferOps;
+    SmallVector<SemaphoreReleaseOp> prodReleaseOps;
+    for (auto &pair : pairs) {
+      for (Operation *user : pair.empty->getUsers()) {
+        if (auto acq = dyn_cast<SemaphoreAcquireOp>(user))
+          prodAcquireOps.push_back(acq);
+      }
+    }
+    for (auto prodAcquire : prodAcquireOps) {
+      for (Operation *tokUser : prodAcquire.getToken().getUsers()) {
+        if (auto bufOp = dyn_cast<SemaphoreBufferOp>(tokUser))
+          prodBufferOps.push_back(bufOp);
+        if (auto relOp = dyn_cast<SemaphoreReleaseOp>(tokUser))
+          prodReleaseOps.push_back(relOp);
+      }
+    }
+
+    auto firstProdAcquire =
+        *llvm::min_element(prodAcquireOps, [](auto a, auto b) {
+          return a->isBeforeInBlock(b);
+        });
+    auto lastProdRelease =
+        *llvm::max_element(prodReleaseOps, [](auto a, auto b) {
+          return a->isBeforeInBlock(b);
+        });
+    auto prodPartition = getPartitionWsTagIds(firstProdAcquire);
+    auto prodStage = getStageCluster(firstProdAcquire);
+
+    builder.setInsertionPoint(firstProdAcquire);
+    auto combinedProdAcquire = SemaphoreAcquireOp::create(
+        builder, firstProdAcquire.getLoc(), combinedEmpty,
+        builder.getType<AsyncTokenType>());
+    assignStageCluster(combinedProdAcquire, prodPartition, prodStage, builder);
+
+    builder.setInsertionPointAfter(combinedProdAcquire);
+    auto combinedProdBuf = SemaphoreBufferOp::create(
+        builder, firstProdAcquire.getLoc(), combinedEmpty,
+        TypeRange(mutableBufTypes), combinedProdAcquire.getToken());
+    assignStageCluster(combinedProdBuf, prodPartition, prodStage, builder);
+
+    bufOffset = 0;
+    for (auto prodBufferOp : prodBufferOps) {
+      moveUserAfter(prodBufferOp, combinedProdBuf);
+      for (auto [j, oldBuf] : llvm::enumerate(prodBufferOp.getBuffers()))
+        oldBuf.replaceAllUsesWith(combinedProdBuf.getBuffers()[bufOffset + j]);
+      bufOffset += prodBufferOp.getBuffers().size();
+    }
+
+    // Combined producer release (cross-release: targets combinedFull).
+    llvm::SmallSetVector<Attribute, 5> prodAsyncOpsSet;
+    for (auto relOp : prodReleaseOps)
+      prodAsyncOpsSet.insert(relOp.getAsyncOps().begin(),
+                             relOp.getAsyncOps().end());
+
+    builder.setInsertionPoint(lastProdRelease);
+    auto combinedProdRelease = SemaphoreReleaseOp::create(
+        builder, lastProdRelease.getLoc(), combinedFull,
+        combinedProdAcquire.getToken(),
+        builder.getArrayAttr(
+            SmallVector<Attribute>(prodAsyncOpsSet.begin(),
+                                  prodAsyncOpsSet.end())));
+    assignStageCluster(combinedProdRelease,
+                       getPartitionWsTagIds(lastProdRelease),
+                       getStageCluster(lastProdRelease), builder);
+
+    // --- Step E: erase old ops (reverse order) -----------------------------
+    for (auto relOp : consReleaseOps)
+      relOp->erase();
+    for (auto bufOp : consBufferOps)
+      bufOp->erase();
+    for (auto &acqOp : acquireGroup)
+      acqOp->erase();
+    for (auto relOp : prodReleaseOps)
+      relOp->erase();
+    for (auto bufOp : prodBufferOps)
+      bufOp->erase();
+    for (auto acqOp : prodAcquireOps)
+      acqOp->erase();
+    for (auto &pair : pairs) {
+      pair.full->erase();
+      pair.empty->erase();
+    }
+  }
 }
 
 bool requiresAssignSemaphoreStagePhase(ModuleOp module) {
@@ -682,6 +1022,15 @@ public:
 
     bool phase2Mode = requiresAssignSemaphoreStagePhase(m);
     if (phase2Mode) {
+      // Combine semaphores sharing the same dominant consumer.
+      SmallVector<scf::ForOp> loops;
+      m.walk([&](scf::ForOp loop) {
+        if (loop->hasAttr(triton::kWarpSpecializeAttrName))
+          loop->walk([&](scf::ForOp op) { loops.push_back(op); });
+      });
+      for (scf::ForOp loop : loops)
+        combineSemaphores(loop);
+
       multiBufferSemaphore(m, numStages);
       OpPassManager pm("builtin.module");
       pm.addPass(createNVWSAssignSemaphoreStagePhase());
@@ -753,6 +1102,14 @@ public:
     config.enableFolding(false);
     if (failed(applyPatternsGreedily(m, std::move(patterns), config)))
       signalPassFailure();
+
+    // Hoist all poison ops to the top of function.  They are unannotated and
+    // will trip subsequent passes (e.g. PartitionLoops), so hoist them.
+    m.walk([&](triton::FuncOp funcOp) {
+      auto *block = &funcOp.getBody().front();
+      funcOp.walk(
+          [&](ub::PoisonOp op) { op->moveBefore(&block->front()); });
+    });
   }
 };
 
