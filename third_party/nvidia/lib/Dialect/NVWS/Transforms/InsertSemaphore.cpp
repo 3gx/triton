@@ -1,34 +1,24 @@
-/*
- * Copyright (c) 2025 NVIDIA Corporation & Affiliates. All rights reserved.
- *
- * Permission is hereby granted, free of charge, to any person obtaining
- * a copy of this software and associated documentation files
- * (the "Software"), to deal in the Software without restriction,
- * including without limitation the rights to use, copy, modify, merge,
- * publish, distribute, sublicense, and/or sell copies of the Software,
- * and to permit persons to whom the Software is furnished to do so,
- * subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be
- * included in all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
- * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
- * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
- * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
- * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
- */
-
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/Pass/Pass.h"
-#include "mlir/Pass/PassManager.h"
+#include "Utilities.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/Support/DebugStringHelper.h"
+#include "mlir/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/OpInterfaces.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
+#include "triton/Dialect/TritonGPU/Transforms/PartitionBuilder.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "llvm/ADT/SmallVector.h"
 
 namespace mlir {
 namespace triton {
@@ -38,20 +28,667 @@ namespace triton {
 
 namespace {
 
-class NVWSInsertSemaphore
-    : public impl::NVWSInsertSemaphoreBase<NVWSInsertSemaphore> {
-public:
-  void runOnOperation() override {
-    OpPassManager pm("builtin.module");
-    pm.addPass(createNVWSInsertAref());
-    pm.addPass(createNVWSLowerArefToSemaphore({1}));
+using namespace mlir;
+using namespace triton::gpu;
+using namespace triton::nvidia_gpu;
+using namespace triton::nvws;
 
-    if (failed(runPipeline(pm, getOperation())))
-      signalPassFailure();
-  }
+// ---------------------------------------------------------------------------
+// Helpers reused verbatim from InsertAref.cpp
+// ---------------------------------------------------------------------------
+
+struct ProducedValueInfo {
+  SetVector<int> partitions;
+  Value result;
 };
 
+SmallVector<ProducedValueInfo> getProducedValues(Operation *op,
+                                                 Block *loopBody) {
+  SmallVector<ProducedValueInfo> producedValues;
+
+  if (!hasPartition(op))
+    return {};
+
+  auto partitionOutputs = op->getNumRegions() == 0
+                              ? SmallVector<SetVector<int>, 4>(
+                                    op->getNumResults(), getPartitionIds(op))
+                              : getPartitionOutputs(op);
+
+  for (auto result : op->getResults()) {
+    if (isa<AsyncTokenType>(result.getType()))
+      continue;
+    producedValues.push_back(
+        {partitionOutputs[result.getResultNumber()], result});
+  }
+
+  return producedValues;
+};
+
+template <typename AllocOp, typename LoadOp>
+std::optional<std::pair<AllocOp, LoadOp>> isLoadAndAlloc(Value result) {
+  auto alloc = result.getDefiningOp<AllocOp>();
+  if (!alloc || !alloc.getSrc())
+    return std::nullopt;
+  if (auto load = alloc.getSrc().template getDefiningOp<LoadOp>();
+      load && getPartitionIds(alloc) == getPartitionIds(load)) {
+    return std::make_pair(alloc, load);
+  }
+  return std::nullopt;
+}
+
+template <typename AllocOp> auto isDescLoadAndAlloc(Value result) {
+  return isLoadAndAlloc<AllocOp, triton::DescriptorOpInterface>(result);
+}
+
+template <typename AllocOp> auto isGlobalLoadAndAlloc(Value result) {
+  return isLoadAndAlloc<AllocOp, triton::LoadOp>(result);
+}
+
+RankedTensorType getTensorTypeFromScalar(OpBuilder &builder, Value scalar) {
+  auto mod = scalar.getParentRegion()->getParentOfType<ModuleOp>();
+  auto nWarps = lookupNumWarps(mod);
+  auto threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
+  int CTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
+  Attribute encoding = getDefaultBlockedEncoding(builder.getContext(), {1},
+                                                 nWarps, threadsPerWarp, CTAs);
+  return RankedTensorType::get({1}, scalar.getType(), encoding);
+}
+
+int getTxCount(Operation *descOp) {
+  auto getTensorTypeAndDesc =
+      [](Operation *op) -> std::pair<RankedTensorType, Value> {
+    if (auto loadOp = dyn_cast<triton::DescriptorLoadOp>(op)) {
+      return {loadOp.getType(), loadOp.getDesc()};
+    } else if (auto gatherOp = dyn_cast<triton::DescriptorGatherOp>(op)) {
+      return {gatherOp.getType(), gatherOp.getDesc()};
+    } else {
+      llvm_unreachable("Unsupported operation type");
+    }
+  };
+  auto [tensorType, desc] = getTensorTypeAndDesc(descOp);
+  auto encoding = getEncodingFromDescriptor(descOp, tensorType, desc);
+  auto shapePerCTA = getShapePerCTA(encoding, tensorType.getShape());
+  return product(shapePerCTA) *
+         getIntOrFloatOrPtrBitWidth(tensorType.getElementType()) / 8;
+}
+
+void createNVWSDescriptorLoadOp(OpBuilder &builder, Operation *ttDescLoadOp,
+                                Value dataBuf,
+                                SetVector<int> const &producerPartitions,
+                                Location loc) {
+  auto txCount = getTxCount(ttDescLoadOp);
+  if (auto descLoad = dyn_cast<triton::DescriptorLoadOp>(ttDescLoadOp)) {
+    auto newDescLoad = triton::nvws::DescriptorLoadOp::create(
+        builder, loc, descLoad.getDesc(), descLoad.getIndices(), txCount,
+        dataBuf, descLoad.getCache(), descLoad.getEvict());
+    newDescLoad->setAttrs(descLoad->getAttrs());
+    setPartition(newDescLoad, producerPartitions);
+  } else if (auto descGather =
+                 dyn_cast<triton::DescriptorGatherOp>(ttDescLoadOp)) {
+    auto newDescGather = triton::nvws::DescriptorGatherOp::create(
+        builder, loc, descGather.getDesc(), descGather.getXOffsets(),
+        descGather.getYOffset(), txCount, dataBuf);
+    newDescGather->setAttrs(descGather->getAttrs());
+    setPartition(newDescGather, producerPartitions);
+  } else {
+    llvm_unreachable("unknown descriptor op.");
+  }
+}
+
+StageCluster getStageClusterForProducer(Value producedValue) {
+  if (auto arg = dyn_cast<BlockArgument>(producedValue)) {
+    Value prevProducedValue;
+    do {
+      prevProducedValue = producedValue;
+      auto terminator = arg.getOwner()->getTerminator();
+      if (!isa<scf::YieldOp>(terminator)) {
+        return {};
+      }
+      producedValue = terminator->getOperand(arg.getArgNumber() - 1);
+      arg = dyn_cast<BlockArgument>(producedValue);
+    } while (arg && prevProducedValue != producedValue);
+  }
+
+  if (auto opt = isDescLoadAndAlloc<LocalAllocOp>(producedValue)) {
+    return getStageCluster(opt->second);
+  } else if (auto opt = isGlobalLoadAndAlloc<LocalAllocOp>(producedValue)) {
+    return getStageCluster(opt->second);
+  } else if (auto op = producedValue.getDefiningOp()) {
+    return getStageCluster(op);
+  } else {
+    return {};
+  }
+}
+
+SetVector<Operation *>
+getTransitiveConsumers(Operation *op,
+                       SetVector<int> const &consumerPartitions) {
+  SetVector<Operation *> opConsumers;
+  auto isMemDesc = [](auto res) { return isa<MemDescType>(res.getType()); };
+  for (auto &use : op->getUses()) {
+    if (llvm::count_if(use.getOwner()->getResults(), isMemDesc) > 0) {
+      auto consumers =
+          getTransitiveConsumers(use.getOwner(), consumerPartitions);
+      opConsumers.insert(consumers.begin(), consumers.end());
+    } else {
+      if (getPartitionIds(&use) == consumerPartitions) {
+        opConsumers.insert(use.getOwner());
+        opConsumers.insert(
+            op->getBlock()->findAncestorOpInBlock(*use.getOwner()));
+      }
+    }
+  }
+  return opConsumers;
+}
+
+SmallVector<Operation *>
+getTransitiveConsumers(const SetVector<Value> &results,
+                       SetVector<int> const &consumerPartitions) {
+  SetVector<Operation *> opSet;
+  for (auto result : results) {
+    if (isa<BlockArgument>(result)) {
+      for (auto &use : result.getUses()) {
+        if (getPartitionIds(&use) == consumerPartitions) {
+          opSet.insert(use.getOwner());
+        }
+      }
+    } else {
+      auto consumers =
+          getTransitiveConsumers(result.getDefiningOp(), consumerPartitions);
+      opSet.insert(consumers.begin(), consumers.end());
+    }
+  }
+  return SmallVector<Operation *>{opSet.begin(), opSet.end()};
+}
+
+SmallVector<Attribute> getConsumerAsyncOpKinds(ArrayRef<Operation *> consumers,
+                                               MLIRContext *ctx) {
+  SetVector<AsyncOp> kindSet;
+  for (auto consumer : consumers) {
+    if (isa<scf::ForOp>(consumer) && consumers.size() > 1) {
+      continue;
+    }
+    if (isa<WarpGroupDotOp>(consumer)) {
+      kindSet.insert(AsyncOp::WGMMA);
+    } else if (isa<MMAv5OpInterface>(consumer)) {
+      kindSet.insert(AsyncOp::TC5MMA);
+    } else {
+      kindSet.insert(AsyncOp::NONE);
+    }
+  }
+
+  SmallVector<Attribute> kindAttrs;
+  for (auto kind : kindSet) {
+    kindAttrs.push_back(AsyncOpAttr::get(ctx, kind));
+  }
+
+  return kindAttrs;
+}
+
+std::pair<StageCluster, StageCluster>
+getEnterAndExitStageClustersOfUses(const SetVector<Value> &producedResults,
+                                   std::function<bool(Operation *)> filterUse,
+                                   scf::ForOp forOp) {
+  CoarseSchedule coarseSchedule;
+  if (!forOp || failed(coarseSchedule.deSerialize(forOp)) ||
+      producedResults.empty()) {
+    return std::make_pair(std::nullopt, std::nullopt);
+  }
+
+  SmallVector<Operation *> ops;
+  for (auto res : producedResults) {
+    if (auto blockArg = dyn_cast<BlockArgument>(res)) {
+      assert(producedResults.size() == 1);
+      auto block = blockArg.getOwner();
+      auto forOp = cast<scf::ForOp>(block->getParentOp());
+      auto opnd = forOp.getYieldedValues()[blockArg.getArgNumber() - 1];
+      auto op = opnd.getDefiningOp();
+      auto stageCluster = getStageCluster(op);
+      return std::make_pair(stageCluster, stageCluster);
+    }
+    auto op = res.getDefiningOp();
+    ops.push_back(op);
+  }
+
+  auto firstOp =
+      triton::getFirstUseOfPipelinedOp(ops, forOp, coarseSchedule, filterUse);
+  auto lastOp =
+      triton::getLastUseOfPipelinedOp(ops, forOp, coarseSchedule, filterUse);
+  assert(firstOp && lastOp);
+
+  return std::make_pair(getStageCluster(firstOp), getStageCluster(lastOp));
+}
+
+Operation *getEarliestUserInBlock(Block *block, ArrayRef<OpOperand *> uses) {
+  OpOperand *use =
+      *llvm::min_element(uses, [block](OpOperand *lhs, OpOperand *rhs) {
+        auto lhsOwner = block->findAncestorOpInBlock(*lhs->getOwner());
+        auto rhsOwner = block->findAncestorOpInBlock(*rhs->getOwner());
+        return lhsOwner->isBeforeInBlock(rhsOwner);
+      });
+  return block->findAncestorOpInBlock(*use->getOwner());
+}
+
+// ---------------------------------------------------------------------------
+// Helpers from LowerArefToSemaphore.cpp
+// ---------------------------------------------------------------------------
+
+static MemDescType getAsMutable(MemDescType type) {
+  return MemDescType::get(type.getShape(), type.getElementType(),
+                          type.getEncoding(), type.getMemorySpace(),
+                          /*mutableMemory=*/true, type.getAllocShape());
+}
+
+static void propagateMutability(Value value) {
+  for (Operation *user : value.getUsers()) {
+    if (user->hasTrait<OpTrait::MemDescViewTrait>()) {
+      user->getResult(0).setType(
+          getAsMutable(cast<MemDescType>(user->getResult(0).getType())));
+      propagateMutability(user->getResult(0));
+    }
+  }
+}
+
+static SmallVector<Type> getMutableBufferTypes(TypeRange bufferTypes) {
+  SmallVector<Type> mutableTypes;
+  mutableTypes.reserve(bufferTypes.size());
+  for (Type type : bufferTypes) {
+    if (auto memTy = dyn_cast<MemDescType>(type)) {
+      mutableTypes.push_back(MemDescType::get(
+          memTy.getShape(), memTy.getElementType(), memTy.getEncoding(),
+          memTy.getMemorySpace(), /*mutableMemory=*/true,
+          memTy.getAllocShape()));
+    } else {
+      mutableTypes.push_back(type);
+    }
+  }
+  return mutableTypes;
+}
+
+static void hoistPoisonOps(triton::FuncOp funcOp) {
+  auto *block = &funcOp.getBody().front();
+  funcOp.walk([&](ub::PoisonOp op) { op->moveBefore(&block->front()); });
+}
+
+// ---------------------------------------------------------------------------
+// New: direct semaphore insertion
+// ---------------------------------------------------------------------------
+
+struct SemaphorePair {
+  Value empty; // semaphore initially released (producer acquires)
+  Value full;  // semaphore initially not released (consumer acquires)
+  Value alloc; // underlying buffer allocation
+};
+
+SemaphorePair createSemaphores(OpBuilder &builder,
+                               ProducedValueInfo &producedValue) {
+  auto result = producedValue.result;
+
+  auto getSmemDescType = [](RankedTensorType tensorType, Value tensorResult) {
+    Attribute SharedMemorySpace =
+        SharedMemorySpaceAttr::get(tensorType.getContext());
+    Attribute encoding = tensorResult && tensorResult.getDefiningOp()
+                             ? getSharedEncoding(tensorResult.getDefiningOp())
+                             : getSharedEncoding(tensorType);
+    return MemDescType::get(tensorType.getShape(), tensorType.getElementType(),
+                            encoding, SharedMemorySpace);
+  };
+
+  MemDescType memDescType;
+  if (result.getDefiningOp<LocalAllocOp>()) {
+    memDescType = dyn_cast<MemDescType>(result.getType());
+  } else if (auto tensorType = dyn_cast<RankedTensorType>(result.getType())) {
+    memDescType = getSmemDescType(tensorType, result);
+  } else if (isa<FloatType, IntegerType>(result.getType())) {
+    auto tensorType = getTensorTypeFromScalar(builder, result);
+    memDescType = getSmemDescType(tensorType, Value());
+  } else {
+    std::string msg = "createSemaphores: unsupported produced value type: " +
+                      mlir::debugString(result.getType());
+    llvm::report_fatal_error(msg.c_str());
+  }
+
+  // Depth=1 at insertion. Phase 2 (LowerSemaphore) handles multi-buffering.
+  MemDescType allocBufType = getMultiBufferedType(memDescType, 1);
+  assert(isa<SharedMemorySpaceAttr>(allocBufType.getMemorySpace()));
+  auto loc = result.getLoc();
+  auto alloc =
+      triton::nvws::createAlloc(builder, loc, allocBufType, Value());
+
+  auto baseTypes =
+      TypeArrayAttr::get(builder.getContext(), {allocBufType});
+  auto depth = getArefDepth(allocBufType);
+  auto semaTy = SemaphoreType::get(builder.getContext(), baseTypes, depth);
+  auto empty = SemaphoreCreateOp::create(builder, loc, semaTy,
+                                          alloc->getResults(), true);
+  auto full = SemaphoreCreateOp::create(builder, loc, semaTy,
+                                         alloc->getResults(), false);
+  return SemaphorePair{empty, full, alloc->getResult(0)};
+}
+
+SmallVector<Operation *> createSemaphorePut(OpBuilder &builder,
+                                            SemaphorePair &sema,
+                                            ProducedValueInfo producedValue) {
+  auto loc = producedValue.result.getLoc();
+  auto allocBufType = cast<MemDescType>(sema.alloc.getType());
+  Value result = producedValue.result;
+  Type dataBufType = getBufferViewType(allocBufType, /*mutable*/ true);
+  StageCluster stageCluster = getStageClusterForProducer(result);
+
+  SetVector<int> producerPartitions;
+  producerPartitions.insert(producedValue.partitions.front());
+
+  // Acquire empty semaphore
+  auto acquire = triton::gpu::createInto<SemaphoreAcquireOp>(
+      builder, loc, producerPartitions, stageCluster, sema.empty,
+      builder.getType<AsyncTokenType>());
+  Value token = acquire.getToken();
+
+  // Get buffer view
+  auto bufOp = triton::gpu::createInto<SemaphoreBufferOp>(
+      builder, loc, producerPartitions, stageCluster, sema.empty,
+      TypeRange(getMutableBufferTypes({dataBufType})), token);
+  Value dataBuf = bufOp.getBuffers()[0];
+
+  // Producer logic — same cases as InsertAref::createArefPut
+  auto producerKind = AsyncOp::NONE;
+  SmallVector<Operation *> staleOps;
+  if (auto opt = isDescLoadAndAlloc<LocalAllocOp>(result)) {
+    auto [alloc, descOp] = *opt;
+    createNVWSDescriptorLoadOp(builder, descOp, dataBuf, producerPartitions,
+                               loc);
+    producerKind = AsyncOp::TMALoad;
+    staleOps.push_back(alloc);
+    staleOps.push_back(descOp);
+  } else if (isGlobalLoadAndAlloc<LocalAllocOp>(result)) {
+    llvm_unreachable("cpasync not supported yet");
+  } else if (auto alloc = result.getDefiningOp<LocalAllocOp>()) {
+    triton::gpu::createInto<LocalStoreOp>(builder, loc, producerPartitions,
+                                          stageCluster, alloc.getSrc(),
+                                          dataBuf);
+    staleOps.push_back(alloc);
+  } else if (auto tensorType = dyn_cast<RankedTensorType>(result.getType())) {
+    if (auto descOp = result.getDefiningOp<triton::DescriptorOpInterface>()) {
+      createNVWSDescriptorLoadOp(builder, descOp, dataBuf, producerPartitions,
+                                 loc);
+      producerKind = AsyncOp::TMALoad;
+      staleOps.push_back(descOp);
+    } else if (auto loadOp = result.getDefiningOp<triton::LoadOp>()) {
+      llvm_unreachable("cpasync not supported yet");
+    } else {
+      triton::gpu::createInto<LocalStoreOp>(builder, loc, producerPartitions,
+                                            stageCluster, result, dataBuf);
+      producerKind = AsyncOp::NONE;
+    }
+  } else if (isa<FloatType, IntegerType>(result.getType())) {
+    auto tensorType = getTensorTypeFromScalar(builder, result);
+    auto splatOp = triton::gpu::createInto<triton::SplatOp>(
+        builder, loc, producerPartitions, stageCluster, tensorType, result);
+    triton::gpu::createInto<LocalStoreOp>(builder, loc, producerPartitions,
+                                          stageCluster, splatOp, dataBuf);
+    producerKind = AsyncOp::NONE;
+  } else {
+    std::string msg = "createSemaphorePut: unsupported produced value type: " +
+                      mlir::debugString(result.getType());
+    llvm::report_fatal_error(msg.c_str());
+  }
+
+  // Cross-release: producer releases full semaphore
+  triton::gpu::createInto<SemaphoreReleaseOp>(
+      builder, loc, producerPartitions, stageCluster, sema.full, token,
+      builder.getArrayAttr(SmallVector<Attribute>{
+          AsyncOpAttr::get(builder.getContext(), producerKind)}));
+
+  return staleOps;
+}
+
+void createSemaphoreGet(OpBuilder &builder, scf::ForOp loop,
+                        SemaphorePair &sema, const SetVector<Value> &results,
+                        int consumerPartition,
+                        SmallVector<OpOperand *> &uses) {
+  OpBuilder::InsertionGuard g(builder);
+  assert(results.size() == 1 || results.size() == 2);
+  auto loc = results[0].getLoc();
+
+  scf::ForOp scheduledLoop;
+  loop->walk([&](scf::ForOp op) {
+    if (op->hasAttr(mlir::triton::kScheduledMaxStageAttrName)) {
+      scheduledLoop = op;
+    }
+  });
+
+  auto filterUse = [&](Operation *user) {
+    if (hasPartition(user)) {
+      return llvm::is_contained(getPartitionIds(user), consumerPartition);
+    } else {
+      return false;
+    }
+  };
+
+  SetVector<Value> resultsInScheduledLoop;
+  for (Value v : results) {
+    if (Operation *defOp = v.getDefiningOp()) {
+      if (scheduledLoop && scheduledLoop->isAncestor(defOp))
+        resultsInScheduledLoop.insert(v);
+    }
+  }
+
+  auto [stageClusterEnter, stageClusterExit] =
+      getEnterAndExitStageClustersOfUses(resultsInScheduledLoop, filterUse,
+                                         scheduledLoop);
+
+  SetVector<int> consumerPartitions;
+  consumerPartitions.insert(consumerPartition);
+  auto allocBufType = cast<MemDescType>(sema.alloc.getType());
+  Type bufferType = getBufferViewType(allocBufType, /*mutable*/ false);
+
+  // Acquire full semaphore
+  auto acquire = triton::gpu::createInto<SemaphoreAcquireOp>(
+      builder, loc, consumerPartitions, stageClusterEnter, sema.full,
+      builder.getType<AsyncTokenType>());
+  Value token = acquire.getToken();
+
+  // Get buffer view
+  auto bufOp = triton::gpu::createInto<SemaphoreBufferOp>(
+      builder, loc, consumerPartitions, stageClusterEnter, sema.full,
+      TypeRange(getMutableBufferTypes({bufferType})), token);
+  Value dataBuf = bufOp.getBuffers()[0];
+  propagateMutability(dataBuf);
+
+  auto consumers = getTransitiveConsumers(results, consumerPartitions);
+  assert(consumers.size() > 0);
+  auto asyncKinds =
+      getConsumerAsyncOpKinds(consumers, builder.getContext());
+
+  Operation *exitInsertPointAfter = nullptr;
+
+  auto replaceUsesWithLocalLoad = [&](Value result,
+                                      StageCluster stageCluster) {
+    auto localLoadOp = triton::gpu::createInto<LocalLoadOp>(
+        builder, loc, consumerPartitions, stageCluster, result.getType(),
+        dataBuf);
+
+    for (auto use : uses) {
+      if (use->get() == result) {
+        use->set(localLoadOp.getResult());
+      }
+    }
+    if (dataBuf.hasOneUse()) {
+      exitInsertPointAfter = localLoadOp;
+    }
+  };
+
+  for (auto result : results) {
+    if (auto localAlloc = result.getDefiningOp<LocalAllocOp>()) {
+      auto callback = [&](Operation *oldOp, Operation *newOp) {
+        assert(llvm::is_contained(getPartitionIds(oldOp), consumerPartition));
+        setPartition(newOp, consumerPartitions);
+      };
+      replaceUsesAndPropagateType(builder, localAlloc, dataBuf, callback);
+    } else if (isa<RankedTensorType>(result.getType())) {
+      replaceUsesWithLocalLoad(result, stageClusterEnter);
+    } else if (isa<FloatType, IntegerType>(result.getType())) {
+      auto tensorType = getTensorTypeFromScalar(builder, result);
+      auto localLoadOp = triton::gpu::createInto<LocalLoadOp>(
+          builder, loc, consumerPartitions, stageClusterEnter, tensorType,
+          dataBuf);
+      auto scalar = triton::gpu::createInto<triton::UnsplatOp>(
+          builder, loc, consumerPartitions, stageClusterEnter, localLoadOp);
+      for (auto use : uses) {
+        use->set(scalar);
+      }
+      exitInsertPointAfter = localLoadOp;
+    } else {
+      std::string msg =
+          "createSemaphoreGet: unsupported produced value type: " +
+          mlir::debugString(result.getType());
+      llvm::report_fatal_error(msg.c_str());
+    }
+  }
+
+  if (exitInsertPointAfter == nullptr) {
+    PostDominanceInfo dom(loop);
+    exitInsertPointAfter = findNearestCommonPostDominator(consumers, dom);
+  }
+
+  builder.setInsertionPointAfter(exitInsertPointAfter);
+
+  // Cross-release: consumer releases empty semaphore
+  triton::gpu::createInto<SemaphoreReleaseOp>(
+      builder, loc, consumerPartitions, stageClusterExit, sema.empty, token,
+      builder.getArrayAttr(asyncKinds));
+}
+
+bool insertSemaphores(OpBuilder &builder, scf::ForOp loop, Block *block,
+                      ProducedValueInfo producedValue) {
+  DenseMap<int, SetVector<Value>> resultsPerPartition;
+  DenseMap<int, SmallVector<OpOperand *>> usesPerPartition;
+  auto processResultUses = [&](Value result) {
+    for (auto &use : result.getUses()) {
+      auto user = use.getOwner();
+      if (!hasPartition(user))
+        continue;
+      auto userPartitions = getPartitionIds(&use);
+      for (auto id : producedValue.partitions) {
+        userPartitions.remove(id);
+      }
+      for (auto id : userPartitions) {
+        resultsPerPartition[id].insert(result);
+        usesPerPartition[id].push_back(&use);
+      }
+    }
+  };
+
+  processResultUses(producedValue.result);
+
+  if (auto opt = isDescLoadAndAlloc<LocalAllocOp>(producedValue.result)) {
+    auto alloc = opt->first;
+    processResultUses(alloc.getSrc());
+  }
+
+  if (resultsPerPartition.empty()) {
+    return false;
+  }
+
+  SemaphorePair sema;
+  {
+    OpBuilder::InsertionGuard g(builder);
+    auto wsLoop = getOuterWSLoop(loop);
+    builder.setInsertionPoint(wsLoop);
+    sema = createSemaphores(builder, producedValue);
+  }
+
+  auto staleOps = createSemaphorePut(builder, sema, producedValue);
+
+  for (auto [consumerPartition, results] : resultsPerPartition) {
+    OpBuilder::InsertionGuard g(builder);
+    auto earliestUser =
+        getEarliestUserInBlock(block, usesPerPartition[consumerPartition]);
+    builder.setInsertionPoint(earliestUser);
+    createSemaphoreGet(builder, loop, sema, results, consumerPartition,
+                       usesPerPartition[consumerPartition]);
+  }
+
+  for (auto op : staleOps) {
+    op->erase();
+  }
+
+  return true;
+}
+
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Pass class
+// ---------------------------------------------------------------------------
+
+class NVWSInsertSemaphore
+    : public triton::impl::NVWSInsertSemaphoreBase<NVWSInsertSemaphore> {
+public:
+  void runOnFunction(triton::FuncOp func) {
+    SmallVector<scf::ForOp> loops;
+    func.walk([&](scf::ForOp loop) {
+      if (loop->hasAttr(triton::kWarpSpecializeAttrName) && hasPartition(loop))
+        loops.push_back(loop);
+    });
+
+    for (scf::ForOp loop : loops) {
+      // Communicate iter_args across partitions
+      loop.walk([&](scf::ForOp forOp) {
+        for (auto arg : forOp.getRegionIterArgs()) {
+          if (isa<RankedTensorType, FloatType, IntegerType>(arg.getType())) {
+            auto producerPartition =
+                getPartitionOutputs(forOp)[arg.getArgNumber() - 1];
+            ProducedValueInfo producedValue{producerPartition, arg};
+            OpBuilder builder(forOp);
+            builder.setInsertionPointToStart(forOp.getBody());
+            insertSemaphores(builder, loop, forOp.getBody(), producedValue);
+          }
+        }
+      });
+
+      // Process memory ops first (desc_load+alloc patterns)
+      SmallVector<Operation *> memoryOps;
+      loop.walk([&](Operation *op) {
+        if (op->getNumResults() > 0 &&
+            (isDescLoadAndAlloc<LocalAllocOp>(op->getResult(0)) ||
+             isa<LocalAllocOp>(op))) {
+          memoryOps.push_back(op);
+        }
+      });
+
+      for (auto op : memoryOps) {
+        auto producedValues = getProducedValues(op, loop.getBody());
+        for (auto producedValue : producedValues) {
+          OpBuilder builder(op);
+          insertSemaphores(builder, loop, op->getBlock(), producedValue);
+        }
+      }
+
+      // Handle non-tmem ops including desc_load register uses
+      loop.walk([&](Operation *op) {
+        if (op == loop || isa<MMAv5OpInterface, TMEMAllocOp, TMEMStoreOp>(op)) {
+          return WalkResult::advance();
+        }
+        auto producedValues = getProducedValues(op, loop.getBody());
+        for (auto producedValue : producedValues) {
+          OpBuilder builder(op);
+          builder.setInsertionPointAfter(op);
+          insertSemaphores(builder, loop, op->getBlock(), producedValue);
+        }
+        return WalkResult::advance();
+      });
+    }
+
+    // Hoist poison ops to function entry
+    hoistPoisonOps(func);
+  }
+
+  void runOnOperation() override {
+    getOperation().walk(
+        [&](triton::FuncOp func) { runOnFunction(func); });
+  }
+};
 
 } // namespace triton
 } // namespace mlir
