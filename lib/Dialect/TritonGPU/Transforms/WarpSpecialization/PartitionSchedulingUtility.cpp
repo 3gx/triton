@@ -42,7 +42,7 @@ Flags getNodeFlags(Node *node) {
     if (op->hasAttr("store"))
       return Flags::STORE;
 
-    if (isa<tt::DescriptorLoadOp>(op))
+    if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op))
       return Flags::LOAD;
     if (isa<tt::DescriptorStoreLikeOpInterface>(op))
       return Flags::STORE;
