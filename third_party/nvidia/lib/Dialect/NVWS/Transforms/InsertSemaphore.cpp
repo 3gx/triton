@@ -1,4 +1,5 @@
 #include "Utilities.h"
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
@@ -364,7 +365,8 @@ getEnterAndExitStageClustersOfUses(const SetVector<Value> &producedResults,
                                    std::function<bool(Operation *)> filterUse,
                                    scf::ForOp forOp) {
   CoarseSchedule coarseSchedule;
-  if (!forOp || failed(coarseSchedule.deSerialize(forOp))) {
+  if (!forOp || failed(coarseSchedule.deSerialize(forOp)) ||
+      producedResults.empty()) {
     return std::make_pair(std::nullopt, std::nullopt);
   }
 
@@ -424,8 +426,22 @@ void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
       return false;
     }
   };
+
+  // Filter results to include only those defined inside the scheduled loop
+  // (if any). This is done because otherwise the result might not have its
+  // last use (in either direction) inside the scheduled loop and we will not be
+  // able to get `stageClusterEnter` and/or `stageClusterExit`.
+  SetVector<Value> resultsInScheduledLoop;
+  for (Value v : results) {
+    if (Operation *defOp = v.getDefiningOp()) {
+      if (scheduledLoop && scheduledLoop->isAncestor(defOp))
+        resultsInScheduledLoop.insert(v);
+    }
+  }
+
   auto [stageClusterEnter, stageClusterExit] =
-      getEnterAndExitStageClustersOfUses(results, filterUse, scheduledLoop);
+      getEnterAndExitStageClustersOfUses(resultsInScheduledLoop, filterUse,
+                                         scheduledLoop);
 
   SetVector<int> consumerPartitions;
   consumerPartitions.insert(consumerPartition);
@@ -588,7 +604,6 @@ public:
   void runOnFunction(triton::FuncOp func) {
     SmallVector<scf::ForOp> loops;
     func.walk([&](scf::ForOp loop) {
-      auto func = loop->getParentOfType<triton::FuncOp>();
       if (loop->hasAttr(triton::kWarpSpecializeAttrName) && hasPartition(loop))
         loops.push_back(loop);
     });
