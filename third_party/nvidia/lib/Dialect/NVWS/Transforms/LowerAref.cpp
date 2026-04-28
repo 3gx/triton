@@ -165,8 +165,8 @@ SmallVector<AsyncOp> castAsyncOpAttrs(ArrayAttr opAttrs) {
 void createTMALoad(triton::nvws::DescriptorLoadOp op, PatternRewriter &rewriter,
                    Value barrierAlloc, Value pred) {
   auto newLoadOp = triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp::create(
-      rewriter, op.getLoc(), op.getDesc(), op.getIndices(), barrierAlloc,
-      op.getResult(), pred);
+      rewriter, op.getLoc(), /*multicastTargets*/ Value(), op.getDesc(),
+      op.getIndices(), barrierAlloc, op.getResult(), pred);
   assignStageCluster(newLoadOp, getPartitionWsTagIds(op), getStageCluster(op),
                      rewriter);
 }
@@ -319,8 +319,7 @@ void rewriteRelease(
       break;
     case AsyncOp::TC5MMA:
     case AsyncOp::TMEMCopy:
-      arriveOp =
-          TCGen5CommitOp::create(rewriter, loc, mbar, Value(), ValueRange{});
+      arriveOp = TCGen5CommitOp::create(rewriter, loc, mbar, Value(), false);
       break;
     case AsyncOp::TMALoad:
       break;

@@ -253,7 +253,7 @@ struct AssignStagePhase {
                                      DenseSet<Value> &visiting) const {
     if (!useD || !visiting.insert(useD).second)
       return {};
-    auto guard = llvm::scope_exit([&] { visiting.erase(useD); });
+    auto guard = llvm::make_scope_exit([&] { visiting.erase(useD); });
 
     if (auto it = facts.find(useD); it != facts.end())
       return it->second;
@@ -281,7 +281,7 @@ struct AssignStagePhase {
                             DenseSet<Value> &visiting) const {
     if (!token || !visiting.insert(token).second)
       return false;
-    auto guard = llvm::scope_exit([&] { visiting.erase(token); });
+    auto guard = llvm::make_scope_exit([&] { visiting.erase(token); });
 
     if (token == acquireToken) {
       return true;
@@ -319,7 +319,7 @@ struct AssignStagePhase {
     // this proof path cannot make progress; bail out conservatively.
     if (!token || !visiting.insert({useD, token}).second)
       return false;
-    auto guard = llvm::scope_exit([&] { visiting.erase({useD, token}); });
+    auto guard = llvm::make_scope_exit([&] { visiting.erase({useD, token}); });
 
     // Once token backtracking reaches the acquire we are proving against, the
     // remaining work is to resolve the current `useD` on that acquire path.

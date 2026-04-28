@@ -36,6 +36,8 @@ namespace mlir::triton::gpu {
 // Finally the partition assignments in the dataflow graph are serialized to
 // attributes, and the temporary data structure is discarded.
 
+#define GEN_PASS_DECL_TRITONGPUPARTITIONSCHEDULING
+#include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 #define GEN_PASS_DEF_TRITONGPUPARTITIONSCHEDULING
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
@@ -219,7 +221,7 @@ SmallVector<OutputPort> initialDataValues(Graph *graph) {
   graph->walk([&](Node *node) {
     if (node->isOp()) {
       auto op = node->getOp();
-      if (isa<tt::DescriptorLoadLikeOpInterface>(op)) {
+      if (isa<tt::DescriptorLoadOp>(op)) {
         node->setDataValue(0);
         values.push_back({node, 0});
       }
@@ -430,7 +432,7 @@ SmallVector<std::pair<std::string, std::function<bool(Edge)>>> heuristics = {
          return false;
        }
 
-       if (node_isa<tt::DescriptorLoadLikeOpInterface>(edge.getFromNode())) {
+       if (node_isa<tt::DescriptorLoadOp>(edge.getFromNode())) {
          // require layouts to match for TMA load + alloc
          auto load = edge.getFromNode()->getOp();
          auto alloc = cast<ttg::LocalAllocOp>(edge.getToNode()->getOp());
