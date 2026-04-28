@@ -1569,12 +1569,13 @@ BATCH, N_HEADS = 4, 32
 # vary seq length for fixed head and batch=4
 configs = []
 for HEAD_DIM in [128]:  #64, 128]:
-    for baseVariant in ["ws", "ws_persistent"]:
-        for mode in ["fwd", "bwd"]:
+#    for baseVariant in ["ws", "ws_persistent"]:
+    for baseVariant in ["ws_persistent"]:
+        for mode in ["fwd"]: #, "bwd"]:
             configs.append(
                 triton.testing.Benchmark(
                     x_names=["N_CTX"],
-                    x_vals=[2**i for i in range(12, 13)],  #0, 15)],
+                    x_vals=[2**i for i in range(14, 15)],  #0, 15)],
                     line_arg="provider",
                     line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
                     line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
