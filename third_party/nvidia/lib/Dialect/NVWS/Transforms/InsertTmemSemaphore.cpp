@@ -1,4 +1,5 @@
 #include "Utilities.h"
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -107,7 +108,7 @@ struct TmemAccessDag {
     auto elseDag =
         std::make_unique<Node>(nullptr, nullptr, std::nullopt, nullptr);
     auto thenTok = addOp(*useThen, thenDag.get());
-    auto elseTok = addOp(*useElse, elseDag.get());
+    addOp(*useElse, elseDag.get());
 
     auto tokPos =
         *findValuePosInRange(ifOp.thenYield()->getOperands(), thenTok);
@@ -347,7 +348,6 @@ struct TmemAccessDag {
   // --------------------------------------------------------------------------
 
   std::unique_ptr<Node> dag;
-  DenseMap<scf::ForOp, TMEMAllocOp> arefTmemAllocs;
 };
 
 void assignStage(OpBuilder &b, Operation *op, StageCluster stageCluster) {
@@ -652,7 +652,6 @@ int insertTmemSemaphore(TmemAccessDag &accessDag, int numTmemBlocks) {
   auto allocOp = cast<TMEMAllocOp>(rootNode->op);
 
   auto isMultiStaged = hasProducerConsumerPartitioning(accessDag);
-  int numTmemBlock = 0;
   if (isMultiStaged) {
     for (auto user : allocOp.getResult().getUsers()) {
       if (auto mmaOp = dyn_cast<MMAv5OpInterface>(user)) {
@@ -879,6 +878,15 @@ void workaroundForLoopScheduler(triton::FuncOp funcOp) {
 }
 
 LogicalResult runOnFunction(triton::FuncOp funcOp) {
+  // Skip this function if there is no warp specialized loop.
+  auto walkResult = funcOp.walk([&](scf::ForOp forOp) {
+    if (forOp->hasAttr(kWarpSpecializeAttrName))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  if (!walkResult.wasInterrupted())
+    return success();
+
   SmallVector<TmemAccessDag> tmemDags;
   funcOp.walk([&](TMEMAllocOp allocOp) {
     tmemDags.push_back(TmemAccessDag::build(allocOp));
