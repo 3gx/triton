@@ -1,4 +1,5 @@
 import json
+import os
 import pytest
 import torch
 
@@ -7,6 +8,7 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
+USE_META_WS = tl.constexpr(os.environ.get("TRITON_USE_META_WS") == "1")
 
 
 def is_hip():
@@ -572,7 +574,9 @@ def _attn_fwd_persist(
             merge_epilogue=True,
             separate_epilogue_store=True,
             data_partition_factor=DP_FACTOR,
-            smem_alloc_algo=0,
+            # Meta warp specialization with FP8 has correctness issues and may
+            # hang with algorithm 0, so use algorithm 1 for this path.
+            smem_alloc_algo=1 if FP8_OUTPUT and USE_META_WS else 0,
     ):
         pid = tile_idx % n_tile_num
         off_hz = tile_idx // n_tile_num
