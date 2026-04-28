@@ -25,6 +25,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/MapVector.h"
 #include <unordered_set>
 
@@ -1719,6 +1720,7 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
 
     if (isPost) {
       // Generate the local store
+      builder.setAsynTaskIdsFromArray(channel->relation.first);
       builder.setLoopScheduleInfoFromOp(srcOp);
       auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
           srcOp->getLoc(), srcResult, allocOp);
@@ -1951,12 +1953,14 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
       int cc = getNVIDIAComputeCapability(funcOp->getParentOfType<ModuleOp>());
+      bool useChannelSmem =
+          triton::tools::getBoolEnv("TRITON_META_WS_USE_CHANNEL_SMEM");
+      bool useTMEM =
+          isPost && !useChannelSmem && cc >= 100 &&
+          tensorType.getShape().size() == 1 &&
+          tensorType.getElementType().isIntOrFloat();
       auto res = createLocalAlloc(
-          builder, channel,
-          isPost ? (cc >= 100 && tensorType.getShape().size() == 1 &&
-                    tensorType.getElementType().isIntOrFloat())
-                 : false,
-          isPost);
+          builder, channel, useTMEM, isPost);
       buffer = res.first;
       newProducer = res.second;
     } else {

@@ -198,9 +198,9 @@ def _host_descriptor_pre_hook(nargs):
 if is_hip():
     NUM_STAGES_OPTIONS = [1]
 elif supports_host_descriptor():
-    NUM_STAGES_OPTIONS = [3]
+    NUM_STAGES_OPTIONS = [2]
 else:
-    NUM_STAGES_OPTIONS = [3]
+    NUM_STAGES_OPTIONS = [2]
 
 configs = [
     triton.Config(
@@ -213,6 +213,7 @@ configs = [
         num_warps=w,
         pre_hook=_host_descriptor_pre_hook,
         # ir_override=f"/home/mren/OpenSource/tritonbench/override/_attn_fwd_persist.ttgir"
+#    ) for BM in [256] for BN in [128] for s in NUM_STAGES_OPTIONS for w in [4]
     ) for BM in [256] for BN in [128] for s in NUM_STAGES_OPTIONS for w in [4]
 ]
 
@@ -1569,15 +1570,19 @@ BATCH, N_HEADS = 4, 32
 # vary seq length for fixed head and batch=4
 configs = []
 for HEAD_DIM in [128]:  #64, 128]:
-    for baseVariant in ["ws", "ws_persistent"]:
-        for mode in ["fwd", "bwd"]:
+#    for baseVariant in ["ws", "ws_persistent"]:
+#    for baseVariant in ["ws"]:
+    for baseVariant in ["ws_persistent"]:
+        for mode in ["fwd"]: #, "bwd"]:
             configs.append(
                 triton.testing.Benchmark(
                     x_names=["N_CTX"],
-                    x_vals=[2**i for i in range(12, 13)],  #0, 15)],
+                    x_vals=[2**i for i in range(10, 17)],  #0, 15)],
                     line_arg="provider",
-                    line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
-                    line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
+                    #line_vals=["triton-fp8"] + (["flash"] if HAS_FLASH else []),
+                    #line_names=["Triton [FP8]"] + (["Flash-2"] if HAS_FLASH else []),
+                    line_vals=["triton-fp16", "triton-fp8"],
+                    line_names=["Triton [FP16]", "triton-fp8"],
                     styles=[("red", "-"), ("blue", "-"), ("green", "-")],
                     ylabel="TFLOPS",
                     plot_name=f"fused-attention-{baseVariant}-{mode}-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
@@ -1594,6 +1599,7 @@ for HEAD_DIM in [128]:  #64, 128]:
 @triton.testing.perf_report(configs)
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider, device=DEVICE):
     assert mode in ["fwd", "bwd"]
+    print(f"BATCH: {BATCH}, H: {H}, N_CTX: {N_CTX}, HEAD_DIM: {HEAD_DIM}, mode: {mode}, provider: {provider}")
     dtype = torch.float16
     if "triton" in provider:
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
@@ -1633,6 +1639,13 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider
 
 if __name__ == "__main__":
     if is_blackwell():
+        import sys
+        print("Test op fp16...")
+        sys.stdout.flush()
+        test_op(Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="fwd", baseVariant="ws_persistent", provider="triton-fp16", SUBTILING=True, VECT_MUL=1, FADD2_REDUCE=False, bwd_config_idx=0)
+        print("Test op fp8...")
+        sys.stdout.flush()
+        test_op(Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="fwd", baseVariant="ws_persistent", provider="triton-fp8", SUBTILING=True, VECT_MUL=1, FADD2_REDUCE=False, bwd_config_idx=0)
         print("Running benchmarks...")
         bench_flash_attention.run(print_data=True)
     else:
