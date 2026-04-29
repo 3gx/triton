@@ -1,4 +1,6 @@
 // RUN: triton-opt %s -split-input-file --nvws-ws-data-partition=num-warp-groups=3 | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvws-ws-data-partition=num-warp-groups=3 --tritongpu-partition-scheduling -allow-unregistered-dialect | FileCheck %s --check-prefix=GENERIC
+// RUN: triton-opt %s -split-input-file --nvws-ws-data-partition=num-warp-groups=3 --nvws-partition-scheduling-meta="merge-epilogue separate-epilogue-store" --nvws-hoist-tmem-store --nvws-memory-planner=num-buffers=3 -allow-unregistered-dialect | FileCheck %s --check-prefix=PIPE
 
 
 // -----
@@ -17,6 +19,8 @@
 #tmem1 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @_helion_attention_kernel
+  // GENERIC-LABEL: @_helion_attention_kernel
+  // PIPE-LABEL: @_helion_attention_kernel
   tt.func public @_helion_attention_kernel(%q: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %k: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %v: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %lse: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %o: !tt.ptr<bf16> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %false = arith.constant false
     %true = arith.constant true
@@ -49,6 +53,7 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
       %offset_0 = arith.muli %pid_0, %c256_i32 : i32
       %q_i_load = tt.descriptor_load %q_desc[%pid_1, %offset_0, %c0_i32] : !tt.tensordesc<tensor<1x256x128xbf16, #shared>> -> tensor<256x128xbf16, #blocked1>
       %q_i_load_5 = ttg.local_alloc %q_i_load : (tensor<256x128xbf16, #blocked1>) -> !ttg.memdesc<256x128xbf16, #shared2, #smem>
+      // PIPE: ttng.tmem_alloc {{.*}}buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32, buffer.offset = 0 : i32
       %qk, %qk_6 = ttng.tmem_alloc : () -> (!ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
       %acc, %acc_7 = ttng.tmem_alloc : () -> (!ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
       %acc_8 = ttng.tmem_store %cst_3, %acc[%acc_7], %true : tensor<256x128xf32, #blocked> -> !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
@@ -59,6 +64,8 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
         %permute = ttg.local_alloc %k_j_load : (tensor<128x128xbf16, #blocked1>) -> !ttg.memdesc<128x128xbf16, #shared2, #smem>
         %permute_19 = ttg.memdesc_trans %permute {order = array<i32: 1, 0>} : !ttg.memdesc<128x128xbf16, #shared2, #smem> -> !ttg.memdesc<128x128xbf16, #shared3, #smem>
         // CHECK-COUNT-2: ttng.tc_gen5_mma
+        // GENERIC: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: 2>
+        // PIPE: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: 1>
         %qk_20 = ttng.tc_gen5_mma %q_i_load_5, %permute_19, %qk[%qk_16], %false, %true : !ttg.memdesc<256x128xbf16, #shared2, #smem>, !ttg.memdesc<128x128xbf16, #shared3, #smem>, !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
         %qk_21, %qk_22 = ttng.tmem_load %qk[%qk_20] : !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<256x128xf32, #blocked>
         %amax = "tt.reduce"(%qk_21) <{axis = 1 : i32}> ({
@@ -113,6 +120,8 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
       %subscript_2 = ttg.convert_layout %v_17 : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<256xf32, #ttg.slice<{dim = 0, parent = #blocked1}>>
       %subscript_2_13 = tt.expand_dims %subscript_2 {axis = 0 : i32} : tensor<256xf32, #ttg.slice<{dim = 0, parent = #blocked1}>> -> tensor<1x256xf32, #blocked1>
       // CHECK-COUNT-2: tt.descriptor_store
+      // GENERIC: tt.descriptor_store {{.*}}ttg.partition = array<i32: 0>
+      // PIPE: tt.descriptor_store {{.*}}ttg.partition = array<i32: 2>
       tt.descriptor_store %lse_desc_4[%pid_1, %offset_0], %subscript_2_13 : !tt.tensordesc<tensor<1x256xf32, #shared1>>, tensor<1x256xf32, #blocked1>
       %subscript_3 = ttg.convert_layout %v_18_12 : tensor<256x128xf32, #blocked> -> tensor<256x128xf32, #ttg.slice<{dim = 0, parent = #blocked5}>>
       %subscript_3_14 = tt.expand_dims %subscript_3 {axis = 0 : i32} : tensor<256x128xf32, #ttg.slice<{dim = 0, parent = #blocked5}>> -> tensor<1x256x128xf32, #blocked5>
@@ -120,6 +129,10 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
       // CHECK-COUNT-2: tt.descriptor_store
       tt.descriptor_store %o_desc[%pid_1, %offset_0, %c0_i32], %v_19 : !tt.tensordesc<tensor<1x256x128xbf16, #shared>>, tensor<1x256x128xbf16, #blocked5>
     } {tt.warp_specialize}
+    // GENERIC: tt.warp_specialize
+    // GENERIC-SAME: ttg.partition = array<i32: 0, 1, 2, 3>
+    // PIPE: tt.warp_specialize
+    // PIPE-SAME: ttg.partition.types = ["correction", "gemm", "epilogue_store", "load", "computation", "computation"]
     tt.return
   }
 }

@@ -2561,14 +2561,161 @@ static bool isNestedInWarpSpecializeLoop(Operation *op) {
   return false;
 }
 
-static void tagPartitionedOpsForLoop(FuncOp funcOp, int tag) {
+static bool isWarpSpecializeLoopOp(Operation *op) {
+  auto forOp = dyn_cast<scf::ForOp>(op);
+  return forOp && forOp->hasAttr(kWarpSpecializeAttrName);
+}
+
+static std::optional<int> getEnclosingWarpSpecializeTag(Operation *op) {
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
+      if (forOp->hasAttr(kWarpSpecializeAttrName))
+        return getWarpSpecializeTag(forOp);
+    }
+  }
+  return std::nullopt;
+}
+
+static std::optional<int> getAssociatedWarpSpecializeTag(Value value) {
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return std::nullopt;
+  if (auto forOp = dyn_cast<scf::ForOp>(def)) {
+    if (forOp->hasAttr(kWarpSpecializeAttrName))
+      return getWarpSpecializeTag(forOp);
+  }
+  if (auto tag = getWarpSpecializeTag(def))
+    return tag;
+  return getEnclosingWarpSpecializeTag(def);
+}
+
+static SetVector<int> inferAssociatedWarpSpecializeTags(Operation *op) {
+  SetVector<int> tags;
+
+  for (Value operand : op->getOperands()) {
+    if (auto tag = getAssociatedWarpSpecializeTag(operand))
+      tags.insert(*tag);
+  }
+
+  for (Value result : op->getResults()) {
+    for (Operation *user : result.getUsers()) {
+      if (auto tag = getWarpSpecializeTag(user))
+        tags.insert(*tag);
+      if (auto tag = getEnclosingWarpSpecializeTag(user))
+        tags.insert(*tag);
+    }
+  }
+
+  return tags;
+}
+
+static LogicalResult tagPartitionedOpsForFunc(FuncOp funcOp,
+                                              ArrayRef<scf::ForOp> loops) {
+  SetVector<int> loopTags;
+  for (scf::ForOp loop : loops) {
+    auto tag = getWarpSpecializeTag(loop);
+    assert(tag && "WS loop must be tagged before final tag propagation");
+    loopTags.insert(*tag);
+  }
+
+  bool changed = false;
+  do {
+    changed = false;
+    Operation *ambiguous = nullptr;
+    SetVector<int> ambiguousTags;
+
+    funcOp.walk([&](Operation *op) {
+      if (!hasPartition(op) || isNestedInWarpSpecializeLoop(op) ||
+          isWarpSpecializeLoopOp(op))
+        return WalkResult::advance();
+
+      SetVector<int> tags = inferAssociatedWarpSpecializeTags(op);
+      if (tags.size() > 1) {
+        ambiguous = op;
+        ambiguousTags = tags;
+        return WalkResult::interrupt();
+      }
+
+      if (tags.empty() && loopTags.size() == 1)
+        tags.insert(loopTags.front());
+
+      if (tags.size() == 1) {
+        int inferredTag = tags.front();
+        if (auto existingTag = getWarpSpecializeTag(op)) {
+          if (*existingTag != inferredTag) {
+            ambiguous = op;
+            ambiguousTags.insert(*existingTag);
+            ambiguousTags.insert(inferredTag);
+            return WalkResult::interrupt();
+          }
+        } else {
+          setWarpSpecializeTag(op, inferredTag);
+          changed = true;
+        }
+      }
+
+      return WalkResult::advance();
+    });
+
+    if (ambiguous) {
+      return ambiguous->emitError(
+          "partitioned op outside tt.warp_specialize loop has ambiguous "
+          "ttg.warp_specialize.tag association");
+    }
+  } while (changed);
+
+  Operation *untagged = nullptr;
   funcOp.walk([&](Operation *op) {
-    if (!hasPartition(op) || op->hasAttr(kWarpSpecializeTagAttrName))
-      return;
-    if (isNestedInWarpSpecializeLoop(op))
-      return;
-    setWarpSpecializeTag(op, tag);
+    if (!hasPartition(op) || isNestedInWarpSpecializeLoop(op) ||
+        isWarpSpecializeLoopOp(op))
+      return WalkResult::advance();
+    if (!hasWarpSpecializeTag(op)) {
+      untagged = op;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
   });
+  if (untagged) {
+    return untagged->emitError(
+        "partitioned op outside tt.warp_specialize loop is missing an "
+        "unambiguous ttg.warp_specialize.tag association");
+  }
+
+  Operation *badUseClosure = nullptr;
+  funcOp.walk([&](Operation *op) {
+    if (!hasPartition(op) || isNestedInWarpSpecializeLoop(op) ||
+        isWarpSpecializeLoopOp(op))
+      return WalkResult::advance();
+    std::optional<int> tag = getWarpSpecializeTag(op);
+    if (!tag)
+      return WalkResult::advance();
+    for (Value result : op->getResults()) {
+      for (Operation *user : result.getUsers()) {
+        if (isNestedInWarpSpecializeLoop(user)) {
+          auto userTag = getEnclosingWarpSpecializeTag(user);
+          if (!userTag || *userTag != *tag) {
+            badUseClosure = op;
+            return WalkResult::interrupt();
+          }
+          continue;
+        }
+        if (!hasPartition(user) || !hasWarpSpecializeTag(user) ||
+            *getWarpSpecializeTag(user) != *tag) {
+          badUseClosure = op;
+          return WalkResult::interrupt();
+        }
+      }
+    }
+    return WalkResult::advance();
+  });
+  if (badUseClosure) {
+    return badUseClosure->emitError(
+        "partitioned op outside tt.warp_specialize loop has a result use "
+        "outside its WS tag closure");
+  }
+
+  return success();
 }
 
 static LogicalResult verifyFinalizedPartitionAnnotations(FuncOp funcOp,
@@ -2685,10 +2832,6 @@ LogicalResult NVWSPartitionSchedulingMeta::runOnFuncOp(FuncOp funcOp) {
         kWarpSpecializeTagAttrName,
         IntegerAttr::get(IntegerType::get(loop.getContext(), 32), idx));
     finalizePartitionAnnotations(loop);
-    tagPartitionedOpsForLoop(funcOp, idx);
-    if (failed(verifyFinalizedPartitionAnnotations(funcOp, loop)))
-      return failure();
-
     schedule.serialize(loop);
     // Clean Broadcast/ExpandDims that were left with no users
     // after optimizeSchedule. We wait until after the schedule is
@@ -2701,6 +2844,14 @@ LogicalResult NVWSPartitionSchedulingMeta::runOnFuncOp(FuncOp funcOp) {
         op->erase();
     });
   }
+  if (failed(tagPartitionedOpsForFunc(funcOp, loops)))
+    return failure();
+
+  for (scf::ForOp loop : loops) {
+    if (failed(verifyFinalizedPartitionAnnotations(funcOp, loop)))
+      return failure();
+  }
+
   return success();
 }
 

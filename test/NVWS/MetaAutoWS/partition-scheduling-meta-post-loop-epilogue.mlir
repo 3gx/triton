@@ -46,16 +46,21 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // --- Post-loop: tmem_load → epilogue ---
 // CHECK: ttng.tmem_load
 // CHECK-SAME: ttg.partition = array<i32: [[EPIL]]>
+// CHECK-SAME: ttg.warp_specialize.tag = 0 : i32
 // --- Post-loop: truncf → epilogue ---
 // CHECK: arith.truncf
 // CHECK-SAME: ttg.partition = array<i32: [[EPIL]]>
+// CHECK-SAME: ttg.warp_specialize.tag = 0 : i32
 // --- Post-loop: local_alloc → epilogue ---
-// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[EPIL]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[EPIL]]
+// CHECK-SAME: ttg.warp_specialize.tag = 0 : i32
 // --- Post-loop: TMA store → epilogue partition ---
 // CHECK: ttng.async_tma_copy_local_to_global
 // CHECK-SAME: ttg.partition = array<i32: [[EPIL]]>
+// CHECK-SAME: ttg.warp_specialize.tag = 0 : i32
 // CHECK: ttng.async_tma_store_token_wait
 // CHECK-SAME: ttg.partition = array<i32: [[EPIL]]>
+// CHECK-SAME: ttg.warp_specialize.tag = 0 : i32
 tt.func public @post_loop_tmem_load_not_in_epilogue(
   %A_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
   %B_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,

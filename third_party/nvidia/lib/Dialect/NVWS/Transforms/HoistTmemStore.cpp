@@ -25,6 +25,7 @@
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Interfaces/InferIntRangeInterface.h"
 #include "mlir/Interfaces/Utils/InferIntRangeCommon.h"
 #include "mlir/Pass/Pass.h"
@@ -51,6 +52,89 @@ namespace triton {
 #define GEN_PASS_DEF_NVWSHOISTTMEMSTORE
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h.inc"
 namespace {
+
+void insertAll(SetVector<int> &dst, const SetVector<int> &src) {
+  dst.insert(src.begin(), src.end());
+}
+
+SetVector<int> getChildPartitionUnion(Operation *op) {
+  SetVector<int> result;
+  for (Region &region : op->getRegions()) {
+    for (Block &block : region.getBlocks()) {
+      for (Operation &child : block.getOperations()) {
+        if (isa<ub::PoisonOp>(child))
+          continue;
+        if (hasPartition(&child))
+          insertAll(result, getPartitionIds(&child));
+      }
+    }
+  }
+  return result;
+}
+
+SetVector<int> getConsumerPartitionUnion(Value value) {
+  SetVector<int> result;
+  for (Operation *user : value.getUsers()) {
+    if (hasPartition(user))
+      insertAll(result, getPartitionIds(user));
+  }
+  return result;
+}
+
+SetVector<int> inferMissingPartition(Operation *op) {
+  SetVector<int> result;
+  for (Value resultValue : op->getResults())
+    insertAll(result, getConsumerPartitionUnion(resultValue));
+
+  for (Value operand : op->getOperands()) {
+    if (Operation *def = operand.getDefiningOp()) {
+      if (hasPartition(def))
+        insertAll(result, getPartitionIds(def));
+    }
+  }
+
+  insertAll(result, getChildPartitionUnion(op));
+
+  if (result.empty()) {
+    if (Operation *parent = op->getParentOp()) {
+      if (hasPartition(parent))
+        insertAll(result, getPartitionIds(parent));
+    }
+  }
+  return result;
+}
+
+void repairPartitionMetadata(scf::ForOp loop) {
+  bool changed = false;
+  do {
+    changed = false;
+    loop.walk<WalkOrder::PostOrder>([&](Operation *op) {
+      if (isa<ub::PoisonOp>(op))
+        return;
+
+      if (!hasPartition(op)) {
+        SetVector<int> ids = inferMissingPartition(op);
+        if (!ids.empty()) {
+          setPartition(op, ids);
+          changed = true;
+        }
+      }
+
+      if (op->getNumRegions() != 0 && hasPartition(op)) {
+        SetVector<int> ids = getPartitionIds(op);
+        insertAll(ids, getChildPartitionUnion(op));
+        if (op->hasAttr(kPartitionOutputsAttrName)) {
+          for (auto outputIds : getPartitionOutputs(op))
+            insertAll(ids, outputIds);
+        }
+        if (ids != getPartitionIds(op)) {
+          setPartition(op, ids);
+          changed = true;
+        }
+      }
+    });
+  } while (changed);
+}
 
 bool underWSLoop(Operation *op) {
   scf::ForOp topLevelFor = op->getParentOfType<scf::ForOp>();
@@ -349,6 +433,11 @@ public:
     ConvertLayoutOp::getCanonicalizationPatterns(patterns, context);
     if (failed(applyPatternsGreedily(m, std::move(patterns))))
       signalPassFailure();
+
+    m.walk([&](scf::ForOp loop) {
+      if (loop->hasAttr(kWarpSpecializeAttrName))
+        repairPartitionMetadata(loop);
+    });
 
     m.walk([&](scf::ForOp loop) {
       if (loop->hasAttr(kWarpSpecializeAttrName)) {

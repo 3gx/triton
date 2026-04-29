@@ -41,6 +41,43 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// Test that fallback ownership for a non-hoistable initialized TMEM alloc is
+// derived from the actual MMA partition, not hard-coded to partition 1.
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared_t = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @fallback_owner_non_one
+  // CHECK: ttng.tmem_alloc {{.*}} {ttg.partition = array<i32: 2>}
+  // CHECK-NOT: ttng.tmem_store
+  // CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: 2>
+  tt.func public @fallback_owner_non_one(
+      %A_sh: !ttg.memdesc<128x128xf16, #shared, #smem>,
+      %B_sh: !ttg.memdesc<128x128xf16, #shared, #smem>,
+      %N: i32, %K: i32) {
+    %true = arith.constant true
+    %false = arith.constant false
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    scf.for %i = %c0_i32 to %N step %c1_i32  : i32 {
+      %acc_tm, %tok0 = ttng.tmem_alloc {ttg.partition = array<i32: 0, 2>} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+      %tok1 = ttng.tmem_store %cst, %acc_tm[%tok0], %true {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %ub = arith.addi %K, %i {ttg.partition = array<i32: 2>} : i32
+      %B_trans = ttg.memdesc_trans %B_sh {order = array<i32: 1, 0>, ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf16, #shared, #smem> -> !ttg.memdesc<128x128xf16, #shared_t, #smem>
+      %inner:2 = scf.for %j = %c0_i32 to %ub step %c1_i32 iter_args(%useD = %false, %inner_tok = %tok1) -> (i1, !ttg.async.token)  : i32 {
+        %mma_tok = ttng.tc_gen5_mma %A_sh, %B_trans, %acc_tm[%inner_tok], %useD, %true {ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf16, #shared_t, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+        scf.yield {ttg.partition = array<i32: 2>} %true, %mma_tok : i1, !ttg.async.token
+      } {ttg.partition = array<i32: 2>, ttg.partition.outputs = [array<i32: 2>, array<i32: 2>]}
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 2>, ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+}
+
+// -----
+
 // Test hoisting with a loop-carried useD flag that starts false.
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
