@@ -6,6 +6,10 @@ add_triton_library(NVWSTransforms
   Utilities.cpp
   InsertTmemSemaphore.cpp
   HoistTmemStore.cpp
+  WSUtility.cpp
+  WSDataPartition.cpp
+  PartitionSchedulingMeta.cpp
+  MemoryPlanner.cpp
 
   DEPENDS
   NVWSTransformsIncGen

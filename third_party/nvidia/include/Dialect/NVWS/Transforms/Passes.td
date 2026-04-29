@@ -176,4 +176,80 @@ def NVWSHoistTmemStore: Pass<"nvws-hoist-tmem-store", "mlir::ModuleOp"> {
   ];
 }
 
+def NVWSWSDataPartition : Pass<"nvws-ws-data-partition", "mlir::ModuleOp"> {
+  let summary = "NVWS warp specialization data partition";
+
+  let description = [{
+    Partitions operations into multiple suboperations that operate on smaller
+    data shapes before warp-specialization partition scheduling.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+
+  let options = [
+    Option<"numWarpGroups", "num-warp-groups",
+           "int32_t", /*default*/"0",
+           "number of warp groups for warp specialization">
+  ];
+}
+
+def NVWSPartitionSchedulingMeta
+    : Pass<"nvws-partition-scheduling-meta", "mlir::triton::FuncOp"> {
+  let summary = "NVWS Meta warp specialization partitioning pass";
+
+  let description = [{
+    Meta-style partition scheduler for NVWS. The pass is transactional at
+    triton::FuncOp granularity: failure leaves the function IR unchanged.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+
+  let options = [
+    Option<"mergeEpilogue", "merge-epilogue",
+           "bool", /*default*/"false",
+           "If true, merge epilogue ops into the correction/reduction partition "
+           "(or computation partition if neither exists)">,
+    Option<"mergeEpilogueToComputation", "merge-epilogue-to-computation",
+           "bool", /*default*/"false",
+           "If true, merge epilogue ops directly into computation partitions">,
+    Option<"mergeCorrection", "merge-correction",
+           "bool", /*default*/"false",
+           "If true, merge correction ops into computation partitions">,
+    Option<"mergeReduction", "merge-reduction",
+           "bool", /*default*/"false",
+           "If true, merge reduction ops into computation partitions">,
+    Option<"separateEpilogueStore", "separate-epilogue-store",
+           "bool", /*default*/"false",
+           "If true, place epilogue store ops in a dedicated 1-warp partition">
+  ];
+}
+
+def NVWSMemoryPlanner : Pass<"nvws-memory-planner", "mlir::ModuleOp"> {
+  let summary = "NVWS TMEM memory planner";
+
+  let description = [{
+    Computes TMEM memory planning metadata for NVWS. Phase 1 is TMEM-only.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+
+  let options = [
+    Option<"numBuffers", "num-buffers",
+           "int32_t", /*default*/"0",
+           "starting buffer id for TMEM allocation">
+  ];
+}
+
 #endif // NVWS_PASSES

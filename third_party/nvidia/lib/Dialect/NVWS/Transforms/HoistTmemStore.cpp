@@ -319,6 +319,21 @@ bool hoistTmemAlloc(ttng::TMEMAllocOp allocToHoist) {
   return true;
 }
 
+SetVector<int> getFallbackTmemOwnerPartition(ttng::TMEMAllocOp alloc) {
+  if (auto opt = getUniqueUserLoopAndMMA(alloc)) {
+    Operation *mma = opt->second.getOperation();
+    if (hasPartition(mma)) {
+      SetVector<int> mmaPartition = getPartitionIds(mma);
+      if (mmaPartition.size() == 1)
+        return mmaPartition;
+    }
+  }
+
+  SetVector<int> fallbackPartition;
+  fallbackPartition.insert(1);
+  return fallbackPartition;
+}
+
 } // namespace
 
 class NVWSHoistTmemStore
@@ -346,12 +361,10 @@ public:
 
         for (auto alloc : tmemAllocToHoist) {
           if (!hoistTmemAlloc(alloc)) {
-            SetVector<int> mmaPartition;
-            mmaPartition.insert(1);
             // tmem store remaining in the outer loop must belong to the MMA
             // partition. This is required by insert-tmem-semaphore for
             // correctly double buffering this accumulator.
-            setPartition(alloc, mmaPartition);
+            setPartition(alloc, getFallbackTmemOwnerPartition(alloc));
           }
         }
       }
