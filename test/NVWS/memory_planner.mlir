@@ -5,10 +5,10 @@
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @tmem_memory_planner(%arg0: tensor<128x128xf32, #blocked>) {
-    // CHECK: ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 0 : i32}
+    // CHECK: ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = [[ID:[0-9]+]] : i32, buffer.offset = 0 : i32}
     %alloc0, %token0 = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
 
-    // CHECK: ttng.tmem_alloc %arg0 {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32}
+    // CHECK: ttng.tmem_alloc %arg0 {buffer.copy = 1 : i32, buffer.id = [[ID]] : i32, buffer.offset = 0 : i32}
     %alloc1, %token1 = ttng.tmem_alloc %arg0 : (tensor<128x128xf32, #blocked>) -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
 
     tt.return

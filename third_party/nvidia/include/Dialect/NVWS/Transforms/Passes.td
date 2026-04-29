@@ -248,7 +248,19 @@ def NVWSMemoryPlanner : Pass<"nvws-memory-planner", "mlir::ModuleOp"> {
   let options = [
     Option<"numBuffers", "num-buffers",
            "int32_t", /*default*/"0",
-           "starting buffer id for TMEM allocation">
+           "starting buffer id for TMEM allocation">,
+    Option<"smemAllocAlgo", "smem-alloc-algo",
+           "int32_t", /*default*/"0",
+           "accepted for Hopper test compatibility; ignored by the TMEM-only "
+           "NVWS phase-1 planner">,
+    Option<"smemBudget", "smem-budget",
+           "int32_t", /*default*/"0",
+           "accepted for Hopper test compatibility; ignored by the TMEM-only "
+           "NVWS phase-1 planner">,
+    Option<"smemCircularReuse", "smem-circular-reuse",
+           "bool", /*default*/"false",
+           "accepted for Hopper test compatibility; ignored by the TMEM-only "
+           "NVWS phase-1 planner">
   ];
 }
 
