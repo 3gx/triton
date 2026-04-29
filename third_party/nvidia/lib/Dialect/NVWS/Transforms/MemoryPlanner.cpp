@@ -32,12 +32,9 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/JSON.h"
 #include <algorithm>
 #include <limits>
-#include <map>
 #include <memory>
-#include <string>
 
 #define DEBUG_TYPE "nvws-memory-planner"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -88,13 +85,6 @@ struct TmemBuffer {
   size_t colOffset = std::numeric_limits<size_t>::max();
   bool isOwnerOfSpace = false;
   TmemBuffer *reuseOwner = nullptr;
-};
-
-struct ChannelAnnotation {
-  std::string operand;
-  std::string memType;
-  unsigned numCopies;
-  unsigned bufferId;
 };
 
 static void setI32Attr(Operation *op, StringRef name, int32_t value) {
@@ -194,122 +184,6 @@ static bool isTmemProducer(Value allocOrSubview, Operation *user) {
 
 static SmallVector<int> getTaskIds(Operation *op) {
   return nvws::getAsyncTaskIds(op);
-}
-
-static std::map<std::pair<Operation *, unsigned>, ChannelAnnotation>
-parseChannelAnnotations(Operation *parentOp) {
-  std::map<std::pair<Operation *, unsigned>, ChannelAnnotation> result;
-  std::map<unsigned, unsigned> bufferIdToCopies;
-
-  parentOp->walk([&](Operation *op) {
-    auto attr = op->getAttrOfType<StringAttr>("tt.autows");
-    if (!attr)
-      return;
-
-    auto parsed = llvm::json::parse(attr.getValue());
-    if (!parsed) {
-      llvm::consumeError(parsed.takeError());
-      return;
-    }
-
-    auto *obj = parsed->getAsObject();
-    if (!obj)
-      return;
-    auto *channels = obj->getArray("channels");
-    if (!channels)
-      return;
-
-    for (auto &elem : *channels) {
-      auto str = elem.getAsString();
-      if (!str)
-        continue;
-
-      SmallVector<StringRef, 4> parts;
-      StringRef(*str).split(parts, ',');
-      if (parts.size() != 4)
-        continue;
-
-      ChannelAnnotation ann;
-      ann.operand = parts[0].str();
-      ann.memType = parts[1].str();
-      ann.numCopies = 0;
-      ann.bufferId = 0;
-      if (parts[2].getAsInteger(10, ann.numCopies) ||
-          parts[3].getAsInteger(10, ann.bufferId))
-        continue;
-
-      if (ann.operand != "opndA" && ann.operand != "opndB" &&
-          ann.operand != "opndD")
-        continue;
-      if (ann.memType != "smem" && ann.memType != "tmem")
-        continue;
-      if (ann.operand == "opndD")
-        ann.memType = "tmem";
-
-      auto it = bufferIdToCopies.find(ann.bufferId);
-      if (it != bufferIdToCopies.end()) {
-        ann.numCopies = std::max(ann.numCopies, it->second);
-        it->second = ann.numCopies;
-      } else {
-        bufferIdToCopies[ann.bufferId] = ann.numCopies;
-      }
-
-      unsigned operandIdx = ann.operand == "opndA"   ? 0
-                            : ann.operand == "opndB" ? 1
-                                                     : 2;
-      result[{op, operandIdx}] = ann;
-    }
-  });
-
-  return result;
-}
-
-static Operation *traceBackToAlloc(Value value) {
-  DenseSet<Value> visited;
-  SmallVector<Value> worklist = {value};
-  while (!worklist.empty()) {
-    Value current = worklist.pop_back_val();
-    if (!visited.insert(current).second)
-      continue;
-
-    Operation *defOp = current.getDefiningOp();
-    if (!defOp)
-      continue;
-    if (isa<ttg::LocalAllocOp, ttng::TMEMAllocOp>(defOp))
-      return defOp;
-
-    for (Value operand : defOp->getOperands())
-      worklist.push_back(operand);
-  }
-  return nullptr;
-}
-
-static DenseMap<Operation *, ChannelAnnotation> buildAllocToAnnotationMap(
-    const std::map<std::pair<Operation *, unsigned>, ChannelAnnotation>
-        &annotations) {
-  DenseMap<Operation *, ChannelAnnotation> result;
-  for (const auto &[key, ann] : annotations) {
-    auto [op, operandIdx] = key;
-    auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op);
-    if (!mmaOp)
-      continue;
-
-    Value operand;
-    if (operandIdx == 0)
-      operand = mmaOp.getA();
-    else if (operandIdx == 1)
-      operand = mmaOp.getB();
-    else
-      operand = mmaOp.getAccumulator();
-
-    Operation *allocOp = traceBackToAlloc(operand);
-    if (!allocOp)
-      continue;
-
-    if (isa<ttng::TMEMAllocOp>(allocOp) && ann.memType == "tmem")
-      result.try_emplace(allocOp, ann);
-  }
-  return result;
 }
 
 static bool needsChannel(int producer, ArrayRef<int> consumers) {
@@ -802,7 +676,7 @@ static bool isDataDependent(Operation *srcOp, Operation *dstOp) {
       for (Operation *user : result.getUsers())
         if (visited.insert(user).second)
           worklist.push_back(user);
-    if (isa<ttg::LocalStoreOp, ttng::TMEMStoreOp>(op))
+    if (isa<ttng::TMEMStoreOp>(op))
       for (Value operand : op->getOperands())
         if (isa<ttg::MemDescType>(operand.getType()))
           for (Operation *user : operand.getUsers())
@@ -837,13 +711,12 @@ public:
 
     for (ttng::TMEMAllocOp alloc : allocs) {
       auto allocSize = ttng::getTmemAllocSizes(alloc.getType());
-      auto buffer = std::make_unique<TmemBuffer>();
-      buffer->owner = alloc.getOperation();
-      buffer->rowSize = allocSize.numRows;
-      buffer->colSize = allocSize.numCols;
-      TmemBuffer *bufferPtr = buffer.get();
-      buffers.push_back(std::move(buffer));
-      allocToBuffer[alloc.getOperation()] = bufferPtr;
+      TmemBuffer buffer;
+      buffer.owner = alloc.getOperation();
+      buffer.rowSize = allocSize.numRows;
+      buffer.colSize = allocSize.numCols;
+      buffers.push_back(buffer);
+      allocToBuffer[alloc.getOperation()] = &buffers.back();
       auto liveOps = livenessForTmemAlloc(alloc, channels);
       allocToIntervals[alloc.getOperation()] =
           intervalFromOps(liveOps, operationId);
@@ -854,8 +727,7 @@ public:
       eraseAttr(alloc, "buffer.offset");
       LLVM_DEBUG({
         auto interval = allocToIntervals[alloc.getOperation()];
-        LDBG("alloc size rows=" << bufferPtr->rowSize
-                                << " cols=" << bufferPtr->colSize
+        LDBG("alloc size rows=" << buffer.rowSize << " cols=" << buffer.colSize
                                 << " live=[" << interval.start() << ","
                                 << interval.end() << ")");
         alloc->dump();
@@ -882,19 +754,13 @@ public:
       return getLoopDepth(a) > getLoopDepth(b);
     });
 
-    DenseSet<Operation *> handledAllocs;
-    auto annotations = parseChannelAnnotations(funcOp);
-    if (!annotations.empty()) {
-      auto tmemAnnotations = buildAllocToAnnotationMap(annotations);
-      preAssignAnnotatedAllocs(tmemAnnotations, handledAllocs);
-    }
-
     SmallVector<Operation *> innermostLoops;
     funcOp.walk([&](scf::ForOp forOp) {
       if (isInnermostLoop(forOp))
         innermostLoops.push_back(forOp.getOperation());
     });
 
+    DenseSet<Operation *> handledAllocs;
     unsigned ctrlIdx = 0;
     for (Operation *ctrlOp : innermostLoops) {
       SmallVector<ttng::TMEMAllocOp> loopAllocs;
@@ -927,12 +793,6 @@ public:
   }
 
 private:
-  struct AllocationState {
-    DenseMap<TmemBuffer *, std::pair<TmemBuffer *, size_t>> assignment;
-    DenseSet<TmemBuffer *> owners;
-    size_t usedRows = 0;
-  };
-
   TmemBuffer *getBuffer(Operation *op) {
     auto it = allocToBuffer.find(op);
     return it == allocToBuffer.end() ? nullptr : it->second;
@@ -996,153 +856,9 @@ private:
     return isDataDependent(srcDst, dstSrc) || isDataDependent(dstSrc, srcDst);
   }
 
-  int hasPotentialReuse(TmemBuffer *owner, TmemBuffer *candidate,
-                        Operation *ctrlOp) {
-    if (candidate->colSize > owner->colSize)
-      return 0;
-    if (allocToIntervals[owner->owner].intersects(
-            allocToIntervals[candidate->owner]))
-      return 0;
-
-    TmemDataChannelPost *ownerCh = allocToChannel.lookup(owner->owner);
-    TmemDataChannelPost *candidateCh =
-        allocToChannel.lookup(candidate->owner);
-    if (!ownerCh || !candidateCh)
-      return 0;
-
-    Operation *ownerDst = ownerCh->getDstOp();
-    Operation *candidateSrc = candidateCh->getSrcOp();
-    Operation *candidateDst = candidateCh->getDstOp();
-    Operation *ownerSrc = ownerCh->getSrcOp();
-    bool hasDependency =
-        isDataDependent(ownerDst, candidateSrc) ||
-        isDataDependent(candidateDst, ownerSrc) ||
-        (sameLoop(owner, ctrlOp) &&
-         alongDependencyChain(owner->owner, candidate->owner));
-    if (!hasDependency)
-      return 0;
-
-    return candidate->colSize == owner->colSize ? 2 : 1;
-  }
-
-  size_t computeColOffset(TmemBuffer *candidate, TmemBuffer *owner,
-                          const AllocationState &state, Operation *ctrlOp) {
-    size_t maxColOffset = 0;
-    for (const auto &[reuser, assignment] : state.assignment) {
-      auto [reuseOwner, reuserColOffset] = assignment;
-      if (reuseOwner != owner)
-        continue;
-
-      bool canShareColumns =
-          hasPotentialReuse(reuser, candidate, ctrlOp) > 0 ||
-          hasPotentialReuse(candidate, reuser, ctrlOp) > 0;
-      if (!canShareColumns)
-        maxColOffset =
-            std::max(maxColOffset, reuserColOffset + reuser->colSize);
-    }
-
-    if (maxColOffset + candidate->colSize > owner->colSize)
-      return std::numeric_limits<size_t>::max();
-    return maxColOffset;
-  }
-
-  bool tryAllocateBacktracking(ArrayRef<ttng::TMEMAllocOp> toAllocate,
-                               size_t idx, AllocationState &state,
-                               Operation *ctrlOp) {
-    if (idx == toAllocate.size())
-      return true;
-
-    ttng::TMEMAllocOp candidateAlloc = toAllocate[idx];
-    TmemBuffer *candidate = getBuffer(candidateAlloc.getOperation());
-    SmallVector<std::pair<TmemBuffer *, int>> reuseCandidates;
-    for (TmemBuffer *owner : state.owners) {
-      int priority = hasPotentialReuse(owner, candidate, ctrlOp);
-      if (priority > 0)
-        reuseCandidates.push_back({owner, priority});
-    }
-    llvm::sort(reuseCandidates, [](const auto &a, const auto &b) {
-      return a.second > b.second;
-    });
-
-    for (auto &[owner, priority] : reuseCandidates) {
-      size_t colOffset = computeColOffset(candidate, owner, state, ctrlOp);
-      if (colOffset == std::numeric_limits<size_t>::max())
-        continue;
-
-      AllocationState nextState = state;
-      nextState.assignment[candidate] = {owner, colOffset};
-      if (tryAllocateBacktracking(toAllocate, idx + 1, nextState, ctrlOp)) {
-        state = std::move(nextState);
-        return true;
-      }
-    }
-
-    constexpr size_t maxTmemRows = 512;
-    if (state.usedRows + candidate->rowSize <= maxTmemRows) {
-      AllocationState nextState = state;
-      nextState.owners.insert(candidate);
-      nextState.usedRows += candidate->rowSize;
-      if (tryAllocateBacktracking(toAllocate, idx + 1, nextState, ctrlOp)) {
-        state = std::move(nextState);
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  LogicalResult allocateTmemAllocsBacktracking(
-      ArrayRef<ttng::TMEMAllocOp> toAllocate, Operation *ctrlOp) {
-    AllocationState state;
-    if (!tryAllocateBacktracking(toAllocate, 0, state, ctrlOp)) {
-      ttng::TMEMAllocOp firstAlloc = toAllocate.front();
-      return firstAlloc.emitError(
-          "can't find tmem space: failed backtracking TMEM allocation");
-    }
-
-    size_t rowOffset = 0;
-    DenseMap<TmemBuffer *, unsigned> ownerToBufferId;
-    for (ttng::TMEMAllocOp alloc : toAllocate) {
-      TmemBuffer *buffer = getBuffer(alloc.getOperation());
-      if (!state.owners.contains(buffer))
-        continue;
-
-      buffer->rowOffset = rowOffset;
-      buffer->colOffset = 0;
-      buffer->isOwnerOfSpace = true;
-      buffer->reuseOwner = buffer;
-      ownerToBufferId[buffer] = nextBufferId;
-      setI32Attr(alloc, "buffer.id", nextBufferId++);
-      setI32Attr(alloc, "buffer.copy", 1);
-      setI32Attr(alloc, "buffer.offset", 0);
-      rowOffset += buffer->rowSize;
-    }
-
-    for (ttng::TMEMAllocOp alloc : toAllocate) {
-      TmemBuffer *buffer = getBuffer(alloc.getOperation());
-      if (state.owners.contains(buffer))
-        continue;
-
-      auto it = state.assignment.find(buffer);
-      assert(it != state.assignment.end());
-      auto [owner, colOffset] = it->second;
-      buffer->rowOffset = owner->rowOffset;
-      buffer->colOffset = colOffset;
-      buffer->isOwnerOfSpace = false;
-      buffer->reuseOwner = owner;
-      auto ownerId = ownerToBufferId.lookup(owner);
-      setI32Attr(alloc, "buffer.id", ownerId);
-      setI32Attr(alloc, "buffer.copy", 1);
-      setI32Attr(alloc, "buffer.offset", colOffset);
-    }
-
-    return success();
-  }
-
   bool checkOtherReuses(TmemBuffer *candidate, TmemBuffer *reuseOwner,
                         size_t colOffset) {
-    for (auto &bufferPtr : buffers) {
-      TmemBuffer &buffer = *bufferPtr;
+    for (TmemBuffer &buffer : buffers) {
       if (!buffer.isOwnerOfSpace && buffer.reuseOwner == reuseOwner) {
         Interval<size_t> candRange(colOffset,
                                    colOffset + candidate->colSize);
@@ -1157,61 +873,10 @@ private:
     return true;
   }
 
-  void preAssignAnnotatedAllocs(
-      const DenseMap<Operation *, ChannelAnnotation> &annotations,
-      DenseSet<Operation *> &handledAllocs) {
-    if (annotations.empty())
-      return;
-
-    std::map<unsigned, SmallVector<ttng::TMEMAllocOp>> groups;
-    for (ttng::TMEMAllocOp alloc : allocs) {
-      auto it = annotations.find(alloc.getOperation());
-      if (it != annotations.end())
-        groups[it->second.bufferId].push_back(alloc);
-    }
-
-    size_t rowOffset = 0;
-    for (auto &[bufferId, group] : groups) {
-      if (group.empty())
-        continue;
-
-      ttng::TMEMAllocOp ownerAlloc = group.front();
-      TmemBuffer *owner = getBuffer(ownerAlloc.getOperation());
-      owner->rowOffset = rowOffset;
-      owner->colOffset = 0;
-      owner->isOwnerOfSpace = true;
-      owner->reuseOwner = owner;
-      setI32Attr(ownerAlloc, "buffer.id", bufferId);
-      setI32Attr(ownerAlloc, "buffer.copy",
-                 annotations.lookup(ownerAlloc.getOperation()).numCopies);
-      setI32Attr(ownerAlloc, "buffer.offset", 0);
-      handledAllocs.insert(ownerAlloc.getOperation());
-      rowOffset += owner->rowSize;
-
-      size_t nextColOffset = 0;
-      for (ttng::TMEMAllocOp reuserAlloc : ArrayRef(group).drop_front()) {
-        TmemBuffer *reuser = getBuffer(reuserAlloc.getOperation());
-        reuser->rowOffset = owner->rowOffset;
-        reuser->colOffset = nextColOffset;
-        reuser->isOwnerOfSpace = false;
-        reuser->reuseOwner = owner;
-        setI32Attr(reuserAlloc, "buffer.id", bufferId);
-        setI32Attr(reuserAlloc, "buffer.copy",
-                   annotations.lookup(reuserAlloc.getOperation()).numCopies);
-        setI32Attr(reuserAlloc, "buffer.offset", nextColOffset);
-        handledAllocs.insert(reuserAlloc.getOperation());
-        nextColOffset += reuser->colSize;
-      }
-
-      nextBufferId = std::max(nextBufferId, bufferId + 1);
-    }
-  }
-
   size_t findUsesInCtrlOp(TmemBuffer *owner, TmemBuffer *candidate,
                           Operation *ctrlOp) {
     size_t maxColOffset = 0;
-    for (auto &bufferPtr : buffers) {
-      TmemBuffer &buffer = *bufferPtr;
+    for (TmemBuffer &buffer : buffers) {
       if (!buffer.isOwnerOfSpace && buffer.reuseOwner == owner->reuseOwner &&
           &buffer != owner &&
           (sameLoop(&buffer, ctrlOp) ||
@@ -1226,8 +891,7 @@ private:
   size_t findReuseSpace(TmemBuffer *candidate, TmemBuffer *reuseOwner,
                         Operation *ctrlOp) {
     size_t maxColOffset = 0;
-    for (auto &bufferPtr : buffers) {
-      TmemBuffer &buffer = *bufferPtr;
+    for (TmemBuffer &buffer : buffers) {
       if (!buffer.isOwnerOfSpace && buffer.reuseOwner == reuseOwner) {
         if (sameLoop(&buffer, ctrlOp) ||
             allocToIntervals[buffer.owner].intersects(
@@ -1240,8 +904,7 @@ private:
       return maxColOffset;
 
     if (!sameLoop(reuseOwner, ctrlOp)) {
-      for (auto &bufferPtr : buffers) {
-        TmemBuffer &buffer = *bufferPtr;
+      for (TmemBuffer &buffer : buffers) {
         if (!buffer.isOwnerOfSpace && buffer.reuseOwner == reuseOwner &&
             buffer.colOffset == 0 && sameLoop(&buffer, ctrlOp) &&
             alongDependencyChain(buffer.owner, candidate->owner)) {
@@ -1256,8 +919,7 @@ private:
 
   TmemBuffer *findReuseChannel(TmemBuffer *candidate, Operation *ctrlOp,
                                unsigned partitionCondition) {
-    for (auto &bufferPtr : buffers) {
-      TmemBuffer &buffer = *bufferPtr;
+    for (TmemBuffer &buffer : buffers) {
       if (!buffer.isOwnerOfSpace)
         continue;
       if (allocToIntervals[buffer.owner].intersects(
@@ -1292,8 +954,7 @@ private:
   }
 
   bool allInterfere(TmemBuffer *candidate) {
-    for (auto &bufferPtr : buffers) {
-      TmemBuffer &buffer = *bufferPtr;
+    for (TmemBuffer &buffer : buffers) {
       if (buffer.rowOffset != std::numeric_limits<size_t>::max() &&
           !allocToIntervals[buffer.owner].intersects(
               allocToIntervals[candidate->owner]))
@@ -1304,8 +965,7 @@ private:
 
   bool allocateNewSpace(TmemBuffer *candidate, bool apply) {
     size_t maxRowOffset = 0;
-    for (auto &bufferPtr : buffers) {
-      TmemBuffer &buffer = *bufferPtr;
+    for (TmemBuffer &buffer : buffers) {
       if (buffer.rowOffset != std::numeric_limits<size_t>::max())
         maxRowOffset = std::max(maxRowOffset, buffer.rowOffset + buffer.rowSize);
     }
@@ -1332,9 +992,6 @@ private:
 
   LogicalResult allocateTmemAllocs(ArrayRef<ttng::TMEMAllocOp> toAllocate,
                                    Operation *ctrlOp) {
-    if (getTmemAllocAlgo(ctrlOp) == 2)
-      return allocateTmemAllocsBacktracking(toAllocate, ctrlOp);
-
     for (ttng::TMEMAllocOp alloc : toAllocate) {
       TmemBuffer *candidate = getBuffer(alloc.getOperation());
       if (!candidate)
@@ -1368,23 +1025,6 @@ private:
       }
     }
     return success();
-  }
-
-  int getTmemAllocAlgo(Operation *ctrlOp) {
-    int algo = 1;
-    if (!ctrlOp)
-      return algo;
-    if (auto attr = ctrlOp->getAttrOfType<IntegerAttr>("tt.tmem_alloc_algo"))
-      algo = attr.getInt();
-    for (auto parent = ctrlOp->getParentOfType<scf::ForOp>(); parent;
-         parent = parent->getParentOfType<scf::ForOp>()) {
-      if (auto attr =
-              parent->getAttrOfType<IntegerAttr>("tt.tmem_alloc_algo")) {
-        if (!ctrlOp->getAttrOfType<IntegerAttr>("tt.tmem_alloc_algo"))
-          algo = attr.getInt();
-      }
-    }
-    return algo;
   }
 
   bool hasLoopCarriedAccToken(ttng::TMEMAllocOp alloc, scf::ForOp forOp) {
@@ -1460,7 +1100,7 @@ private:
   unsigned nextBufferId;
   DenseMap<Operation *, size_t> operationId;
   SmallVector<ttng::TMEMAllocOp> allocs;
-  SmallVector<std::unique_ptr<TmemBuffer>> buffers;
+  SmallVector<TmemBuffer> buffers;
   DenseMap<Operation *, TmemBuffer *> allocToBuffer;
   DenseMap<Operation *, Interval<size_t>> allocToIntervals;
   DenseMap<Operation *, TmemDataChannelPost *> allocToChannel;
