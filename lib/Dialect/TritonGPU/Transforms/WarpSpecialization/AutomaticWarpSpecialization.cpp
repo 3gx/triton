@@ -90,6 +90,62 @@ std::unique_ptr<Pass> createVerifyWarpSpecializationPartitionsPass() {
   return std::make_unique<VerifyWarpSpecializationPartitions>();
 }
 
+struct NVWSPartitionSchedulingChoice
+    : PassWrapper<NVWSPartitionSchedulingChoice, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NVWSPartitionSchedulingChoice)
+
+  LogicalResult runMetaScheduler(FuncOp funcOp) {
+    OpPassManager pm(FuncOp::getOperationName());
+    NVWSPartitionSchedulingMetaOptions options;
+    options.mergeEpilogue = true;
+    options.separateEpilogueStore = true;
+    pm.addPass(createNVWSPartitionSchedulingMeta(options));
+    return runPipeline(pm, funcOp);
+  }
+
+  LogicalResult runGenericScheduler(ModuleOp moduleOp) {
+    OpPassManager pm;
+    pm.addPass(createTritonGPUPartitionScheduling());
+    return runPipeline(pm, moduleOp);
+  }
+
+  void runOnOperation() override {
+    ModuleOp moduleOp = getOperation();
+    SmallVector<FuncOp> funcOps;
+    moduleOp.walk([&](FuncOp funcOp) { funcOps.push_back(funcOp); });
+
+    SetVector<Operation *> fallbackFuncs;
+    for (FuncOp funcOp : funcOps) {
+      if (failed(runMetaScheduler(funcOp)))
+        fallbackFuncs.insert(funcOp.getOperation());
+    }
+    if (fallbackFuncs.empty())
+      return;
+
+    SmallVector<std::pair<Operation *, Attribute>> disabledWarpAttrs;
+    moduleOp.walk([&](scf::ForOp loop) {
+      FuncOp parentFunc = loop->getParentOfType<FuncOp>();
+      if (!parentFunc || fallbackFuncs.contains(parentFunc.getOperation()))
+        return;
+
+      Attribute attr = loop->getAttr(kWarpSpecializeAttrName);
+      if (!attr)
+        return;
+      disabledWarpAttrs.push_back({loop.getOperation(), attr});
+      loop->removeAttr(kWarpSpecializeAttrName);
+    });
+
+    LogicalResult result = runGenericScheduler(moduleOp);
+    for (auto [op, attr] : disabledWarpAttrs)
+      op->setAttr(kWarpSpecializeAttrName, attr);
+
+    if (failed(result)) {
+      signalPassFailure();
+      return;
+    }
+  }
+};
+
 } // namespace
 
 void AutomaticWarpSpecialization::runOnOperation() {
@@ -99,8 +155,15 @@ void AutomaticWarpSpecialization::runOnOperation() {
     pm.addPass(createVerifyWarpSpecializationPartitionsPass());
   };
 
-  addPassWithPartitionVerifier(createTritonGPUPartitionScheduling());
+  NVWSWSDataPartitionOptions dataPartitionOptions;
+  dataPartitionOptions.numWarpGroups = numWarpGroups;
+  addPassWithPartitionVerifier(createNVWSWSDataPartition(dataPartitionOptions));
+  addPassWithPartitionVerifier(
+      std::make_unique<NVWSPartitionSchedulingChoice>());
   addPassWithPartitionVerifier(createNVWSHoistTmemStore());
+  NVWSMemoryPlannerOptions memoryPlannerOptions;
+  memoryPlannerOptions.numBuffers = numStages;
+  addPassWithPartitionVerifier(createNVWSMemoryPlanner(memoryPlannerOptions));
   addPassWithPartitionVerifier(createNVWSInsertSemaphore());
   addPassWithPartitionVerifier(createNVWSInsertTmemSemaphore());
   addPassWithPartitionVerifier(createNVWSLowerSemaphore({numStages}));

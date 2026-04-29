@@ -393,7 +393,8 @@ getEnterAndExitStageClustersOfUses(const SetVector<Value> &producedResults,
       triton::getFirstUseOfPipelinedOp(ops, forOp, coarseSchedule, filterUse);
   auto lastOp =
       triton::getLastUseOfPipelinedOp(ops, forOp, coarseSchedule, filterUse);
-  assert(firstOp && lastOp);
+  if (!firstOp || !lastOp)
+    return std::make_pair(std::nullopt, std::nullopt);
 
   return std::make_pair(getStageCluster(firstOp), getStageCluster(lastOp));
 }
@@ -461,7 +462,16 @@ void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
   Value dataBuf = bufOp.getBuffers()[0];
 
   auto consumers = getTransitiveConsumers(results, consumerPartitions);
-  assert(consumers.size() > 0);
+  if (consumers.empty()) {
+    SetVector<Operation *> directConsumers;
+    for (OpOperand *use : uses) {
+      Operation *owner = use->getOwner();
+      Operation *ancestor = loop.getBody()->findAncestorOpInBlock(*owner);
+      directConsumers.insert(ancestor ? ancestor : owner);
+    }
+    consumers = SmallVector<Operation *>{directConsumers.begin(),
+                                         directConsumers.end()};
+  }
   auto asyncKinds = getConsumerAsyncOpKinds(consumers, builder.getContext());
 
   Operation *exitInsertPointAfter = nullptr;
