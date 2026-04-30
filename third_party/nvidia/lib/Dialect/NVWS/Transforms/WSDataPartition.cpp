@@ -1,4 +1,5 @@
 #include "WSUtility.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
@@ -234,6 +235,71 @@ static bool needToSlice(Value v, unsigned dim, int size) {
   return shape.size() > dim && shape[dim] > size;
 }
 
+static std::optional<Attribute> getSlicedTensorMemoryEncoding(
+    MLIRContext *ctx, nvidia_gpu::TensorMemoryEncodingAttr tmem,
+    ArrayRef<int64_t> slicedShape, unsigned dim) {
+  if (slicedShape.size() < 2 || dim > 1)
+    return std::nullopt;
+
+  ArrayRef<int64_t> matrixShape = slicedShape.take_back(2);
+  int64_t m = matrixShape[0];
+  int64_t n = matrixShape[1];
+  if (m <= 0 || n <= 0)
+    return std::nullopt;
+
+  unsigned blockM = tmem.getBlockM();
+  unsigned blockN = tmem.getBlockN();
+  unsigned ctaSplitM = tmem.getCTASplitM();
+  unsigned ctaSplitN = tmem.getCTASplitN();
+
+  if (dim == 0 && m < static_cast<int64_t>(blockM) * ctaSplitM) {
+    if (m >= static_cast<int64_t>(64) * ctaSplitM) {
+      blockM = 64;
+    } else {
+      return std::nullopt;
+    }
+  }
+
+  if (n < static_cast<int64_t>(blockN) * ctaSplitN) {
+    if (n % ctaSplitN != 0)
+      return std::nullopt;
+    blockN = n / ctaSplitN;
+  }
+
+  if (!llvm::is_contained({64u, 128u}, blockM) ||
+      !llvm::isPowerOf2_32(blockN) || blockN > 512)
+    return std::nullopt;
+  if (m < static_cast<int64_t>(blockM) * ctaSplitM ||
+      n < static_cast<int64_t>(blockN) * ctaSplitN)
+    return std::nullopt;
+
+  return triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
+      ctx, blockM, blockN, tmem.getColStride(), ctaSplitM, ctaSplitN,
+      tmem.getTwoCTAs());
+}
+
+static std::optional<MemDescType>
+getSlicedMemDescType(MLIRContext *ctx, MemDescType type,
+                     ArrayRef<int64_t> slicedShape, unsigned dim) {
+  Attribute encoding = type.getEncoding();
+  if (auto tmem =
+          dyn_cast<nvidia_gpu::TensorMemoryEncodingAttr>(type.getEncoding())) {
+    auto slicedEncoding =
+        getSlicedTensorMemoryEncoding(ctx, tmem, slicedShape, dim);
+    if (!slicedEncoding)
+      return std::nullopt;
+    encoding = *slicedEncoding;
+  }
+  return MemDescType::get(slicedShape, type.getElementType(), encoding,
+                          type.getMemorySpace(), type.getMutableMemory());
+}
+
+static bool isGenericSliceableOp(Operation *op) {
+  return !op->getName().getStringRef().contains('.') &&
+         op->getNumRegions() == 0 &&
+         !op->hasTrait<OpTrait::IsTerminator>();
+}
+
 // Duplicate the op for different partition dims.
 static bool rematerializeOp(Operation *op, DataPartitionScheme &partitionScheme,
                             unsigned currentDim) {
@@ -243,7 +309,7 @@ static bool rematerializeOp(Operation *op, DataPartitionScheme &partitionScheme,
     return true;
   }
 
-  if (isa<LocalAllocOp, arith::ConstantOp>(op)) {
+  if (isa<LocalAllocOp, arith::ConstantOp, ub::PoisonOp>(op)) {
     // assert op has a conflicting partition dim.
     auto existingDim = partitionScheme.opPartitionDims[op];
     assert(existingDim != currentDim && "op has no conflicting partition dim");
@@ -302,6 +368,25 @@ static bool getBackwardSliceToPartition(Value v,
   assert(partitionScheme.isValidPartitionDim(currentDim) && "invalid dim");
   if (!needToSlice(v, currentDim, partitionScheme.numPartitions))
     return true;
+  if (currentDim != DataPartitionScheme::noOpPartitionDim) {
+    if (auto type = dyn_cast<MemDescType>(v.getType())) {
+      if (isa<nvidia_gpu::TensorMemoryEncodingAttr>(type.getEncoding())) {
+        SmallVector<int64_t> shape(type.getShape());
+        if (shape.size() <= currentDim ||
+            shape[currentDim] % partitionScheme.numPartitions != 0)
+          return false;
+        shape[currentDim] /= partitionScheme.numPartitions;
+        if (!getSlicedMemDescType(v.getContext(), type, shape, currentDim)) {
+          LLVM_DEBUG({
+            LDBG("partition not possible: invalid sliced TMEM memdesc");
+            LDBG("dim " << currentDim);
+            LDBG("value type " << v.getType());
+          });
+          return false;
+        }
+      }
+    }
+  }
   if (auto op = v.getDefiningOp()) {
     // Check dim compatibility
     if (!partitionScheme.ops.insert(op)) {
@@ -356,12 +441,15 @@ static bool getBackwardSliceToPartition(Value v,
                    TransOp, MemDescTransOp, AtomicRMWOp, triton::AddPtrOp,
                    nvidia_gpu::TMEMAllocOp, nvidia_gpu::TMEMLoadOp,
                    nvidia_gpu::TMEMStoreOp, FpToFpOp, SplitOp, JoinOp,
-                   ReshapeOp>(op)) {
+                   ReshapeOp>(op) ||
+               isGenericSliceableOp(op)) {
       for (Value operand : op->getOperands())
         if (!getBackwardSliceToPartition(operand, partitionScheme,
                                          currentDim)) {
           return false;
         }
+    } else if (isa<ub::PoisonOp>(op)) {
+      return true;
     } else if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op)) {
       if (!getBackwardSliceToPartition(currentDim == 0 ? Value(dotOp.getA())
                                                        : dotOp.getB(),
@@ -409,13 +497,23 @@ static bool getBackwardSliceToPartition(Value v,
         return false;
       }
     } else {
-      llvm_unreachable("Unexpected op");
+      LLVM_DEBUG({
+        LDBG("partition not possible: unsupported backward slice op");
+        op->dump();
+      });
+      return false;
     }
   } else {
     assert(isa<BlockArgument>(v) && "value is not an operation or block ");
     auto bbArg = cast<BlockArgument>(v);
     Operation *bbAargOwner = bbArg.getOwner()->getParentOp();
     if (auto forOp = dyn_cast<scf::ForOp>(bbAargOwner)) {
+      partitionScheme.ops.insert(forOp);
+      partitionScheme.opPartitionDims[forOp] = currentDim;
+      auto yieldOp = forOp.getBody()->getTerminator();
+      partitionScheme.ops.insert(yieldOp);
+      partitionScheme.opPartitionDims[yieldOp] = currentDim;
+
       // track initial value
       auto initArg = forOp.getInitArgs()[bbArg.getArgNumber() - 1];
       if (!getBackwardSliceToPartition(initArg, partitionScheme, currentDim)) {
@@ -565,6 +663,7 @@ static bool getForwardSliceToPartition(Value v,
       for (OpOperand &operand : yieldOp->getOpOperands()) {
         if (operand.get() == v) {
           partitionScheme.ops.insert(parentOp);
+          partitionScheme.opPartitionDims[parentOp] = currentDim;
           if (!getForwardSliceToPartition(
                   parentOp->getResult(operand.getOperandNumber()),
                   partitionScheme, currentDim, seen))
@@ -616,7 +715,7 @@ static bool getSliceToPartition(Value root,
                                        currentDim))
         return false;
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
-               isa<StoreOp, AtomicRMWOp>(op)) {
+               isa<StoreOp, AtomicRMWOp>(op) || isGenericSliceableOp(op)) {
       for (OpOperand &operand : op->getOpOperands()) {
         if (!getBackwardSliceToPartition(operand.get(), partitionScheme,
                                          currentDim))
@@ -804,7 +903,7 @@ static void rewriteRematerializedOps(triton::FuncOp &funcOp,
         auto viewOp = builder.createWithAsyncTaskIds<MemDescSubsliceOp>(
             allocOp.getLoc(), slicedMemdescType, allocOp.getResult(), offsets);
         newOp = viewOp;
-      } else if (isa<arith::ConstantOp>(oldOp)) {
+      } else if (isa<arith::ConstantOp, ub::PoisonOp>(oldOp)) {
         newOp = builder.clone(*oldOp);
       } else {
         llvm_unreachable("Unexpected op");
@@ -925,25 +1024,11 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
                                      type.getShape().end()};
           int sliceSize = shape[dim] / numOfPartitions;
           shape[dim] = sliceSize;
-          // change encoding for ttng.tensor_memory_encoding to match gen5.
-          if (auto tmem = dyn_cast<nvidia_gpu::TensorMemoryEncodingAttr>(
-                  type.getEncoding())) {
-            Attribute accEncoding =
-                triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
-                    builder.getContext(), tmem.getBlockM(),
-                    dim == 1 ? tmem.getBlockN() / 2 : tmem.getBlockN(),
-                    tmem.getColStride(), tmem.getCTASplitM(),
-                    tmem.getCTASplitN(), tmem.getTwoCTAs());
-            auto newType = MemDescType::get(shape, type.getElementType(),
-                                            accEncoding, type.getMemorySpace(),
-                                            type.getMutableMemory());
-            newV.setType(newType);
-          } else {
-            auto newType = MemDescType::get(
-                shape, type.getElementType(), type.getEncoding(),
-                type.getMemorySpace(), type.getMutableMemory());
-            newV.setType(newType);
-          }
+          auto newType = getSlicedMemDescType(builder.getContext(), type,
+                                              shape, dim);
+          if (!newType)
+            llvm::report_fatal_error("unsupported sliced memdesc type");
+          newV.setType(*newType);
         } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
           SmallVector<int64_t> shape{type.getShape().begin(),
                                      type.getShape().end()};
@@ -976,7 +1061,9 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
   if ((dim == DataPartitionScheme::noOpPartitionDim) ||
       op->hasTrait<OpTrait::Elementwise>() ||
       isa<ConvertLayoutOp, BroadcastOp, SplatOp, ExpandDimsOp, FpToFpOp,
-          AtomicRMWOp, LocalAllocOp, SplitOp, JoinOp, ReshapeOp>(op)) {
+          AtomicRMWOp, LocalAllocOp, SplitOp, JoinOp, ReshapeOp,
+          ub::PoisonOp>(op) ||
+      isGenericSliceableOp(op)) {
     for (Value operand : op->getOperands())
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
     newOp = cloneAndSetResultType(op);
@@ -1054,19 +1141,21 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     auto retShapePerCTA = getShapePerCTA(oldSrcType);
     int numWarps = mlir::triton::gpu::lookupNumWarps(op);
     builder.setInsertionPoint(op);
-    // The source op is already sliced at this point, so srcTy, type, tmem is
+    // The source op is already sliced at this point, so dstTy, type, tmem is
     // sliced. We use getTmemCompatibleLayout to get a block layout that is
     // for the sliced tmem here.
-    auto compatibleLayouts =
-        nvidia_gpu::getTmemCompatibleLayouts(op, oldSrcType, type);
-    assert(!compatibleLayouts.empty() && "No TMEM-compatible layout found");
-    auto newDistributedEncoding = compatibleLayouts.front();
-    // oldRetType is the desired output, we slice it and convert from the
-    // compatible layout to the sliced desired output.
     SmallVector<int64_t> shape{oldSrcType.getShape().begin(),
                                oldSrcType.getShape().end()};
     int sliceSize = shape[dim] / numOfPartitions;
     shape[dim] = sliceSize;
+    auto slicedSrcType = RankedTensorType::get(
+        shape, oldSrcType.getElementType(), oldSrcType.getEncoding());
+    auto compatibleLayouts =
+        nvidia_gpu::getTmemCompatibleLayouts(op, slicedSrcType, type);
+    assert(!compatibleLayouts.empty() && "No TMEM-compatible layout found");
+    auto newDistributedEncoding = compatibleLayouts.front();
+    // oldSrcType is the desired input, we slice it and convert from the
+    // compatible layout to the sliced desired output.
     auto newSrcType = RankedTensorType::get(shape, oldSrcType.getElementType(),
                                             newDistributedEncoding);
     sliceOp(tmemStOp.getSrc(), offset, mappings, reverseMappings,
@@ -1108,17 +1197,16 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       shape[dim] = sliceSize;
       auto tmem =
           cast<nvidia_gpu::TensorMemoryEncodingAttr>(retType.getEncoding());
-      auto accEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
-          builder.getContext(), tmem.getBlockM(),
-          dim == 1 ? tmem.getBlockN() / 2 : tmem.getBlockN(),
-          tmem.getColStride(), tmem.getCTASplitM(), tmem.getCTASplitN(),
-          tmem.getTwoCTAs());
+      auto accEncoding = getSlicedTensorMemoryEncoding(
+          builder.getContext(), tmem, shape, dim);
+      if (!accEncoding)
+        llvm::report_fatal_error("unsupported sliced tensor memory encoding");
       auto newType = MemDescType::get(shape, retType.getElementType(),
-                                      accEncoding, retType.getMemorySpace(),
+                                      *accEncoding, retType.getMemorySpace(),
                                       retType.getMutableMemory());
 
       auto newDistributedEncoding =
-          nvidia_gpu::getDefaultLayoutForTmemLdSt(retType, numWarps, CGALayout);
+          nvidia_gpu::getDefaultLayoutForTmemLdSt(newType, numWarps, CGALayout);
       auto newAccType = RankedTensorType::get(
           srcTy.getShape(), srcTy.getElementType(), newDistributedEncoding);
       auto cvtOp = builder.createWithAsyncTaskIds<ConvertLayoutOp>(
@@ -1201,8 +1289,15 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       shape = getShape(storeOp.getSrc());
     }
     auto newCoordVal = coordVal;
+    Value oldCoordMapping;
+    bool hadCoordMapping = mappings.contains(coordVal);
+    if (hadCoordMapping)
+      oldCoordMapping = mappings.lookupOrNull(coordVal);
     if (offset) {
-      builder.setInsertionPointAfter(coordVal.getDefiningOp());
+      if (auto defOp = coordVal.getDefiningOp())
+        builder.setInsertionPointAfter(defOp);
+      else
+        builder.setInsertionPoint(op);
       Value offsetVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
           op->getLoc(), offset * shape[dim] / numOfPartitions, 32);
       newCoordVal = builder.createWithAsyncTaskIds<arith::AddIOp>(
@@ -1212,6 +1307,12 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     }
 
     newOp = cloneAndSetResultType(op);
+    if (offset) {
+      if (hadCoordMapping)
+        mappings.map(coordVal, oldCoordMapping);
+      else
+        mappings.erase(coordVal);
+    }
     if (isa<DescriptorLoadOp>(op)) {
       // map load result
       auto v = op->getResult(0);
@@ -1250,18 +1351,57 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     mappings.map(v, newV);
     reverseMappings.map(newV, v);
   } else if (isa<nvidia_gpu::WarpGroupDotOp, nvidia_gpu::TCGen5MMAOp>(op)) {
+    auto sliceMemDescBlockArg = [&](Value operand, unsigned operandDim) {
+      if (mappings.lookupOrNull(operand))
+        return true;
+      auto bbArg = dyn_cast<BlockArgument>(operand);
+      if (!bbArg || !isa<triton::FuncOp>(bbArg.getOwner()->getParentOp()))
+        return false;
+      auto type = dyn_cast<MemDescType>(operand.getType());
+      if (!type)
+        return false;
+      if (isa<nvidia_gpu::TensorMemorySpaceAttr>(type.getMemorySpace()))
+        return false;
+      // A dot input may be an already-populated SMEM memdesc function argument.
+      // There is no producer op for data partitioning to clone, so create a
+      // per-partition SMEM view. Do not use this path for TMEM: accumulator
+      // storage is partitioned through ttng.tmem_alloc/tmem_store handling so
+      // TMEM ownership remains explicit for later hoisting and memory planning.
+      SmallVector<int64_t> shape(type.getShape());
+      if (operandDim >= shape.size() ||
+          shape[operandDim] % numOfPartitions != 0)
+        llvm::report_fatal_error("unsupported sliced memdesc block argument");
+      int64_t sliceSize = shape[operandDim] / numOfPartitions;
+      shape[operandDim] = sliceSize;
+      auto newType =
+          getSlicedMemDescType(builder.getContext(), type, shape, operandDim);
+      if (!newType)
+        llvm::report_fatal_error("unsupported sliced memdesc block argument");
+      SmallVector<int32_t> offsets(shape.size(), 0);
+      offsets[operandDim] = offset * sliceSize;
+      builder.setInsertionPoint(op);
+      auto viewOp = builder.createWithAsyncTaskIds<MemDescSubsliceOp>(
+          op->getLoc(), *newType, operand, offsets);
+      mappings.map(operand, viewOp.getResult());
+      reverseMappings.map(viewOp.getResult(), operand);
+      return true;
+    };
+
     assert(partitionScheme.dotPartitionOperand.contains(op) &&
            "no operand info");
     unsigned opndIndx = partitionScheme.dotPartitionOperand[op];
     LDBG("slicing operand " << opndIndx << "\n");
-    sliceOp(op->getOperand(opndIndx), offset, mappings, reverseMappings,
-            partitionScheme);
+    if (!sliceMemDescBlockArg(op->getOperand(opndIndx), dim))
+      sliceOp(op->getOperand(opndIndx), offset, mappings, reverseMappings,
+              partitionScheme);
     if (dim == 0 && opndIndx == 1 || dim == 1 && opndIndx == 0) {
       // slice the other operand
       unsigned otherOpndIndx = 1 - opndIndx;
       LDBG("slicing operand " << otherOpndIndx << "\n");
-      sliceOp(op->getOperand(otherOpndIndx), offset, mappings, reverseMappings,
-              partitionScheme);
+      unsigned otherDim = 1 - dim;
+      if (!sliceMemDescBlockArg(op->getOperand(otherOpndIndx), otherDim))
+        sliceOp(op->getOperand(otherOpndIndx), offset, mappings, reverseMappings,
+                partitionScheme);
     }
     // Handle accumulator
     Value accumulator;
@@ -1394,8 +1534,11 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
           }
         }
         assert(newOperandIndex >= 0 && "newV not found in newYieldOp");
+        auto oldResult = ifOp.getResult(operandIndex);
         auto newResult = newIfOp.getResult(operandIndex);
         auto newSlicedResult = newIfOp.getResult(newOperandIndex);
+        if (!mappings.contains(oldResult))
+          mappings.map(oldResult, newSlicedResult);
         mappings.map(newResult, newSlicedResult);
         reverseMappings.map(newSlicedResult, newResult);
       }
@@ -1435,6 +1578,11 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     // recursively set async task ids for child ops
     newOp->walk(
         [&](Operation *childOp) { setAsyncTaskIds(childOp, sliceTaskIds); });
+  } else if (op->getNumResults() == 0 &&
+             !op->hasTrait<OpTrait::IsTerminator>()) {
+    for (Value operand : op->getOperands())
+      sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
+    newOp = cloneAndSetResultType(op);
   } else {
     llvm_unreachable("unsupported op type");
   }
