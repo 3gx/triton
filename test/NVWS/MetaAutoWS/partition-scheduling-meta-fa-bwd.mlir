@@ -13,18 +13,17 @@
 
 // CHECK-LABEL: @_attn_bwd_persist
 //
-// --- Pre-loop: address computation -> reduction partition ---
-// (scalar ops may be unscheduled since they can be rematerialized)
-// CHECK: arith.divsi {{.*}}ttg.partition = array<i32: [[RED:[0-9]+]]>
-// CHECK: arith.remsi {{.*}}ttg.partition = array<i32: [[RED]]>
-// CHECK: arith.muli {{.*}}ttg.partition = array<i32: [[RED]]>
-// CHECK: arith.divsi {{.*}}ttg.partition = array<i32: [[RED]]>
-// CHECK: arith.muli {{.*}}ttg.partition = array<i32: [[RED]]>
-// CHECK: arith.addi {{.*}}ttg.partition = array<i32: [[RED]]>
-// CHECK: arith.extsi {{.*}}ttg.partition = array<i32: [[RED]]>
-// CHECK: arith.divsi {{.*}}ttg.partition = array<i32: [[RED]]>
+// --- Scalar address glue spans all consumer partitions that need it ---
+// CHECK: arith.remsi {{.*}}ttg.partition = array<i32: [[RED:[0-9]+]], [[GEMM:[0-9]+]], [[LOAD:[0-9]+]], [[COMP:[0-9]+]]>
+// CHECK: arith.divsi {{.*}}ttg.partition = array<i32: [[RED]], [[LOAD]], [[COMP]]>
+// CHECK: arith.muli {{.*}}ttg.partition = array<i32: [[RED]], [[COMP]]>
+// CHECK: arith.extsi {{.*}}ttg.partition = array<i32: [[RED]], [[COMP]]>
+// CHECK: arith.remsi {{.*}}ttg.partition = array<i32: [[RED]], [[LOAD]], [[COMP]]>
+// CHECK: arith.muli {{.*}}ttg.partition = array<i32: [[RED]], [[LOAD]], [[COMP]]>
+// CHECK: arith.divsi {{.*}}ttg.partition = array<i32: [[RED]], [[LOAD]], [[COMP]]>
+// CHECK: arith.trunci {{.*}}ttg.partition = array<i32: [[LOAD]], [[COMP]]>
 // --- Pre-loop: K, V descriptor_load -> load partition ---
-// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD:[0-9]+]]>
+// CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
 // CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
 // CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
 // CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
@@ -34,15 +33,15 @@
 // CHECK: ttng.tmem_alloc {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[RED]]>
-// --- In-loop: address computation → reduction partition ---
-// CHECK: arith.extsi {{.*}}ttg.partition = array<i32: [[RED]]>
-// CHECK: arith.addi {{.*}}ttg.partition = array<i32: [[RED]]>
-// CHECK: arith.trunci {{.*}}ttg.partition = array<i32: [[RED]]>
+// --- In-loop: scalar address computation spans its consumers ---
+// CHECK: arith.extsi {{.*}}ttg.partition = array<i32: [[RED]], [[LOAD]]>
+// CHECK: arith.addi {{.*}}ttg.partition = array<i32: [[RED]], [[LOAD]]>
+// CHECK: arith.trunci {{.*}}ttg.partition = array<i32: [[RED]], [[LOAD]]>
 // --- In-loop: Q descriptor_load, local_alloc → load partition ---
 // CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
 // CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
 // --- In-loop: Q memdesc_trans → gemm partition ---
-// CHECK: ttg.memdesc_trans {{.*}}ttg.partition = array<i32: [[GEMM:[0-9]+]]>
+// CHECK: ttg.memdesc_trans {{.*}}ttg.partition = array<i32: [[GEMM]]>
 // --- In-loop: QK MMA → gemm partition ---
 // CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
 // --- In-loop: QK tmem_load, softmax → computation partition ---

@@ -1,6 +1,7 @@
 // RUN: triton-opt %s -split-input-file --nvws-ws-data-partition=num-warp-groups=3 | FileCheck %s
 // RUN: triton-opt %s -split-input-file --nvws-ws-data-partition=num-warp-groups=3 --tritongpu-partition-scheduling -allow-unregistered-dialect | FileCheck %s --check-prefix=GENERIC
 // RUN: triton-opt %s -split-input-file --nvws-ws-data-partition=num-warp-groups=3 --nvws-partition-scheduling-meta="merge-epilogue separate-epilogue-store" --nvws-hoist-tmem-store --nvws-memory-planner=num-buffers=3 -allow-unregistered-dialect | FileCheck %s --check-prefix=PIPE
+// RUN: triton-opt %s -split-input-file --nvws-ws-data-partition=num-warp-groups=3 --nvws-partition-scheduling-meta="merge-epilogue separate-epilogue-store" --nvws-hoist-tmem-store --nvws-memory-planner=num-buffers=3 --nvws-insert-semaphore -allow-unregistered-dialect | FileCheck %s --check-prefix=SEMA
 
 
 // -----
@@ -21,6 +22,7 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
   // CHECK-LABEL: @_helion_attention_kernel
   // GENERIC-LABEL: @_helion_attention_kernel
   // PIPE-LABEL: @_helion_attention_kernel
+  // SEMA-LABEL: @_helion_attention_kernel
   tt.func public @_helion_attention_kernel(%q: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %k: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %v: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %lse: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %o: !tt.ptr<bf16> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %false = arith.constant false
     %true = arith.constant true
@@ -66,6 +68,7 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
         // CHECK-COUNT-2: ttng.tc_gen5_mma
         // GENERIC: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: 2>
         // PIPE: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: 1>
+        // SEMA: nvws.semaphore.create
         %qk_20 = ttng.tc_gen5_mma %q_i_load_5, %permute_19, %qk[%qk_16], %false, %true : !ttg.memdesc<256x128xbf16, #shared2, #smem>, !ttg.memdesc<128x128xbf16, #shared3, #smem>, !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
         %qk_21, %qk_22 = ttng.tmem_load %qk[%qk_20] : !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<256x128xf32, #blocked>
         %amax = "tt.reduce"(%qk_21) <{axis = 1 : i32}> ({

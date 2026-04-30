@@ -18,6 +18,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 
 namespace mlir {
@@ -658,7 +659,11 @@ public:
       }
 
       // handle non-tmem ops in the loop, including uses of desc_load results.
+      DenseSet<Operation *> preExistingOps;
+      loop.walk([&](Operation *op) { preExistingOps.insert(op); });
       loop.walk([&](Operation *op) {
+        if (!preExistingOps.contains(op))
+          return WalkResult::advance();
         if (op == loop || isa<MMAv5OpInterface, TMEMAllocOp, TMEMStoreOp>(op)) {
           return WalkResult::advance();
         }

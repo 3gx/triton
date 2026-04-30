@@ -2408,11 +2408,66 @@ static SetVector<int> getChildPartitionUnion(Operation *op) {
 
 static SetVector<int> getConsumerPartitionUnion(Value value) {
   SetVector<int> result;
-  for (Operation *user : value.getUsers()) {
-    if (hasPartition(user))
-      insertAll(result, getPartitionIds(user));
-  }
+  DenseSet<Value> visited;
+
+  std::function<void(Value)> collect = [&](Value value) {
+    if (!visited.insert(value).second)
+      return;
+
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
+      if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
+        Operation *parent = yieldOp->getParentOp();
+        unsigned idx = use.getOperandNumber();
+        if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
+          if (idx < forOp.getNumRegionIterArgs())
+            collect(forOp.getRegionIterArg(idx));
+          if (idx < forOp.getNumResults())
+            collect(forOp.getResult(idx));
+          continue;
+        }
+        if (auto ifOp = dyn_cast<scf::IfOp>(parent)) {
+          if (idx < ifOp.getNumResults())
+            collect(ifOp.getResult(idx));
+          continue;
+        }
+      }
+
+      if (auto forOp = dyn_cast<scf::ForOp>(user)) {
+        int idx = use.getOperandNumber() - forOp.getNumControlOperands();
+        if (idx >= 0) {
+          if (static_cast<unsigned>(idx) < forOp.getNumRegionIterArgs())
+            collect(forOp.getRegionIterArg(idx));
+          if (static_cast<unsigned>(idx) < forOp.getNumResults())
+            collect(forOp.getResult(idx));
+          continue;
+        }
+      }
+
+      if (auto reduceReturn = dyn_cast<ReduceReturnOp>(user)) {
+        if (auto reduceOp = dyn_cast<ReduceOp>(reduceReturn->getParentOp())) {
+          unsigned idx = use.getOperandNumber();
+          if (idx < reduceOp->getNumResults())
+            collect(reduceOp->getResult(idx));
+        }
+        continue;
+      }
+
+      if (hasPartition(user))
+        insertAll(result, getPartitionIds(user));
+    }
+  };
+
+  collect(value);
   return result;
+}
+
+static bool isScalarPartitionGlueOp(Operation *op) {
+  if (op->getNumResults() == 0)
+    return false;
+  return llvm::all_of(op->getResults(), [](Value value) {
+    return isa<FloatType, IntegerType, IndexType>(value.getType());
+  });
 }
 
 static SetVector<int> getOperandDefPartitionUnion(Operation *op) {
@@ -2456,7 +2511,50 @@ static void collectYieldedValues(Operation *op, unsigned resultIdx,
   }
 }
 
+static void insertPartitionForUser(SetVector<int> &result, Operation *user,
+                                   Block *scope = nullptr) {
+  if (hasPartition(user)) {
+    insertAll(result, getPartitionIds(user));
+    return;
+  }
+  if (!scope)
+    return;
+  if (Operation *ancestor = scope->findAncestorOpInBlock(*user)) {
+    if (hasPartition(ancestor))
+      insertAll(result, getPartitionIds(ancestor));
+  }
+}
+
+static SetVector<int> inferAsyncTokenResultPartition(Operation *op,
+                                                     unsigned resultIdx) {
+  SetVector<int> result;
+  if (resultIdx >= op->getNumResults() ||
+      !isa<AsyncTokenType>(op->getResult(resultIdx).getType()))
+    return result;
+
+  if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+    if (resultIdx >= forOp.getNumRegionIterArgs())
+      return result;
+    BlockArgument arg = forOp.getRegionIterArg(resultIdx);
+    for (OpOperand &use : arg.getUses())
+      insertPartitionForUser(result, use.getOwner(), forOp.getBody());
+    return result;
+  }
+
+  SmallVector<Value> yieldedValues;
+  collectYieldedValues(op, resultIdx, yieldedValues);
+  for (Value value : yieldedValues) {
+    if (Operation *def = value.getDefiningOp())
+      insertPartitionForUser(result, def);
+  }
+  return result;
+}
+
 static SetVector<int> inferResultPartition(Operation *op, unsigned resultIdx) {
+  SetVector<int> tokenResult = inferAsyncTokenResultPartition(op, resultIdx);
+  if (!tokenResult.empty())
+    return tokenResult;
+
   SetVector<int> result;
   if (resultIdx < op->getNumResults())
     insertAll(result, getConsumerPartitionUnion(op->getResult(resultIdx)));
@@ -2488,6 +2586,14 @@ static SetVector<int> inferOpPartition(Operation *op) {
         insertAll(result, getPartitionIds(parent));
     }
   }
+  return result;
+}
+
+static SetVector<int> inferScalarPartition(Operation *op) {
+  SetVector<int> result;
+  if (hasPartition(op))
+    insertAll(result, getPartitionIds(op));
+  insertAll(result, inferOpPartition(op));
   return result;
 }
 
@@ -2531,7 +2637,9 @@ static void finalizePartitionAnnotations(scf::ForOp loop) {
       if (isa<ub::PoisonOp>(op))
         return;
 
-      if (!hasPartition(op))
+      if (isScalarPartitionGlueOp(op))
+        changed |= setPartitionIfChanged(op, inferScalarPartition(op));
+      else if (!hasPartition(op))
         changed |= setPartitionIfChanged(op, inferOpPartition(op));
 
       if (op->getNumRegions() != 0) {

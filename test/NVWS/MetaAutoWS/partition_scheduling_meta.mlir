@@ -27,13 +27,16 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // --- In-loop: tmem_load and addf → computation partition ---
 // CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[COMP:[0-9]+]]>
 // CHECK: arith.addf {{.*}}ttg.partition = array<i32: [[COMP]]>
+// CHECK: arith.addi {{.*}}ttg.partition = array<i32: [[LOAD]], [[COMP]]>
+// CHECK: "consume_scalar"{{.*}}ttg.partition = array<i32: [[COMP]]>
+// CHECK: arith.addi {{.*}}ttg.partition = array<i32: [[GEMM]], [[LOAD]]>
 // --- Terminator: finalizer annotates yields too ---
 // CHECK: scf.yield {{.*}}ttg.partition = array<i32: 0, 1, 2>
 //
 // --- Partition types ---
 // CHECK: tt.warp_specialize
 // CHECK-SAME: ttg.partition = array<i32: 0, 1, 2>
-// CHECK-SAME: ttg.partition.outputs = [array<i32: [[COMP]]>]
+// CHECK-SAME: ttg.partition.outputs = [array<i32: [[COMP]]>, array<i32: [[GEMM]], [[LOAD]]>]
 // CHECK-SAME: ttg.partition.types = ["gemm", "load", "computation"]
 // CHECK-SAME: ttg.warp_specialize.tag = 0 : i32
 tt.func public @simple_gemm_partition_types(
@@ -47,9 +50,9 @@ tt.func public @simple_gemm_partition_types(
   %c64_i32 = arith.constant 64 : i32
   %zero = arith.constant dense<0.0> : tensor<128x64xf32, #blocked>
 
-  %loop_out = scf.for %i = %c0_i32 to %n_tiles step %c64_i32 iter_args(
-    %acc = %zero
-  ) -> (tensor<128x64xf32, #blocked>) : i32 {
+  %loop_out:2 = scf.for %i = %c0_i32 to %n_tiles step %c64_i32 iter_args(
+    %acc = %zero, %carry = %c0_i32
+  ) -> (tensor<128x64xf32, #blocked>, i32) : i32 {
     // Load B
     %B = tt.descriptor_load %B_desc[%i, %c0_i32] : !tt.tensordesc<tensor<64x64xf16, #shared>> -> tensor<64x64xf16, #load_blocked>
     %B_shared = ttg.local_alloc %B : (tensor<64x64xf16, #load_blocked>) -> !ttg.memdesc<64x64xf16, #shared, #smem>
@@ -61,11 +64,16 @@ tt.func public @simple_gemm_partition_types(
 
     %result, %result_tok = ttng.tmem_load %C_tmem[%mma_tok] : !ttg.memdesc<128x64xf32, #tmem_acc, #ttng.tensor_memory, mutable> -> tensor<128x64xf32, #blocked>
     %new_acc = arith.addf %acc, %result : tensor<128x64xf32, #blocked>
+    %scalar_seed = arith.addi %i, %c64_i32 {ttg.partition = array<i32: 1>} : i32
+    %scalar_user = arith.addi %scalar_seed, %c64_i32 : i32
+    "consume_scalar"(%scalar_user) {ttg.partition = array<i32: 2>} : (i32) -> ()
+    %yield_scalar = arith.addi %carry, %c64_i32 {ttg.partition = array<i32: 1>} : i32
 
-    scf.yield %new_acc : tensor<128x64xf32, #blocked>
+    scf.yield %new_acc, %yield_scalar : tensor<128x64xf32, #blocked>, i32
   } {tt.warp_specialize}
 
-  "use"(%loop_out) : (tensor<128x64xf32, #blocked>) -> ()
+  "use"(%loop_out#0) : (tensor<128x64xf32, #blocked>) -> ()
+  "use_scalar"(%loop_out#1) {ttg.partition = array<i32: 0>} : (i32) -> ()
   tt.return
 }
 
