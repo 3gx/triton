@@ -2651,23 +2651,41 @@ static SetVector<int> inferAsyncTokenResultPartition(Operation *op,
   return result;
 }
 
+static void insertYieldedProducerPartitions(SetVector<int> &result,
+                                            Value value) {
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return;
+
+  if (def->getNumRegions() != 0 && def->hasAttr(kPartitionOutputsAttrName)) {
+    auto it = llvm::find(def->getResults(), value);
+    if (it != def->result_end()) {
+      unsigned pos = std::distance(def->result_begin(), it);
+      auto outputs = getPartitionOutputs(def);
+      if (pos < outputs.size()) {
+        insertAll(result, outputs[pos]);
+        return;
+      }
+    }
+  }
+
+  if (hasPartition(def))
+    insertAll(result, getPartitionIds(def));
+}
+
 static SetVector<int> inferResultPartition(Operation *op, unsigned resultIdx) {
   SetVector<int> tokenResult = inferAsyncTokenResultPartition(op, resultIdx);
   if (!tokenResult.empty())
     return tokenResult;
 
   SetVector<int> result;
-  if (resultIdx < op->getNumResults())
-    insertAll(result, getConsumerPartitionUnion(op->getResult(resultIdx)));
-
   SmallVector<Value> yieldedValues;
   collectYieldedValues(op, resultIdx, yieldedValues);
-  for (Value value : yieldedValues) {
-    if (Operation *def = value.getDefiningOp()) {
-      if (hasPartition(def))
-        insertAll(result, getPartitionIds(def));
-    }
-  }
+  for (Value value : yieldedValues)
+    insertYieldedProducerPartitions(result, value);
+
+  if (result.empty() && resultIdx < op->getNumResults())
+    insertAll(result, getConsumerPartitionUnion(op->getResult(resultIdx)));
 
   if (result.empty() && hasPartition(op))
     insertAll(result, getPartitionIds(op));
