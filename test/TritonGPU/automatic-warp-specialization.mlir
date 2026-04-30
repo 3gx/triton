@@ -134,8 +134,21 @@ tt.func @matmul_tma_and_regular_load(
   // CHECK-LABEL: partition0
   // OPT-LABEL: partition0
   // OPT-SAME: num_warps(4)
-  // PIPELINE-COUNT-3: async_copy_global_to_local
-  // PIPELINE-NOT: async_copy_global_to_local
+
+  // PIPELINE: [[BUFFERS:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x64x128xf16,
+  // PIPELINE: [[BUF0:%.*]] = ttg.memdesc_index [[BUFFERS]][%c0_i32
+  // PIPELINE: async_copy_global_to_local %{{[0-9]+}}, [[BUF0]]
+  // PIPELINE: async_commit_group
+  // PIPELINE: async_wait {{.*}} {num = 0 : i32}
+  // PIPELINE: [[BUF0:%.*]] = ttg.memdesc_index [[BUFFERS]][%c0_i32
+  // PIPELINE: tc_gen5_mma %{{[0-9]+}}, [[BUF0]]
+  // PIPELINE: [[BUF1:%.*]] = ttg.memdesc_index [[BUFFERS]][%c1_i32
+  // PIPELINE: async_copy_global_to_local %{{[0-9]+}}, [[BUF1]]
+  // PIPELINE: async_commit_group
+  // PIPELINE: scf.for
+  // PIPELINE:   tc_gen5_mma
+  // PIPELINE:   async_copy_global_to_local
+
   // CHECK-LABEL: partition1
   // OPT-LABEL: partition1
   // OPT-SAME: num_warps(4)
@@ -325,9 +338,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %c_ptr = tt.addptr %group_c_ptrs, %g : !tt.ptr<i64>, i32
       %c_ptr_10 = tt.load %c_ptr : !tt.ptr<i64>
       %c_ptr_11 = tt.int_to_ptr %c_ptr_10 : i64 -> !tt.ptr<f16>
-      %a_desc_12 = tt.make_tensor_descriptor %a_ptr_7, [%gm, %gk], [%stride, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x64xf16, #shared>>
-      %b_desc_13 = tt.make_tensor_descriptor %b_ptr_9, [%gn, %gk], [%stride, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x64xf16, #shared>>
-      %c_desc_14 = tt.make_tensor_descriptor %c_ptr_11, [%gm, %gn], [%stride, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x128xf16, #shared>>
+      %a_desc_12 = tt.make_tensor_descriptor %a_ptr_7, [%gm, %gk], [%stride, %c1_i64] : <f16>, <tensor<128x64xf16, #shared>>
+      %b_desc_13 = tt.make_tensor_descriptor %b_ptr_9, [%gn, %gk], [%stride, %c1_i64] : <f16>, <tensor<128x64xf16, #shared>>
+      %c_desc_14 = tt.make_tensor_descriptor %c_ptr_11, [%gm, %gn], [%stride, %c1_i64] : <f16>, <tensor<128x128xf16, #shared>>
       scf.for %tile_idx = %start_pid to %num_tiles step %c4_i32  : i32 {
         %tile_m_idx = arith.divsi %tile_idx, %num_n_tiles_1 : i32
         %tile_n_idx = arith.remsi %tile_idx, %num_n_tiles_1 : i32
