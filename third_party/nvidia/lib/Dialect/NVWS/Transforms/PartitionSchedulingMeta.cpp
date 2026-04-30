@@ -2454,7 +2454,7 @@ static SetVector<int> getConsumerPartitionUnion(Value value) {
       }
 
       if (hasPartition(user))
-        insertAll(result, getPartitionIds(user));
+        insertAll(result, getPartitionIds(&use));
     }
   };
 
@@ -2462,11 +2462,15 @@ static SetVector<int> getConsumerPartitionUnion(Value value) {
   return result;
 }
 
-static bool isScalarPartitionGlueOp(Operation *op) {
+static bool isScalarOrAddressGlueType(Type type) {
+  return type.isIntOrIndexOrFloat() || isa<PointerType>(type);
+}
+
+static bool isScalarOrAddressPartitionGlueOp(Operation *op) {
   if (op->getNumResults() == 0)
     return false;
   return llvm::all_of(op->getResults(), [](Value value) {
-    return isa<FloatType, IntegerType, IndexType>(value.getType());
+    return isScalarOrAddressGlueType(value.getType());
   });
 }
 
@@ -2637,7 +2641,7 @@ static void finalizePartitionAnnotations(scf::ForOp loop) {
       if (isa<ub::PoisonOp>(op))
         return;
 
-      if (isScalarPartitionGlueOp(op))
+      if (isScalarOrAddressPartitionGlueOp(op))
         changed |= setPartitionIfChanged(op, inferScalarPartition(op));
       else if (!hasPartition(op))
         changed |= setPartitionIfChanged(op, inferOpPartition(op));
@@ -2854,6 +2858,27 @@ static LogicalResult verifyFinalizedPartitionAnnotations(FuncOp funcOp,
   if (badOutputs)
     return badOutputs->emitError("missing ttg.partition.outputs after NVWS "
                                  "partition-scheduling-meta finalizer");
+
+  Operation *badGlueUse = nullptr;
+  loop.walk([&](Operation *op) {
+    if (!isScalarOrAddressPartitionGlueOp(op) || !hasPartition(op))
+      return WalkResult::advance();
+    SetVector<int> producerIds = getPartitionIds(op);
+    for (Value result : op->getResults()) {
+      SetVector<int> consumerIds = getConsumerPartitionUnion(result);
+      for (int id : consumerIds) {
+        if (!producerIds.contains(id)) {
+          badGlueUse = op;
+          return WalkResult::interrupt();
+        }
+      }
+    }
+    return WalkResult::advance();
+  });
+  if (badGlueUse)
+    return badGlueUse->emitError(
+        "scalar/address glue op partition does not cover all partitioned "
+        "consumers after NVWS partition-scheduling-meta finalizer");
 
   Operation *badTag = nullptr;
   funcOp.walk([&](Operation *op) {
