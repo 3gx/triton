@@ -102,6 +102,22 @@ struct SemaphorePair {
   Value alloc; // underlying buffer allocation
 };
 
+template <typename OpT> OpT setTagIfPresent(OpT op, std::optional<int> wsTag) {
+  if (wsTag)
+    setWarpSpecializeTag(op, *wsTag);
+  return op;
+}
+
+template <typename OpT, typename... Args>
+OpT createInto(OpBuilder &builder, Location loc,
+               std::optional<SetVector<int>> partitionSet,
+               StageCluster stageCluster, std::optional<int> wsTag,
+               Args &&...args) {
+  auto op = triton::gpu::createInto<OpT>(
+      builder, loc, partitionSet, stageCluster, std::forward<Args>(args)...);
+  return setTagIfPresent(op, wsTag);
+}
+
 SemaphorePair createSemaphores(OpBuilder &builder,
                                ProducedValueInfo &producedValue) {
   auto result = producedValue.result;
@@ -109,8 +125,9 @@ SemaphorePair createSemaphores(OpBuilder &builder,
   auto getSmemDescType = [](RankedTensorType tensorType, Value tensorResult) {
     Attribute SharedMemorySpace =
         SharedMemorySpaceAttr::get(tensorType.getContext());
-    Attribute encoding = tensorResult && tensorResult.getDefiningOp()
-                             ? getSharedEncoding(tensorResult.getDefiningOp())
+    Operation *defOp = tensorResult ? tensorResult.getDefiningOp() : nullptr;
+    Attribute encoding = defOp && !isa<scf::ForOp>(defOp)
+                             ? getSharedEncoding(defOp)
                              : getSharedEncoding(tensorType);
     return MemDescType::get(tensorType.getShape(), tensorType.getElementType(),
                             encoding, SharedMemorySpace);
@@ -212,7 +229,8 @@ StageCluster getStageClusterForProducer(Value producedValue) {
 
 SmallVector<Operation *>
 createSemaphoreProducer(OpBuilder &builder, SemaphorePair &sema,
-                        ProducedValueInfo producedValue) {
+                        ProducedValueInfo producedValue,
+                        std::optional<int> wsTag = std::nullopt) {
   auto loc = producedValue.result.getLoc();
   auto allocBufType = cast<MemDescType>(sema.alloc.getType());
   Value result = producedValue.result;
@@ -224,14 +242,14 @@ createSemaphoreProducer(OpBuilder &builder, SemaphorePair &sema,
   producerPartitions.insert(producedValue.partitions.front());
 
   // Acquire empty semaphore
-  auto acquire = triton::gpu::createInto<SemaphoreAcquireOp>(
-      builder, loc, producerPartitions, stageCluster, sema.empty,
+  auto acquire = createInto<SemaphoreAcquireOp>(
+      builder, loc, producerPartitions, stageCluster, wsTag, sema.empty,
       builder.getType<AsyncTokenType>());
   Value token = acquire.getToken();
 
   // Get buffer view
-  auto bufOp = triton::gpu::createInto<SemaphoreBufferOp>(
-      builder, loc, producerPartitions, stageCluster, sema.empty,
+  auto bufOp = createInto<SemaphoreBufferOp>(
+      builder, loc, producerPartitions, stageCluster, wsTag, sema.empty,
       TypeRange{dataBufType}, token);
   Value dataBuf = bufOp.getBuffers()[0];
 
@@ -247,9 +265,8 @@ createSemaphoreProducer(OpBuilder &builder, SemaphorePair &sema,
   } else if (isGlobalLoadAndAlloc<LocalAllocOp>(result)) {
     llvm_unreachable("cpasync not supported yet");
   } else if (auto alloc = result.getDefiningOp<LocalAllocOp>()) {
-    triton::gpu::createInto<LocalStoreOp>(builder, loc, producerPartitions,
-                                          stageCluster, alloc.getSrc(),
-                                          dataBuf);
+    createInto<LocalStoreOp>(builder, loc, producerPartitions, stageCluster,
+                             wsTag, alloc.getSrc(), dataBuf);
     staleOps.push_back(alloc);
   } else if (auto tensorType = dyn_cast<RankedTensorType>(result.getType())) {
     if (auto descOp = result.getDefiningOp<triton::DescriptorOpInterface>()) {
@@ -260,16 +277,17 @@ createSemaphoreProducer(OpBuilder &builder, SemaphorePair &sema,
     } else if (auto loadOp = result.getDefiningOp<triton::LoadOp>()) {
       llvm_unreachable("cpasync not supported yet");
     } else {
-      triton::gpu::createInto<LocalStoreOp>(builder, loc, producerPartitions,
-                                            stageCluster, result, dataBuf);
+      createInto<LocalStoreOp>(builder, loc, producerPartitions, stageCluster,
+                               wsTag, result, dataBuf);
       producerKind = AsyncOp::NONE;
     }
   } else if (isa<FloatType, IntegerType>(result.getType())) {
     auto tensorType = getTensorTypeFromScalar(builder, result);
-    auto splatOp = triton::gpu::createInto<triton::SplatOp>(
-        builder, loc, producerPartitions, stageCluster, tensorType, result);
-    triton::gpu::createInto<LocalStoreOp>(builder, loc, producerPartitions,
-                                          stageCluster, splatOp, dataBuf);
+    auto splatOp = createInto<triton::SplatOp>(
+        builder, loc, producerPartitions, stageCluster, wsTag, tensorType,
+        result);
+    createInto<LocalStoreOp>(builder, loc, producerPartitions, stageCluster,
+                             wsTag, splatOp, dataBuf);
     producerKind = AsyncOp::NONE;
   } else {
     std::string msg =
@@ -279,8 +297,8 @@ createSemaphoreProducer(OpBuilder &builder, SemaphorePair &sema,
   }
 
   // Cross-release: producer releases full semaphore
-  triton::gpu::createInto<SemaphoreReleaseOp>(
-      builder, loc, producerPartitions, stageCluster, sema.full, token,
+  createInto<SemaphoreReleaseOp>(
+      builder, loc, producerPartitions, stageCluster, wsTag, sema.full, token,
       builder.getArrayAttr(SmallVector<Attribute>{
           AsyncOpAttr::get(builder.getContext(), producerKind)}));
 
@@ -404,7 +422,8 @@ void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
                              SemaphorePair &sema,
                              const SetVector<Value> &results,
                              int consumerPartition,
-                             SmallVector<OpOperand *> &uses) {
+                             SmallVector<OpOperand *> &uses,
+                             std::optional<int> wsTag = std::nullopt) {
 
   // The vector "results" contains either
   // 1. One of local_load(desc_load()) or desc_load()
@@ -436,7 +455,8 @@ void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
   SetVector<Value> resultsInScheduledLoop;
   for (Value v : results) {
     if (Operation *defOp = v.getDefiningOp()) {
-      if (scheduledLoop && scheduledLoop->isAncestor(defOp))
+      if (scheduledLoop && defOp != scheduledLoop &&
+          scheduledLoop->isAncestor(defOp))
         resultsInScheduledLoop.insert(v);
     }
   }
@@ -451,14 +471,14 @@ void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
   Type bufferType = getBufferViewType(allocBufType, /*mutable*/ false);
 
   // Acquire full semaphore
-  auto acquire = triton::gpu::createInto<SemaphoreAcquireOp>(
-      builder, loc, consumerPartitions, stageClusterEnter, sema.full,
+  auto acquire = createInto<SemaphoreAcquireOp>(
+      builder, loc, consumerPartitions, stageClusterEnter, wsTag, sema.full,
       builder.getType<AsyncTokenType>());
   Value token = acquire.getToken();
 
   // Get buffer view
-  auto bufOp = triton::gpu::createInto<SemaphoreBufferOp>(
-      builder, loc, consumerPartitions, stageClusterEnter, sema.full,
+  auto bufOp = createInto<SemaphoreBufferOp>(
+      builder, loc, consumerPartitions, stageClusterEnter, wsTag, sema.full,
       TypeRange{bufferType}, token);
   Value dataBuf = bufOp.getBuffers()[0];
 
@@ -478,8 +498,8 @@ void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
   Operation *exitInsertPointAfter = nullptr;
 
   auto replaceUsesWithLocalLoad = [&](Value result, StageCluster stageCluster) {
-    auto localLoadOp = triton::gpu::createInto<LocalLoadOp>(
-        builder, loc, consumerPartitions, stageCluster, result.getType(),
+    auto localLoadOp = createInto<LocalLoadOp>(
+        builder, loc, consumerPartitions, stageCluster, wsTag, result.getType(),
         dataBuf);
 
     for (auto use : uses) {
@@ -506,11 +526,12 @@ void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
       replaceUsesWithLocalLoad(result, stageClusterEnter);
     } else if (isa<FloatType, IntegerType>(result.getType())) {
       auto tensorType = getTensorTypeFromScalar(builder, result);
-      auto localLoadOp = triton::gpu::createInto<LocalLoadOp>(
-          builder, loc, consumerPartitions, stageClusterEnter, tensorType,
+      auto localLoadOp = createInto<LocalLoadOp>(
+          builder, loc, consumerPartitions, stageClusterEnter, wsTag, tensorType,
           dataBuf);
-      auto scalar = triton::gpu::createInto<triton::UnsplatOp>(
-          builder, loc, consumerPartitions, stageClusterEnter, localLoadOp);
+      auto scalar = createInto<triton::UnsplatOp>(
+          builder, loc, consumerPartitions, stageClusterEnter, wsTag,
+          localLoadOp);
       for (auto use : uses) {
         use->set(scalar);
       }
@@ -531,8 +552,9 @@ void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
   builder.setInsertionPointAfter(exitInsertPointAfter);
 
   // Cross-release: consumer releases empty semaphore
-  triton::gpu::createInto<SemaphoreReleaseOp>(
-      builder, loc, consumerPartitions, stageClusterExit, sema.empty, token,
+  createInto<SemaphoreReleaseOp>(
+      builder, loc, consumerPartitions, stageClusterExit, wsTag, sema.empty,
+      token,
       builder.getArrayAttr(asyncKinds));
 }
 
@@ -544,6 +566,42 @@ Operation *getEarliestUserInBlock(Block *block, ArrayRef<OpOperand *> uses) {
         return lhsOwner->isBeforeInBlock(rhsOwner);
       });
   return block->findAncestorOpInBlock(*use->getOwner());
+}
+
+bool insertSemaphoresForUses(
+    OpBuilder &builder, scf::ForOp loop, Block *block,
+    ProducedValueInfo producedValue,
+    DenseMap<int, SetVector<Value>> &resultsPerPartition,
+    DenseMap<int, SmallVector<OpOperand *>> &usesPerPartition,
+    std::optional<int> wsTag = std::nullopt) {
+  if (resultsPerPartition.empty()) {
+    return false;
+  }
+
+  SemaphorePair sema;
+  {
+    OpBuilder::InsertionGuard g(builder);
+    auto wsLoop = getOuterWSLoop(loop);
+    builder.setInsertionPoint(wsLoop);
+    sema = createSemaphores(builder, producedValue);
+  }
+
+  auto staleOps = createSemaphoreProducer(builder, sema, producedValue, wsTag);
+
+  for (auto [consumerPartition, results] : resultsPerPartition) {
+    OpBuilder::InsertionGuard g(builder);
+    auto earliestUser =
+        getEarliestUserInBlock(block, usesPerPartition[consumerPartition]);
+    builder.setInsertionPoint(earliestUser);
+    createSemaphoreConsumer(builder, loop, sema, results, consumerPartition,
+                            usesPerPartition[consumerPartition], wsTag);
+  }
+
+  for (auto op : staleOps) {
+    op->erase();
+  }
+
+  return true;
 }
 
 bool insertSemaphores(OpBuilder &builder, scf::ForOp loop, Block *block,
@@ -577,34 +635,55 @@ bool insertSemaphores(OpBuilder &builder, scf::ForOp loop, Block *block,
     processResultUses(alloc.getSrc());
   }
 
-  if (resultsPerPartition.empty()) {
-    return false;
-  }
+  return insertSemaphoresForUses(builder, loop, block, producedValue,
+                                 resultsPerPartition, usesPerPartition);
+}
 
-  SemaphorePair sema;
-  {
+bool insertLoopResultSemaphores(OpBuilder &builder, scf::ForOp loop) {
+  auto wsTag = getWarpSpecializeTag(loop);
+  auto partitionOutputs = getPartitionOutputs(loop);
+  bool changed = false;
+
+  for (auto [idx, result] : llvm::enumerate(loop.getResults())) {
+    if (!isa<RankedTensorType>(result.getType()))
+      continue;
+    if (idx >= partitionOutputs.size())
+      continue;
+
+    ProducedValueInfo producedValue{partitionOutputs[idx], result};
+    DenseMap<int, SetVector<Value>> resultsPerPartition;
+    DenseMap<int, SmallVector<OpOperand *>> usesPerPartition;
+
+    for (auto &use : result.getUses()) {
+      Operation *user = use.getOwner();
+      if (!hasPartition(user))
+        continue;
+      if (wsTag) {
+        auto userTag = getWarpSpecializeTag(user);
+        if (!userTag || *userTag != *wsTag)
+          continue;
+      }
+      if (loop->getBlock() != user->getBlock() &&
+          !loop->getBlock()->findAncestorOpInBlock(*user))
+        continue;
+
+      auto userPartitions = getPartitionIds(&use);
+      for (auto id : producedValue.partitions)
+        userPartitions.remove(id);
+      for (auto id : userPartitions) {
+        resultsPerPartition[id].insert(result);
+        usesPerPartition[id].push_back(&use);
+      }
+    }
+
     OpBuilder::InsertionGuard g(builder);
-    auto wsLoop = getOuterWSLoop(loop);
-    builder.setInsertionPoint(wsLoop);
-    sema = createSemaphores(builder, producedValue);
+    builder.setInsertionPointAfter(loop);
+    changed |= insertSemaphoresForUses(builder, loop, loop->getBlock(),
+                                       producedValue, resultsPerPartition,
+                                       usesPerPartition, wsTag);
   }
 
-  auto staleOps = createSemaphoreProducer(builder, sema, producedValue);
-
-  for (auto [consumerPartition, results] : resultsPerPartition) {
-    OpBuilder::InsertionGuard g(builder);
-    auto earliestUser =
-        getEarliestUserInBlock(block, usesPerPartition[consumerPartition]);
-    builder.setInsertionPoint(earliestUser);
-    createSemaphoreConsumer(builder, loop, sema, results, consumerPartition,
-                            usesPerPartition[consumerPartition]);
-  }
-
-  for (auto op : staleOps) {
-    op->erase();
-  }
-
-  return true;
+  return changed;
 }
 
 } // namespace
@@ -675,6 +754,9 @@ public:
         }
         return WalkResult::advance();
       });
+
+      OpBuilder builder(loop);
+      insertLoopResultSemaphores(builder, loop);
     }
   }
 
