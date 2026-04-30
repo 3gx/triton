@@ -54,7 +54,7 @@ static void fixTaskId(triton::FuncOp &funcOp) {
         if (!defOp)
           continue;
         // Do not update loads.
-        if (isa<LoadOp, DescriptorLoadOp>(defOp))
+        if (isa<LoadOp, DescriptorLoadOp, DescriptorGatherOp>(defOp))
           continue;
         auto defTaskIds = getAsyncTaskIds(defOp);
         // Backward propagation: ensure def covers op's task IDs.
@@ -432,6 +432,34 @@ static bool getBackwardSliceToPartition(Value v,
           remappedSqueezedDim(inputShape, outputShape, currentDim, true);
       if (!getBackwardSliceToPartition(loadOp.getDesc(), partitionScheme,
                                        remappedDim)) {
+        return false;
+      }
+    } else if (auto gatherOp = dyn_cast<DescriptorGatherOp>(op)) {
+      // descriptor_gather rows are selected by x_offsets while the descriptor
+      // block itself has a single row. Row partitioning therefore slices the
+      // offset tensor and leaves the descriptor/y_offset unchanged.
+      if (currentDim != 0) {
+        LLVM_DEBUG({
+          LDBG("partition not possible: descriptor_gather only supports row "
+               "slicing");
+          op->dump();
+        });
+        return false;
+      }
+
+      if (auto bbArg = dyn_cast<BlockArgument>(gatherOp.getXOffsets())) {
+        if (isa<triton::FuncOp>(bbArg.getOwner()->getParentOp())) {
+          LLVM_DEBUG({
+            LDBG("partition not possible: descriptor_gather x_offsets function "
+                 "argument would require tensor function signature rewriting");
+            op->dump();
+          });
+          return false;
+        }
+      }
+
+      if (!getBackwardSliceToPartition(gatherOp.getXOffsets(),
+                                       partitionScheme, currentDim)) {
         return false;
       }
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
@@ -1274,6 +1302,16 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
     // TODO: slice store base ptr
     newOp = cloneAndSetResultType(op);
+  } else if (auto gatherOp = dyn_cast<DescriptorGatherOp>(op)) {
+    if (dim != 0)
+      llvm::report_fatal_error("unsupported descriptor_gather slice dim");
+    sliceOp(gatherOp.getXOffsets(), offset, mappings, reverseMappings,
+            partitionScheme);
+    newOp = cloneAndSetResultType(op);
+    auto v = op->getResult(0);
+    auto newV = newOp->getResult(0);
+    mappings.map(v, newV);
+    reverseMappings.map(newV, v);
   } else if (isa<DescriptorLoadOp, DescriptorStoreOp>(op)) {
     SmallVector<int64_t> shape;
     Value coordVal;
@@ -1453,8 +1491,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
         newInitArg = mappings.lookupOrNull(initArg);
       }
 
-      if (newInitArg) {
-        assert(newInitArg != initArg && "value not sliced");
+      if (newInitArg && newInitArg != initArg) {
         newLoopArgs.append({newInitArg});
         forOp.getBody()->insertArgument(forOp.getBody()->getNumArguments(),
                                         newInitArg.getType(), forOp.getLoc());
@@ -1764,7 +1801,7 @@ static void reorderLoadsToFirstUse(triton::FuncOp &funcOp) {
     // Collect load ops in block order.
     SmallVector<Operation *> loads;
     for (auto &op : block->getOperations()) {
-      if (isa<DescriptorLoadOp, LoadOp>(&op))
+      if (isa<DescriptorLoadOp, DescriptorGatherOp, LoadOp>(&op))
         loads.push_back(&op);
     }
 
