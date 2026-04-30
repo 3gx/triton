@@ -128,7 +128,10 @@ def TritonGPUAutomaticWarpSpecialization : Pass<"tritongpu-automatic-warp-specia
     Option<"numStages", "num-stages", "int32_t", /*default*/"3",
            "number of pipeline stages">,
     Option<"numWarpGroups", "num-warp-groups", "int32_t", /*default*/"3",
-           "number of warp groups for NVWS data partitioning">
+           "number of warp groups for NVWS data partitioning">,
+    Option<"useMetaPartitioner", "use-meta-partitioner", "bool",
+           /*default*/"false",
+           "use NVWS data partitioning and Meta partition scheduling">
   ];
 }
 
