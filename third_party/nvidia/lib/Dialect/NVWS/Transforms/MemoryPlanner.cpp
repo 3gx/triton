@@ -176,6 +176,21 @@ static bool isConstFalse(Value v) {
   return false;
 }
 
+static bool isLoopCarriedInitConstFalse(Value v, scf::ForOp forOp) {
+  // A loop-carried use_acc flag initialized to false means the first MMA
+  // iteration fully overwrites operand D, so it can seed producer tracking.
+  auto blockArg = dyn_cast<BlockArgument>(v);
+  if (!blockArg || blockArg.getOwner() != forOp.getBody())
+    return false;
+
+  unsigned argNum = blockArg.getArgNumber();
+  unsigned numInductionVars = forOp.getNumInductionVars();
+  if (argNum < numInductionVars)
+    return false;
+
+  return isConstFalse(forOp.getInitArgs()[argNum - numInductionVars]);
+}
+
 static Value getTmemAllocValue(Operation *allocOp) {
   auto alloc = cast<ttng::TMEMAllocOp>(allocOp);
   return alloc.getResult();
@@ -457,7 +472,9 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
 
     if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(&op)) {
       if (mmaOp.getAccumulator() == tmemAllocOp.getResult()) {
-        if (currentProds.empty() && isConstFalse(mmaOp.useAccumulator())) {
+        if (currentProds.empty() &&
+            (isConstFalse(mmaOp.useAccumulator()) ||
+             isLoopCarriedInitConstFalse(mmaOp.useAccumulator(), forOp))) {
           currentProds.push_back(&op);
           continue;
         }
