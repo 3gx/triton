@@ -967,6 +967,101 @@ static bool tryScheduleOp(Partition *partition, Operation *op) {
   return true;
 }
 
+static bool isAddressComputationType(Type type) {
+  if (type.isIntOrIndex() || isa<PointerType>(type))
+    return true;
+  if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
+    Type elementType = tensorType.getElementType();
+    return elementType.isIntOrIndex() || isa<PointerType>(elementType);
+  }
+  return false;
+}
+
+static bool isAddressComputationOp(Operation *op) {
+  if (op->getNumResults() == 0)
+    return false;
+  return llvm::all_of(op->getResults(), [](Value result) {
+    return isAddressComputationType(result.getType());
+  });
+}
+
+static void addPartitionToOp(Operation *op, Partition *partition) {
+  SetVector<int> ids;
+  if (hasPartition(op))
+    insertAll(ids, getPartitionIds(op));
+  ids.insert(partition->getIndex());
+  setPartition(op, ids);
+}
+
+static void addPartitionToAddressDeps(Operation *root, Partition *partition) {
+  SmallVector<Operation *> worklist;
+  for (Value operand : root->getOperands())
+    if (Operation *defOp = operand.getDefiningOp())
+      worklist.push_back(defOp);
+
+  DenseSet<Operation *> visited;
+  while (!worklist.empty()) {
+    Operation *op = worklist.pop_back_val();
+    if (!visited.insert(op).second)
+      continue;
+    if (!isAddressComputationOp(op))
+      continue;
+
+    addPartitionToOp(op, partition);
+    for (Value operand : op->getOperands())
+      if (Operation *defOp = operand.getDefiningOp())
+        worklist.push_back(defOp);
+  }
+}
+
+static bool regularLoadAllocFeedsOnlyMma(LocalAllocOp alloc, LoadOp load) {
+  if (!llvm::all_of(load->getUsers(), [&](Operation *user) {
+        return user == alloc.getOperation();
+      }))
+    return false;
+
+  bool hasMmaUser = false;
+  for (Operation *user : alloc->getUsers()) {
+    if (!isMMAOp(user))
+      return false;
+    hasMmaUser = true;
+  }
+  return hasMmaUser;
+}
+
+static void keepRegularLoadAllocsWithMmaPartition(ArrayRef<scf::ForOp> loops,
+                                                  Partition *mmaPartition) {
+  if (!mmaPartition)
+    return;
+
+  for (scf::ForOp loop : loops) {
+    for (Operation &op : loop.getOps()) {
+      if (!isMMAOp(&op))
+        continue;
+
+      for (Value operand : op.getOperands()) {
+        auto alloc = operand.getDefiningOp<LocalAllocOp>();
+        if (!alloc || !alloc.getSrc())
+          continue;
+
+        auto load = alloc.getSrc().getDefiningOp<LoadOp>();
+        if (!load || !regularLoadAllocFeedsOnlyMma(alloc, load))
+          continue;
+
+        // Temporary workaround until NVWSInsertSemaphore supports cp.async for
+        // tt.load -> ttg.local_alloc producers. Generic PartitionScheduling
+        // keeps regular global-load allocs with the MMA partition, so do the
+        // same here to avoid creating an unsupported cross-partition cp.async
+        // channel. Remove this once createSemaphoreProducer handles
+        // isGlobalLoadAndAlloc<LocalAllocOp>().
+        setPartition(load, mmaPartition);
+        setPartition(alloc, mmaPartition);
+        addPartitionToAddressDeps(load, mmaPartition);
+      }
+    }
+  }
+}
+
 // Check if any of the inputs to `op` are reachable from a non-null partition.
 static bool hasDefPartition(scf::ForOp loop, Operation *op,
                             PartitionSet &schedule) {
@@ -1420,6 +1515,8 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
       }
     }
   } // if (mmaPartition)
+
+  keepRegularLoadAllocsWithMmaPartition(loops, mmaPartition);
 
   // If there are no loads or MMAs, don't warp specialize.
   if (loadsAndAllocs.empty() && mmas.empty())
