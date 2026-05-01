@@ -27,8 +27,8 @@
 // CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
 // CHECK: tt.descriptor_load {{.*}}ttg.partition = array<i32: [[LOAD]]>
 // CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[LOAD]]>
-// CHECK: tt.splat {{.*}}ttg.partition = array<i32: [[COMP:[0-9]+]]>
-// CHECK: tt.splat {{.*}}ttg.partition = array<i32: [[COMP]]>
+// CHECK: tt.splat {{.*}}ttg.partition = array<i32: [[RED]], [[COMP]]>
+// CHECK: tt.splat {{.*}}ttg.partition = array<i32: [[RED]], [[COMP]]>
 // --- Pre-loop: dq tmem_alloc, dk/dv init → reduction partition ---
 // CHECK: ttng.tmem_alloc {{.*}}ttg.partition = array<i32: [[RED]]>
 // CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: [[RED]]>

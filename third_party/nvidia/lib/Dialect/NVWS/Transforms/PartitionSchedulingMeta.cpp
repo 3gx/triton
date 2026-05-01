@@ -2566,7 +2566,13 @@ static SetVector<int> getConsumerPartitionUnion(Value value) {
 }
 
 static bool isScalarOrAddressGlueType(Type type) {
-  return type.isIntOrIndexOrFloat() || isa<PointerType>(type);
+  if (type.isIntOrIndexOrFloat() || isa<PointerType>(type))
+    return true;
+  if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
+    Type elementType = tensorType.getElementType();
+    return elementType.isIntOrIndex() || isa<PointerType>(elementType);
+  }
+  return false;
 }
 
 static bool isScalarOrAddressPartitionGlueOp(Operation *op) {
