@@ -2533,6 +2533,12 @@ static SetVector<int> getConsumerPartitionUnion(Value value) {
       if (auto forOp = dyn_cast<scf::ForOp>(user)) {
         int idx = use.getOperandNumber() - forOp.getNumControlOperands();
         if (idx >= 0) {
+          // PartitionLoops sees the region op itself as the direct SSA
+          // consumer for iter_args. Scalar/address producers therefore need
+          // to cover the whole loop partition set, not only the partitions of
+          // the block-argument uses inside the loop body.
+          if (hasPartition(forOp))
+            insertAll(result, getPartitionIds(forOp));
           if (static_cast<unsigned>(idx) < forOp.getNumRegionIterArgs())
             collect(forOp.getRegionIterArg(idx));
           if (static_cast<unsigned>(idx) < forOp.getNumResults())

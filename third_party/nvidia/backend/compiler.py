@@ -396,6 +396,7 @@ class CUDABackend(BaseBackend):
             if knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_optimize_partition_warps(pm)
         elif capability // 10 >= 10:
+            use_nvws_meta = knobs.nvidia.use_nvws_meta and not knobs.nvidia.use_meta_ws
             passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttir.add_triton_licm(pm)
@@ -409,7 +410,8 @@ class CUDABackend(BaseBackend):
                 # TRITON_USE_MODULO_SCHEDULE=1 (default algo: rau)
                 # TRITON_USE_MODULO_SCHEDULE=sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
-            nvidia.passes.hopper.add_data_partitioning(pm, 1)
+            if not use_nvws_meta:
+                nvidia.passes.hopper.add_data_partitioning(pm, 1)
             # assign_latencies sets tt.latency on loads/MMAs (stage-distance
             # latencies). schedule_loops reads tt.latency AND tt.autows:
             # when MMA ops have tt.autows, scheduleKeyOpsAnnotation places
@@ -421,7 +423,7 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
             passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
             if not knobs.nvidia.use_meta_ws:
-                passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
+                passes.ttgpuir.add_warp_specialize(pm, opt.num_stages, 1, use_nvws_meta)
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
                 nvidia.passes.hopper.add_tma_store_lowering(pm)
