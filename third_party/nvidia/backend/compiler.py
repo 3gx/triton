@@ -397,6 +397,7 @@ class CUDABackend(BaseBackend):
                 passes.ttgpuir.add_optimize_partition_warps(pm)
         elif capability // 10 >= 10:
             use_nvws_meta = knobs.nvidia.use_nvws_meta and not knobs.nvidia.use_meta_ws
+            use_bw_meta_swp_schedule = use_meta_swp_schedule or use_nvws_meta
             passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttir.add_triton_licm(pm)
@@ -422,8 +423,8 @@ class CUDABackend(BaseBackend):
             # latency-based heuristic. Without assign_latencies, the WS
             # pass's internal scheduleLoops has no latencies and can't
             # enter the code path that reads tt.autows annotations.
-            passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_meta_swp_schedule)
-            passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_meta_swp_schedule)
+            passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, use_bw_meta_swp_schedule)
+            passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, use_bw_meta_swp_schedule)
             if not knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_warp_specialize(pm, opt.num_stages, 1, use_nvws_meta)
             else:
