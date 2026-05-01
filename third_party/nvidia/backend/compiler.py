@@ -410,7 +410,9 @@ class CUDABackend(BaseBackend):
                 # TRITON_USE_MODULO_SCHEDULE=1 (default algo: rau)
                 # TRITON_USE_MODULO_SCHEDULE=sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
-            if not use_nvws_meta:
+            if use_nvws_meta:
+                nvidia.passes.nvws.add_data_partitioning(pm, 1)
+            else:
                 nvidia.passes.hopper.add_data_partitioning(pm, 1)
             # assign_latencies sets tt.latency on loads/MMAs (stage-distance
             # latencies). schedule_loops reads tt.latency AND tt.autows:

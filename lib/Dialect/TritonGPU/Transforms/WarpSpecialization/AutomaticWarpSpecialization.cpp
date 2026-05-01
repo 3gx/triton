@@ -100,11 +100,6 @@ void AutomaticWarpSpecialization::runOnOperation() {
   };
 
   if (useMetaPartitioner) {
-    NVWSWSDataPartitionOptions dataPartitionOptions;
-    dataPartitionOptions.numWarpGroups = numWarpGroups;
-    addPassWithPartitionVerifier(
-        createNVWSWSDataPartition(dataPartitionOptions));
-
     NVWSPartitionSchedulingMetaOptions options;
     options.mergeEpilogue = true;
     options.separateEpilogueStore = true;

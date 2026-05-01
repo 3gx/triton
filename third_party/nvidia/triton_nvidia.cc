@@ -83,6 +83,8 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
 }
 
 void init_triton_nvidia_passes_nvws(py::module &&m) {
+  ADD_PASS_OPTION_WRAPPER_1("add_data_partitioning",
+                            mlir::triton::createNVWSWSDataPartition, int32_t);
   ADD_PASS_WRAPPER_0("add_lower_warp_group",
                      mlir::triton::createNVWSLowerWarpGroup);
   ADD_PASS_WRAPPER_0("add_assign_stage_phase",
