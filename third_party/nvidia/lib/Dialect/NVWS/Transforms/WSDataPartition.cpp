@@ -1233,8 +1233,17 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
                                       *accEncoding, retType.getMemorySpace(),
                                       retType.getMutableMemory());
 
+      // NVWS hardening adjusts the sliced TMEM memdesc result above, e.g.
+      // M-sliced 64xN allocations use blockM=64 instead of keeping an invalid
+      // blockM=128 encoding. Keep the initializer tensor layout derived from
+      // the original memdesc like Hopper MetaDP when the sliced encoding is
+      // unchanged; fall back to newType only when hardening actually changed
+      // the TMEM encoding and the original layout would be incompatible.
+      MemDescType layoutMemDesc =
+          *accEncoding == retType.getEncoding() ? retType : newType;
       auto newDistributedEncoding =
-          nvidia_gpu::getDefaultLayoutForTmemLdSt(newType, numWarps, CGALayout);
+          nvidia_gpu::getDefaultLayoutForTmemLdSt(layoutMemDesc, numWarps,
+                                                  CGALayout);
       auto newAccType = RankedTensorType::get(
           srcTy.getShape(), srcTy.getElementType(), newDistributedEncoding);
       auto cvtOp = builder.createWithAsyncTaskIds<ConvertLayoutOp>(
