@@ -104,6 +104,7 @@ void AutomaticWarpSpecialization::runOnOperation() {
     options.mergeEpilogue = true;
     options.separateEpilogueStore = true;
     pm.nest<FuncOp>().addPass(createNVWSPartitionSchedulingMeta(options));
+    pm.nest<FuncOp>().addPass(createNVWSStripPartitionAttrsOutsideWS());
     pm.addPass(createVerifyWarpSpecializationPartitionsPass());
   } else {
     addPassWithPartitionVerifier(createTritonGPUPartitionScheduling());

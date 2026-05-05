@@ -9,6 +9,7 @@ add_triton_library(NVWSTransforms
   WSUtility.cpp
   WSDataPartition.cpp
   PartitionSchedulingMeta.cpp
+  StripPartitionAttrsOutsideWS.cpp
   MemoryPlanner.cpp
 
   DEPENDS
