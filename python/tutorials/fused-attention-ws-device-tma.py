@@ -198,9 +198,9 @@ def _host_descriptor_pre_hook(nargs):
 if is_hip():
     NUM_STAGES_OPTIONS = [1]
 elif supports_host_descriptor():
-    NUM_STAGES_OPTIONS = [3]
+    NUM_STAGES_OPTIONS = [2]
 else:
-    NUM_STAGES_OPTIONS = [3]
+    NUM_STAGES_OPTIONS = [2]
 
 configs = [
     triton.Config(
@@ -213,6 +213,7 @@ configs = [
         num_warps=w,
         pre_hook=_host_descriptor_pre_hook,
         # ir_override=f"/home/mren/OpenSource/tritonbench/override/_attn_fwd_persist.ttgir"
+#    ) for BM in [256] for BN in [128] for s in NUM_STAGES_OPTIONS for w in [4]
     ) for BM in [256] for BN in [128] for s in NUM_STAGES_OPTIONS for w in [4]
 ]
 
@@ -1570,7 +1571,8 @@ BATCH, N_HEADS = 4, 32
 configs = []
 for HEAD_DIM in [128]:  #64, 128]:
 #    for baseVariant in ["ws", "ws_persistent"]:
-    for baseVariant in ["ws_persistent"]:
+    for baseVariant in ["ws"]:
+#    for baseVariant in ["ws_persistent"]:
         for mode in ["fwd"]: #, "bwd"]:
             configs.append(
                 triton.testing.Benchmark(
