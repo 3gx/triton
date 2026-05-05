@@ -672,7 +672,7 @@ int insertTmemSemaphore(TmemAccessDag &accessDag, int numTmemBlocks) {
       }
     }
   }
-  auto numStages = 1 + isMultiStaged;
+  auto numStages = 1 + 0*isMultiStaged;
 
   // update numTmemBlocks for the number of TMEM blocks used by the aref buffer
   auto allocShape = allocOp.getType().getShape();
