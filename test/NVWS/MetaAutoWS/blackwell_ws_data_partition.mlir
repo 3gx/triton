@@ -55,7 +55,10 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
       %offset_0 = arith.muli %pid_0, %c256_i32 : i32
       %q_i_load = tt.descriptor_load %q_desc[%pid_1, %offset_0, %c0_i32] : !tt.tensordesc<tensor<1x256x128xbf16, #shared>> -> tensor<256x128xbf16, #blocked1>
       %q_i_load_5 = ttg.local_alloc %q_i_load : (tensor<256x128xbf16, #blocked1>) -> !ttg.memdesc<256x128xbf16, #shared2, #smem>
-      // PIPE: ttng.tmem_alloc {{.*}}buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32, buffer.offset = 0 : i32
+      // PIPE: ttng.tmem_alloc {{.*}}buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0, 1, 5>
+      // PIPE-NEXT: ttng.tmem_alloc {{.*}}buffer.copy = 1 : i32, buffer.id = 6 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0, 1, 4>
+      // PIPE-NEXT: ttng.tmem_alloc {{.*}}buffer.copy = 1 : i32, buffer.id = 3 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>
+      // PIPE-NEXT: ttng.tmem_alloc {{.*}}buffer.copy = 1 : i32, buffer.id = 4 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>
       %qk, %qk_6 = ttng.tmem_alloc : () -> (!ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
       %acc, %acc_7 = ttng.tmem_alloc : () -> (!ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
       %acc_8 = ttng.tmem_store %cst_3, %acc[%acc_7], %true : tensor<256x128xf32, #blocked> -> !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
@@ -106,6 +109,8 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
         %inline_triton_result_3_31 = tt.trans %inline_triton_result_3 {order = array<i32: 0, 2, 1>} : tensor<256x64x2xf32, #blocked3> -> tensor<256x2x64xf32, #blocked2>
         %inline_triton_result_3_32 = tt.reshape %inline_triton_result_3_31 : tensor<256x2x64xf32, #blocked2> -> tensor<256x128xf32, #blocked>
         %v_13 = arith.truncf %v_10 : tensor<256x128xf32, #blocked> to tensor<256x128xbf16, #blocked>
+        // PIPE: ttng.tmem_alloc {{.*}}buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 5>
+        // PIPE: ttng.tmem_alloc {{.*}}buffer.copy = 1 : i32, buffer.id = 6 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 4>
         %acc_33 = ttng.tmem_alloc %v_13 : (tensor<256x128xbf16, #blocked>) -> !ttg.memdesc<256x128xbf16, #tmem1, #ttng.tensor_memory>
         %acc_34 = ttng.tmem_store %inline_triton_result_3_32, %acc[%acc_27], %true : tensor<256x128xf32, #blocked> -> !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
         // CHECK-COUNT-2: ttng.tc_gen5_mma

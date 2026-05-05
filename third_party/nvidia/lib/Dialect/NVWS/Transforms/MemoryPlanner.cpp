@@ -62,9 +62,12 @@ struct TmemDataChannelPost {
   int producer;
   SmallVector<int> consumers;
   Operation *allocOp;
+  Operation *explicitSrcOp = nullptr;
+  SmallVector<Operation *> explicitDstOps;
   bool isOperandD;
   bool isOperandDNoAcc;
   bool isSameIterGuard = false;
+  bool isPlannerOnly = false;
   unsigned uniqID;
 
   TmemDataChannelPost(int producer, ArrayRef<int> consumers,
@@ -73,6 +76,17 @@ struct TmemDataChannelPost {
       : producer(producer), consumers(consumers.begin(), consumers.end()),
         allocOp(allocOp), isOperandD(isOperandD),
         isOperandDNoAcc(isOperandDNoAcc), uniqID(uniqID) {}
+
+  TmemDataChannelPost(int producer, ArrayRef<int> consumers,
+                      Operation *allocOp, Operation *srcOp,
+                      ArrayRef<Operation *> dstOps, bool isOperandD,
+                      bool isOperandDNoAcc, bool isPlannerOnly,
+                      unsigned uniqID)
+      : producer(producer), consumers(consumers.begin(), consumers.end()),
+        allocOp(allocOp), explicitSrcOp(srcOp),
+        explicitDstOps(dstOps.begin(), dstOps.end()), isOperandD(isOperandD),
+        isOperandDNoAcc(isOperandDNoAcc), isPlannerOnly(isPlannerOnly),
+        uniqID(uniqID) {}
 
   Operation *getAllocOp() const { return allocOp; }
   Operation *getSrcOp() const;
@@ -333,6 +347,18 @@ static bool needsChannel(int producer, ArrayRef<int> consumers) {
   });
 }
 
+static SmallVector<int> getUniqueTaskIds(ArrayRef<Operation *> ops) {
+  SmallVector<int> taskIds;
+  DenseSet<int> seenTaskIds;
+  for (Operation *op : ops) {
+    for (int id : getTaskIds(op)) {
+      if (seenTaskIds.insert(id).second)
+        taskIds.push_back(id);
+    }
+  }
+  return taskIds;
+}
+
 static void setTmemChannelAttr(Operation *op, int channelId,
                                StringRef attrName) {
   SmallVector<int> ids;
@@ -363,6 +389,9 @@ static Operation *findTmemStartEnd(const TmemDataChannelPost *ch,
 }
 
 Operation *TmemDataChannelPost::getSrcOp() const {
+  if (explicitSrcOp)
+    return explicitSrcOp;
+
   if (isOperandD)
     return findTmemStartEnd(this, "tmem.start");
 
@@ -394,6 +423,9 @@ static void getAllConsumers(const TmemDataChannelPost *ch,
 }
 
 Operation *TmemDataChannelPost::getDstOp() const {
+  if (!explicitDstOps.empty())
+    return explicitDstOps.back();
+
   if (isOperandD)
     return findTmemStartEnd(this, "tmem.end");
 
@@ -406,6 +438,11 @@ Operation *TmemDataChannelPost::getDstOp() const {
 
 void TmemDataChannelPost::getDstOps(
     SmallVectorImpl<Operation *> &dsts) const {
+  if (!explicitDstOps.empty()) {
+    dsts.append(explicitDstOps.begin(), explicitDstOps.end());
+    return;
+  }
+
   if (isOperandD) {
     if (Operation *dst = getDstOp())
       dsts.push_back(dst);
@@ -648,6 +685,9 @@ createTmemChannelPost(ttng::TMEMAllocOp alloc,
         user == usr ? Value(alloc.getResult()) : Value(usr->getResult(0));
     if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(user)) {
       if (mmaOp.getAccumulator() == accessValue) {
+        if (user != usr)
+          return user->emitError("NVWS memory planner does not support "
+                                 "partial-view TMEM producer modeling");
         if (!isConstFalse(mmaOp.useAccumulator())) {
           operandDMma = mmaOp;
           isOperandD = true;
@@ -659,6 +699,9 @@ createTmemChannelPost(ttng::TMEMAllocOp alloc,
         consumers.push_back(user);
       }
     } else if (isa<ttng::TMEMStoreOp>(user)) {
+      if (user != usr)
+        return user->emitError("NVWS memory planner does not support "
+                               "partial-view TMEM producer modeling");
       producers.push_back(user);
     } else if (isa<ttng::TMEMLoadOp>(user)) {
       consumers.push_back(user);
@@ -671,8 +714,30 @@ createTmemChannelPost(ttng::TMEMAllocOp alloc,
     return handleOperandD(alloc, operandDMma, channels);
 
   if (producers.empty()) {
-    // ttng.tmem_alloc %src is initialized storage. It must not become an
-    // extra producer channel; consumers still participate in liveness below.
+    if (!alloc.getSrc())
+      return success();
+    if (consumers.empty())
+      return success();
+
+    SmallVector<int> producerIds = getTaskIds(alloc.getOperation());
+    if (producerIds.size() != 1)
+      return alloc.emitError("NVWS memory planner expected sourceful "
+                             "ttng.tmem_alloc to have exactly one partition");
+
+    SmallVector<int> consumerTaskIds = getUniqueTaskIds(consumers);
+    consumerTaskIds.erase(std::remove(consumerTaskIds.begin(),
+                                      consumerTaskIds.end(),
+                                      producerIds.front()),
+                          consumerTaskIds.end());
+
+    // Sourceful ttng.tmem_alloc is planner-equivalent to a hoisted storage
+    // allocation plus an init store at the real alloc op. Keep that producer
+    // record internal to the planner; InsertTmemSemaphore must not see it as an
+    // extra real channel.
+    channels.push_back(std::make_unique<TmemDataChannelPost>(
+        producerIds.front(), consumerTaskIds, alloc.getOperation(),
+        alloc.getOperation(), consumers, false /*isOperandD*/,
+        false /*isOperandDNoAcc*/, true /*isPlannerOnly*/, channels.size()));
     return success();
   }
 
@@ -696,13 +761,7 @@ createTmemChannelPost(ttng::TMEMAllocOp alloc,
     return success();
   int producerId = producerIds.front();
 
-  SmallVector<int> consumerTaskIds;
-  DenseSet<int> seenTaskIds;
-  for (Operation *consumer : consumers) {
-    for (int id : getTaskIds(consumer))
-      if (seenTaskIds.insert(id).second)
-        consumerTaskIds.push_back(id);
-  }
+  SmallVector<int> consumerTaskIds = getUniqueTaskIds(consumers);
   consumerTaskIds.erase(
       std::remove(consumerTaskIds.begin(), consumerTaskIds.end(), producerId),
       consumerTaskIds.end());
@@ -711,6 +770,11 @@ createTmemChannelPost(ttng::TMEMAllocOp alloc,
     channels.push_back(std::make_unique<TmemDataChannelPost>(
         producerId, consumerTaskIds, alloc.getOperation(),
         false /*isOperandD*/, isOperandDNoAcc, channels.size()));
+  } else if (!consumers.empty()) {
+    channels.push_back(std::make_unique<TmemDataChannelPost>(
+        producerId, consumerTaskIds, alloc.getOperation(), producerOp,
+        consumers, false /*isOperandD*/, isOperandDNoAcc,
+        true /*isPlannerOnly*/, channels.size()));
   }
 
   return success();
@@ -981,6 +1045,12 @@ private:
     return combinedTasks;
   }
 
+  bool isSourcefulOperandD(TmemBuffer *buffer) {
+    auto alloc = dyn_cast<ttng::TMEMAllocOp>(buffer->owner);
+    TmemDataChannelPost *channel = allocToChannel.lookup(buffer->owner);
+    return alloc && alloc.getSrc() && channel && channel->isOperandD;
+  }
+
   bool samePartition(TmemBuffer *a, TmemBuffer *b,
                      unsigned partitionCondition) {
     if (partitionCondition == 0)
@@ -1015,6 +1085,9 @@ private:
 
   int hasPotentialReuse(TmemBuffer *owner, TmemBuffer *candidate,
                         Operation *ctrlOp) {
+    if (isSourcefulOperandD(owner) || isSourcefulOperandD(candidate))
+      return 0;
+
     if (candidate->colSize > owner->colSize)
       return 0;
     if (allocToIntervals[owner->owner].intersects(
@@ -1192,6 +1265,8 @@ private:
       if (group.empty())
         continue;
 
+      nextBufferId = std::max(nextBufferId, bufferId + 1);
+
       ttng::TMEMAllocOp ownerAlloc = group.front();
       TmemBuffer *owner = getBuffer(ownerAlloc.getOperation());
       owner->rowOffset = rowOffset;
@@ -1205,22 +1280,42 @@ private:
       handledAllocs.insert(ownerAlloc.getOperation());
       rowOffset += owner->rowSize;
 
-      size_t nextColOffset = 0;
       for (ttng::TMEMAllocOp reuserAlloc : ArrayRef(group).drop_front()) {
         TmemBuffer *reuser = getBuffer(reuserAlloc.getOperation());
-        reuser->rowOffset = owner->rowOffset;
-        reuser->colOffset = nextColOffset;
-        reuser->isOwnerOfSpace = false;
-        reuser->reuseOwner = owner;
-        setI32Attr(reuserAlloc, "buffer.id", bufferId);
-        setI32Attr(reuserAlloc, "buffer.copy",
-                   annotations.lookup(reuserAlloc.getOperation()).numCopies);
-        setI32Attr(reuserAlloc, "buffer.offset", nextColOffset);
-        handledAllocs.insert(reuserAlloc.getOperation());
-        nextColOffset += reuser->colSize;
-      }
+        bool canReuseAnnotatedOwner =
+            hasPotentialReuse(owner, reuser, nullptr) > 0 ||
+            hasPotentialReuse(reuser, owner, nullptr) > 0;
+        size_t colOffset =
+            canReuseAnnotatedOwner ? findReuseSpace(reuser, owner, nullptr)
+                                   : std::numeric_limits<size_t>::max();
 
-      nextBufferId = std::max(nextBufferId, bufferId + 1);
+        if (colOffset != std::numeric_limits<size_t>::max() &&
+            checkOtherReuses(reuser, owner, colOffset)) {
+          reuser->rowOffset = owner->rowOffset;
+          reuser->colOffset = colOffset;
+          reuser->isOwnerOfSpace = false;
+          reuser->reuseOwner = owner;
+          setI32Attr(reuserAlloc, "buffer.id", bufferId);
+          setI32Attr(reuserAlloc, "buffer.copy",
+                     annotations.lookup(reuserAlloc.getOperation()).numCopies);
+          setI32Attr(reuserAlloc, "buffer.offset", colOffset);
+        } else {
+          // Autotuning annotations may encode an intended physical packing
+          // group. Preserve the pinned id only when the planner can prove the
+          // same semantic reuse relation; otherwise split the alloc into its
+          // own semantic TMEM group.
+          reuser->rowOffset = rowOffset;
+          reuser->colOffset = 0;
+          reuser->isOwnerOfSpace = true;
+          reuser->reuseOwner = reuser;
+          setI32Attr(reuserAlloc, "buffer.id", nextBufferId++);
+          setI32Attr(reuserAlloc, "buffer.copy",
+                     annotations.lookup(reuserAlloc.getOperation()).numCopies);
+          setI32Attr(reuserAlloc, "buffer.offset", 0);
+          rowOffset += reuser->rowSize;
+        }
+        handledAllocs.insert(reuserAlloc.getOperation());
+      }
     }
   }
 
@@ -1277,19 +1372,22 @@ private:
       TmemBuffer &buffer = *bufferPtr;
       if (!buffer.isOwnerOfSpace)
         continue;
+      if (isSourcefulOperandD(&buffer) || isSourcefulOperandD(candidate))
+        continue;
       if (allocToIntervals[buffer.owner].intersects(
               allocToIntervals[candidate->owner]) ||
           buffer.colSize < candidate->colSize)
         continue;
 
-      bool hasBothChannels = allocToChannel.lookup(buffer.owner) &&
-                             allocToChannel.lookup(candidate->owner);
+      if (!allocToChannel.lookup(buffer.owner) ||
+          !allocToChannel.lookup(candidate->owner))
+        continue;
+
       bool compatible =
-          !hasBothChannels ||
-          ((!sameLoop(&buffer, ctrlOp) &&
-            samePartition(&buffer, candidate, partitionCondition)) ||
-           (sameLoop(&buffer, ctrlOp) &&
-            alongDependencyChain(buffer.owner, candidate->owner)));
+          (!sameLoop(&buffer, ctrlOp) &&
+           samePartition(&buffer, candidate, partitionCondition)) ||
+          (sameLoop(&buffer, ctrlOp) &&
+           alongDependencyChain(buffer.owner, candidate->owner));
       if (!compatible)
         continue;
 
