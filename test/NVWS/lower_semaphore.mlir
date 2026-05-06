@@ -420,6 +420,29 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // -----
 
+#tmem_base = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#tmem_f16_view = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 2>
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-DAG: #[[$TMEM_F16_VIEW:.*]] = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 2>
+  // CHECK-LABEL: @coalesce_same_buffer_id_tmem_allocs
+  tt.func @coalesce_same_buffer_id_tmem_allocs() {
+    // CHECK: [[BASE:%.*]] = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 42 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32,
+    %base = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 42 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32, #tmem_base, #ttng.tensor_memory, mutable>
+    // CHECK-NOT: ttng.tmem_alloc {{.*}}buffer.id = 42
+    // CHECK: [[SUB:%.*]] = ttng.tmem_subslice [[BASE]] {N = 0 : i32}
+    // CHECK-SAME: -> !ttg.memdesc<1x128x64xf32,
+    // CHECK-NEXT: [[VIEW:%.*]] = ttg.memdesc_reinterpret [[SUB]]
+    // CHECK-SAME: -> !ttg.memdesc<1x128x128xf16, #[[$TMEM_F16_VIEW]], #ttng.tensor_memory, mutable>
+    %alias = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 42 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf16, #tmem_base, #ttng.tensor_memory, mutable>
+    "use_base"(%base) : (!ttg.memdesc<1x128x128xf32, #tmem_base, #ttng.tensor_memory, mutable>) -> ()
+    // CHECK: "use_alias"([[VIEW]]) : (!ttg.memdesc<1x128x128xf16, #[[$TMEM_F16_VIEW]], #ttng.tensor_memory, mutable>) -> ()
+    "use_alias"(%alias) : (!ttg.memdesc<1x128x128xf16, #tmem_base, #ttng.tensor_memory, mutable>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
 #blocked4 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #shared4 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem4 = #ttg.shared_memory
