@@ -677,15 +677,16 @@ struct AssignStagePhase {
       return classifyFirstAccessAfterAcquireOp(bodyToken, forOp.getBody(),
                                                acquireOp);
     } else if (auto bufferOp = getTrackedBufferOp(eventOp, {trackedToken})) {
-      std::optional<AccessKind> merged = AccessKind::Store;
+      std::optional<AccessKind> merged;
       for (Value result : bufferOp->getResults()) {
         SetVector<Value> trackedBuffer;
         trackedBuffer.insert(result);
         auto access = classifyFirstAccessAfterBufferOp(
             bufferOp->getBlock(), bufferOp.getOperation(), trackedBuffer,
             acquireOp, trackedToken);
-        assert(access && "token-derived buffer must reach a real use");
-        merged = mergeBranchAccess(merged, access);
+        if (!access)
+          continue;
+        merged = merged ? mergeBranchAccess(merged, access) : access;
       }
       return merged;
     } else if (getTrackedReleaseOp(eventOp, {trackedToken})) {

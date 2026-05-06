@@ -193,6 +193,36 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 !elt = tensor<1xi32, #blocked>
 
 module attributes {"ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @multi_result_buffer_unused_sibling
+  tt.func @multi_result_buffer_unused_sibling(%lb: i32, %ub: i32, %step: i32) {
+    %buf0 = ttg.local_alloc : () -> !ttg.memdesc<2x1xi32, #shared, #smem, mutable>
+    %buf1 = ttg.local_alloc : () -> !ttg.memdesc<2x1xi32, #shared, #smem, mutable>
+    // CHECK: [[SEM:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}} true
+    %sem = nvws.semaphore.create %buf0, %buf1 true : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>, !ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>
+    %v = arith.constant dense<0> : !elt
+    scf.for %i = %lb to %ub step %step : i32 {
+      // CHECK: [[TOK:%.*]] = nvws.semaphore.acquire [[SEM]]
+      %tok = nvws.semaphore.acquire %sem {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>, !ttg.memdesc<2x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+      // CHECK: [[VIEW:%.*]]:2 = nvws.semaphore.buffer [[SEM]]
+      %view0, %view1 = nvws.semaphore.buffer %sem, %tok {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>, !ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 2x1>, !ttg.memdesc<1xi32, #shared, #smem, mutable, 2x1>
+      // CHECK: ttg.local_store {{.*}}, [[VIEW]]#0
+      ttg.local_store %v, %view0 {ttg.partition = array<i32: 0>} : !elt -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 2x1>
+      nvws.semaphore.release %sem, %tok [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>, !ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
+    } {ttg.partition = array<i32: 0>, ttg.partition.stages = [0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    ttg.local_dealloc %buf0 : !ttg.memdesc<2x1xi32, #shared, #smem, mutable>
+    ttg.local_dealloc %buf1 : !ttg.memdesc<2x1xi32, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+!elt = tensor<1xi32, #blocked>
+
+module attributes {"ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @if_observation
   tt.func @if_observation(%cond: i1, %lb: i32, %ub: i32, %step: i32) {
     %buf = ttg.local_alloc : () -> !ttg.memdesc<2x1xi32, #shared, #smem, mutable>
