@@ -1136,7 +1136,8 @@ struct SingleTMEMSemaphore {
   }
 
   void release(OpBuilder &b, Location loc) {
-    assert(asyncOp[partitionId]);
+    if (!asyncOp[partitionId])
+      asyncOp[partitionId] = AsyncOp::NONE;
     StageCluster stageCluster;
     if (partitionId)
       stageCluster = stageClusters[*partitionId];
@@ -1396,6 +1397,8 @@ bool isMultiStagedMember(TMEMAllocOp allocOp, TmemAccessDag &accessDag,
   return valid;
 }
 
+void copyBufferAttrs(TMEMAllocOp src, TMEMAllocOp dst);
+
 int insertTmemSemaphoreSingle(TmemAccessDag &accessDag, int numTmemBlocks) {
   auto rootNode = accessDag.getRootNode();
   auto allocOp = cast<TMEMAllocOp>(rootNode->op);
@@ -1421,7 +1424,7 @@ int insertTmemSemaphoreSingle(TmemAccessDag &accessDag, int numTmemBlocks) {
       }
     }
   }
-  auto numStages = 1 + 1 * isMultiStaged;
+  auto numStages = 1 + 0 * isMultiStaged;
 
   // update numTmemBlocks for the number of TMEM blocks used by the aref buffer
   auto allocShape = allocOp.getType().getShape();
@@ -1439,6 +1442,7 @@ int insertTmemSemaphoreSingle(TmemAccessDag &accessDag, int numTmemBlocks) {
 
   auto semAlloc =
       cast<TMEMAllocOp>(createAlloc(b, allocOp.getLoc(), semBufType, Value()));
+  copyBufferAttrs(allocOp, semAlloc);
 
   // Create ping/pong semaphore pair.
   auto baseTypes = TypeArrayAttr::get(b.getContext(), {semBufType});
@@ -1554,6 +1558,19 @@ LogicalResult eraseOriginalAllocs(SmallVectorImpl<TMEMAllocOp> &members) {
   return success();
 }
 
+void eraseUnusedTmemAllocs(triton::FuncOp funcOp) {
+  SmallVector<TMEMAllocOp> unusedAllocs;
+  funcOp.walk([&](TMEMAllocOp allocOp) {
+    for (Value result : allocOp->getResults())
+      if (!result.use_empty())
+        return;
+    unusedAllocs.push_back(allocOp);
+  });
+
+  for (TMEMAllocOp allocOp : unusedAllocs)
+    allocOp.erase();
+}
+
 LogicalResult insertTmemSemaphore(BufferAccessDag &groupDag,
                                   ArrayRef<std::unique_ptr<TmemAccessDag>>
                                       memberDags,
@@ -1564,7 +1581,7 @@ LogicalResult insertTmemSemaphore(BufferAccessDag &groupDag,
   bool isMultiStaged = false;
   for (auto [idx, dag] : llvm::enumerate(memberDags))
     isMultiStaged |= isMultiStagedMember(members[idx], *dag, numTmemBlocks);
-  auto numStages = 1 + 1 * isMultiStaged;
+  auto numStages = 1 + 0 * isMultiStaged;
 
   SmallVector<Type> semBufTypes;
   for (TMEMAllocOp allocOp : members) {
@@ -1788,6 +1805,7 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
   }
 
   workaroundForLoopScheduler(funcOp);
+  eraseUnusedTmemAllocs(funcOp);
 
   return success();
 }
