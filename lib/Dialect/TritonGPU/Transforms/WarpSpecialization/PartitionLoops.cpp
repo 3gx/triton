@@ -163,6 +163,10 @@ void cloneForOp(scf::ForOp forOp, SmallVector<WarpGroupBuilder> &builders,
     auto newForOp =
         scf::ForOp::create(b, forOp.getLoc(), lb, ub, step, initArgs);
     newForOp->setAttrs(forOp->getAttrs());
+    if (forOp->hasAttr(kScheduledMaxStageAttrName)) {
+      newForOp->setAttr(kScheduledMaxStageAttrName,
+                        b.getI32IntegerAttr(partition->getStage()));
+    }
     if (forOp->hasAttr(kPartitionOutputsAttrName)) {
       newForOp->removeAttr(kPartitionOutputsAttrName);
     }

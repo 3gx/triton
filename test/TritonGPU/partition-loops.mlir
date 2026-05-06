@@ -418,6 +418,29 @@ tt.func @if_stmt_split(%arg1: !ty, %ub: i32, %lb: i32, %step: i32) {
   tt.return
 }
 
+// CHECK-LABEL: @partition_stage_sets_loop_scheduled_max_stage
+tt.func @partition_stage_sets_loop_scheduled_max_stage(%lb: i32, %ub: i32, %step: i32) {
+  // CHECK: nvws.warp_group
+  // CHECK: partition0
+  // CHECK-NEXT: scf.for
+  // CHECK-NEXT: "op_p0"
+  // CHECK-NEXT: } {tt.scheduled_max_stage = 0 : i32
+  // CHECK: partition1
+  // CHECK-NEXT: scf.for
+  // CHECK-NEXT: "op_p1"
+  // CHECK-NEXT: } {tt.scheduled_max_stage = 1 : i32
+  // CHECK: partition2
+  // CHECK-NEXT: scf.for
+  // CHECK-NEXT: "op_p2"
+  // CHECK-NEXT: } {tt.scheduled_max_stage = 0 : i32
+  scf.for %i = %lb to %ub step %step : i32 {
+    "op_p0"(%i) {ttg.partition = array<i32: 0>} : (i32) -> ()
+    "op_p1"(%i) {ttg.partition = array<i32: 1>} : (i32) -> ()
+    "op_p2"(%i) {ttg.partition = array<i32: 2>} : (i32) -> ()
+  } {tt.scheduled_max_stage = 1 : i32, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32, ttg.partition = array<i32: 0, 1, 2>}
+  tt.return
+}
+
 }
 
 // -----
