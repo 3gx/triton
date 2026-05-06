@@ -115,7 +115,7 @@ static void lowerTMAStore(Operation *op, mlir::TypedValue<RankedTensorType> src,
   // then we can safely reuse the allocation being loaded from as the source of
   // the TMA store.
   Value alloc;
-#if 0
+#if 1
   if (auto localLoad =
           dyn_cast_or_null<gpu::LocalLoadOp>(src.getDefiningOp())) {
     bool interfere = false;
