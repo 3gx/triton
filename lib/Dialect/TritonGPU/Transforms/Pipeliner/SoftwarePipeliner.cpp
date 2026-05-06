@@ -99,6 +99,7 @@ static void expandLoops(ModuleOp moduleOp) {
     loops.push_back(forOp);
   });
   auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
+  auto nvwsMeta = triton::tools::getBoolEnv("TRITON_NVWS_USE_META");
 
   for (scf::ForOp forOp : loops) {
     CoarseSchedule schedule;
@@ -133,7 +134,7 @@ static void expandLoops(ModuleOp moduleOp) {
         !forOp->getParentOfType<triton::gpu::WarpSpecializeOp>() &&
         !keepPredicateStage; // do not peel if we are testing the stage
                              // predication
-    if (metaWS && hasWarpSpec)
+    if ((metaWS || nvwsMeta) && hasWarpSpec)
       customEpiloguePeeling = true;
 
     if (keepPredicateStage || customEpiloguePeeling) {
