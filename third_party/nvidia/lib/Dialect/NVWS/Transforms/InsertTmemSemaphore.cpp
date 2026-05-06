@@ -1424,7 +1424,7 @@ int insertTmemSemaphoreSingle(TmemAccessDag &accessDag, int numTmemBlocks) {
       }
     }
   }
-  auto numStages = 1 + 0 * isMultiStaged;
+  auto numStages = 1 + 1 * isMultiStaged;
 
   // update numTmemBlocks for the number of TMEM blocks used by the aref buffer
   auto allocShape = allocOp.getType().getShape();
@@ -1581,7 +1581,7 @@ LogicalResult insertTmemSemaphore(BufferAccessDag &groupDag,
   bool isMultiStaged = false;
   for (auto [idx, dag] : llvm::enumerate(memberDags))
     isMultiStaged |= isMultiStagedMember(members[idx], *dag, numTmemBlocks);
-  auto numStages = 1 + 0 * isMultiStaged;
+  auto numStages = 1 + 1 * isMultiStaged;
 
   SmallVector<Type> semBufTypes;
   for (TMEMAllocOp allocOp : members) {

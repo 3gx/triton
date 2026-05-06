@@ -426,7 +426,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-DAG: #[[$TMEM_F16_VIEW:.*]] = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 2>
   // CHECK-LABEL: @coalesce_same_buffer_id_tmem_allocs
   tt.func @coalesce_same_buffer_id_tmem_allocs() {
-    // CHECK: [[BASE:%.*]] = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 42 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32,
+    // CHECK: [[BASE:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32,
     %base = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 42 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32, #tmem_base, #ttng.tensor_memory, mutable>
     // CHECK-NOT: ttng.tmem_alloc {{.*}}buffer.id = 42
     // CHECK: [[SUB:%.*]] = ttng.tmem_subslice [[BASE]] {N = 0 : i32}

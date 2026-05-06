@@ -1169,6 +1169,14 @@ void coalesceDuplicateTmemAllocsByBufferId(triton::FuncOp funcOp) {
     }
   }
 }
+
+void stripTmemBufferAttrs(triton::FuncOp funcOp) {
+  funcOp.walk([&](TMEMAllocOp allocOp) {
+    allocOp->removeAttr(kBufferIdAttrName);
+    allocOp->removeAttr(kBufferOffsetAttrName);
+    allocOp->removeAttr(kBufferCopyAttrName);
+  });
+}
 } // anonymous namespace
 
 class NVWSLowerSemaphore
@@ -1223,6 +1231,7 @@ public:
     m.walk([&](triton::FuncOp funcOp) {
       hoistPoisonOps(funcOp);
       coalesceDuplicateTmemAllocsByBufferId(funcOp);
+      stripTmemBufferAttrs(funcOp);
     });
   }
 };
