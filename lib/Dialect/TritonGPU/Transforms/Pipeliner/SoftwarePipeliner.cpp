@@ -100,6 +100,7 @@ static void expandLoops(ModuleOp moduleOp) {
   });
   auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
   auto nvwsMeta = triton::tools::getBoolEnv("TRITON_NVWS_USE_META");
+  bool metaLikeWS = metaWS || nvwsMeta;
 
   for (scf::ForOp forOp : loops) {
     CoarseSchedule schedule;
@@ -107,7 +108,7 @@ static void expandLoops(ModuleOp moduleOp) {
       continue;
     }
     // Skip pipelining when we have a single stage.
-    if (metaWS && schedule.getNumStages() == 1) {
+    if (metaLikeWS && schedule.getNumStages() == 1) {
       continue;
     }
 
@@ -134,7 +135,7 @@ static void expandLoops(ModuleOp moduleOp) {
         !forOp->getParentOfType<triton::gpu::WarpSpecializeOp>() &&
         !keepPredicateStage; // do not peel if we are testing the stage
                              // predication
-    if ((metaWS || nvwsMeta) && hasWarpSpec)
+    if (metaLikeWS && hasWarpSpec)
       customEpiloguePeeling = true;
 
     if (keepPredicateStage || customEpiloguePeeling) {
@@ -225,6 +226,8 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
 
     {
       auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
+      auto nvwsMeta = triton::tools::getBoolEnv("TRITON_NVWS_USE_META");
+      bool metaLikeWS = metaWS || nvwsMeta;
       SmallVector<scf::ForOp> loops;
       bool hasWarpSpec = false;
       getOperation()->walk([&](scf::ForOp forOp) {
@@ -236,7 +239,7 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
       });
 
       // With Meta's warpspec, we are handling this in AutoWS.
-      if (!metaWS || !hasWarpSpec)
+      if (!metaLikeWS || !hasWarpSpec)
         for (scf::ForOp forOp : loops) {
           mlir::triton::pipelineTMAStores(forOp);
         }
