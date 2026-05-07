@@ -118,17 +118,64 @@ OpT createInto(OpBuilder &builder, Location loc,
   return setTagIfPresent(op, wsTag);
 }
 
-SemaphorePair createSemaphores(OpBuilder &builder,
-                               ProducedValueInfo &producedValue) {
+static triton::DescriptorStoreOp findDescriptorStoreConsumer(Value value,
+                                                             Operation *user) {
+  if (auto store = dyn_cast<triton::DescriptorStoreOp>(user)) {
+    return store.getSrc() == value ? store : triton::DescriptorStoreOp();
+  }
+
+  auto convert = dyn_cast<ConvertLayoutOp>(user);
+  if (!convert || convert.getSrc() != value)
+    return {};
+
+  Value converted = convert.getResult();
+  for (Operation *convertUser : converted.getUsers()) {
+    if (auto store = dyn_cast<triton::DescriptorStoreOp>(convertUser)) {
+      if (store.getSrc() == converted)
+        return store;
+    }
+  }
+
+  return {};
+}
+
+static Attribute getDescriptorStoreConsumerEncoding(
+    RankedTensorType tensorType,
+    const DenseMap<int, SmallVector<OpOperand *>> &usesPerPartition) {
+  Attribute descriptorEncoding;
+
+  for (const auto &entry : usesPerPartition) {
+    for (OpOperand *use : entry.second) {
+      auto store = findDescriptorStoreConsumer(use->get(), use->getOwner());
+      if (!store)
+        continue;
+
+      Attribute encoding =
+          getEncodingFromDescriptor(store, tensorType, store.getDesc());
+      if (descriptorEncoding && descriptorEncoding != encoding)
+        return {};
+      descriptorEncoding = encoding;
+    }
+  }
+
+  return descriptorEncoding;
+}
+
+SemaphorePair createSemaphores(
+    OpBuilder &builder, ProducedValueInfo &producedValue,
+    const DenseMap<int, SmallVector<OpOperand *>> &usesPerPartition) {
   auto result = producedValue.result;
 
-  auto getSmemDescType = [](RankedTensorType tensorType, Value tensorResult) {
+  auto getSmemDescType = [](RankedTensorType tensorType, Value tensorResult,
+                            Attribute encodingOverride = {}) {
     Attribute SharedMemorySpace =
         SharedMemorySpaceAttr::get(tensorType.getContext());
     Operation *defOp = tensorResult ? tensorResult.getDefiningOp() : nullptr;
-    Attribute encoding = defOp && !isa<scf::ForOp>(defOp)
-                             ? getSharedEncoding(defOp)
-                             : getSharedEncoding(tensorType);
+    Attribute encoding =
+        encodingOverride ? encodingOverride
+                         : (defOp && !isa<scf::ForOp>(defOp)
+                                ? getSharedEncoding(defOp)
+                                : getSharedEncoding(tensorType));
     return MemDescType::get(tensorType.getShape(), tensorType.getElementType(),
                             encoding, SharedMemorySpace);
   };
@@ -137,7 +184,9 @@ SemaphorePair createSemaphores(OpBuilder &builder,
   if (result.getDefiningOp<LocalAllocOp>()) {
     memDescType = dyn_cast<MemDescType>(result.getType());
   } else if (auto tensorType = dyn_cast<RankedTensorType>(result.getType())) {
-    memDescType = getSmemDescType(tensorType, result);
+    Attribute descriptorEncoding =
+        getDescriptorStoreConsumerEncoding(tensorType, usesPerPartition);
+    memDescType = getSmemDescType(tensorType, result, descriptorEncoding);
   } else if (isa<FloatType, IntegerType>(result.getType())) {
     auto tensorType = getTensorTypeFromScalar(builder, result);
     memDescType = getSmemDescType(tensorType, Value());
@@ -583,7 +632,7 @@ bool insertSemaphoresForUses(
     OpBuilder::InsertionGuard g(builder);
     auto wsLoop = getOuterWSLoop(loop);
     builder.setInsertionPoint(wsLoop);
-    sema = createSemaphores(builder, producedValue);
+    sema = createSemaphores(builder, producedValue, usesPerPartition);
   }
 
   auto staleOps = createSemaphoreProducer(builder, sema, producedValue, wsTag);

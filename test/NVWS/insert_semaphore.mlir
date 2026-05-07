@@ -272,6 +272,59 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     } {ttg.partition = array<i32: 0, 1, 2>, ttg.partition.outputs = [array<i32: 1>], tt.num_stages = 2 : i32, tt.scheduled_max_stage = 1 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
     %result_0, %token_1 = ttng.tmem_load %result[%1] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
     "use"(%result_0) : (tensor<128x128xf32, #blocked>) -> ()
+tt.return
+}
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
+#linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [128, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @descriptor_store_via_convert_uses_descriptor_encoding
+  // CHECK: [[ALLOC:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
+  // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] true
+  // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ALLOC]] false
+  tt.func @descriptor_store_via_convert_uses_descriptor_encoding(%desc: !tt.tensordesc<tensor<128x128xf16, #shared>>, %lb: i32, %ub: i32, %step: i32) {
+    %c0_i32 = arith.constant 0 : i32
+    scf.for %i = %lb to %ub step %step : i32 {
+      %val = "producer"() {ttg.partition = array<i32: 0>} : () -> tensor<128x128xf16, #linear>
+      // CHECK: [[PTOK:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 0>}
+      // CHECK-NEXT: [[PBUF:%.*]] = nvws.semaphore.buffer [[EMPTY]], [[PTOK]] {ttg.partition = array<i32: 0>}
+      // CHECK-NEXT: ttg.local_store {{.*}}, [[PBUF]] {ttg.partition = array<i32: 0>} : tensor<128x128xf16, #linear> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable, 1x128x128>
+      %cvt = ttg.convert_layout %val {ttg.partition = array<i32: 1>} : tensor<128x128xf16, #linear> -> tensor<128x128xf16, #blocked>
+      // CHECK: [[GTOK:%.*]] = nvws.semaphore.acquire [[FULL]] {ttg.partition = array<i32: 1>}
+      // CHECK-NEXT: [[GBUF:%.*]] = nvws.semaphore.buffer [[FULL]], [[GTOK]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, 1x128x128>
+      // CHECK-NEXT: [[LOADED:%.*]] = ttg.local_load [[GBUF]] {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem, 1x128x128> -> tensor<128x128xf16, #linear>
+      // CHECK: [[CVT:%.*]] = ttg.convert_layout [[LOADED]] {ttg.partition = array<i32: 1>}
+      // CHECK-NEXT: tt.descriptor_store %{{.*}}[%{{.*}}, %{{.*}}], [[CVT]] {ttg.partition = array<i32: 1>}
+      tt.descriptor_store %desc[%i, %c0_i32], %cvt {ttg.partition = array<i32: 1>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, tensor<128x128xf16, #blocked>
+      scf.yield
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // CHECK-LABEL: @descriptor_store_direct_uses_descriptor_encoding
+  // CHECK: [[ALLOC:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
+  // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] true
+  // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ALLOC]] false
+  tt.func @descriptor_store_direct_uses_descriptor_encoding(%desc: !tt.tensordesc<tensor<128x128xf16, #shared>>, %lb: i32, %ub: i32, %step: i32) {
+    %c0_i32 = arith.constant 0 : i32
+    scf.for %i = %lb to %ub step %step : i32 {
+      %val = "producer"() {ttg.partition = array<i32: 0>} : () -> tensor<128x128xf16, #blocked>
+      // CHECK: [[PTOK:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 0>}
+      // CHECK-NEXT: [[PBUF:%.*]] = nvws.semaphore.buffer [[EMPTY]], [[PTOK]] {ttg.partition = array<i32: 0>}
+      // CHECK-NEXT: ttg.local_store {{.*}}, [[PBUF]] {ttg.partition = array<i32: 0>} : tensor<128x128xf16, #blocked> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable, 1x128x128>
+      // CHECK: [[GTOK:%.*]] = nvws.semaphore.acquire [[FULL]] {ttg.partition = array<i32: 1>}
+      // CHECK-NEXT: [[GBUF:%.*]] = nvws.semaphore.buffer [[FULL]], [[GTOK]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, 1x128x128>
+      // CHECK-NEXT: [[LOADED:%.*]] = ttg.local_load [[GBUF]] {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem, 1x128x128> -> tensor<128x128xf16, #blocked>
+      // CHECK: tt.descriptor_store %{{.*}}[%{{.*}}, %{{.*}}], [[LOADED]] {ttg.partition = array<i32: 1>}
+      tt.descriptor_store %desc[%i, %c0_i32], %val {ttg.partition = array<i32: 1>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, tensor<128x128xf16, #blocked>
+      scf.yield
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32}
     tt.return
   }
 }
