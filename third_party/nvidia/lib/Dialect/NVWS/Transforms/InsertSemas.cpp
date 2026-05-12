@@ -117,9 +117,7 @@ bool isSupportedAccessOp(Operation *op) {
 
 bool isSupportedMemDescForwardingOp(Operation *op) {
   StringRef name = op->getName().getStringRef();
-  return name == "ttg.memdesc_trans" || name == "ttg.memdesc_reinterpret" ||
-         name == "ttg.memdesc_index" || name == "ttg.memdesc_subslice" ||
-         name == "ttg.memdesc_reshape";
+  return name == "ttg.memdesc_trans" || name == "ttg.memdesc_reinterpret";
 }
 
 bool isSupportedSourcefulTokenlessUse(Value value,
@@ -1453,8 +1451,7 @@ LogicalResult insertTmemSemaphore(BufferAccessDag &groupDag,
         !isa<nvidia_gpu::TensorMemoryScalesEncodingAttr>(
             allocOp.getType().getEncoding()))
       return allocOp.emitError("buffer reuse: unsupported TMEM alias on "
-                               "non-2D allocation; semaphore backing would "
-                               "require an unsupported memdesc rank");
+                               "non-2D original allocation");
     auto shape = allocOp.getType().getShape();
     if (shape.size() >= 2)
       numTmemBlocks += shape[0] * shape[1] * numStages;
