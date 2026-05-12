@@ -120,6 +120,23 @@ def NVWSInsertTmemSemaphore: Pass<"nvws-insert-tmem-semaphore", "mlir::ModuleOp"
   ];
 }
 
+def NVWSInsertSemas: Pass<"nvws-insert-semas", "mlir::ModuleOp"> {
+  let summary = "Insert semaphore ops for ownership transfer.";
+
+  let description = [{
+    Staged replacement for nvws-insert-tmem-semaphore. The initial
+    implementation is a TMEM-only wiring clone; later stages replace
+    token-derived scheduling with alloc/access-derived scheduling.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def NVWSHoistTmemStore: Pass<"nvws-hoist-tmem-store", "mlir::ModuleOp"> {
   let summary = "Hoist tmem store before the inner loop to the top level if possible.";
 

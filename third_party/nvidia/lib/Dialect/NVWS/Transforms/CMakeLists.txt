@@ -5,6 +5,7 @@ add_triton_library(NVWSTransforms
   InsertSemaphore.cpp
   Utilities.cpp
   InsertTmemSemaphore.cpp
+  InsertSemas.cpp
   HoistTmemStore.cpp
   WSUtility.cpp
   WSDataPartition.cpp
