@@ -1,7 +1,7 @@
 // RUN: triton-opt %s -split-input-file --nvws-ws-data-partition=num-warp-groups=3 | FileCheck %s
 // RUN: triton-opt %s -split-input-file --nvws-ws-data-partition=num-warp-groups=3 --tritongpu-partition-scheduling -allow-unregistered-dialect | FileCheck %s --check-prefix=GENERIC
 // RUN: triton-opt %s -split-input-file --nvws-ws-data-partition=num-warp-groups=3 --nvws-partition-scheduling-meta="merge-epilogue separate-epilogue-store" --nvws-hoist-tmem-store --nvws-memory-planner=num-buffers=3 -allow-unregistered-dialect | FileCheck %s --check-prefix=PIPE
-// RUN: triton-opt %s -split-input-file --nvws-ws-data-partition=num-warp-groups=3 --nvws-partition-scheduling-meta="merge-epilogue separate-epilogue-store" --nvws-hoist-tmem-store --nvws-memory-planner=num-buffers=3 --nvws-insert-semaphore -allow-unregistered-dialect | FileCheck %s --check-prefix=SEMA
+// RUN: triton-opt %s -split-input-file --nvws-ws-data-partition=num-warp-groups=3 --nvws-partition-scheduling-meta="merge-epilogue separate-epilogue-store" --nvws-hoist-tmem-store --nvws-memory-planner=num-buffers=3 --nvws-insert-semas -allow-unregistered-dialect | FileCheck %s --check-prefix=SEMA
 
 
 // -----

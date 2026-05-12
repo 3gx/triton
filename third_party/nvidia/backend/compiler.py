@@ -430,10 +430,10 @@ class CUDABackend(BaseBackend):
                 passes.ttgpuir.add_warp_specialize(pm, opt.num_stages, 1, use_nvws_meta)
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
-                nvidia.passes.hopper.add_tma_store_lowering(pm)
                 if knobs.nvidia.use_meta_partition:
                     nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 else:
+                    nvidia.passes.hopper.add_tma_store_lowering(pm)
                     passes.ttgpuir.add_partition_scheduling(pm)
                 smem_budget = _max_shared_mem_for_capability(capability)
                 generate_subtiled = opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region

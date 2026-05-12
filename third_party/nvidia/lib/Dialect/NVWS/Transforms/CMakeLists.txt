@@ -2,9 +2,11 @@ add_triton_library(NVWSTransforms
   AssignStagePhase.cpp
   LowerAref.cpp
   LowerWarpGroup.cpp
+  InsertAllocas.cpp
   InsertSemaphore.cpp
   Utilities.cpp
   InsertTmemSemaphore.cpp
+  InsertSemas.cpp
   HoistTmemStore.cpp
   WSUtility.cpp
   WSDataPartition.cpp

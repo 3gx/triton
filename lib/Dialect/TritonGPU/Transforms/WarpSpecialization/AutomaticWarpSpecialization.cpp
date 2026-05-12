@@ -111,11 +111,11 @@ void AutomaticWarpSpecialization::runOnOperation() {
   }
 
   addPassWithPartitionVerifier(createNVWSHoistTmemStore());
-  addPassWithPartitionVerifier(createNVWSInsertSemaphore());
+  addPassWithPartitionVerifier(createNVWSInsertAllocas());
   NVWSMemoryPlannerOptions memoryPlannerOptions;
   memoryPlannerOptions.numBuffers = numStages;
-  addPassWithPartitionVerifier(createNVWSMemoryPlanner(memoryPlannerOptions));
-  addPassWithPartitionVerifier(createNVWSInsertTmemSemaphore());
+  // addPassWithPartitionVerifier(createNVWSMemoryPlanner(memoryPlannerOptions));
+  addPassWithPartitionVerifier(createNVWSInsertSemas());
   addPassWithPartitionVerifier(createNVWSLowerSemaphore({numStages}));
   pm.addPass(createTritonGPUPartitionLoops());
   pm.addPass(createNVWSLowerWarpGroup());

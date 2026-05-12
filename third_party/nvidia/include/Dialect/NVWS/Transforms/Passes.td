@@ -104,12 +104,44 @@ def NVWSInsertSemaphore: Pass<"nvws-insert-semaphore", "mlir::ModuleOp"> {
   ];
 }
 
+def NVWSInsertAllocas: Pass<"nvws-insert-allocas", "mlir::ModuleOp"> {
+  let summary = "Materialize NVWS communication allocations and accesses.";
+
+  let description = [{
+    Materializes explicit local/TMEM communication buffers and memory accesses
+    for cross-partition SSA values without inserting semaphore operations.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def NVWSInsertTmemSemaphore: Pass<"nvws-insert-tmem-semaphore", "mlir::ModuleOp"> {
   let summary = "Insert TMEM semaphore ops for ownership transfer.";
 
   let description = [{
     Inserts synchronization directly as semaphore operations for TMEM ownership
     transfer between partitions.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def NVWSInsertSemas: Pass<"nvws-insert-semas", "mlir::ModuleOp"> {
+  let summary = "Insert semaphore ops for ownership transfer.";
+
+  let description = [{
+    Access-DAG-driven TMEM semaphore insertion for ownership transfer between
+    warp-specialized partitions.
   }];
 
   let dependentDialects = [
