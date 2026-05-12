@@ -62,300 +62,6 @@ std::optional<PartitionId> getPartitionId(Operation *op, int pos = 0) {
   return std::make_pair(*partitionIds.begin(), getWsTag(op));
 }
 
-struct TmemAccessDag {
-  struct Node {
-    // For now we assume there is only one use of generated async tmem token
-    std::unique_ptr<Node> user;
-    SmallVector<std::unique_ptr<Node>> subDags;
-    Node(Operation *op, OpOperand *tokOperand,
-         std::optional<PartitionId> partitionId, Node *parent)
-        : op(op), tokOperand(tokOperand), partitionId(partitionId),
-          parent(parent), parentDag(nullptr) {}
-
-    // ------------------------------------------------------------------------
-
-    Operation *op;
-    OpOperand *tokOperand;
-    Node *parent;
-    Node *parentDag;
-    std::optional<int> tokPos;
-    std::optional<PartitionId> partitionId;
-  };
-
-  TmemAccessDag(std::unique_ptr<Node> dag) : dag(std::move(dag)) {}
-
-  Node *getRootNode() { return dag.get(); }
-  TMEMAllocOp getAllocOp() { return cast<TMEMAllocOp>(dag->op); }
-
-  Value addIfOp(Value tok, Node *node) {
-    SmallVector<OpOperand *> uses;
-    for (auto &use : tok.getUses())
-      uses.push_back(&use);
-    assert(uses.size() == 2 && "expecting two uses of a token");
-    auto useThen = uses[0];
-    auto useElse = uses[1];
-
-    auto ifOp = cast<scf::IfOp>(useThen->getOwner()->getParentOp());
-    node->user.reset(new Node(ifOp, nullptr, {}, node));
-    auto ifOpNode = node->user.get();
-
-    if (ifOp.thenBlock() != useThen->getOwner()->getBlock())
-      std::swap(useThen, useElse);
-    assert(ifOp.thenBlock() == useThen->getOwner()->getBlock());
-    assert(ifOp.elseBlock() == useElse->getOwner()->getBlock());
-
-    // Create access DAGs for then/else blocks.
-    auto thenDag =
-        std::make_unique<Node>(nullptr, nullptr, std::nullopt, nullptr);
-    auto elseDag =
-        std::make_unique<Node>(nullptr, nullptr, std::nullopt, nullptr);
-    auto thenTok = addOp(*useThen, thenDag.get());
-    addOp(*useElse, elseDag.get());
-
-    auto tokPos =
-        *findValuePosInRange(ifOp.thenYield()->getOperands(), thenTok);
-    ifOpNode->partitionId = getPartitionId(ifOp, tokPos);
-
-    // find final node in then-branch and assign yieldOp as its user
-    // XXX: improve representation later, but for now the user's parentDag
-    //      points to the first op in the branch, because we will need to get
-    //      stageCluser information later in aref insertion as ifOps don't carry
-    //      partition assignment to their results like nvws-branch
-    Node *finalThenNode = thenDag.get();
-    while (finalThenNode->user)
-      finalThenNode = finalThenNode->user.get();
-    auto thenYieldOp = ifOp.thenYield();
-    finalThenNode->user =
-        std::make_unique<Node>(thenYieldOp, &thenYieldOp->getOpOperand(tokPos),
-                               ifOpNode->partitionId, finalThenNode);
-    finalThenNode->user->parentDag = thenDag->user.get();
-
-    // do the same with else-branch
-    Node *finalElseNode = elseDag.get();
-    while (finalElseNode->user)
-      finalElseNode = finalElseNode->user.get();
-    auto elseYieldOp = ifOp.elseYield();
-    finalElseNode->user =
-        std::make_unique<Node>(elseYieldOp, &elseYieldOp->getOpOperand(tokPos),
-                               ifOpNode->partitionId, finalElseNode);
-    finalElseNode->user->parentDag = elseDag->user.get();
-
-    // the parent of the first op in the branch is null, but parent dag points
-    // to original ifOp
-    thenDag->user->parent = nullptr;
-    elseDag->user->parent = nullptr;
-    thenDag->user->parentDag = ifOpNode;
-    elseDag->user->parentDag = ifOpNode;
-
-    ifOpNode->subDags.push_back(std::move(thenDag->user));
-    ifOpNode->subDags.push_back(std::move(elseDag->user));
-
-    ifOpNode->tokPos = tokPos;
-
-    auto newTok = ifOp.getResult(tokPos);
-    assert(newTok.hasOneUse());
-    return addOp(*newTok.getUses().begin(), ifOpNode);
-  }
-
-  Value addForOp(OpOperand &tokOperand, Node *forOpNode) {
-    auto forOp = cast<scf::ForOp>(tokOperand.getOwner());
-    auto tokPos = tokOperand.getOperandNumber() - 3;
-    auto tokDefOp = forOp.getYieldedValues()[tokPos].getDefiningOp();
-    assert(tokDefOp && "expecting a token definition op");
-
-    // Create access node for the for-loop body. The first op is nullptr,
-    // but it has partitionIdx, indicating which partition owns the Tmem when
-    // entering the region
-    auto subDag =
-        std::make_unique<Node>(nullptr, nullptr, std::nullopt, nullptr);
-    auto tokArg = forOp.getRegionIterArg(tokPos);
-    assert(tokArg.hasOneUse());
-    addOp(*tokArg.getUses().begin(), subDag.get());
-    forOpNode->partitionId = getPartitionId(forOp, tokPos);
-
-    // finalNode keep track of partition ownership transfer ownership when
-    // before exiting the loop-body or re-entering loop body
-    // same as in IfOp then/else branches
-    Node *finalNode = subDag->user.get();
-    while (finalNode->user)
-      finalNode = finalNode->user.get();
-    auto yieldOp = forOp.getBody()->getTerminator();
-    finalNode->user =
-        std::make_unique<Node>(yieldOp, &yieldOp->getOpOperand(tokPos),
-                               forOpNode->partitionId, finalNode);
-    finalNode->user->parentDag = subDag->user.get();
-    forOpNode->tokPos = tokPos;
-
-    // subDag->user->parentDag = subDag->user.get();
-    subDag->user->parent = nullptr;
-    subDag->user->parentDag = forOpNode;
-
-    forOpNode->subDags.push_back(std::move(subDag->user));
-    return forOp.getResult(tokPos);
-  }
-
-  Value addOp(OpOperand &tokOperand, Node *node) {
-    if (isa<scf::YieldOp>(tokOperand.getOwner()))
-      return tokOperand.get(); // return token back to the caller
-
-    auto op = tokOperand.getOwner();
-    std::optional<PartitionId> partitionId;
-    // tmem owning partition for if & for ops are inferred from their regions
-    if (op->getNumRegions() == 0)
-      partitionId = getPartitionId(op);
-    node->user.reset(new Node(op, &tokOperand, partitionId, node));
-    auto newNode = node->user.get();
-    Value newTok;
-
-    if (auto tmemLoad = dyn_cast<TMEMLoadOp>(op)) {
-      newTok = tmemLoad.getToken();
-    } else if (auto tmemStore = dyn_cast<TMEMStoreOp>(op)) {
-      newTok = tmemStore.getToken();
-    } else if (auto mmav5 = dyn_cast<MMAv5OpInterface>(op)) {
-      newTok = mmav5.getToken();
-    } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-      newTok = addForOp(tokOperand, newNode);
-    } else {
-      llvm_unreachable("unsupported user");
-    }
-
-    if (newTok.use_empty())
-      return newTok;
-
-    if (newTok.hasOneUse()) {
-      auto &use = *newTok.getUses().begin();
-      return addOp(use, newNode);
-    }
-
-    // Multiple uses of token are expected only in IfOp: one in then and one in
-    // else branches.
-    return addIfOp(newTok, newNode);
-  }
-
-  static TmemAccessDag build(TMEMAllocOp allocOp) {
-    std::optional<PartitionId> partitionId;
-    if (allocOp.getSrc()) {
-      partitionId = getPartitionId(allocOp);
-    }
-    TmemAccessDag accessDag(
-        std::make_unique<Node>(allocOp, nullptr, partitionId, nullptr));
-
-    if (!allocOp.getToken()) {
-      // Tokenless tmem_allocs are represented by their single buffer consumer.
-      // Sourceful tokenless allocs additionally get lowered to an explicit store
-      // during the semaphore rewrite.
-      assert(allocOp->hasOneUse());
-      auto user = *allocOp->getUsers().begin();
-      accessDag.getRootNode()->user.reset(new Node{
-          user, nullptr, getPartitionId(user), accessDag.getRootNode()});
-    } else {
-      auto tok = allocOp.getToken();
-      assert(tok);
-      if (tok.hasOneUse()) {
-        auto &tokUse = *tok.getUses().begin();
-        accessDag.addOp(tokUse, accessDag.getRootNode());
-      } else {
-        accessDag.addIfOp(tok, accessDag.getRootNode());
-      }
-    }
-    return accessDag;
-  }
-
-  void collectPartitions(
-      Node *node, bool &hasRootPartition,
-      SmallVector<std::pair<PartitionId, Operation *>> &partitions) {
-    if (node->partitionId) {
-      partitions.push_back(std::make_pair(*node->partitionId, node->op));
-    } else {
-      // root partition is considered a real owner only if there are already
-      // other partitions owning tmem
-      hasRootPartition = !partitions.empty();
-    }
-    for (auto &subDag : node->subDags) {
-      if (subDag) {
-        collectPartitions(subDag.get(), hasRootPartition, partitions);
-      }
-    }
-    if (node->user) {
-      collectPartitions(node->user.get(), hasRootPartition, partitions);
-    }
-  };
-
-  std::pair<bool, SmallVector<std::pair<PartitionId, Operation *>>>
-  collectPartitionsVec() {
-    SmallVector<std::pair<PartitionId, Operation *>> partitions;
-    bool hasRootPartition = false;
-    auto node = getRootNode();
-    auto allocOp = getAllocOp();
-    if (allocOp.getSrc() && node->partitionId)
-      partitions.push_back(std::make_pair(*node->partitionId, node->op));
-    collectPartitions(getRootNode()->user.get(), hasRootPartition, partitions);
-    return {hasRootPartition, partitions};
-  }
-
-  std::pair<bool, std::set<PartitionId>> collectPartitionsSet() {
-    auto [hasRootPartition, partitions] = collectPartitionsVec();
-    std::set<PartitionId> partitionSet;
-    for (auto [partition, _] : partitions) {
-      partitionSet.insert(partition);
-    }
-    return {hasRootPartition, partitionSet};
-  }
-
-  void printNode(Node *node, int indent, llvm::raw_ostream &os) {
-    if (!node)
-      return;
-    for (int i = 0; i < indent; i++) {
-      os << " ";
-    }
-    std::set<PartitionId> partitions;
-    os << "|- [" << node->op << "]";
-    bool hasRootPartition = false;
-    if (node->partitionId)
-      partitions.insert(*node->partitionId);
-    else
-      hasRootPartition = true;
-    if (node->op) {
-      os << node->op->getName().getStringRef() << " ";
-      if (auto tmemAlloc = dyn_cast<TMEMAllocOp>(node->op)) {
-        if (tmemAlloc.getSrc()) {
-          os << " %src ";
-        } else {
-          std::tie(hasRootPartition, partitions) = collectPartitionsSet();
-        }
-      }
-      os << "  ";
-    }
-    os << "[" << (hasRootPartition ? "root" : "");
-    for (auto partition : partitions) {
-      auto [id, tag] = partition;
-      os << " @" << tag << "." << id << " ";
-    }
-    os << "]";
-    os << " prev[" << (node->parent ? node->parent->op : nullptr) << "]";
-    os << "\n";
-    for (auto &subDag : node->subDags) {
-      for (int i = 0; i < indent + 4; i++)
-        os << " ";
-      os << "|- subDag\n";
-      if (subDag)
-        printNode(subDag.get(), indent + 8, os);
-    }
-    if (node->user) {
-      printNode(node->user.get(), indent, os);
-    }
-  };
-  void printDag(llvm::raw_ostream &os) {
-    os << "TMEMDAG\n";
-    printNode(dag.get(), 2, os);
-    os << "\n";
-  }
-
-  // --------------------------------------------------------------------------
-
-  std::unique_ptr<Node> dag;
-};
-
 void assignStage(OpBuilder &b, Operation *op, StageCluster stageCluster) {
   if (stageCluster) {
     op->setAttr(kLoopStageAttrName, b.getI32IntegerAttr(stageCluster->first));
@@ -409,6 +115,39 @@ bool isSupportedAccessOp(Operation *op) {
   return isa<TMEMLoadOp, TMEMStoreOp, MMAv5OpInterface>(op);
 }
 
+bool isSupportedMemDescForwardingOp(Operation *op) {
+  StringRef name = op->getName().getStringRef();
+  return name == "ttg.memdesc_trans" || name == "ttg.memdesc_reinterpret" ||
+         name == "ttg.memdesc_index" || name == "ttg.memdesc_subslice" ||
+         name == "ttg.memdesc_reshape";
+}
+
+bool isSupportedSourcefulTokenlessUse(Value value,
+                                      llvm::SmallPtrSetImpl<Value> &visited) {
+  if (!visited.insert(value).second)
+    return true;
+  for (Operation *user : value.getUsers()) {
+    if (isa<TMEMLoadOp>(user))
+      continue;
+    if (auto mmaOp = dyn_cast<MMAv5OpInterface>(user)) {
+      if (mmaOp.getAccumulator() == value)
+        return false;
+      bool foundOperand = false;
+      for (OpOperand &opnd : user->getOpOperands())
+        foundOperand |= opnd.get() == value;
+      if (foundOperand)
+        continue;
+    }
+    if (isSupportedMemDescForwardingOp(user) && user->getNumResults() == 1) {
+      if (!isSupportedSourcefulTokenlessUse(user->getResult(0), visited))
+        return false;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
 LogicalResult validateSourcefulTokenlessAlloc(TMEMAllocOp allocOp) {
   if (!allocOp.getSrc() || allocOp.getToken())
     return success();
@@ -417,28 +156,27 @@ LogicalResult validateSourcefulTokenlessAlloc(TMEMAllocOp allocOp) {
     return allocOp.emitError("buffer reuse: sourceful tmem_alloc must have "
                              "exactly one user");
 
-  Operation *user = *allocOp->user_begin();
-  if (isa<TMEMLoadOp>(user))
+  llvm::SmallPtrSet<Value, 8> visited;
+  if (isSupportedSourcefulTokenlessUse(allocOp.getResult(), visited))
     return success();
 
-  if (auto mmaOp = dyn_cast<MMAv5OpInterface>(user)) {
-    if (mmaOp.getAccumulator() == allocOp.getResult())
-      return allocOp.emitError("buffer reuse: sourceful tmem_alloc used as "
-                               "MMAv5 accumulator destination");
-
-    for (OpOperand &opnd : user->getOpOperands()) {
-      if (opnd.get() == allocOp.getResult())
-        return success();
-    }
-  }
-
   return allocOp.emitError("buffer reuse: sourceful tmem_alloc supports only "
-                           "read/consume uses (tmem_load or non-accumulator "
-                           "MMAv5 operand)");
+                           "read/consume uses through supported TMEM aliases "
+                           "(tmem_load or non-accumulator MMAv5 operand)");
 }
 
 struct BufferAccessDag {
   enum EventKind { Access, SourcefulStore, Boundary };
+
+  struct AliasStep {
+    Operation *op = nullptr;
+    unsigned sourceOperand = 0;
+  };
+
+  struct AliasInfo {
+    unsigned memberIdx = 0;
+    SmallVector<AliasStep> viewChain;
+  };
 
   struct Event {
     EventKind kind = Access;
@@ -473,7 +211,9 @@ struct BufferAccessDag {
       : funcOp(funcOp), members(members.begin(), members.end()) {
     for (auto [idx, alloc] : llvm::enumerate(this->members)) {
       origMembers.insert({alloc.getResult(), idx});
-      if (alloc.getSrc() && !alloc.getToken())
+      aliases.insert({alloc.getResult(), AliasInfo{static_cast<unsigned>(idx),
+                                                   {}}});
+      if (alloc.getSrc())
         sourcefulAllocs[alloc.getOperation()] = idx;
     }
   }
@@ -483,7 +223,7 @@ struct BufferAccessDag {
     if (body.empty())
       return success();
     root = buildBlock(&body.front());
-    return success();
+    return aliasFailure ? failure() : success();
   }
 
   llvm::MapVector<unsigned, int> getSlotMap(Operation *op) const {
@@ -493,15 +233,67 @@ struct BufferAccessDag {
     return it->second;
   }
 
+  const AliasInfo *lookupAlias(Value value) const {
+    auto it = aliases.find(value);
+    if (it == aliases.end())
+      return nullptr;
+    return &it->second;
+  }
+
+  bool hasAliasOperand(Operation *op) const {
+    return llvm::any_of(op->getOperands(),
+                        [&](Value value) { return lookupAlias(value); });
+  }
+
+  LogicalResult recordForwardingAlias(Operation *op) {
+    SmallVector<unsigned> aliasOperands;
+    for (OpOperand &operand : op->getOpOperands())
+      if (lookupAlias(operand.get()))
+        aliasOperands.push_back(operand.getOperandNumber());
+
+    if (aliasOperands.empty())
+      return success();
+    if (isSupportedAccessOp(op))
+      return success();
+    if (!isSupportedMemDescForwardingOp(op))
+      return op->emitError("buffer reuse: unsupported TMEM memdesc alias use ")
+             << op->getName();
+    if (aliasOperands.size() != 1 || op->getNumResults() != 1 ||
+        !isa<MemDescType>(op->getResult(0).getType()))
+      return op->emitError("buffer reuse: unsupported TMEM memdesc forwarding "
+                           "shape for ")
+             << op->getName();
+
+    const AliasInfo *sourceAlias =
+        lookupAlias(op->getOperand(aliasOperands.front()));
+    assert(sourceAlias && "expected alias source");
+    AliasInfo alias = *sourceAlias;
+    alias.viewChain.push_back({op, aliasOperands.front()});
+    aliases.insert({op->getResult(0), std::move(alias)});
+    aliasOps.push_back(op);
+    return success();
+  }
+
   std::unique_ptr<BlockNode> buildBlock(Block *block) {
     auto blockNode = std::make_unique<BlockNode>();
     blockNode->block = block;
 
     for (Operation &op : *block) {
-      if (isa<scf::YieldOp>(&op))
+      if (isa<scf::YieldOp>(&op)) {
+        if (hasAliasOperand(&op)) {
+          op.emitError("buffer reuse: unsupported TMEM memdesc alias through "
+                       "control-flow yield");
+          aliasFailure = true;
+        }
         continue;
+      }
 
       if (auto forOp = dyn_cast<scf::ForOp>(&op)) {
+        if (hasAliasOperand(forOp)) {
+          op.emitError("buffer reuse: unsupported TMEM memdesc alias through "
+                       "scf.for operands");
+          aliasFailure = true;
+        }
         auto region = std::make_unique<RegionNode>();
         region->op = forOp;
         regionNodes[forOp] = region.get();
@@ -513,6 +305,11 @@ struct BufferAccessDag {
       }
 
       if (auto ifOp = dyn_cast<scf::IfOp>(&op)) {
+        if (hasAliasOperand(ifOp)) {
+          op.emitError("buffer reuse: unsupported TMEM memdesc alias through "
+                       "scf.if operands");
+          aliasFailure = true;
+        }
         auto region = std::make_unique<RegionNode>();
         region->op = ifOp;
         regionNodes[ifOp] = region.get();
@@ -526,6 +323,13 @@ struct BufferAccessDag {
           addRegion(*blockNode, std::move(region));
         continue;
       }
+
+      if (failed(recordForwardingAlias(&op))) {
+        aliasFailure = true;
+        continue;
+      }
+      if (isSupportedMemDescForwardingOp(&op) && hasAliasOperand(&op))
+        continue;
 
       if (auto event = getEvent(&op))
         addEvent(*blockNode, *event);
@@ -629,11 +433,11 @@ struct BufferAccessDag {
     }
 
     auto recordIfMember = [&](Value value, Value depToken, Value resultToken) {
-      auto it = origMembers.find(value);
-      if (it == origMembers.end())
+      const AliasInfo *alias = lookupAlias(value);
+      if (!alias)
         return;
-      recordSlotForToken(depToken, it->second);
-      recordSlotForToken(resultToken, it->second);
+      recordSlotForToken(depToken, alias->memberIdx);
+      recordSlotForToken(resultToken, alias->memberIdx);
     };
 
     if (auto loadOp = dyn_cast<TMEMLoadOp>(op)) {
@@ -662,11 +466,11 @@ struct BufferAccessDag {
 
     SmallVector<unsigned, 2> memberIdxs;
     auto addMember = [&](Value value) {
-      auto it = origMembers.find(value);
-      if (it == origMembers.end())
+      const AliasInfo *alias = lookupAlias(value);
+      if (!alias)
         return;
-      if (!llvm::is_contained(memberIdxs, it->second))
-        memberIdxs.push_back(it->second);
+      if (!llvm::is_contained(memberIdxs, alias->memberIdx))
+        memberIdxs.push_back(alias->memberIdx);
     };
 
     if (auto loadOp = dyn_cast<TMEMLoadOp>(op)) {
@@ -757,6 +561,73 @@ struct BufferAccessDag {
     return events;
   }
 
+  void collectOrderedEvents(const BlockNode *blockNode,
+                            SmallVectorImpl<Event> &events) const {
+    if (!blockNode)
+      return;
+    for (const Item &item : blockNode->items) {
+      if (item.isRegion) {
+        collectOrderedEvents(item.region->body.get(), events);
+        collectOrderedEvents(item.region->thenBlock.get(), events);
+        collectOrderedEvents(item.region->elseBlock.get(), events);
+        continue;
+      }
+      events.push_back(item.event);
+    }
+  }
+
+  std::optional<PartitionId>
+  getNextDistinctPartitionAfter(Operation *op, PartitionId current) const {
+    SmallVector<Event> events;
+    collectOrderedEvents(root.get(), events);
+    if (events.empty())
+      return std::nullopt;
+
+    std::optional<size_t> pos;
+    for (auto [idx, event] : llvm::enumerate(events)) {
+      if (event.op == op && event.partitionId && *event.partitionId == current)
+        pos = idx;
+    }
+    if (!pos)
+      return std::nullopt;
+
+    for (size_t offset = 1; offset <= events.size(); ++offset) {
+      const Event &event = events[(*pos + offset) % events.size()];
+      if (event.partitionId && *event.partitionId != current)
+        return event.partitionId;
+    }
+    return std::nullopt;
+  }
+
+  std::optional<Event> getFirstEvent(const BlockNode *blockNode) const {
+    if (!blockNode)
+      return std::nullopt;
+    for (const Item &item : blockNode->items) {
+      if (!item.isRegion)
+        return item.event;
+
+      if (!item.region->slotMap.empty()) {
+        auto [memberIdx, tokPos] = item.region->slotMap.front();
+        (void)memberIdx;
+        Event boundary;
+        boundary.kind = Boundary;
+        boundary.op = item.region->op;
+        if (hasPartition(item.region->op))
+          boundary.partitionId = getPartitionId(item.region->op, tokPos);
+        return boundary;
+      }
+      if (auto event = getFirstEvent(item.region->body.get()))
+        return event;
+      if (auto event = getFirstEvent(item.region->thenBlock.get()))
+        return event;
+      if (auto event = getFirstEvent(item.region->elseBlock.get()))
+        return event;
+    }
+    return std::nullopt;
+  }
+
+  std::optional<Event> getFirstEvent() const { return getFirstEvent(root.get()); }
+
   void printBlock(const BlockNode *blockNode, int indent,
                   llvm::raw_ostream &os) const {
     if (!blockNode)
@@ -791,20 +662,25 @@ struct BufferAccessDag {
   triton::FuncOp funcOp;
   SmallVector<TMEMAllocOp> members;
   llvm::MapVector<Value, unsigned> origMembers;
+  llvm::MapVector<Value, AliasInfo> aliases;
+  SmallVector<Operation *> aliasOps;
   DenseMap<Operation *, unsigned> sourcefulAllocs;
   DenseMap<Operation *, llvm::MapVector<unsigned, int>> regionSlotMaps;
   DenseMap<Operation *, RegionNode *> regionNodes;
   std::unique_ptr<BlockNode> root;
+  bool aliasFailure = false;
 };
 
 struct TMEMSemaphore {
   enum Kind { PING, PONG };
 
   TMEMSemaphore(Value ping, Value pong, ArrayRef<Value> allocBufs,
-                const llvm::MapVector<Value, unsigned> &origMembers,
-                Value replToken)
+                const llvm::MapVector<Value, BufferAccessDag::AliasInfo>
+                    &aliases,
+                Value replToken, bool extendReleaseToSameOwnerOps)
       : ping(ping), pong(pong), allocBufs(allocBufs.begin(), allocBufs.end()),
-        origMembers(origMembers), replToken(replToken), kind(PING) {}
+        aliases(aliases), replToken(replToken),
+        extendReleaseToSameOwnerOps(extendReleaseToSameOwnerOps), kind(PING) {}
 
   void acquire(OpBuilder &b, Location loc,
                std::pair<std::optional<PartitionId>, StageCluster>
@@ -819,11 +695,12 @@ struct TMEMSemaphore {
       hasSeenPartitionOwner = true;
     }
     buffers.clear();
+    viewBuffers.clear();
     active = true;
     openedByRootInitialization = false;
   }
 
-  void release(OpBuilder &b, Location loc) {
+  SemaphoreReleaseOp release(OpBuilder &b, Location loc) {
     assert(active && "cannot release an inactive TMEM semaphore state");
     if (!asyncOp[partitionId])
       asyncOp[partitionId] = AsyncOp::NONE;
@@ -832,13 +709,14 @@ struct TMEMSemaphore {
       stageCluster = stageClusters[*partitionId];
     // Cross-release: PING releases pong, PONG releases ping.
     Value sem = (kind == PING) ? pong : ping;
-    createInto<SemaphoreReleaseOp>(
+    auto releaseOp = createInto<SemaphoreReleaseOp>(
         b, loc, {partitionId, stageCluster}, sem, token,
         b.getArrayAttr(SmallVector<Attribute>{
             AsyncOpAttr::get(b.getContext(), *asyncOp[partitionId])}));
     // Toggle kind
     kind = (kind == PING) ? PONG : PING;
     openedByRootInitialization = false;
+    return releaseOp;
   }
 
   Value getBuffer(OpBuilder &b, std::optional<PartitionId> pid, Operation *op,
@@ -861,11 +739,47 @@ struct TMEMSemaphore {
     return buffers[memberIdx];
   }
 
-  std::optional<unsigned> lookupMember(Value value) const {
-    auto it = origMembers.find(value);
-    if (it == origMembers.end())
-      return std::nullopt;
-    return it->second;
+  const BufferAccessDag::AliasInfo *lookupAlias(Value value) const {
+    auto it = aliases.find(value);
+    if (it == aliases.end())
+      return nullptr;
+    return &it->second;
+  }
+
+  Value rebuildAliasView(OpBuilder &b, std::optional<PartitionId> pid,
+                         Operation *accessOp, Value source,
+                         const BufferAccessDag::AliasInfo &alias) {
+    if (alias.viewChain.empty())
+      return getBuffer(b, pid, accessOp, alias.memberIdx);
+
+    auto cached = viewBuffers.find(source);
+    if (cached != viewBuffers.end())
+      return cached->second;
+
+    Value current = getBuffer(b, pid, accessOp, alias.memberIdx);
+    for (const BufferAccessDag::AliasStep &step : alias.viewChain) {
+      Operation *orig = step.op;
+      SmallVector<Value> operands(orig->getOperands());
+      operands[step.sourceOperand] = current;
+
+      OperationState state(orig->getLoc(), orig->getName());
+      state.addOperands(operands);
+      state.addTypes(orig->getResultTypes());
+      state.addAttributes(orig->getAttrs());
+      Operation *clone = b.create(state);
+      assert(clone->getNumResults() == 1 &&
+             "supported TMEM alias op must have one result");
+      current = clone->getResult(0);
+    }
+    viewBuffers[source] = current;
+    return current;
+  }
+
+  Value getBufferForValue(OpBuilder &b, std::optional<PartitionId> pid,
+                          Operation *op, Value source) {
+    const auto *alias = lookupAlias(source);
+    assert(alias && "buffer requested for a non-alias value");
+    return rebuildAliasView(b, pid, op, source, *alias);
   }
 
   // --------------------------------------------------------------------------
@@ -873,16 +787,19 @@ struct TMEMSemaphore {
   Value ping; // semaphore: initially released
   Value pong; // semaphore: initially not released
   SmallVector<Value> allocBufs;
-  llvm::MapVector<Value, unsigned> origMembers;
+  llvm::MapVector<Value, BufferAccessDag::AliasInfo> aliases;
   Value replToken;
+  bool extendReleaseToSameOwnerOps;
 
   SmallVector<Value> buffers;
+  DenseMap<Value, Value> viewBuffers;
   Value token;
   Kind kind;
   bool active = false;
   bool openedByRootInitialization = false;
   bool hasSeenPartitionOwner = false;
   Operation *lastOp = nullptr;
+  DenseMap<PartitionId, Operation *> lastAccessOpByPartition;
   std::optional<PartitionId> partitionId;
   llvm::MapVector<std::optional<PartitionId>, std::optional<AsyncOp>> asyncOp;
   DenseMap<PartitionId, StageCluster> stageClusters;
@@ -926,6 +843,46 @@ LogicalResult ensureAcquiredBefore(Operation *op,
   return success();
 }
 
+SemaphoreReleaseOp releaseForTransition(Operation *op, TMEMSemaphore &state) {
+  OpBuilder b(op);
+  Location loc = op->getLoc();
+  if (state.lastOp && state.lastOp->getBlock() == op->getBlock() &&
+      state.lastOp->isBeforeInBlock(op)) {
+    Operation *anchor = state.lastOp;
+    if (state.extendReleaseToSameOwnerOps) {
+      for (Operation *cur = state.lastOp->getNextNode(); cur && cur != op;
+           cur = cur->getNextNode()) {
+        if (isa<SemaphoreCreateOp, SemaphoreAcquireOp, SemaphoreReleaseOp,
+                SemaphoreBufferOp>(cur))
+          continue;
+        if (!hasPartition(cur)) {
+          if (!state.partitionId)
+            anchor = cur;
+          continue;
+        }
+        if (!state.partitionId)
+          continue;
+        auto partitionIds = getPartitionIds(cur);
+        if (llvm::is_contained(partitionIds, state.partitionId->first) &&
+            getWsTag(cur) == state.partitionId->second)
+          anchor = cur;
+      }
+    }
+    b.setInsertionPointAfter(anchor);
+    loc = anchor->getLoc();
+    if (isa<scf::ForOp>(anchor) && state.partitionId)
+      state.stageClusters[*state.partitionId] = {};
+  } else if (state.lastOp && state.lastOp->getBlock() != op->getBlock()) {
+    b.setInsertionPointToStart(op->getBlock());
+    loc = state.lastOp->getLoc();
+  } else if (!state.lastOp) {
+    b.setInsertionPointToStart(op->getBlock());
+  } else {
+    b.setInsertionPoint(op);
+  }
+  return state.release(b, loc);
+}
+
 LogicalResult transitionTo(Operation *op, std::optional<PartitionId> partitionId,
                            TMEMSemaphore &state) {
   if (failed(ensureAcquiredBefore(op, partitionId, state)))
@@ -937,14 +894,16 @@ LogicalResult transitionTo(Operation *op, std::optional<PartitionId> partitionId
     state.partitionId = partitionId;
     state.stageClusters[*partitionId] = getAcquireStageCluster(state,
                                                                partitionId, op);
+    state.buffers.clear();
+    state.viewBuffers.clear();
     state.openedByRootInitialization = false;
     state.hasSeenPartitionOwner = true;
     return success();
   }
 
+  releaseForTransition(op, state);
   OpBuilder b(op);
   b.setInsertionPoint(op);
-  state.release(b, op->getLoc());
   state.acquire(b, op->getLoc(),
                 {partitionId, getAcquireStageCluster(state, partitionId, op)});
   return success();
@@ -962,7 +921,10 @@ LogicalResult reconcileBefore(Operation *op, TMEMSemaphore &state,
        ++i) {
     OpBuilder b(op);
     b.setInsertionPoint(op);
-    state.release(b, op->getLoc());
+    if (i == 0)
+      releaseForTransition(op, state);
+    else
+      state.release(b, op->getLoc());
     state.acquire(
         b, op->getLoc(),
         {targetPartition, getAcquireStageCluster(state, targetPartition, op)});
@@ -976,25 +938,27 @@ LogicalResult reconcileBefore(Operation *op, TMEMSemaphore &state,
 }
 
 std::optional<PartitionId>
-pickOtherPartition(const std::set<PartitionId> &partitions,
-                   std::optional<PartitionId> current) {
-  for (PartitionId partitionId : partitions)
-    if (!current || partitionId != *current)
-      return partitionId;
-  return current;
+getPhaseRepairPartition(const TMEMSemaphore &state,
+                        std::optional<PartitionId> exactTarget) {
+  if (exactTarget)
+    return exactTarget;
+  return state.partitionId;
 }
 
 LogicalResult closeStateBefore(Operation *op, TMEMSemaphore &state,
                                TMEMSemaphore::Kind targetKind,
-                               const std::set<PartitionId> &partitions) {
+                               std::optional<PartitionId> phaseRepairTarget) {
   if (!state.active)
     return success();
 
   OpBuilder b(op);
   b.setInsertionPoint(op);
-  state.release(b, op->getLoc());
+  if (state.lastOp && isa<scf::ForOp>(state.lastOp) && state.partitionId)
+    state.stageClusters[*state.partitionId] = {};
+  auto releaseOp = releaseForTransition(op, state);
+  b.setInsertionPointAfter(releaseOp);
   while (state.kind != targetKind) {
-    auto partitionId = pickOtherPartition(partitions, state.partitionId);
+    auto partitionId = getPhaseRepairPartition(state, phaseRepairTarget);
     state.acquire(b, op->getLoc(), {partitionId, {}});
     state.release(b, op->getLoc());
   }
@@ -1006,7 +970,7 @@ LogicalResult closeStateBefore(Operation *op, TMEMSemaphore &state,
 
 LogicalResult closeStateAfter(Operation *op, TMEMSemaphore &state,
                               TMEMSemaphore::Kind targetKind,
-                              const std::set<PartitionId> &partitions) {
+                              std::optional<PartitionId> phaseRepairTarget) {
   if (!state.active)
     return success();
 
@@ -1014,7 +978,7 @@ LogicalResult closeStateAfter(Operation *op, TMEMSemaphore &state,
   b.setInsertionPointAfter(op);
   state.release(b, op->getLoc());
   while (state.kind != targetKind) {
-    auto partitionId = pickOtherPartition(partitions, state.partitionId);
+    auto partitionId = getPhaseRepairPartition(state, phaseRepairTarget);
     state.acquire(b, op->getLoc(), {partitionId, {}});
     state.release(b, op->getLoc());
   }
@@ -1029,7 +993,11 @@ void mergeStateMetadata(TMEMSemaphore &dst, const TMEMSemaphore &src) {
     dst.asyncOp[partitionId] = asyncOp;
   for (auto [partitionId, stageCluster] : src.stageClusters)
     dst.stageClusters[partitionId] = stageCluster;
+  for (auto [partitionId, op] : src.lastAccessOpByPartition)
+    dst.lastAccessOpByPartition[partitionId] = op;
 }
+
+bool shouldUseMmaAsyncPayload(Operation *op);
 
 LogicalResult rewriteAccessEvent(const BufferAccessDag::Event &event,
                                  TMEMSemaphore &state) {
@@ -1052,28 +1020,30 @@ LogicalResult rewriteAccessEvent(const BufferAccessDag::Event &event,
     state.openedByRootInitialization =
         !event.partitionId && !state.hasSeenPartitionOwner;
     state.lastOp = op;
+    if (event.partitionId)
+      state.lastAccessOpByPartition[*event.partitionId] = op;
     return success();
   }
 
   if (auto tmemLoadOp = dyn_cast<TMEMLoadOp>(op)) {
-    auto memberIdx = state.lookupMember(tmemLoadOp.getSrc());
-    if (!memberIdx)
+    auto alias = state.lookupAlias(tmemLoadOp.getSrc());
+    if (!alias)
       return op->emitError("buffer reuse: tmem_load does not use grouped buffer");
     if (auto id = event.partitionId)
       state.stageClusters[*id] = getStageCluster(op);
     tmemLoadOp.getSrcMutable().assign(
-        state.getBuffer(b, event.partitionId, op, *memberIdx));
+        state.getBufferForValue(b, event.partitionId, op, tmemLoadOp.getSrc()));
     tmemLoadOp.getDepMutable().clear();
     tmemLoadOp.getToken().replaceAllUsesWith(state.replToken);
     state.asyncOp[event.partitionId] = AsyncOp::NONE;
   } else if (auto tmemStoreOp = dyn_cast<TMEMStoreOp>(op)) {
-    auto memberIdx = state.lookupMember(tmemStoreOp.getDst());
-    if (!memberIdx)
+    auto alias = state.lookupAlias(tmemStoreOp.getDst());
+    if (!alias)
       return op->emitError("buffer reuse: tmem_store does not use grouped buffer");
     if (auto id = event.partitionId)
       state.stageClusters[*id] = getStageCluster(op);
     tmemStoreOp.getDstMutable().assign(
-        state.getBuffer(b, event.partitionId, op, *memberIdx));
+        state.getBufferForValue(b, event.partitionId, op, tmemStoreOp.getDst()));
     tmemStoreOp.getDepMutable().clear();
     tmemStoreOp.getToken().replaceAllUsesWith(state.replToken);
     state.asyncOp[event.partitionId] = AsyncOp::NONE;
@@ -1082,18 +1052,24 @@ LogicalResult rewriteAccessEvent(const BufferAccessDag::Event &event,
   } else if (auto mmaOp = dyn_cast<MMAv5OpInterface>(op)) {
     if (auto id = event.partitionId)
       state.stageClusters[*id] = getStageCluster(op);
-    if (auto memberIdx = state.lookupMember(mmaOp.getAccumulator())) {
+    bool usesGroupedTmem = false;
+    if (state.lookupAlias(mmaOp.getAccumulator())) {
       mmaOp.getAccDepMutable().clear();
       mmaOp.getToken().replaceAllUsesWith(state.replToken);
-      mmaOp.setAccumulator(
-          state.getBuffer(b, event.partitionId, op, *memberIdx));
-      state.asyncOp[event.partitionId] = AsyncOp::TC5MMA;
+      mmaOp.setAccumulator(state.getBufferForValue(
+          b, event.partitionId, op, mmaOp.getAccumulator()));
+      usesGroupedTmem = true;
     }
     for (OpOperand &opnd : op->getOpOperands()) {
-      if (auto memberIdx = state.lookupMember(opnd.get()))
-        opnd.set(state.getBuffer(b, event.partitionId, op, *memberIdx));
+      if (state.lookupAlias(opnd.get())) {
+        opnd.set(state.getBufferForValue(b, event.partitionId, op, opnd.get()));
+        usesGroupedTmem = true;
+      }
     }
-    if (!state.asyncOp[event.partitionId])
+    if (usesGroupedTmem)
+      state.asyncOp[event.partitionId] =
+          shouldUseMmaAsyncPayload(op) ? AsyncOp::TC5MMA : AsyncOp::NONE;
+    else if (!state.asyncOp[event.partitionId])
       state.asyncOp[event.partitionId] = AsyncOp::NONE;
   } else {
     return op->emitError("buffer reuse: unsupported grouped TMEM access op ")
@@ -1101,6 +1077,8 @@ LogicalResult rewriteAccessEvent(const BufferAccessDag::Event &event,
   }
 
   state.lastOp = op;
+  if (event.partitionId)
+    state.lastAccessOpByPartition[*event.partitionId] = op;
   return success();
 }
 
@@ -1120,7 +1098,8 @@ LogicalResult processLocalBlock(BufferAccessDag::BlockNode *blockNode,
 
   if (failed(processBlock(blockNode, localState, partitions)))
     return failure();
-  return closeStateBefore(terminator, localState, entryKind, partitions);
+  return closeStateBefore(terminator, localState, entryKind,
+                          parent.partitionId);
 }
 
 LogicalResult processForRegion(BufferAccessDag::RegionNode *region,
@@ -1261,186 +1240,6 @@ LogicalResult processBlock(BufferAccessDag::BlockNode *blockNode,
   return success();
 }
 
-struct SingleTMEMSemaphore {
-  enum Kind { PING, PONG };
-
-  SingleTMEMSemaphore(Value ping, Value pong, Value allocBuf, Value origBuffer,
-                      Value replToken)
-      : ping(ping), pong(pong), allocBuf(allocBuf), origBuffer(origBuffer),
-        replToken(replToken), kind(PING) {}
-
-  void acquire(OpBuilder &b, Location loc,
-               std::pair<std::optional<PartitionId>, StageCluster>
-                   partitionIdStageCluster) {
-    Value sem = (kind == PING) ? ping : pong;
-    auto op = createInto<SemaphoreAcquireOp>(b, loc, partitionIdStageCluster,
-                                             sem, b.getType<AsyncTokenType>());
-    token = op.getToken();
-    partitionId = partitionIdStageCluster.first;
-    if (partitionId)
-      stageClusters[*partitionId] = partitionIdStageCluster.second;
-    buffer = {};
-  }
-
-  void release(OpBuilder &b, Location loc) {
-    if (!asyncOp[partitionId])
-      asyncOp[partitionId] = AsyncOp::NONE;
-    StageCluster stageCluster;
-    if (partitionId)
-      stageCluster = stageClusters[*partitionId];
-    // Cross-release: PING releases pong, PONG releases ping.
-    Value sem = (kind == PING) ? pong : ping;
-    createInto<SemaphoreReleaseOp>(
-        b, loc, {partitionId, stageCluster}, sem, token,
-        b.getArrayAttr(SmallVector<Attribute>{
-            AsyncOpAttr::get(b.getContext(), *asyncOp[partitionId])}));
-    // Toggle kind
-    kind = (kind == PING) ? PONG : PING;
-  }
-
-  Value getBuffer(OpBuilder &b, std::optional<PartitionId> pid,
-                  Operation *op) {
-    if (!buffer) {
-      auto stageCluster = getStageCluster(op);
-      auto bufType = cast<MemDescType>(allocBuf.getType());
-      Type dataBufType = getSemaphoreViewBufferType(bufType);
-      Value sem = (kind == PING) ? ping : pong;
-      auto bufferOp =
-          createInto<SemaphoreBufferOp>(b, op->getLoc(), {pid, stageCluster},
-                                        sem, TypeRange{dataBufType}, token);
-      buffer = bufferOp.getBuffers()[0];
-    }
-    return buffer;
-  }
-
-  // --------------------------------------------------------------------------
-
-  Value ping;     // semaphore: initially released
-  Value pong;     // semaphore: initially not released
-  Value allocBuf; // underlying TMEM buffer allocation
-  Value origBuffer;
-  Value replToken;
-
-  Value buffer;
-  Value token;
-  Kind kind;
-  std::optional<PartitionId> partitionId;
-  llvm::MapVector<std::optional<PartitionId>, std::optional<AsyncOp>> asyncOp;
-  DenseMap<PartitionId, StageCluster> stageClusters;
-};
-
-TmemAccessDag::Node *
-insertTmemSemaphoreImplSingle(TmemAccessDag::Node *node,
-                              std::optional<PartitionId> curPartitionId,
-                              SingleTMEMSemaphore &state) {
-  // When entering a warp-specialized loop, curPartitionId is std::nullopt.
-  // We skip ownership changes here since there's an implicit synchronization
-  // barrier when entering the ws-loop that handles the transition safely.
-  if (curPartitionId && node->partitionId != curPartitionId) {
-    OpBuilder b(node->op);
-    Operation *prevOp = nullptr;
-    if (node->parent) {
-      // release right after the last op which owns the tmem
-      prevOp = node->parent->op;
-      b.setInsertionPointAfter(prevOp);
-    } else {
-      // if we are inside if-stmt or for-stmt subdag and need to change
-      // ownership, release at the top of the block.
-      prevOp = node->parentDag->op;
-      b.setInsertionPointToStart(node->op->getBlock());
-    }
-    state.release(b, prevOp->getLoc());
-
-    // acquire right before op that acquires ownership of tmem
-    auto curOp = node->op;
-    auto partitionId = node->partitionId;
-    b.setInsertionPoint(curOp);
-
-    if (isa<scf::YieldOp>(curOp)) {
-      // in yieldOp we overload parentDag as the first op in the current subDag
-      // so we use its stageCluster to insert acquire
-      curOp = node->parentDag->op;
-    }
-    auto stageCluster = getStageCluster(curOp);
-    // if stage-cluster is empty, use the stage-cluster used from the last op
-    // that acquired ownership of tmem in a partition
-    if (!stageCluster && partitionId)
-      stageCluster = state.stageClusters[*partitionId];
-    state.acquire(b, curOp->getLoc(), {partitionId, stageCluster});
-  }
-
-  for (auto &subDag : node->subDags) {
-    auto subdagState = state;
-    if (auto forOp = dyn_cast<scf::ForOp>(node->op)) {
-      // forOp may have token operand, if so, we need to update the token and
-      // reset buffer.
-      if (node->tokOperand) {
-        subdagState.token =
-            forOp.getRegionIterArg(node->tokOperand->getOperandNumber() - 3);
-        subdagState.buffer = {};
-      }
-    }
-    insertTmemSemaphoreImplSingle(subDag.get(), node->partitionId,
-                                  subdagState);
-
-    // subDag may change asyncOp value, update it after inserting arefs
-    state.asyncOp = subdagState.asyncOp;
-    // store subdag state partitionId
-    state.partitionId = subdagState.partitionId;
-  }
-
-  if (isa<MMAv5OpInterface>(node->op)) {
-    state.asyncOp[node->partitionId] = AsyncOp::TC5MMA;
-  } else if (isa<TMEMLoadOp, TMEMStoreOp>(node->op)) {
-    state.asyncOp[node->partitionId] = AsyncOp::NONE;
-  }
-
-  OpBuilder b(node->op);
-  if (auto tmemLoadOp = dyn_cast<TMEMLoadOp>(node->op)) {
-    if (auto id = node->partitionId)
-      state.stageClusters[*id] = getStageCluster(node->op);
-    tmemLoadOp.getSrcMutable().assign(
-        state.getBuffer(b, node->partitionId, node->op));
-    tmemLoadOp.getDepMutable().clear();
-    tmemLoadOp.getToken().replaceAllUsesWith(state.replToken);
-  } else if (auto tmemStoreOp = dyn_cast<TMEMStoreOp>(node->op)) {
-    if (auto id = node->partitionId)
-      state.stageClusters[*id] = getStageCluster(node->op);
-    tmemStoreOp.getDstMutable().assign(
-        state.getBuffer(b, node->partitionId, node->op));
-    tmemStoreOp.getDepMutable().clear();
-    tmemStoreOp.getToken().replaceAllUsesWith(state.replToken);
-  } else if (auto mmaOp = dyn_cast<MMAv5OpInterface>(node->op)) {
-    if (auto id = node->partitionId)
-      state.stageClusters[*id] = getStageCluster(node->op);
-    if (mmaOp.getAccumulator() == state.origBuffer) {
-      mmaOp.getAccDepMutable().clear();
-      mmaOp.getToken().replaceAllUsesWith(state.replToken);
-    }
-    for (auto &opnd : mmaOp->getOpOperands()) {
-      if (opnd.get() == state.origBuffer)
-        opnd.set(state.getBuffer(b, node->partitionId, node->op));
-    }
-  } else if (auto yieldOp = dyn_cast<scf::YieldOp>(node->op)) {
-    yieldOp.setOperand(node->tokOperand->getOperandNumber(), state.token);
-  } else if (isa<scf::IfOp, scf::ForOp>(node->op)) {
-    if (node->tokPos) {
-      // forOp/if may return token, if so, update state token, and reset buffer
-      if (isa<scf::ForOp>(node->op))
-        node->op->setOperand(node->tokOperand->getOperandNumber(), state.token);
-      state.token = node->op->getResult(*node->tokPos);
-      state.buffer = {};
-    }
-  } else {
-    llvm_unreachable("unsupported tmem op");
-  }
-
-  if (node->user)
-    return insertTmemSemaphoreImplSingle(node->user.get(), node->partitionId,
-                                         state);
-  return node;
-}
-
 bool canDoubleBufferAcc(MMAv5OpInterface mmaOp, int numTmemBlocks) {
   auto tmemDesc = mmaOp.getAccumulator().getType();
   auto blockM = tmemDesc.getShape()[0];
@@ -1455,30 +1254,6 @@ bool canDoubleBufferAcc(MMAv5OpInterface mmaOp, int numTmemBlocks) {
   }
   return true;
 };
-
-bool hasProducerConsumerPartitioning(TmemAccessDag &accessDag) {
-  auto [hasRootPartition, partitions] = accessDag.collectPartitionsVec();
-  (void)hasRootPartition;
-  bool expectProducer = true;
-  int changeGroup = 0;
-  bool valid = true;
-
-  for (size_t i = 0; i + 1 < partitions.size(); ++i) {
-    auto op = partitions[i].second;
-    if (isa<TMEMLoadOp, TMEMStoreOp, MMAv5OpInterface>(op)) {
-      valid = valid && (expectProducer
-                            ? isa<TMEMStoreOp, MMAv5OpInterface>(op)
-                            : isa<TMEMLoadOp>(op));
-    }
-    if (partitions[i].first != partitions[i + 1].first) {
-      expectProducer = !expectProducer;
-      ++changeGroup;
-    }
-  }
-  valid = valid && changeGroup == 2;
-
-  return valid;
-}
 
 bool hasProducerConsumerPartitioning(const BufferAccessDag &accessDag,
                                      unsigned memberIdx) {
@@ -1577,134 +1352,25 @@ bool isMultiStagedMember(TMEMAllocOp allocOp, const BufferAccessDag &accessDag,
   return valid;
 }
 
-void copyBufferAttrs(TMEMAllocOp src, TMEMAllocOp dst);
+bool shouldUseMmaAsyncPayload(Operation *op) {
+  auto loop = op->getParentOfType<scf::ForOp>();
+  if (!loop)
+    return true;
+  auto wsLoop = getOuterWSLoop(loop);
+  return !wsLoop || hasPartition(wsLoop);
+}
 
-int insertTmemSemaphoreSingle(TmemAccessDag &accessDag, int numTmemBlocks) {
-  auto rootNode = accessDag.getRootNode();
-  auto allocOp = cast<TMEMAllocOp>(rootNode->op);
-
-  auto isMultiStaged = hasProducerConsumerPartitioning(accessDag);
-  if (isMultiStaged) {
-    for (auto user : allocOp.getResult().getUsers()) {
-      if (auto mmaOp = dyn_cast<MMAv5OpInterface>(user)) {
-        if (auto loop = dyn_cast<scf::ForOp>(user->getParentOp())) {
-          auto wsLoop = getOuterWSLoop(loop);
-          // Determine if the MMA accumulator can be multibuffered.
-          bool accIsMultiBuffered =
-              // MMAs in subsequent iterations can be overlapped.
-              !nvidia_gpu::hasAccReadModifyWrite(mmaOp, loop) &&
-              // The accumulator is reset at some point, thus allowing
-              // multibuffering.
-              isAccMultibufferingPossible(mmaOp, loop) &&
-              // The user didn't disable it with a flag.
-              !getDisallowAccMultiBuffer(wsLoop) &&
-              canDoubleBufferAcc(mmaOp, numTmemBlocks);
-          isMultiStaged = isMultiStaged && accIsMultiBuffered;
-        }
-      }
-    }
-  }
-  auto numStages = 1 + 1 * isMultiStaged;
-
-  // update numTmemBlocks for the number of TMEM blocks used by the aref buffer
-  auto allocShape = allocOp.getType().getShape();
-  numTmemBlocks += allocShape[0] * allocShape[1] * numStages;
-  auto semBufType =
-      getSemaphoreMultiBufferedType(allocOp.getResult().getType(), numStages);
-  OpBuilder b(allocOp);
-
-  // alloc can be inside ws-loop, we need to find the entry point for ws-loop
-  auto outerWsLoop = allocOp->getParentOfType<scf::ForOp>();
-  while (outerWsLoop && !outerWsLoop->hasAttr(triton::kWarpSpecializeAttrName))
-    outerWsLoop = outerWsLoop->getParentOfType<scf::ForOp>();
-  if (outerWsLoop)
-    b.setInsertionPoint(outerWsLoop);
-
-  auto semAlloc =
-      cast<TMEMAllocOp>(createAlloc(b, allocOp.getLoc(), semBufType, Value()));
-  copyBufferAttrs(allocOp, semAlloc);
-
-  // Create ping/pong semaphore pair.
-  auto baseTypes = TypeArrayAttr::get(b.getContext(), {semBufType});
-  auto semaTy = SemaphoreType::get(b.getContext(), baseTypes);
-  auto pingSem = SemaphoreCreateOp::create(b, allocOp.getLoc(), semaTy,
-                                           semAlloc->getResults(), true);
-  auto pongSem = SemaphoreCreateOp::create(b, allocOp.getLoc(), semaTy,
-                                           semAlloc->getResults(), false);
-
-  auto stageCluster = getStageCluster(allocOp);
-  auto partitionId = accessDag.getRootNode()->partitionId;
-  if (!allocOp.getSrc() && outerWsLoop) {
-    // if tmem_alloc inside ws-loop, the first owner is that of the first user
-    partitionId = accessDag.getRootNode()->user->partitionId;
-  }
-
-  SingleTMEMSemaphore state(
-      pingSem, pongSem, semAlloc->getResult(0), allocOp.getResult(),
-      ub::PoisonOp::create(b, allocOp.getLoc(), b.getType<AsyncTokenType>()));
-  b.setInsertionPoint(allocOp);
-  state.acquire(b, allocOp.getLoc(), {partitionId, stageCluster});
-
-  // If initial acquire is in root partition (no partition annotation), the
-  // release must be in the partition of the first owner that has a partition
-  // annotation. Find that partition and update state.partitionId accordingly.
-  if (!state.partitionId) {
-    auto node = rootNode->user.get();
-    do {
-      state.partitionId = node->partitionId;
-      node = node->user.get();
-    } while (node && !state.partitionId);
-  }
-
-  if (auto src = allocOp.getSrc()) {
-    auto buffer = state.getBuffer(b, partitionId, allocOp);
-    state.asyncOp[partitionId] = AsyncOp::NONE;
-    auto vTrue = createInto<arith::ConstantIntOp>(
-        b, allocOp.getLoc(), {partitionId, stageCluster}, true, 1);
-    createInto<TMEMStoreOp>(b, allocOp.getLoc(), {partitionId, stageCluster},
-                            Type(), buffer, Value(), src, vTrue);
-  } else {
-    // allocOp w/o src, assume the ownership of tmem belongs to first user
-    // partitionId = accessDag.getRootNode()->user->partitionId;
-  }
-
-  auto node =
-      insertTmemSemaphoreImplSingle(rootNode->user.get(), partitionId, state);
-
-  if (outerWsLoop) {
-    // aref is only used inside ws-loop, so we use the last op to insert
-    // matching exit
-    b.setInsertionPointAfter(node->op);
-  } else {
-    // aref is used outside ws-loop, find the last point in the same block as
-    // create op to have matching exit
-    auto op1 = pingSem->getBlock()->findAncestorOpInBlock(*node->op);
-    if (auto id = node->partitionId)
-      state.stageClusters[*id] = {};
-    b.setInsertionPointAfter(op1);
-  }
-  state.release(b, node->op->getLoc());
-
-  if (state.kind == SingleTMEMSemaphore::PONG) {
-    // When the state ends up in PONG operation, we need to acquire and release
-    // the corresponding partition to prevent deadlocks. This is necessary
-    // because if we're inside an outer loop, re-entering the loop without
-    // posting a matching PONG operation for the PING would cause the dead-lock.
-    auto [hasRootPartition, partitions] = accessDag.collectPartitionsSet();
-    std::optional<PartitionId> otherPartitionId;
-    // since we only have two partition, we just pick the other partition for
-    // get
-    for (auto partitionId : partitions) {
-      if (partitionId != state.partitionId) {
-        otherPartitionId = partitionId;
-        break;
-      }
-    }
-    state.acquire(b, node->op->getLoc(), {otherPartitionId, {}});
-    state.release(b, node->op->getLoc());
-  }
-
-  return numTmemBlocks;
+std::optional<PartitionId>
+getFinalPhaseRepairTarget(const BufferAccessDag &groupDag,
+                          const TMEMSemaphore &state) {
+  if (!state.partitionId)
+    return std::nullopt;
+  auto it = state.lastAccessOpByPartition.find(*state.partitionId);
+  if (it == state.lastAccessOpByPartition.end())
+    return state.partitionId;
+  auto next = groupDag.getNextDistinctPartitionAfter(it->second,
+                                                     *state.partitionId);
+  return next ? next : state.partitionId;
 }
 
 void copyBufferAttrs(TMEMAllocOp src, TMEMAllocOp dst) {
@@ -1723,7 +1389,16 @@ Operation *getSemaphoreInsertionAnchor(SmallVectorImpl<TMEMAllocOp> &members) {
   return outerWsLoop ? outerWsLoop.getOperation() : anchor;
 }
 
-LogicalResult eraseOriginalAllocs(SmallVectorImpl<TMEMAllocOp> &members) {
+LogicalResult eraseOriginalAllocs(SmallVectorImpl<TMEMAllocOp> &members,
+                                  ArrayRef<Operation *> aliasOps) {
+  for (Operation *op : llvm::reverse(aliasOps)) {
+    if (llvm::any_of(op->getResults(),
+                     [](Value result) { return !result.use_empty(); }))
+      return op->emitError("buffer reuse: original TMEM alias still has users "
+                           "after semaphore insertion");
+    op->erase();
+  }
+
   for (TMEMAllocOp allocOp : members) {
     if (!allocOp.getResult().use_empty())
       return allocOp.emitError("buffer reuse: original tmem_alloc result still "
@@ -1768,8 +1443,18 @@ LogicalResult insertTmemSemaphore(BufferAccessDag &groupDag,
         isMultiStagedMember(member, groupDag, idx, numTmemBlocks);
   auto numStages = 1 + 1 * isMultiStaged;
 
+  bool hasViewAlias = llvm::any_of(groupDag.aliases, [](const auto &entry) {
+    return !entry.second.viewChain.empty();
+  });
+
   SmallVector<Type> semBufTypes;
   for (TMEMAllocOp allocOp : members) {
+    if (hasViewAlias && allocOp.getType().getShape().size() != 2 &&
+        !isa<nvidia_gpu::TensorMemoryScalesEncodingAttr>(
+            allocOp.getType().getEncoding()))
+      return allocOp.emitError("buffer reuse: unsupported TMEM alias on "
+                               "non-2D allocation; semaphore backing would "
+                               "require an unsupported memdesc rank");
     auto shape = allocOp.getType().getShape();
     if (shape.size() >= 2)
       numTmemBlocks += shape[0] * shape[1] * numStages;
@@ -1799,24 +1484,173 @@ LogicalResult insertTmemSemaphore(BufferAccessDag &groupDag,
       ub::PoisonOp::create(b, members.front().getLoc(),
                            b.getType<AsyncTokenType>());
 
-  TMEMSemaphore state(pingSem, pongSem, semAllocResults, groupDag.origMembers,
-                      replToken);
+  TMEMSemaphore state(pingSem, pongSem, semAllocResults, groupDag.aliases,
+                      replToken, members.size() > 1);
+  if (members.size() == 1) {
+    auto firstEvent = groupDag.getFirstEvent();
+    assert(firstEvent && "live semaphore group must have an access event");
+    state.acquire(b, members.front().getLoc(),
+                  {firstEvent->partitionId,
+                   getAcquireStageCluster(state, firstEvent->partitionId,
+                                          firstEvent->op)});
+  }
   auto [hasRootOwner, partitions] = groupDag.collectOwners();
   (void)hasRootOwner;
 
   if (failed(processBlock(groupDag.root.get(), state, partitions)))
     return failure();
 
-  if (state.active && state.lastOp) {
-    if (failed(closeStateAfter(state.lastOp, state, TMEMSemaphore::PING,
-                               partitions)))
-      return failure();
+  bool needsFinalClose = true;
+  if (members.size() == 1 && members.front().getSrc()) {
+    needsFinalClose = llvm::any_of(groupDag.collectEventsForMember(0),
+                                   [](const BufferAccessDag::Event &event) {
+                                     return isa<TMEMLoadOp>(event.op);
+                                   });
   }
 
-  return eraseOriginalAllocs(members);
+  if (needsFinalClose && state.active && state.lastOp) {
+    auto phaseRepairTarget = getFinalPhaseRepairTarget(groupDag, state);
+    if (Operation *terminator = state.lastOp->getBlock()->getTerminator()) {
+      if (failed(closeStateBefore(terminator, state, TMEMSemaphore::PING,
+                                  phaseRepairTarget)))
+        return failure();
+    } else if (failed(closeStateAfter(state.lastOp, state, TMEMSemaphore::PING,
+                                      phaseRepairTarget))) {
+      return failure();
+    }
+  }
+
+  return eraseOriginalAllocs(members, groupDag.aliasOps);
+}
+
+Operation *getFirstNonYieldOp(Block *block) {
+  for (Operation &op : *block)
+    if (!isa<scf::YieldOp>(op))
+      return &op;
+  return nullptr;
+}
+
+Operation *getPostConsumerReleaseInsertionPoint(scf::IfOp ifOp) {
+  Operation *insertPt = ifOp.thenYield();
+  for (Operation &op : ifOp.thenBlock()->without_terminator()) {
+    if (isa<TMEMLoadOp, TMEMStoreOp, MMAv5OpInterface>(op)) {
+      insertPt = op.getNextNode();
+      break;
+    }
+  }
+  return insertPt;
+}
+
+SemaphoreAcquireOp getFirstAcquireAfter(Operation *op) {
+  for (Operation *cur = op ? op->getNextNode() : nullptr; cur;
+       cur = cur->getNextNode()) {
+    if (isa<scf::YieldOp>(cur))
+      return {};
+    if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(cur))
+      return acquireOp;
+  }
+  return {};
+}
+
+void splitAccessDagConditionalTransfers(triton::FuncOp funcOp) {
+  SmallVector<scf::IfOp> ifs;
+  funcOp.walk([&](scf::IfOp ifOp) {
+    if (!ifOp.elseBlock() || ifOp.getNumResults() != 1 ||
+        !isa<AsyncTokenType>(ifOp.getResult(0).getType()))
+      return;
+
+    auto thenRelease = dyn_cast_or_null<SemaphoreReleaseOp>(
+        getFirstNonYieldOp(ifOp.thenBlock()));
+    auto elseRelease = dyn_cast_or_null<SemaphoreReleaseOp>(
+        getFirstNonYieldOp(ifOp.elseBlock()));
+    if (!thenRelease || !elseRelease)
+      return;
+
+    auto thenAcquire = getFirstAcquireAfter(thenRelease);
+    auto elseAcquire = getFirstAcquireAfter(elseRelease);
+    if (!thenAcquire || !elseAcquire)
+      return;
+
+    auto postRelease =
+        dyn_cast_or_null<SemaphoreReleaseOp>(ifOp->getNextNode());
+    if (!postRelease || postRelease.getToken() != ifOp.getResult(0))
+      return;
+    auto postAcquire =
+        dyn_cast_or_null<SemaphoreAcquireOp>(postRelease->getNextNode());
+    if (!postAcquire)
+      return;
+
+    ifs.push_back(ifOp);
+  });
+
+  for (scf::IfOp ifOp : ifs) {
+    auto thenRelease =
+        cast<SemaphoreReleaseOp>(getFirstNonYieldOp(ifOp.thenBlock()));
+    auto elseRelease =
+        cast<SemaphoreReleaseOp>(getFirstNonYieldOp(ifOp.elseBlock()));
+    auto thenAcquire = getFirstAcquireAfter(thenRelease);
+    auto elseAcquire = getFirstAcquireAfter(elseRelease);
+    auto postRelease = cast<SemaphoreReleaseOp>(ifOp->getNextNode());
+    auto postAcquire = cast<SemaphoreAcquireOp>(postRelease->getNextNode());
+    Value entryToken = thenRelease.getToken();
+
+    ImplicitLocOpBuilder b(ifOp.getLoc(), ifOp);
+    auto releaseIf =
+        scf::IfOp::create(b, TypeRange{}, ifOp.getCondition(), false);
+    releaseIf->setAttrs(ifOp->getAttrs());
+    thenRelease->moveBefore(releaseIf.thenBlock(),
+                            releaseIf.thenBlock()->begin());
+
+    b.setInsertionPoint(ifOp);
+    Value poisonToken =
+        ub::PoisonOp::create(b, b.getType<AsyncTokenType>());
+
+    Operation *postReleaseInsertPt = getPostConsumerReleaseInsertionPoint(ifOp);
+    postRelease->setOperand(1, thenAcquire.getToken());
+    postRelease->moveBefore(postReleaseInsertPt);
+
+    ifOp.thenYield().setOperand(0, poisonToken);
+    ifOp.elseYield().setOperand(0, poisonToken);
+    elseAcquire.erase();
+    elseRelease.erase();
+
+    b.setInsertionPointAfter(ifOp);
+    auto enterIf = scf::IfOp::create(
+        b, SmallVector<Type>{b.getType<AsyncTokenType>()}, ifOp.getCondition(),
+        true);
+    enterIf->setAttrs(ifOp->getAttrs());
+    postAcquire->moveBefore(enterIf.thenBlock(), enterIf.thenBlock()->begin());
+    b.setInsertionPointToEnd(enterIf.thenBlock());
+    scf::YieldOp::create(b, postAcquire.getToken());
+    b.setInsertionPointToEnd(enterIf.elseBlock());
+    scf::YieldOp::create(b, entryToken);
+
+    postAcquire.getToken().replaceUsesWithIf(
+        enterIf.getResult(0), [&](OpOperand &use) {
+          return use.getOwner()->getBlock() != enterIf.thenBlock();
+        });
+
+    if (hasPartition(thenRelease)) {
+      auto releaseIds = getPartitionIds(thenRelease);
+      setPartition(releaseIf, releaseIds);
+      setPartition(enterIf, releaseIds);
+      setPartitionOutputs(releaseIf, {});
+      setPartitionOutputs(enterIf, {releaseIds});
+    }
+    if (hasPartition(thenAcquire)) {
+      auto acquireIds = getPartitionIds(thenAcquire);
+      setPartition(ifOp, acquireIds);
+      setPartitionOutputs(ifOp, {acquireIds});
+    }
+    assignStage(b, releaseIf, getStageCluster(thenRelease));
+    assignStage(b, ifOp, getStageCluster(thenAcquire));
+    assignStage(b, enterIf, getStageCluster(postAcquire));
+  }
 }
 
 void workaroundForLoopScheduler(triton::FuncOp funcOp) {
+  splitAccessDagConditionalTransfers(funcOp);
+
   SmallVector<scf::IfOp> ifs;
   funcOp.walk([&](scf::IfOp ifOp) {
     auto firstOp = &*ifOp.thenBlock()->begin();
@@ -1970,21 +1804,6 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
     auto totalOwners = static_cast<int>(hasRootPartition) + partitions.size();
     if (totalOwners <= 1)
       continue;
-
-    if (members.size() == 1) {
-      TmemAccessDag accessDag = TmemAccessDag::build(members.front());
-      LLVM_DEBUG({ accessDag.printDag(llvm::dbgs()); });
-      auto [legacyHasRootPartition, legacyPartitions] =
-          accessDag.collectPartitionsSet();
-      auto legacyTotalOwners =
-          static_cast<int>(legacyHasRootPartition) + legacyPartitions.size();
-      if (legacyTotalOwners <= 1)
-        continue;
-      if (legacyPartitions.size() <= 2) {
-        numTmemBlocks = insertTmemSemaphoreSingle(accessDag, numTmemBlocks);
-        continue;
-      }
-    }
 
     if (failed(insertTmemSemaphore(groupDag, numTmemBlocks)))
       return failure();

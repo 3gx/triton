@@ -124,9 +124,8 @@ def NVWSInsertSemas: Pass<"nvws-insert-semas", "mlir::ModuleOp"> {
   let summary = "Insert semaphore ops for ownership transfer.";
 
   let description = [{
-    Staged replacement for nvws-insert-tmem-semaphore. The initial
-    implementation is a TMEM-only wiring clone; later stages replace
-    token-derived scheduling with alloc/access-derived scheduling.
+    Access-DAG-driven TMEM semaphore insertion for ownership transfer between
+    warp-specialized partitions.
   }];
 
   let dependentDialects = [
