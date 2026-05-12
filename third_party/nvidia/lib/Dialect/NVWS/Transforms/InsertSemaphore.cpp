@@ -18,6 +18,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -96,6 +97,122 @@ RankedTensorType getTensorTypeFromScalar(OpBuilder &builder, Value scalar) {
   return RankedTensorType::get({1}, scalar.getType(), encoding);
 }
 
+bool hasBlackwellOrNewerTarget(Value value) {
+  auto mod = value.getParentRegion()->getParentOfType<ModuleOp>();
+  auto targetAttr =
+      mod ? mod->getAttrOfType<StringAttr>(triton::gpu::AttrTargetName)
+          : StringAttr();
+  if (!targetAttr)
+    return false;
+
+  StringRef target = targetAttr.strref();
+  if (!target.starts_with("cuda:"))
+    return false;
+
+  int cc = 0;
+  if (target.drop_front(5).getAsInteger(10, cc))
+    return false;
+  return cc >= 100;
+}
+
+std::optional<Attribute> getExpandedRank1Encoding(RankedTensorType tensorType) {
+  Attribute encoding = tensorType.getEncoding();
+  if (auto sliceEnc = dyn_cast_or_null<SliceEncodingAttr>(encoding)) {
+    if (sliceEnc.getDim() != 1)
+      return std::nullopt;
+    return sliceEnc.getParent();
+  }
+
+  auto blockedEnc = dyn_cast_or_null<BlockedEncodingAttr>(encoding);
+  if (!blockedEnc || tensorType.getRank() != 1)
+    return std::nullopt;
+
+  constexpr unsigned axis = 1;
+  MLIRContext *ctx = tensorType.getContext();
+  SmallVector<unsigned> sizePerThread(blockedEnc.getSizePerThread());
+  SmallVector<unsigned> threadsPerWarp(blockedEnc.getThreadsPerWarp());
+  SmallVector<unsigned> warpsPerCTA(blockedEnc.getWarpsPerCTA());
+  SmallVector<unsigned> order{axis, blockedEnc.getOrder()[0]};
+  sizePerThread.insert(sizePerThread.begin() + axis, 1);
+  threadsPerWarp.insert(threadsPerWarp.begin() + axis, 1);
+  warpsPerCTA.insert(warpsPerCTA.begin() + axis, 1);
+
+  auto cgaLayout = blockedEnc.getCGALayout();
+  SmallVector<unsigned> ctasPerCGA = cgaLayout.getCTAsPerCGA();
+  SmallVector<unsigned> ctaSplitNum = cgaLayout.getCTASplitNum();
+  SmallVector<unsigned> ctaOrder{axis, cgaLayout.getCTAOrder()[0]};
+  ctasPerCGA.insert(ctasPerCGA.begin() + axis, 1);
+  ctaSplitNum.insert(ctaSplitNum.begin() + axis, 1);
+  auto expandedCGALayout =
+      CGAEncodingAttr::fromSplitParams(ctx, ctasPerCGA, ctaSplitNum, ctaOrder);
+  return BlockedEncodingAttr::get(ctx, sizePerThread, threadsPerWarp,
+                                  warpsPerCTA, order, expandedCGALayout);
+}
+
+std::optional<RankedTensorType>
+getExpandedRank1TensorType(RankedTensorType tensorType) {
+  auto encoding = getExpandedRank1Encoding(tensorType);
+  if (!encoding)
+    return std::nullopt;
+  return RankedTensorType::get({tensorType.getShape()[0], 1},
+                               tensorType.getElementType(), *encoding);
+}
+
+std::optional<RankedTensorType>
+getExpandDimsInputTensorType(RankedTensorType tensorType) {
+  auto expandedType = getExpandedRank1TensorType(tensorType);
+  if (!expandedType)
+    return std::nullopt;
+
+  if (isa<BlockedEncodingAttr>(tensorType.getEncoding())) {
+    auto sliceEnc =
+        SliceEncodingAttr::get(tensorType.getContext(), 1,
+                               cast<DistributedEncodingTrait>(
+                                   (*expandedType).getEncoding()));
+    return RankedTensorType::get(tensorType.getShape(),
+                                 tensorType.getElementType(), sliceEnc);
+  }
+  return tensorType;
+}
+
+bool isEligibleSsaTmemTensor(RankedTensorType tensorType) {
+  if (tensorType.getRank() != 1)
+    return false;
+  if (!isa<FloatType>(tensorType.getElementType()))
+    return false;
+  int64_t blockM = tensorType.getShape()[0];
+  if (blockM != 64 && blockM != 128)
+    return false;
+  unsigned elemBitWidth = tensorType.getElementType().getIntOrFloatBitWidth();
+  if (elemBitWidth != 16 && elemBitWidth != 32)
+    return false;
+  return getExpandedRank1TensorType(tensorType).has_value();
+}
+
+bool useSsaTmemChannel(Value value, RankedTensorType tensorType) {
+  return triton::tools::getBoolEnv("NVWS_USE_SSA_TMEM") &&
+         hasBlackwellOrNewerTarget(value) && isEligibleSsaTmemTensor(tensorType);
+}
+
+MemDescType getTmemDescType(RankedTensorType tensorType) {
+  auto blockM = tensorType.getShape()[0];
+  auto elemType = tensorType.getElementType();
+  unsigned elemBitWidth = elemType.getIntOrFloatBitWidth();
+  unsigned colStride = 32 / elemBitWidth;
+  auto encoding = TensorMemoryEncodingAttr::get(
+      tensorType.getContext(), blockM, /*blockN=*/1, colStride,
+      /*CTASplitM=*/1, /*CTASplitN=*/1, /*twoCTAs=*/false);
+  return MemDescType::get({blockM, 1}, elemType, encoding,
+                          TensorMemorySpaceAttr::get(tensorType.getContext()),
+                          /*mutableMemory=*/true);
+}
+
+bool isTensorMemoryBuffer(Value value) {
+  auto memDescType = dyn_cast<MemDescType>(value.getType());
+  return memDescType &&
+         isa<TensorMemorySpaceAttr>(memDescType.getMemorySpace());
+}
+
 struct SemaphorePair {
   Value empty; // semaphore initially released (producer acquires)
   Value full;  // semaphore initially not released (consumer acquires)
@@ -116,6 +233,71 @@ OpT createInto(OpBuilder &builder, Location loc,
   auto op = triton::gpu::createInto<OpT>(
       builder, loc, partitionSet, stageCluster, std::forward<Args>(args)...);
   return setTagIfPresent(op, wsTag);
+}
+
+Value prepareRank1TmemStoreSrc(OpBuilder &builder, Location loc, Value src,
+                               const SetVector<int> &partitions,
+                               StageCluster stageCluster,
+                               std::optional<int> wsTag, MemDescType tmemDesc) {
+  auto tensorType = cast<RankedTensorType>(src.getType());
+  auto expandInputType = *getExpandDimsInputTensorType(tensorType);
+  Value expandInput = src;
+  if (expandInputType != tensorType) {
+    expandInput = createInto<ConvertLayoutOp>(
+        builder, loc, partitions, stageCluster, wsTag, expandInputType, src);
+  }
+
+  auto expanded = createInto<triton::ExpandDimsOp>(
+      builder, loc, partitions, stageCluster, wsTag, expandInput, 1);
+  Value storeSrc = expanded.getResult();
+  auto expandedType = cast<RankedTensorType>(storeSrc.getType());
+  if (!isDistributedLayoutTMemCompatible(expanded, expandedType, tmemDesc)) {
+    auto compatibleLayouts =
+        getTmemCompatibleLayouts(expanded, expandedType, tmemDesc);
+    assert(!compatibleLayouts.empty() && "no TMEM-compatible layout found");
+    auto compatibleType =
+        expandedType.cloneWithEncoding(compatibleLayouts.front());
+    storeSrc = createInto<ConvertLayoutOp>(
+        builder, loc, partitions, stageCluster, wsTag, compatibleType, storeSrc);
+  }
+  return storeSrc;
+}
+
+void createRank1TmemStore(OpBuilder &builder, Location loc, Value src,
+                          Value dataBuf, const SetVector<int> &partitions,
+                          StageCluster stageCluster,
+                          std::optional<int> wsTag) {
+  auto tmemDesc = cast<MemDescType>(dataBuf.getType());
+  Value storeSrc = prepareRank1TmemStoreSrc(builder, loc, src, partitions,
+                                            stageCluster, wsTag, tmemDesc);
+  auto pred = createInto<arith::ConstantIntOp>(
+      builder, loc, partitions, stageCluster, wsTag, true, 1);
+  createInto<TMEMStoreOp>(builder, loc, partitions, stageCluster, wsTag, Type(),
+                          dataBuf, Value(), storeSrc, pred);
+}
+
+Value createRank1TmemLoad(OpBuilder &builder, Location loc,
+                          RankedTensorType resultType, Value dataBuf,
+                          const SetVector<int> &partitions,
+                          StageCluster stageCluster,
+                          std::optional<int> wsTag) {
+  auto tmemDesc = cast<MemDescType>(dataBuf.getType());
+  auto expandedType = *getExpandedRank1TensorType(resultType);
+  auto compatibleLayouts =
+      getTmemCompatibleLayouts(dataBuf.getDefiningOp(), expandedType, tmemDesc);
+  assert(!compatibleLayouts.empty() && "no TMEM-compatible layout found");
+  auto loadType = expandedType.cloneWithEncoding(compatibleLayouts.front());
+
+  auto load = createInto<TMEMLoadOp>(
+      builder, loc, partitions, stageCluster, wsTag, loadType,
+      builder.getType<AsyncTokenType>(), dataBuf, Value());
+  auto reshape = createInto<triton::ReshapeOp>(
+      builder, loc, partitions, stageCluster, wsTag, resultType.getShape(),
+      load.getResult());
+  auto converted = createInto<ConvertLayoutOp>(
+      builder, loc, partitions, stageCluster, wsTag, resultType,
+      reshape.getResult());
+  return converted.getResult();
 }
 
 static triton::DescriptorStoreOp findDescriptorStoreConsumer(Value value,
@@ -184,9 +366,13 @@ SemaphorePair createSemaphores(
   if (result.getDefiningOp<LocalAllocOp>()) {
     memDescType = dyn_cast<MemDescType>(result.getType());
   } else if (auto tensorType = dyn_cast<RankedTensorType>(result.getType())) {
-    Attribute descriptorEncoding =
-        getDescriptorStoreConsumerEncoding(tensorType, usesPerPartition);
-    memDescType = getSmemDescType(tensorType, result, descriptorEncoding);
+    if (useSsaTmemChannel(result, tensorType)) {
+      memDescType = getTmemDescType(tensorType);
+    } else {
+      Attribute descriptorEncoding =
+          getDescriptorStoreConsumerEncoding(tensorType, usesPerPartition);
+      memDescType = getSmemDescType(tensorType, result, descriptorEncoding);
+    }
   } else if (isa<FloatType, IntegerType>(result.getType())) {
     auto tensorType = getTensorTypeFromScalar(builder, result);
     memDescType = getSmemDescType(tensorType, Value());
@@ -196,8 +382,10 @@ SemaphorePair createSemaphores(
     llvm::report_fatal_error(msg.c_str());
   }
 
-  MemDescType allocBufType = getMultiBufferedType(memDescType, 1);
-  assert(isa<SharedMemorySpaceAttr>(allocBufType.getMemorySpace()));
+  MemDescType allocBufType =
+      isa<TensorMemorySpaceAttr>(memDescType.getMemorySpace())
+          ? getSemaphoreMultiBufferedType(memDescType, 1)
+          : getMultiBufferedType(memDescType, 1);
   auto loc = result.getLoc();
   auto alloc = triton::nvws::createAlloc(builder, loc, allocBufType, Value());
 
@@ -326,8 +514,13 @@ createSemaphoreProducer(OpBuilder &builder, SemaphorePair &sema,
     } else if (auto loadOp = result.getDefiningOp<triton::LoadOp>()) {
       llvm_unreachable("cpasync not supported yet");
     } else {
-      createInto<LocalStoreOp>(builder, loc, producerPartitions, stageCluster,
-                               wsTag, result, dataBuf);
+      if (isTensorMemoryBuffer(dataBuf)) {
+        createRank1TmemStore(builder, loc, result, dataBuf, producerPartitions,
+                             stageCluster, wsTag);
+      } else {
+        createInto<LocalStoreOp>(builder, loc, producerPartitions, stageCluster,
+                                 wsTag, result, dataBuf);
+      }
       producerKind = AsyncOp::NONE;
     }
   } else if (isa<FloatType, IntegerType>(result.getType())) {
@@ -547,20 +740,31 @@ void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
   Operation *exitInsertPointAfter = nullptr;
 
   auto replaceUsesWithLocalLoad = [&](Value result, StageCluster stageCluster) {
-    auto localLoadOp = createInto<LocalLoadOp>(
-        builder, loc, consumerPartitions, stageCluster, wsTag, result.getType(),
-        dataBuf);
+    Operation *loadOp = nullptr;
+    Value loaded;
+    if (isTensorMemoryBuffer(dataBuf)) {
+      auto resultType = cast<RankedTensorType>(result.getType());
+      loaded = createRank1TmemLoad(builder, loc, resultType, dataBuf,
+                                   consumerPartitions, stageCluster, wsTag);
+      loadOp = loaded.getDefiningOp();
+    } else {
+      auto localLoadOp = createInto<LocalLoadOp>(
+          builder, loc, consumerPartitions, stageCluster, wsTag, result.getType(),
+          dataBuf);
+      loaded = localLoadOp.getResult();
+      loadOp = localLoadOp;
+    }
 
     for (auto use : uses) {
       if (use->get() == result) {
-        use->set(localLoadOp.getResult());
+        use->set(loaded);
       }
     }
     if (dataBuf.hasOneUse()) {
-      // If there is only one consumer for dataBuf, it is localLoadOp created
+      // If there is only one consumer for dataBuf, it is the load created
       // above, and we hit this code path, the empty barrier can be released
-      // after local load.
-      exitInsertPointAfter = localLoadOp;
+      // after the reload sequence.
+      exitInsertPointAfter = loadOp;
     }
   };
 

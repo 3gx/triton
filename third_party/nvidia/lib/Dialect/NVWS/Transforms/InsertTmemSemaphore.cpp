@@ -1571,6 +1571,12 @@ void eraseUnusedTmemAllocs(triton::FuncOp funcOp) {
     allocOp.erase();
 }
 
+bool isSemaphoreBackingAlloc(TMEMAllocOp allocOp) {
+  return llvm::any_of(allocOp->getUsers(), [](Operation *user) {
+    return isa<SemaphoreCreateOp>(user);
+  });
+}
+
 LogicalResult insertTmemSemaphore(BufferAccessDag &groupDag,
                                   ArrayRef<std::unique_ptr<TmemAccessDag>>
                                       memberDags,
@@ -1747,6 +1753,8 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
 
   int64_t nextBufferId = 0;
   funcOp.walk([&](TMEMAllocOp allocOp) {
+    if (isSemaphoreBackingAlloc(allocOp))
+      return;
     if (auto bufferId = getBufferId(allocOp))
       nextBufferId = std::max(nextBufferId, *bufferId + 1);
   });
@@ -1754,6 +1762,8 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
   DenseMap<Operation *, int64_t> syntheticBufferIds;
   llvm::MapVector<int64_t, SmallVector<TMEMAllocOp>> groupsByBufferId;
   auto allocWalk = funcOp.walk([&](TMEMAllocOp allocOp) -> WalkResult {
+    if (isSemaphoreBackingAlloc(allocOp))
+      return WalkResult::advance();
     auto bufferId = getBufferId(allocOp);
     if (!bufferId) {
       syntheticBufferIds[allocOp.getOperation()] = nextBufferId++;
