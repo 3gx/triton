@@ -2187,6 +2187,27 @@ LogicalResult emitSemaphores(BufferGroup &group) {
         if (eventIdx == state.writerPhaseLastEventIdx) {
           Operation *releaseAnchor = getReadReleaseAnchor(
               group, event, /*includeTmemLoadUsers=*/true);
+          // If this is the last writer phase for this resource (no
+          // further same-resource event), defer the release to the
+          // block-terminator boundary so unrelated ops (like
+          // loop-carried arith) precede the release. Otherwise the
+          // release stays at the consumer anchor so following
+          // owner-phase ops appear after it in program order.
+          bool isLastPhaseForResource = true;
+          for (unsigned idx = eventIdx + 1; idx < group.events.size(); ++idx) {
+            if (eventTouchesResource(group.events[idx], resourceKey)) {
+              isLastPhaseForResource = false;
+              break;
+            }
+          }
+          if (isLastPhaseForResource) {
+            if (Block *block = event.op->getBlock()) {
+              Operation *term = block->getTerminator();
+              if (term && releaseAnchor->isBeforeInBlock(term))
+                releaseAnchor = term->getPrevNode() ? term->getPrevNode()
+                                                    : releaseAnchor;
+            }
+          }
           createRelease(builder, releaseAnchor, /*after=*/true,
                         state.writerPhaseFullSem, state.writerToken,
                         event.owner, state.writerPhaseAsyncPayload);
