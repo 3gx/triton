@@ -1578,7 +1578,8 @@ Operation *getReadReleaseAnchor(const BufferGroup &group,
   // For local/SMEM loads, walk forward through use chains; for TMEM loads,
   // walk forward only when explicitly requested (writer-phase
   // coalescing). Other memory-space-specific terminal ops fall back to
-  // anchoring at the event itself.
+  // anchoring at the event itself. Block terminators are never selected
+  // as the anchor — release ops must precede the terminator.
   Value loadedValue;
   if (group.memory == MemorySpaceKind::Local) {
     if (auto loadOp = dyn_cast<LocalLoadOp>(event.op))
@@ -1602,6 +1603,8 @@ Operation *getReadReleaseAnchor(const BufferGroup &group,
       if (user->getBlock() != anchor->getBlock())
         continue;
       if (!seenOps.insert(user).second)
+        continue;
+      if (user->hasTrait<OpTrait::IsTerminator>())
         continue;
       if (anchor == user || anchor->isBeforeInBlock(user))
         anchor = user;
@@ -2231,7 +2234,25 @@ LogicalResult emitSemaphores(BufferGroup &group) {
           sameOwnerWriteNext || !group.isTmem() ||
           hasFutureWrite(group, eventIdx, resourceKey);
       if (needsDoneRelease && !sameOwnerWriteNext) {
-        Operation *releaseAnchor = getReadReleaseAnchor(group, event);
+        // v4 §Combine C: for a linear chain on TMEM, when the next event
+        // for this resource is a sourceful tmem_alloc (write of a new
+        // member), defer the done-release so it lands after the loaded
+        // tensor's consumers but before the next resource event. For
+        // pure fanout (no following sourceful alloc), keep the release
+        // anchor at the load itself so each fanout consumer signals
+        // immediately.
+        bool includeTmem = false;
+        for (unsigned nextIdx = eventIdx + 1; nextIdx < group.events.size();
+             ++nextIdx) {
+          AccessEvent &nxt = group.events[nextIdx];
+          if (!eventTouchesResource(nxt, resourceKey))
+            continue;
+          if (nxt.sourcefulAllocStore)
+            includeTmem = true;
+          break;
+        }
+        Operation *releaseAnchor =
+            getReadReleaseAnchor(group, event, includeTmem);
         createRelease(builder, releaseAnchor, /*after=*/true,
                       materialized.empty, token, event.owner,
                       getAsyncPayload(event.op));
