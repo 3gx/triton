@@ -1183,6 +1183,197 @@ GroupOptSyncDag optimizeSyncEdgesForFanoutFanin(const GroupRawSyncDag &raw) {
   return opt;
 }
 
+// ---------------------------------------------------------------------------
+// v4 §Plan Verification and Enablement. Pre-emission verifier validates the
+// ownership plan + sync graph before any nvws.semaphore.* op is emitted.
+// Failure is a hard pass diagnostic, not an assertion.
+// ---------------------------------------------------------------------------
+
+LogicalResult verifyOwnershipPlan(BufferGroup &group,
+                                  const GroupOwnershipPlan &ownershipPlan,
+                                  triton::FuncOp funcOp) {
+  // Every retargeted access must appear in exactly one direct-use record
+  // for its resourceKey. Build a count map.
+  for (const auto &kv : ownershipPlan.byResource) {
+    int64_t resourceKey = kv.first;
+    const ResourceOwnershipPlan &plan = kv.second;
+    // Count how often each event index appears as a direct use.
+    DenseMap<unsigned, unsigned> useCount;
+    for (const auto &rec : plan.records)
+      for (const RegionUse &u : rec.second.directUses)
+        ++useCount[u.eventIdx];
+    // Check every event that touches this resource is listed.
+    for (auto [idx, event] : llvm::enumerate(group.events)) {
+      if (!eventTouchesResourceForOwnership(event, resourceKey))
+        continue;
+      auto it = useCount.find(static_cast<unsigned>(idx));
+      if (it == useCount.end())
+        return funcOp.emitError("nvws-insert-semas: ownership plan missing "
+                                "direct-use record for event idx ")
+               << idx << " on resource " << resourceKey;
+      if (it->second != 1)
+        return funcOp.emitError(
+                   "nvws-insert-semas: ownership plan event idx ")
+               << idx << " on resource " << resourceKey << " appears in "
+               << it->second << " region records (must be exactly 1)";
+    }
+    // Every scf.for body region with live uses must have a known carried
+    // owner state when entry != exit.
+    funcOp.walk([&](scf::ForOp forOp) {
+      auto it = plan.records.find(&forOp.getRegion());
+      if (it == plan.records.end())
+        return;
+      const RegionOwnership &rec = it->second;
+      if (rec.directUses.empty() && rec.nestedRegions.empty())
+        return;
+      // No assert — entry/exit are always populated by planRegion; we just
+      // confirm the carried flag matches the boundary mismatch.
+      bool boundaryMismatch = rec.entry != rec.exit;
+      if (boundaryMismatch && !rec.needsCarriedToken) {
+        // Will be diagnosed by a future stronger check; for bring-up,
+        // tolerate.
+      }
+    });
+  }
+  return success();
+}
+
+LogicalResult verifyRawSyncDag(BufferGroup &group,
+                               const GroupRawSyncDag &rawSyncDag,
+                               const GroupOwnershipPlan &ownershipPlan) {
+  // Every cross-owner transition implied by ownership must have a
+  // corresponding SyncEdgeInfo.
+  for (const auto &kv : ownershipPlan.byResource) {
+    int64_t resourceKey = kv.first;
+    auto rawIt = rawSyncDag.byResource.find(resourceKey);
+    if (rawIt == rawSyncDag.byResource.end())
+      return group.members.front().allocOp->emitError(
+          "nvws-insert-semas: raw sync dag missing resource record");
+    // Build a set of (sourceEventIdx, targetEventIdx) pairs in raw graph.
+    llvm::SmallSet<std::pair<unsigned, unsigned>, 4> raw;
+    for (const SyncEdgeInfo &edge : rawIt->second.edges)
+      raw.insert({edge.sourceEventIdx, edge.targetEventIdx});
+
+    // Walk events in program order, find cross-owner transitions on this
+    // resource, and confirm each one has a raw edge.
+    SmallVector<unsigned, 8> idxs =
+        indexEventsForResource(group, resourceKey);
+    std::optional<PartitionId> prevOwner;
+    unsigned prevIdx = 0;
+    bool prevValid = false;
+    for (unsigned idx : idxs) {
+      AccessEvent &event = group.events[idx];
+      if (prevValid && prevOwner != event.owner) {
+        if (!raw.contains({prevIdx, idx}))
+          return event.op->emitError(
+                     "nvws-insert-semas: cross-owner dependency missing "
+                     "raw SyncEdgeInfo from event ")
+                 << prevIdx << " to event " << idx;
+      }
+      prevOwner = event.owner;
+      prevIdx = idx;
+      prevValid = true;
+    }
+  }
+  return success();
+}
+
+LogicalResult verifyOptSyncDag(BufferGroup & /*group*/,
+                               const GroupRawSyncDag &rawSyncDag,
+                               const GroupOptSyncDag &optSyncDag) {
+  // Every SyncGroupInfo's edges must share identity fields. Combine A:
+  // same source event + producedVersion + sourceOwner. Combine B: same
+  // target event + producedVersion + targetOwner. v4 explicitly forbids
+  // combining by target partition only — the source-event / target-event
+  // identity is what makes A/B safe.
+  for (const auto &kv : optSyncDag.byResource) {
+    int64_t resourceKey = kv.first;
+    auto rawIt = rawSyncDag.byResource.find(resourceKey);
+    if (rawIt == rawSyncDag.byResource.end())
+      continue;
+    for (const SyncGroupInfo &sg : kv.second.groups) {
+      if (sg.edgeIdxs.empty())
+        continue;
+      const SyncEdgeInfo &first = rawIt->second.edges[sg.edgeIdxs.front()];
+      switch (sg.kind) {
+      case SyncGroupKind::ReadyFanout:
+        for (unsigned eIdx : sg.edgeIdxs) {
+          const SyncEdgeInfo &e = rawIt->second.edges[eIdx];
+          if (e.sourceEventIdx != first.sourceEventIdx ||
+              e.producedVersion != first.producedVersion ||
+              e.sourceOwner != first.sourceOwner)
+            return first.releaseAnchor->emitError(
+                "nvws-insert-semas: ReadyFanout group edges disagree on "
+                "(source event, produced version, source owner)");
+        }
+        break;
+      case SyncGroupKind::DoneFanin: {
+        llvm::SmallSet<std::optional<PartitionId>, 4> sourceOwners;
+        for (unsigned eIdx : sg.edgeIdxs) {
+          const SyncEdgeInfo &e = rawIt->second.edges[eIdx];
+          if (e.targetEventIdx != first.targetEventIdx ||
+              e.producedVersion != first.producedVersion ||
+              e.targetOwner != first.targetOwner)
+            return first.acquireAnchor->emitError(
+                "nvws-insert-semas: DoneFanin group edges disagree on "
+                "(target event, produced version, target owner)");
+          if (!sourceOwners.insert(e.sourceOwner).second)
+            return first.acquireAnchor->emitError(
+                "nvws-insert-semas: DoneFanin group has multiple "
+                "releases from same source owner");
+        }
+        break;
+      }
+      case SyncGroupKind::LinearChain:
+      case SyncGroupKind::Singleton:
+        // 1:1 groups by construction; no extra invariants beyond the
+        // raw-edge integrity already checked.
+        break;
+      }
+    }
+  }
+  return success();
+}
+
+// ---------------------------------------------------------------------------
+// v4 §Post-Emission Verification. Walks the IR after emission and checks
+// structural invariants. Strict anchor-matching to the planned graph is
+// reserved for when emitSemaphores is rewritten to consume SyncGroupInfo
+// directly; for now we enforce the invariants that survive both the
+// legacy and the v4 emission paths.
+// ---------------------------------------------------------------------------
+
+LogicalResult verifyEmittedIR(triton::FuncOp funcOp) {
+  // 1. No branch-local generated semaphore token has an outside-region use.
+  //    For each nvws.semaphore.acquire token, every user must be inside
+  //    the same enclosing region or yielded through a result.
+  LogicalResult result = success();
+  funcOp.walk([&](SemaphoreAcquireOp acquireOp) {
+    Value token = acquireOp.getToken();
+    Region *parent = acquireOp->getParentRegion();
+    for (Operation *user : token.getUsers()) {
+      if (isa<scf::YieldOp>(user))
+        continue;
+      Region *userRegion = user->getParentRegion();
+      // user must be in `parent` or a descendant region.
+      bool ok = false;
+      for (Region *cur = userRegion; cur; cur = cur->getParentRegion())
+        if (cur == parent) {
+          ok = true;
+          break;
+        }
+      if (!ok) {
+        acquireOp->emitError(
+            "nvws-insert-semas: acquire token escapes its branch/body "
+            "region without being yielded");
+        result = failure();
+        return;
+      }
+    }
+  });
+  return result;
+}
+
 // v4 §Structured Region Ownership: produce one ResourceOwnershipPlan per
 // distinct resourceKey in the group. Pure; no IR mutation.
 GroupOwnershipPlan buildOwnershipPlan(BufferGroup &group, triton::FuncOp funcOp) {
@@ -2652,10 +2843,25 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
     dumpGroupDag(group, ownershipPlans[idx], rawSyncDags[idx],
                  optSyncDags[idx], funcOp);
 
+  // Phase 6b: pre-emission verification (v4 §Plan Verification). Hard
+  // diagnostic on failure. Runs unconditionally during bring-up.
+  for (auto [idx, group] : llvm::enumerate(groups)) {
+    if (failed(verifyOwnershipPlan(group, ownershipPlans[idx], funcOp)))
+      return failure();
+    if (failed(verifyRawSyncDag(group, rawSyncDags[idx], ownershipPlans[idx])))
+      return failure();
+    if (failed(verifyOptSyncDag(group, rawSyncDags[idx], optSyncDags[idx])))
+      return failure();
+  }
+
   // Phase 7: emit semaphores from the planned graph.
   for (BufferGroup &group : groups)
     if (failed(emitSemaphores(group)))
       return failure();
+
+  // Phase 8: post-emission verification (v4 §Post-Emission Verification).
+  if (failed(verifyEmittedIR(funcOp)))
+    return failure();
 
   // Phase 9: legacy IR cleanup permitted by v4 §Final Combine Subpass.
   splitConditionalMultiResultTokenIf(funcOp);
