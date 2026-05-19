@@ -1646,57 +1646,51 @@ void addGuardedLoopClose(triton::FuncOp funcOp) {
   }
 }
 
-LogicalResult processTmemGroups(triton::FuncOp funcOp) {
+// v4 §Uniform Access-DAG Builder: one discovery pass that walks both
+// ttng.tmem_alloc and ttg.local_alloc and produces a single
+// SmallVector<BufferGroup> covering all backing buffers, irrespective of
+// memory space. Memory space is a property of the resulting BufferGroup,
+// not a separate code path.
+SmallVector<BufferGroup, 0> collectAllBackingGroups(triton::FuncOp funcOp) {
+  SmallVector<BufferGroup, 0> groups;
   int64_t nextSyntheticId = 0;
-  llvm::MapVector<int64_t, SmallVector<TMEMAllocOp>> groups;
-  DenseMap<Operation *, int64_t> syntheticIds;
+
+  // TMEM groups: many TMEMAllocOps may share the same buffer.id (members of
+  // one logical group with different members/offsets that may overlap).
+  llvm::MapVector<int64_t, SmallVector<TMEMAllocOp>> tmemBuckets;
+  DenseMap<Operation *, int64_t> tmemSyntheticIds;
   funcOp.walk([&](TMEMAllocOp allocOp) {
     if (isSemaphoreBackingAlloc(allocOp))
       return;
     std::optional<int64_t> bufferId = getBufferId(allocOp);
     if (!bufferId) {
-      syntheticIds[allocOp.getOperation()] = nextSyntheticId++;
-      bufferId = syntheticIds[allocOp.getOperation()];
+      tmemSyntheticIds[allocOp.getOperation()] = nextSyntheticId++;
+      bufferId = tmemSyntheticIds[allocOp.getOperation()];
     }
-    groups[*bufferId].push_back(allocOp);
+    tmemBuckets[*bufferId].push_back(allocOp);
   });
+  for (auto &[bufferId, allocs] : tmemBuckets)
+    groups.push_back(makeTmemGroup(bufferId, allocs));
 
-  for (auto &[bufferId, allocs] : groups) {
-    BufferGroup group = makeTmemGroup(bufferId, allocs);
-    if (failed(collectEvents(group, funcOp)))
-      return failure();
-    dumpGroupDag(group);
-    if (failed(emitSemaphores(group)))
-      return failure();
-    eraseDeadGroupOps(group);
-  }
-  return success();
-}
-
-LogicalResult processLocalGroups(triton::FuncOp funcOp) {
-  int64_t nextSyntheticId = 0;
-  SmallVector<std::pair<int64_t, LocalAllocOp>> allocs;
+  // Local/SMEM groups: each LocalAllocOp is its own backing buffer; the
+  // buffer.id (if present) is informational, not a grouping key.
   funcOp.walk([&](LocalAllocOp allocOp) {
     if (isSemaphoreBackingAlloc(allocOp))
       return;
     if (!isLocalSemaphoreBackingType(cast<MemDescType>(allocOp.getType())))
       return;
     int64_t id = getBufferId(allocOp).value_or(nextSyntheticId++);
-    allocs.push_back({id, allocOp});
+    groups.push_back(makeLocalGroup(id, allocOp));
   });
 
-  for (auto [bufferId, allocOp] : allocs) {
-    BufferGroup group = makeLocalGroup(bufferId, allocOp);
-    if (failed(collectEvents(group, funcOp)))
-      return failure();
-    dumpGroupDag(group);
-    if (failed(emitSemaphores(group)))
-      return failure();
-    eraseDeadGroupOps(group);
-  }
-  return success();
+  return groups;
 }
 
+// v4 §Final Combine Subpass: pipeline runs phase-by-phase across all
+// backing groups uniformly. Each group walks the same five DAGs:
+//   access-dag → ownership-dag → raw-sync-dag → opt-sync-dag → semaphores.
+// Memory-space-specific work lives inside the helpers (collectEvents,
+// materializeGroup, retargetEvent, ...), not in the orchestration.
 LogicalResult runOnFunction(triton::FuncOp funcOp) {
   auto walkResult = funcOp.walk([&](scf::ForOp forOp) {
     if (forOp->hasAttr(kWarpSpecializeAttrName))
@@ -1706,12 +1700,35 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
   if (!walkResult.wasInterrupted())
     return success();
 
-  if (failed(processTmemGroups(funcOp)))
-    return failure();
-  if (failed(processLocalGroups(funcOp)))
-    return failure();
+  // Phase 1: discovery — uniform over TMEM + local.
+  SmallVector<BufferGroup, 0> groups = collectAllBackingGroups(funcOp);
+
+  // Phase 2: access-dag — per-member touches in program order.
+  for (BufferGroup &group : groups)
+    if (failed(collectEvents(group, funcOp)))
+      return failure();
+
+  // Phases 3..6 (ownership-dag, raw-sync-dag, opt-sync-dag, dump) are
+  // currently subsumed inside emitSemaphores during v4 bring-up. They will
+  // become explicit phases that produce in-memory RegionOwnership /
+  // SyncEdgeInfo / SyncGroupInfo records before any nvws.semaphore.* op is
+  // emitted.
+  for (BufferGroup &group : groups)
+    dumpGroupDag(group);
+
+  // Phase 7: emit semaphores from the planned graph.
+  for (BufferGroup &group : groups)
+    if (failed(emitSemaphores(group)))
+      return failure();
+
+  // Phase 9: legacy IR cleanup permitted by v4 §Final Combine Subpass.
   splitConditionalMultiResultTokenIf(funcOp);
   addGuardedLoopClose(funcOp);
+
+  // Phase 10: erase dead alloc/alias ops.
+  for (BufferGroup &group : groups)
+    eraseDeadGroupOps(group);
+
   return success();
 }
 
