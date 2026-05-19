@@ -760,6 +760,223 @@ planFor(scf::ForOp forOp, std::optional<PartitionId> entry, BufferGroup &group,
   return bodyExit;
 }
 
+// ---------------------------------------------------------------------------
+// v4 §Dependency Edges + §Planned SyncEdgeInfo: raw sync graph derivation.
+// One SyncEdgeInfo per cross-owner transition implied by the ownership
+// plan. No IR mutation; pure in-memory record.
+// ---------------------------------------------------------------------------
+
+enum class SyncEdgeKind {
+  Ready,   // writer → reader (different owner): produced version becomes
+           //                                    readable by another owner
+  Done,    // reader → next writer (different owner): reader is done, next
+           //                                          writer may overwrite
+  Handoff, // writer → next writer (different owner, no intervening reader)
+};
+
+struct SyncEdgeInfo {
+  // identity
+  int64_t logicalGroupId = 0;
+  int64_t resourceKey = 0;
+  MemorySpaceKind memory = MemorySpaceKind::Tmem;
+  uint64_t producedVersion = 0;
+
+  // edge classification
+  SyncEdgeKind kind = SyncEdgeKind::Ready;
+
+  // events
+  unsigned sourceEventIdx = 0;
+  unsigned targetEventIdx = 0;
+
+  // owners
+  std::optional<PartitionId> sourceOwner;
+  std::optional<PartitionId> targetOwner;
+
+  // region context (where source and target live)
+  Region *sourceRegion = nullptr;
+  Region *targetRegion = nullptr;
+
+  // pre/post-edge ownership state
+  std::optional<PartitionId> preEdgeOwner;
+  std::optional<PartitionId> postEdgeOwner;
+
+  // planned anchors
+  Operation *releaseAnchor = nullptr;
+  Operation *acquireAnchor = nullptr;
+  bool releaseInsideRegion = false;
+  bool acquireInsideRegion = false;
+
+  // carrier-token assignment
+  bool providesCarrierToken = false;
+
+  // metadata
+  AsyncOp asyncPayload = AsyncOp::NONE;
+  StageCluster stageCluster;
+  SmallVector<unsigned, 2> trackedSourceTouches;
+  SmallVector<unsigned, 2> trackedTargetTouches;
+};
+
+// Collected raw sync graph for one BufferGroup. Keyed by resourceKey to
+// preserve the v4 contract that produced-version / done / handoff edges are
+// per (logicalGroupId, resourceKey).
+struct ResourceSyncEdges {
+  int64_t resourceKey = 0;
+  SmallVector<SyncEdgeInfo, 4> edges;
+};
+
+struct GroupRawSyncDag {
+  std::map<int64_t, ResourceSyncEdges> byResource;
+};
+
+// Indexes the events in a group that touch a given resource, in walk
+// (program) order. Returns event indices into group.events.
+SmallVector<unsigned, 8>
+indexEventsForResource(BufferGroup &group, int64_t resourceKey) {
+  SmallVector<unsigned, 8> idxs;
+  for (auto [idx, event] : llvm::enumerate(group.events))
+    if (eventTouchesResourceForOwnership(event, resourceKey))
+      idxs.push_back(idx);
+  return idxs;
+}
+
+void recordTouchIndices(SmallVectorImpl<unsigned> &dst,
+                        const AccessEvent &event, int64_t resourceKey) {
+  for (auto [idx, touch] : llvm::enumerate(event.touches))
+    if (touch.resourceKey == resourceKey)
+      dst.push_back(idx);
+}
+
+// v4 §Dependency Edges. Walk events in program order; for each cross-owner
+// transition on this resourceKey, emit one SyncEdgeInfo with the
+// appropriate kind. Same-owner transitions are not edges (no semaphore
+// required). Coalesce trailing same-owner reads into one reader phase, so
+// the done/handoff edge is anchored at the last reader of the phase.
+ResourceSyncEdges buildRawSyncEdgesForResource(BufferGroup &group,
+                                               int64_t resourceKey) {
+  ResourceSyncEdges out;
+  out.resourceKey = resourceKey;
+
+  SmallVector<unsigned, 8> eventIdxs =
+      indexEventsForResource(group, resourceKey);
+  if (eventIdxs.empty())
+    return out;
+
+  uint64_t version = 0;
+
+  // Walk forward. Maintain "current phase": (owner, isReader, last event idx
+  // in the phase). When the owner or the read/write polarity changes, emit
+  // an edge.
+  std::optional<PartitionId> phaseOwner;
+  bool phaseIsReader = false;
+  bool phaseValid = false;
+  unsigned phaseLastEvent = 0;
+
+  auto getEffects = [&](unsigned eventIdx, bool &reads, bool &writes) {
+    summarizeTouchEffects(group.events[eventIdx], resourceKey, reads, writes);
+  };
+
+  // Lazy edge emitter — fills in cross-phase edge from prior phase to new
+  // event.
+  auto emitEdge = [&](unsigned prevEventIdx, unsigned curEventIdx,
+                      bool prevWasReader, bool curWrites, bool curReads) {
+    AccessEvent &prev = group.events[prevEventIdx];
+    AccessEvent &cur = group.events[curEventIdx];
+
+    SyncEdgeInfo edge;
+    edge.logicalGroupId = group.logicalId;
+    edge.resourceKey = resourceKey;
+    edge.memory = group.memory;
+    edge.producedVersion = version;
+    edge.sourceEventIdx = prevEventIdx;
+    edge.targetEventIdx = curEventIdx;
+    edge.sourceOwner = prev.owner;
+    edge.targetOwner = cur.owner;
+    edge.sourceRegion = prev.op->getParentRegion();
+    edge.targetRegion = cur.op->getParentRegion();
+    edge.preEdgeOwner = prev.owner;
+    edge.postEdgeOwner = cur.owner;
+    edge.releaseAnchor = prev.op;
+    edge.acquireAnchor = cur.op;
+    edge.asyncPayload = getAsyncPayload(prev.op);
+    edge.stageCluster = getStageCluster(prev.op);
+    recordTouchIndices(edge.trackedSourceTouches, prev, resourceKey);
+    recordTouchIndices(edge.trackedTargetTouches, cur, resourceKey);
+
+    if (prevWasReader) {
+      // Reader phase ends → next is a writer.
+      edge.kind = SyncEdgeKind::Done;
+    } else if (curReads && !curWrites) {
+      // Writer → reader.
+      edge.kind = SyncEdgeKind::Ready;
+    } else {
+      // Writer → next writer (no intervening reader).
+      edge.kind = SyncEdgeKind::Handoff;
+    }
+
+    out.edges.push_back(std::move(edge));
+  };
+
+  for (unsigned eventIdx : eventIdxs) {
+    AccessEvent &event = group.events[eventIdx];
+    bool reads = false, writes = false;
+    getEffects(eventIdx, reads, writes);
+
+    bool isReaderEvent = reads && !writes;
+
+    if (!phaseValid) {
+      // First event for this resource starts the first phase.
+      phaseOwner = event.owner;
+      phaseIsReader = isReaderEvent;
+      phaseLastEvent = eventIdx;
+      phaseValid = true;
+      continue;
+    }
+
+    bool sameOwner = (event.owner == phaseOwner);
+    bool readerCompatible = phaseIsReader && isReaderEvent;
+
+    if (sameOwner && readerCompatible) {
+      // Coalesce into the current same-owner reader phase.
+      phaseLastEvent = eventIdx;
+      continue;
+    }
+
+    if (sameOwner) {
+      // Same owner but different polarity (e.g. owner writes after
+      // reading). No cross-owner sync needed; just extend the phase.
+      phaseIsReader = isReaderEvent;
+      phaseLastEvent = eventIdx;
+      continue;
+    }
+
+    // Cross-owner transition: emit an edge from the phase's last event to
+    // this event.
+    emitEdge(phaseLastEvent, eventIdx, phaseIsReader, writes, reads);
+
+    // A write opens a new produced version; readers see the same version.
+    if (writes)
+      ++version;
+
+    phaseOwner = event.owner;
+    phaseIsReader = isReaderEvent;
+    phaseLastEvent = eventIdx;
+  }
+
+  return out;
+}
+
+GroupRawSyncDag buildRawSyncDag(BufferGroup &group,
+                                const GroupOwnershipPlan & /*ownershipPlan*/) {
+  GroupRawSyncDag dag;
+  std::set<int64_t> resourceKeys;
+  for (const BufferMember &member : group.members)
+    resourceKeys.insert(member.resourceKey);
+  for (int64_t resourceKey : resourceKeys)
+    dag.byResource.emplace(resourceKey,
+                           buildRawSyncEdgesForResource(group, resourceKey));
+  return dag;
+}
+
 // v4 §Structured Region Ownership: produce one ResourceOwnershipPlan per
 // distinct resourceKey in the group. Pure; no IR mutation.
 GroupOwnershipPlan buildOwnershipPlan(BufferGroup &group, triton::FuncOp funcOp) {
@@ -1907,10 +2124,15 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
   for (BufferGroup &group : groups)
     ownershipPlans.push_back(buildOwnershipPlan(group, funcOp));
 
-  // Phases 4..5 (raw-sync-dag, opt-sync-dag) are currently subsumed inside
-  // emitSemaphores during v4 bring-up. They will become explicit phases
-  // producing SyncEdgeInfo / SyncGroupInfo records before any
-  // nvws.semaphore.* op is emitted.
+  // Phase 4: raw-sync-dag — one SyncEdgeInfo per cross-owner transition.
+  SmallVector<GroupRawSyncDag, 0> rawSyncDags;
+  rawSyncDags.reserve(groups.size());
+  for (auto [idx, group] : llvm::enumerate(groups))
+    rawSyncDags.push_back(buildRawSyncDag(group, ownershipPlans[idx]));
+
+  // Phase 5 (opt-sync-dag) is currently subsumed inside emitSemaphores
+  // during v4 bring-up. It will become an explicit phase running
+  // optimizeSyncEdgesForFanoutFanin over the SyncEdgeInfo records.
 
   // Phase 6: debug dump (NVWS_INSERT_SEMA_DUMP_DAG=1).
   for (BufferGroup &group : groups)
