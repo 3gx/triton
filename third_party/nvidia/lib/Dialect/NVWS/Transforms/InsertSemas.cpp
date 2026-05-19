@@ -584,6 +584,199 @@ struct ResourceState {
   Value lastReaderSemaphore;
 };
 
+// ---------------------------------------------------------------------------
+// v4 §Structured Region Ownership: pure in-memory ownership plan keyed by
+// (Region *, logicalGroupId, resourceKey). Populated before any
+// nvws.semaphore.* op is emitted. No IR mutation during planning.
+// ---------------------------------------------------------------------------
+
+// v4 §Effective Owner. Owner is std::optional<PartitionId> already; nullopt
+// is root/external, distinct from (wsTag=0, partition=0).
+
+// One direct use of a backing resource inside one region (not nested).
+struct RegionUse {
+  unsigned eventIdx = 0;
+  std::optional<PartitionId> owner;
+  bool reads = false;
+  bool writes = false;
+};
+
+// Per-region ownership record for one backing resource.
+struct RegionOwnership {
+  Region *region = nullptr;
+  int64_t logicalGroupId = 0;
+  int64_t resourceKey = 0;
+  std::optional<PartitionId> entry;
+  std::optional<PartitionId> exit;
+  SmallVector<RegionUse, 4> directUses;
+  SmallVector<Region *, 2> nestedRegions;
+  bool needsCarriedToken = false;
+};
+
+// All ownership records for one resourceKey, keyed by region pointer.
+struct ResourceOwnershipPlan {
+  int64_t resourceKey = 0;
+  DenseMap<Region *, RegionOwnership> records;
+};
+
+// All ownership plans for one BufferGroup, keyed by resourceKey.
+struct GroupOwnershipPlan {
+  std::map<int64_t, ResourceOwnershipPlan> byResource;
+};
+
+bool eventTouchesResourceForOwnership(const AccessEvent &event,
+                                      int64_t resourceKey) {
+  for (const AccessTouch &touch : event.touches)
+    if (touch.resourceKey == resourceKey)
+      return true;
+  return false;
+}
+
+void summarizeTouchEffects(const AccessEvent &event, int64_t resourceKey,
+                           bool &reads, bool &writes) {
+  reads = false;
+  writes = false;
+  for (const AccessTouch &touch : event.touches) {
+    if (touch.resourceKey != resourceKey)
+      continue;
+    if (hasRead(touch.effect))
+      reads = true;
+    if (hasWrite(touch.effect))
+      writes = true;
+  }
+}
+
+// Forward declarations for mutually-recursive planners.
+std::optional<PartitionId>
+planRegion(Region &region, std::optional<PartitionId> entry, BufferGroup &group,
+           int64_t resourceKey, ResourceOwnershipPlan &plan);
+std::optional<PartitionId>
+planIf(scf::IfOp ifOp, std::optional<PartitionId> entry, BufferGroup &group,
+       int64_t resourceKey, ResourceOwnershipPlan &plan);
+std::optional<PartitionId>
+planFor(scf::ForOp forOp, std::optional<PartitionId> entry, BufferGroup &group,
+        int64_t resourceKey, ResourceOwnershipPlan &plan);
+
+// v4 §Structured Region Ownership rule: "reconcile branch exit owners to the
+// chosen post-if owner/state". If all child exits agree, return that. If
+// they differ, prefer the incoming entry owner when one of the branches
+// preserved it. Otherwise pick the first non-empty child exit.
+std::optional<PartitionId>
+reconcileRegion(Operation * /*controlOp*/,
+                std::optional<PartitionId> entry,
+                ArrayRef<std::optional<PartitionId>> childExits) {
+  if (childExits.empty())
+    return entry;
+  bool allEqual = true;
+  for (auto exit : childExits)
+    if (exit != childExits.front()) {
+      allEqual = false;
+      break;
+    }
+  if (allEqual)
+    return childExits.front();
+  for (auto exit : childExits)
+    if (exit == entry)
+      return entry;
+  return childExits.front();
+}
+
+std::optional<PartitionId>
+planRegion(Region &region, std::optional<PartitionId> entry, BufferGroup &group,
+           int64_t resourceKey, ResourceOwnershipPlan &plan) {
+  RegionOwnership rec;
+  rec.region = &region;
+  rec.logicalGroupId = group.logicalId;
+  rec.resourceKey = resourceKey;
+  rec.entry = entry;
+  std::optional<PartitionId> current = entry;
+
+  // Index events by their containing operation for fast lookup.
+  DenseMap<Operation *, unsigned> eventIdxByOp;
+  for (auto [idx, event] : llvm::enumerate(group.events))
+    eventIdxByOp[event.op] = idx;
+
+  for (Block &block : region) {
+    for (Operation &op : block) {
+      if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+        rec.nestedRegions.push_back(&ifOp.getThenRegion());
+        if (!ifOp.getElseRegion().empty())
+          rec.nestedRegions.push_back(&ifOp.getElseRegion());
+        current = planIf(ifOp, current, group, resourceKey, plan);
+        continue;
+      }
+      if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+        rec.nestedRegions.push_back(&forOp.getRegion());
+        current = planFor(forOp, current, group, resourceKey, plan);
+        continue;
+      }
+      auto it = eventIdxByOp.find(&op);
+      if (it == eventIdxByOp.end())
+        continue;
+      const AccessEvent &event = group.events[it->second];
+      if (!eventTouchesResourceForOwnership(event, resourceKey))
+        continue;
+      bool reads = false, writes = false;
+      summarizeTouchEffects(event, resourceKey, reads, writes);
+      rec.directUses.push_back(
+          {it->second, event.owner, reads, writes});
+      // A write or read both transfer ownership of the produced version
+      // to event.owner. Same-owner repeats are no-ops at the ownership
+      // level; cross-owner moves create raw sync edges later.
+      current = event.owner;
+    }
+  }
+
+  rec.exit = current;
+  plan.records[&region] = std::move(rec);
+  return current;
+}
+
+std::optional<PartitionId>
+planIf(scf::IfOp ifOp, std::optional<PartitionId> entry, BufferGroup &group,
+       int64_t resourceKey, ResourceOwnershipPlan &plan) {
+  std::optional<PartitionId> thenExit =
+      planRegion(ifOp.getThenRegion(), entry, group, resourceKey, plan);
+  std::optional<PartitionId> elseExit = entry;
+  if (!ifOp.getElseRegion().empty())
+    elseExit = planRegion(ifOp.getElseRegion(), entry, group, resourceKey, plan);
+  return reconcileRegion(ifOp.getOperation(), entry, {thenExit, elseExit});
+}
+
+std::optional<PartitionId>
+planFor(scf::ForOp forOp, std::optional<PartitionId> entry, BufferGroup &group,
+        int64_t resourceKey, ResourceOwnershipPlan &plan) {
+  // v4 §Structured Region Ownership: loop body's carried owner/state must
+  // be chosen so the first body access, the last body access, the
+  // next-iteration access, and the post-loop continuation are all
+  // reachable. First pass: derive body exit assuming entry. Then check
+  // whether the body's exit differs from entry; if so the loop carries a
+  // token. The post-loop owner is the body exit.
+  std::optional<PartitionId> bodyExit =
+      planRegion(forOp.getRegion(), entry, group, resourceKey, plan);
+  auto it = plan.records.find(&forOp.getRegion());
+  if (it != plan.records.end() && bodyExit != entry)
+    it->second.needsCarriedToken = true;
+  return bodyExit;
+}
+
+// v4 §Structured Region Ownership: produce one ResourceOwnershipPlan per
+// distinct resourceKey in the group. Pure; no IR mutation.
+GroupOwnershipPlan buildOwnershipPlan(BufferGroup &group, triton::FuncOp funcOp) {
+  GroupOwnershipPlan groupPlan;
+  std::set<int64_t> resourceKeys;
+  for (const BufferMember &member : group.members)
+    resourceKeys.insert(member.resourceKey);
+  for (int64_t resourceKey : resourceKeys) {
+    ResourceOwnershipPlan plan;
+    plan.resourceKey = resourceKey;
+    planRegion(funcOp.getBody(), /*entry=*/std::nullopt, group, resourceKey,
+               plan);
+    groupPlan.byResource.emplace(resourceKey, std::move(plan));
+  }
+  return groupPlan;
+}
+
 bool isInRegion(Operation *op, Region &region) {
   for (Operation *cur = op; cur; cur = cur->getParentOp())
     if (cur->getParentRegion() == &region)
@@ -1708,11 +1901,18 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
     if (failed(collectEvents(group, funcOp)))
       return failure();
 
-  // Phases 3..6 (ownership-dag, raw-sync-dag, opt-sync-dag, dump) are
-  // currently subsumed inside emitSemaphores during v4 bring-up. They will
-  // become explicit phases that produce in-memory RegionOwnership /
-  // SyncEdgeInfo / SyncGroupInfo records before any nvws.semaphore.* op is
-  // emitted.
+  // Phase 3: ownership-dag — pure planRegion/planIf/planFor per resourceKey.
+  SmallVector<GroupOwnershipPlan, 0> ownershipPlans;
+  ownershipPlans.reserve(groups.size());
+  for (BufferGroup &group : groups)
+    ownershipPlans.push_back(buildOwnershipPlan(group, funcOp));
+
+  // Phases 4..5 (raw-sync-dag, opt-sync-dag) are currently subsumed inside
+  // emitSemaphores during v4 bring-up. They will become explicit phases
+  // producing SyncEdgeInfo / SyncGroupInfo records before any
+  // nvws.semaphore.* op is emitted.
+
+  // Phase 6: debug dump (NVWS_INSERT_SEMA_DUMP_DAG=1).
   for (BufferGroup &group : groups)
     dumpGroupDag(group);
 
