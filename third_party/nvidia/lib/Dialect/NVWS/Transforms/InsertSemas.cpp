@@ -1830,6 +1830,37 @@ unsigned getTmemSemaphoreDepth(BufferGroup &group) {
   return 1;
 }
 
+// v4 §Carrier Token + §Initial Writable Permit. Trace `init` backward
+// through any tmem_store/tmem_load/MMA token chain to see if it
+// ultimately roots in one of the group's tmem_alloc token results.
+bool initRootsInGroupAllocToken(BufferGroup &group, Value init) {
+  Value current = init;
+  llvm::DenseSet<Value> visited;
+  while (current && visited.insert(current).second) {
+    for (BufferMember &m : group.members) {
+      if (m.allocOp->getNumResults() > 1 && m.allocOp->getResult(1) == current)
+        return true;
+    }
+    Operation *def = current.getDefiningOp();
+    if (!def)
+      return false;
+    if (auto store = dyn_cast<TMEMStoreOp>(def)) {
+      current = store.getDep();
+      continue;
+    }
+    if (auto load = dyn_cast<TMEMLoadOp>(def)) {
+      current = load.getDep();
+      continue;
+    }
+    if (auto mma = dyn_cast<MMAv5OpInterface>(def)) {
+      current = mma.getAccDep();
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
 Value tryCreateLoopInitialAcquire(BufferGroup &group, AccessEvent &event,
                                   OpBuilder &builder,
                                   const MaterializedGroup &materialized) {
@@ -1846,10 +1877,7 @@ Value tryCreateLoopInitialAcquire(BufferGroup &group, AccessEvent &event,
   if (initIdx >= forOp.getInitArgs().size())
     return Value();
   Value init = forOp.getInitArgs()[initIdx];
-  bool fromOriginalAlloc = llvm::any_of(group.members, [&](BufferMember &m) {
-    return m.allocOp->getNumResults() > 1 && m.allocOp->getResult(1) == init;
-  });
-  if (!fromOriginalAlloc)
+  if (!initRootsInGroupAllocToken(group, init))
     return Value();
 
   builder.setInsertionPoint(forOp);
