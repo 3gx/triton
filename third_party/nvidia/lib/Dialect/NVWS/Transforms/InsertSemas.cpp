@@ -582,6 +582,17 @@ struct ResourceState {
   std::optional<PartitionId> lastReaderOwner;
   Value lastReaderToken;
   Value lastReaderSemaphore;
+
+  // v4 §Structured Region Ownership: when a writer is followed by
+  // consecutive same-owner reads of the same resource, those reads belong
+  // to the same owner phase and share the writer's acquire window. The
+  // release of FULL is deferred to the last event of the phase.
+  bool writerPhaseOpen = false;
+  Value writerPhaseAcquireSem;
+  Value writerPhaseFullSem;
+  SmallVector<Value> writerPhaseBuffers;
+  unsigned writerPhaseLastEventIdx = 0;
+  AsyncOp writerPhaseAsyncPayload = AsyncOp::NONE;
 };
 
 // ---------------------------------------------------------------------------
@@ -1459,6 +1470,57 @@ bool nextSameResourceEventIsSameOwnerWrite(BufferGroup &group, unsigned eventIdx
   return false;
 }
 
+// v4 §Structured Region Ownership: find the last consecutive event for
+// `resourceKey` whose owner equals `owner` starting at `writerIdx`.
+// Returns writerIdx if no follow-up event is same-owner. Stops as soon as
+// any other-owner event appears (we don't coalesce across owner changes).
+unsigned findOwnerPhaseLastEvent(BufferGroup &group, unsigned writerIdx,
+                                 int64_t resourceKey,
+                                 std::optional<PartitionId> owner) {
+  unsigned last = writerIdx;
+  for (unsigned idx = writerIdx + 1; idx < group.events.size(); ++idx) {
+    AccessEvent &next = group.events[idx];
+    if (!eventTouchesResource(next, resourceKey))
+      continue;
+    if (next.owner != owner)
+      break;
+    last = idx;
+  }
+  return last;
+}
+
+// Strict-form check: writer at writerIdx is followed by N >= 1 same-owner
+// read-only events of the same resource, with no intervening other-owner
+// event, and the *next* event after the run is a different-owner event
+// (or end of stream). All events in the phase must live in the same
+// block as the writer to keep the deferred release safely anchored.
+// Returns the last event idx of the phase, or std::nullopt if not a
+// coalesce-eligible writer phase.
+std::optional<unsigned>
+findSameOwnerWriterReadPhase(BufferGroup &group, unsigned writerIdx,
+                             int64_t resourceKey,
+                             std::optional<PartitionId> owner) {
+  unsigned last = writerIdx;
+  bool hasFollowingRead = false;
+  Block *writerBlock = group.events[writerIdx].op->getBlock();
+  for (unsigned idx = writerIdx + 1; idx < group.events.size(); ++idx) {
+    AccessEvent &next = group.events[idx];
+    if (!eventTouchesResource(next, resourceKey))
+      continue;
+    if (next.owner != owner)
+      break;
+    if (eventWritesResource(next, resourceKey))
+      break;
+    if (next.op->getBlock() != writerBlock)
+      break;
+    last = idx;
+    hasFollowingRead = true;
+  }
+  if (!hasFollowingRead)
+    return std::nullopt;
+  return last;
+}
+
 scf::IfOp getEnclosingIf(Operation *op) {
   return op->getParentOfType<scf::IfOp>();
 }
@@ -1511,17 +1573,27 @@ struct SharedReadPhasePlan {
 };
 
 Operation *getReadReleaseAnchor(const BufferGroup &group,
-                                const AccessEvent &event) {
-  if (group.memory != MemorySpaceKind::Local)
-    return event.op;
-  auto loadOp = dyn_cast<LocalLoadOp>(event.op);
-  if (!loadOp)
+                                const AccessEvent &event,
+                                bool includeTmemLoadUsers = false) {
+  // For local/SMEM loads, walk forward through use chains; for TMEM loads,
+  // walk forward only when explicitly requested (writer-phase
+  // coalescing). Other memory-space-specific terminal ops fall back to
+  // anchoring at the event itself.
+  Value loadedValue;
+  if (group.memory == MemorySpaceKind::Local) {
+    if (auto loadOp = dyn_cast<LocalLoadOp>(event.op))
+      loadedValue = loadOp.getResult();
+  } else if (includeTmemLoadUsers) {
+    if (auto loadOp = dyn_cast<TMEMLoadOp>(event.op))
+      loadedValue = loadOp.getResult();
+  }
+  if (!loadedValue)
     return event.op;
 
   Operation *anchor = event.op;
   DenseSet<Value> seenValues;
   DenseSet<Operation *> seenOps;
-  SmallVector<Value> worklist{loadOp.getResult()};
+  SmallVector<Value> worklist{loadedValue};
   while (!worklist.empty()) {
     Value value = worklist.pop_back_val();
     if (!seenValues.insert(value).second)
@@ -2043,6 +2115,51 @@ LogicalResult emitSemaphores(BufferGroup &group) {
       Value acquireSem = materialized.empty;
       if (state.hasWriter && state.readerOwners.empty())
         acquireSem = materialized.full;
+
+      // v4 §Structured Region Ownership + §Combine C Linear Chain: if
+      // this writer is followed by consecutive same-owner reads of the
+      // same resource (writer phase), open a phase that shares the
+      // buffer view and defers the release until the last event of the
+      // phase. For alternating-owner linear chains, the acquire pulls
+      // from the prior phase's release semaphore and the release fires
+      // on the other semaphore.
+      std::optional<unsigned> phaseLast = findSameOwnerWriterReadPhase(
+          group, eventIdx, resourceKey, event.owner);
+      if (phaseLast && event.sourcefulAllocStore) {
+        Value phaseAcqSem;
+        Value phaseRelSem;
+        if (state.lastReaderSemaphore &&
+            state.lastReaderOwner != event.owner) {
+          phaseAcqSem = state.lastReaderSemaphore;
+          phaseRelSem = materialized.empty;
+        } else {
+          phaseAcqSem = materialized.empty;
+          phaseRelSem = fullForWrite(eventIdx);
+        }
+        token = createAcquire(builder, event.op, phaseAcqSem, event.owner);
+        SmallVector<Value> buffers = createBuffers(
+            builder, event.op, group, materialized, phaseAcqSem, token,
+            event.owner, event.touches,
+            /*mutableViews=*/true);
+        if (failed(retargetEventWithBuffers(group, event, materialized,
+                                            buffers)))
+          return failure();
+        state.hasWriter = true;
+        state.writerOwner = event.owner;
+        state.writerToken = token;
+        state.readerOwners.clear();
+        state.lastReaderOwner.reset();
+        state.lastReaderToken = Value();
+        state.lastReaderSemaphore = Value();
+        state.writerPhaseOpen = true;
+        state.writerPhaseAcquireSem = phaseAcqSem;
+        state.writerPhaseFullSem = phaseRelSem;
+        state.writerPhaseBuffers = std::move(buffers);
+        state.writerPhaseLastEventIdx = *phaseLast;
+        state.writerPhaseAsyncPayload = getAsyncPayload(event.op);
+        continue;
+      }
+
       token = createAcquire(builder, event.op, acquireSem, event.owner);
       if (failed(retargetEvent(group, event, materialized, acquireSem, token)))
         return failure();
@@ -2059,6 +2176,29 @@ LogicalResult emitSemaphores(BufferGroup &group) {
     }
 
     if (reads) {
+      // v4 §Structured Region Ownership: if a same-owner writer phase is
+      // open for this resource, reuse the writer's acquire window. No
+      // new acquire is emitted; the read retargets through the shared
+      // buffer view. Release of FULL happens at the end of the phase.
+      if (state.writerPhaseOpen && state.writerOwner == event.owner) {
+        if (failed(retargetEventWithBuffers(group, event, materialized,
+                                            state.writerPhaseBuffers)))
+          return failure();
+        if (eventIdx == state.writerPhaseLastEventIdx) {
+          Operation *releaseAnchor = getReadReleaseAnchor(
+              group, event, /*includeTmemLoadUsers=*/true);
+          createRelease(builder, releaseAnchor, /*after=*/true,
+                        state.writerPhaseFullSem, state.writerToken,
+                        event.owner, state.writerPhaseAsyncPayload);
+          state.writerPhaseOpen = false;
+          state.lastReaderOwner = event.owner;
+          state.lastReaderToken = state.writerToken;
+          state.lastReaderSemaphore = state.writerPhaseFullSem;
+          state.readerOwners.push_back(event.owner);
+        }
+        continue;
+      }
+
       Value token =
           createAcquire(builder, event.op, fullForRead(eventIdx), event.owner);
       if (failed(retargetEvent(group, event, materialized, fullForRead(eventIdx),
