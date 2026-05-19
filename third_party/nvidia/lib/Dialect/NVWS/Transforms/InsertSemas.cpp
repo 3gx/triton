@@ -2069,41 +2069,346 @@ void eraseDeadGroupOps(BufferGroup &group) {
   }
 }
 
-void dumpGroupDag(BufferGroup &group) {
+// ---------------------------------------------------------------------------
+// v4 §Debug DAG Dumps. NVWS_INSERT_SEMA_DUMP_DAG=1 dumps four CFG-shaped
+// tree views per logical buffer group: ACCESS-DAG, OWNERSHIP-DAG,
+// RAW-SYNC-DAG, OPT-SYNC-DAG.
+// ---------------------------------------------------------------------------
+
+// Build the prefix string for a tree row at the given depth, e.g. depth 0
+// → "" (root row uses "|- "), depth 1 → "|  ", depth 2 → "|  |  ". The
+// caller appends the marker ("|- " or "   ") at the end.
+static std::string treePrefix(unsigned depth) {
+  std::string s;
+  for (unsigned i = 0; i < depth; ++i)
+    s += "|  ";
+  return s;
+}
+
+// "{<id>}" for a partition owner, "root" for root/external.
+static std::string ownerStr(std::optional<PartitionId> owner) {
+  if (!owner)
+    return "root";
+  std::string s = "{";
+  s += std::to_string(owner->first);
+  s += "}";
+  return s;
+}
+
+// "R" or "W" memory kind char per v4 plan.
+static char accessKindChar(bool reads, bool writes) {
+  return writes ? 'W' : 'R';
+}
+
+// Synthetic member name for the dump column: "m<memberIdx>".
+static std::string memberName(unsigned memberIdx) {
+  return "m" + std::to_string(memberIdx);
+}
+
+// Synthetic semaphore name from edge index: e.g. "S<idx>" for raw view, or
+// "S_full"/"S_empty" for combined groups.
+static std::string semaphoreNameForEdge(unsigned edgeIdx) {
+  return "S" + std::to_string(edgeIdx);
+}
+
+// Lookup which depth a given region sits at relative to the function body.
+static unsigned regionDepth(Region *region, Region *functionBody) {
+  unsigned depth = 0;
+  for (Region *cur = region; cur && cur != functionBody;
+       cur = cur->getParentRegion())
+    ++depth;
+  return depth;
+}
+
+// Print the ACCESS-DAG tree. Recursively walks the function body and emits
+// one row per AccessEvent that touches this group, with CFG nesting.
+static void dumpAccessDagBlock(Block &block, BufferGroup &group,
+                               DenseMap<Operation *, unsigned> &eventIdxByOp,
+                               unsigned depth) {
+  for (Operation &op : block) {
+    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      llvm::errs() << treePrefix(depth) << "|- scf.for\n";
+      for (Block &b : forOp.getRegion())
+        dumpAccessDagBlock(b, group, eventIdxByOp, depth + 1);
+      continue;
+    }
+    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      llvm::errs() << treePrefix(depth) << "|- scf.if\n";
+      for (Block &b : ifOp.getThenRegion())
+        dumpAccessDagBlock(b, group, eventIdxByOp, depth + 1);
+      if (!ifOp.getElseRegion().empty())
+        for (Block &b : ifOp.getElseRegion())
+          dumpAccessDagBlock(b, group, eventIdxByOp, depth + 1);
+      continue;
+    }
+    auto it = eventIdxByOp.find(&op);
+    if (it == eventIdxByOp.end())
+      continue;
+    AccessEvent &event = group.events[it->second];
+    for (AccessTouch &touch : event.touches) {
+      bool reads = hasRead(touch.effect);
+      bool writes = hasWrite(touch.effect);
+      llvm::errs() << treePrefix(depth) << "|- "
+                   << accessKindChar(reads, writes) << "  "
+                   << memberName(touch.memberIdx) << "  "
+                   << op.getName().getStringRef() << " "
+                   << ownerStr(event.owner) << "\n";
+    }
+  }
+}
+
+// Print the OWNERSHIP-DAG region tree for one backing resource. Recurses
+// into scf.if/scf.for, annotating each region with entry/exit owner.
+static void dumpOwnershipDagBlock(Block &block, BufferGroup &group,
+                                  int64_t resourceKey,
+                                  const ResourceOwnershipPlan &plan,
+                                  DenseMap<Operation *, unsigned> &eventIdxByOp,
+                                  unsigned depth) {
+  for (Operation &op : block) {
+    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      llvm::errs() << treePrefix(depth) << "|- scf.for structural\n";
+      auto it = plan.records.find(&forOp.getRegion());
+      if (it != plan.records.end()) {
+        const RegionOwnership &rec = it->second;
+        llvm::errs() << treePrefix(depth + 1) << "|- body region entry "
+                     << ownerStr(rec.entry) << " exit "
+                     << ownerStr(rec.exit)
+                     << (rec.needsCarriedToken ? " carried" : "") << "\n";
+        for (Block &b : forOp.getRegion())
+          dumpOwnershipDagBlock(b, group, resourceKey, plan, eventIdxByOp,
+                                depth + 2);
+      }
+      continue;
+    }
+    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      llvm::errs() << treePrefix(depth) << "|- scf.if structural\n";
+      auto thenIt = plan.records.find(&ifOp.getThenRegion());
+      if (thenIt != plan.records.end()) {
+        const RegionOwnership &rec = thenIt->second;
+        llvm::errs() << treePrefix(depth + 1) << "|- then region entry "
+                     << ownerStr(rec.entry) << " exit "
+                     << ownerStr(rec.exit) << "\n";
+        for (Block &b : ifOp.getThenRegion())
+          dumpOwnershipDagBlock(b, group, resourceKey, plan, eventIdxByOp,
+                                depth + 2);
+      }
+      if (!ifOp.getElseRegion().empty()) {
+        auto elseIt = plan.records.find(&ifOp.getElseRegion());
+        if (elseIt != plan.records.end()) {
+          const RegionOwnership &rec = elseIt->second;
+          llvm::errs() << treePrefix(depth + 1) << "|- else region entry "
+                       << ownerStr(rec.entry) << " exit "
+                       << ownerStr(rec.exit) << "\n";
+          for (Block &b : ifOp.getElseRegion())
+            dumpOwnershipDagBlock(b, group, resourceKey, plan, eventIdxByOp,
+                                  depth + 2);
+        }
+      }
+      continue;
+    }
+    auto it = eventIdxByOp.find(&op);
+    if (it == eventIdxByOp.end())
+      continue;
+    AccessEvent &event = group.events[it->second];
+    bool relevant = eventTouchesResourceForOwnership(event, resourceKey);
+    if (!relevant)
+      continue;
+    bool reads = false, writes = false;
+    summarizeTouchEffects(event, resourceKey, reads, writes);
+    // Find a touch on this resource for the member-name column.
+    unsigned memberIdx = 0;
+    for (const AccessTouch &touch : event.touches)
+      if (touch.resourceKey == resourceKey) {
+        memberIdx = touch.memberIdx;
+        break;
+      }
+    llvm::errs() << treePrefix(depth) << "|- "
+                 << accessKindChar(reads, writes) << "  "
+                 << memberName(memberIdx) << "  "
+                 << op.getName().getStringRef() << " use "
+                 << ownerStr(event.owner) << "\n";
+  }
+}
+
+// Print the RAW-SYNC-DAG (and OPT-SYNC-DAG) region tree for one resource.
+// Reuses OWNERSHIP-DAG row format and interleaves r/a semaphore marker
+// lines from the SyncEdgeInfo/SyncGroupInfo records.
+static void
+dumpSyncDagBlock(Block &block, BufferGroup &group, int64_t resourceKey,
+                 const ResourceOwnershipPlan &plan,
+                 const ResourceSyncEdges &rawEdges,
+                 DenseMap<Operation *, unsigned> &eventIdxByOp,
+                 unsigned depth, bool optimized,
+                 const ResourceSyncGroups *optGroups) {
+  // Index releases / acquires by the op they anchor to.
+  std::multimap<Operation *, std::pair<char, std::string>> releaseLines;
+  std::multimap<Operation *, std::pair<char, std::string>> acquireLines;
+  if (!optimized) {
+    for (auto [idx, edge] : llvm::enumerate(rawEdges.edges)) {
+      releaseLines.insert({edge.releaseAnchor,
+                           {'r', semaphoreNameForEdge(idx)}});
+      acquireLines.insert({edge.acquireAnchor,
+                           {'a', semaphoreNameForEdge(idx)}});
+    }
+  } else if (optGroups) {
+    for (auto [gIdx, sg] : llvm::enumerate(optGroups->groups)) {
+      std::string name;
+      switch (sg.kind) {
+      case SyncGroupKind::ReadyFanout:
+        name = "S_full";
+        break;
+      case SyncGroupKind::DoneFanin:
+        name = "S_empty";
+        break;
+      case SyncGroupKind::LinearChain:
+      case SyncGroupKind::Singleton:
+        if (!sg.edgeIdxs.empty()) {
+          const SyncEdgeInfo &e = rawEdges.edges[sg.edgeIdxs.front()];
+          name = e.kind == SyncEdgeKind::Done ? "S_empty" : "S_full";
+        } else {
+          name = "S?";
+        }
+        break;
+      }
+      for (unsigned eIdx : sg.edgeIdxs) {
+        const SyncEdgeInfo &edge = rawEdges.edges[eIdx];
+        releaseLines.insert({edge.releaseAnchor, {'r', name}});
+        acquireLines.insert({edge.acquireAnchor, {'a', name}});
+      }
+    }
+  }
+
+  for (Operation &op : block) {
+    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      llvm::errs() << treePrefix(depth) << "|- scf.for structural\n";
+      auto it = plan.records.find(&forOp.getRegion());
+      if (it != plan.records.end()) {
+        const RegionOwnership &rec = it->second;
+        llvm::errs() << treePrefix(depth + 1) << "|- body region entry "
+                     << ownerStr(rec.entry) << " exit "
+                     << ownerStr(rec.exit)
+                     << (rec.needsCarriedToken ? " carried" : "") << "\n";
+        for (Block &b : forOp.getRegion())
+          dumpSyncDagBlock(b, group, resourceKey, plan, rawEdges, eventIdxByOp,
+                           depth + 2, optimized, optGroups);
+      }
+      continue;
+    }
+    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      llvm::errs() << treePrefix(depth) << "|- scf.if structural\n";
+      auto thenIt = plan.records.find(&ifOp.getThenRegion());
+      if (thenIt != plan.records.end()) {
+        const RegionOwnership &rec = thenIt->second;
+        llvm::errs() << treePrefix(depth + 1) << "|- then region entry "
+                     << ownerStr(rec.entry) << " exit "
+                     << ownerStr(rec.exit) << "\n";
+        for (Block &b : ifOp.getThenRegion())
+          dumpSyncDagBlock(b, group, resourceKey, plan, rawEdges, eventIdxByOp,
+                           depth + 2, optimized, optGroups);
+      }
+      if (!ifOp.getElseRegion().empty()) {
+        auto elseIt = plan.records.find(&ifOp.getElseRegion());
+        if (elseIt != plan.records.end()) {
+          const RegionOwnership &rec = elseIt->second;
+          llvm::errs() << treePrefix(depth + 1) << "|- else region entry "
+                       << ownerStr(rec.entry) << " exit "
+                       << ownerStr(rec.exit) << "\n";
+          for (Block &b : ifOp.getElseRegion())
+            dumpSyncDagBlock(b, group, resourceKey, plan, rawEdges,
+                             eventIdxByOp, depth + 2, optimized, optGroups);
+        }
+      }
+      continue;
+    }
+    auto it = eventIdxByOp.find(&op);
+    if (it == eventIdxByOp.end())
+      continue;
+    AccessEvent &event = group.events[it->second];
+    if (!eventTouchesResourceForOwnership(event, resourceKey))
+      continue;
+    bool reads = false, writes = false;
+    summarizeTouchEffects(event, resourceKey, reads, writes);
+    unsigned memberIdx = 0;
+    for (const AccessTouch &touch : event.touches)
+      if (touch.resourceKey == resourceKey) {
+        memberIdx = touch.memberIdx;
+        break;
+      }
+    // Acquire lines come before the access row.
+    auto acRange = acquireLines.equal_range(&op);
+    for (auto ait = acRange.first; ait != acRange.second; ++ait)
+      llvm::errs() << treePrefix(depth) << "|  " << ait->second.first << "  "
+                   << ait->second.second << " acquire " << ownerStr(event.owner)
+                   << "\n";
+    llvm::errs() << treePrefix(depth) << "|- "
+                 << accessKindChar(reads, writes) << "  "
+                 << memberName(memberIdx) << "  "
+                 << op.getName().getStringRef() << " "
+                 << ownerStr(event.owner) << "\n";
+    // Release lines come after the access row.
+    auto relRange = releaseLines.equal_range(&op);
+    for (auto rit = relRange.first; rit != relRange.second; ++rit)
+      llvm::errs() << treePrefix(depth) << "|  " << rit->second.first << "  "
+                   << rit->second.second << " release " << ownerStr(event.owner)
+                   << "\n";
+  }
+}
+
+void dumpGroupDag(BufferGroup &group, const GroupOwnershipPlan &ownershipPlan,
+                  const GroupRawSyncDag &rawSyncDag,
+                  const GroupOptSyncDag &optSyncDag, triton::FuncOp funcOp) {
   if (!shouldDumpSemaDag())
     return;
   llvm::errs() << "NVWS-SEMA-DAG buffer.id=" << group.logicalId
                << " memory=" << (group.isTmem() ? "tmem" : "local") << "\n";
-  bool hasFor = llvm::any_of(group.events, [](const AccessEvent &event) {
-    return event.op->getParentOfType<scf::ForOp>() != nullptr;
-  });
+
+  // Index events by their op for fast lookup during the recursive walk.
+  DenseMap<Operation *, unsigned> eventIdxByOp;
+  for (auto [idx, event] : llvm::enumerate(group.events))
+    eventIdxByOp[event.op] = static_cast<unsigned>(idx);
+
+  // ACCESS-DAG (one tree across the whole function for this group).
   llvm::errs() << "ACCESS-DAG\n";
-  if (hasFor)
-    llvm::errs() << "|- scf.for\n";
-  for (AccessEvent &event : group.events) {
-    for (AccessTouch &touch : event.touches) {
-      llvm::errs() << (hasFor ? "|  |-" : "|- ") << " "
-                   << (hasWrite(touch.effect) ? "W" : "R")
-                   << "  m" << touch.memberIdx << "     "
-                   << event.op->getName() << " " << formatOwner(event.owner)
-                   << " resource=" << touch.resourceKey << "\n";
-    }
+  for (Block &b : funcOp.getBody())
+    dumpAccessDagBlock(b, group, eventIdxByOp, /*depth=*/0);
+
+  // OWNERSHIP-DAG (one tree per backing resource).
+  for (auto &kv : ownershipPlan.byResource) {
+    llvm::errs() << "OWNERSHIP-DAG backing=" << kv.first << "\n";
+    for (Block &b : funcOp.getBody())
+      dumpOwnershipDagBlock(b, group, kv.first, kv.second, eventIdxByOp,
+                            /*depth=*/0);
   }
-  llvm::errs() << "OWNERSHIP-DAG\n";
-  for (AccessEvent &event : group.events)
-    llvm::errs() << "|- " << event.op->getName() << " use "
-                 << formatOwner(event.owner) << "\n";
-  llvm::errs() << "RAW-SYNC-DAG\n";
-  if (hasFor) {
-    llvm::errs() << "|- scf.for\n";
-    llvm::errs() << "|  |  r  S0     release\n";
+
+  // RAW-SYNC-DAG (one tree per backing resource).
+  for (auto &kv : rawSyncDag.byResource) {
+    llvm::errs() << "RAW-SYNC-DAG backing=" << kv.first << "\n";
+    auto ownIt = ownershipPlan.byResource.find(kv.first);
+    if (ownIt == ownershipPlan.byResource.end())
+      continue;
+    for (Block &b : funcOp.getBody())
+      dumpSyncDagBlock(b, group, kv.first, ownIt->second, kv.second,
+                       eventIdxByOp, /*depth=*/0, /*optimized=*/false, nullptr);
   }
-  llvm::errs() << "OPT-SYNC-DAG\n";
-  if (hasFor) {
-    llvm::errs() << "|- scf.for\n";
-    llvm::errs() << "|  |  r  S_full release\n";
-    llvm::errs() << "|  |  a  S_empty acquire\n";
+
+  // OPT-SYNC-DAG (one tree per backing resource).
+  for (auto &kv : optSyncDag.byResource) {
+    llvm::errs() << "OPT-SYNC-DAG backing=" << kv.first << "\n";
+    auto rawIt = rawSyncDag.byResource.find(kv.first);
+    auto ownIt = ownershipPlan.byResource.find(kv.first);
+    if (rawIt == rawSyncDag.byResource.end() ||
+        ownIt == ownershipPlan.byResource.end())
+      continue;
+    for (Block &b : funcOp.getBody())
+      dumpSyncDagBlock(b, group, kv.first, ownIt->second, rawIt->second,
+                       eventIdxByOp, /*depth=*/0, /*optimized=*/true,
+                       &kv.second);
   }
+}
+
+// Back-compat overload used during transition.
+void dumpGroupDag(BufferGroup & /*group*/) {
+  // Real dump now requires plans/dags; called from runOnFunction directly.
 }
 
 Value findReleasedPeerSemaphore(Value semaphore) {
@@ -2343,8 +2648,9 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
     optSyncDags.push_back(optimizeSyncEdgesForFanoutFanin(raw));
 
   // Phase 6: debug dump (NVWS_INSERT_SEMA_DUMP_DAG=1).
-  for (BufferGroup &group : groups)
-    dumpGroupDag(group);
+  for (auto [idx, group] : llvm::enumerate(groups))
+    dumpGroupDag(group, ownershipPlans[idx], rawSyncDags[idx],
+                 optSyncDags[idx], funcOp);
 
   // Phase 7: emit semaphores from the planned graph.
   for (BufferGroup &group : groups)
