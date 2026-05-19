@@ -977,6 +977,212 @@ GroupRawSyncDag buildRawSyncDag(BufferGroup &group,
   return dag;
 }
 
+// ---------------------------------------------------------------------------
+// v4 §Final Combine Subpass: optimize the raw SyncEdge graph into an
+// opt-sync DAG of SyncGroupInfo records. Three combine kinds:
+//   A. ReadyFanout — one producer feeds multiple read-only consumers
+//   B. DoneFanin   — multiple readers feed one next writer (pending count)
+//   C. LinearChain — single-resource linear ownership sequence preserved
+//   plus Singleton — 1:1 edge that didn't qualify for any combine.
+// Conservative: when a safety check fails, edges stay as Singleton groups.
+// ---------------------------------------------------------------------------
+
+enum class SyncGroupKind {
+  ReadyFanout,
+  DoneFanin,
+  LinearChain,
+  Singleton,
+};
+
+struct SyncGroupInfo {
+  SyncGroupKind kind = SyncGroupKind::Singleton;
+  int64_t logicalGroupId = 0;
+  int64_t resourceKey = 0;
+  MemorySpaceKind memory = MemorySpaceKind::Tmem;
+  uint64_t producedVersion = 0;
+  SmallVector<unsigned, 2> edgeIdxs;
+};
+
+struct ResourceSyncGroups {
+  int64_t resourceKey = 0;
+  SmallVector<SyncGroupInfo, 4> groups;
+};
+
+struct GroupOptSyncDag {
+  std::map<int64_t, ResourceSyncGroups> byResource;
+};
+
+// Combine A safety: all edges share source + producedVersion + sourceOwner;
+// all targets are read-only consumers (kind == Ready); identical async
+// payload; identical memory space and group.
+bool combineReadyFanoutSafe(ArrayRef<const SyncEdgeInfo *> edges) {
+  if (edges.empty())
+    return false;
+  const SyncEdgeInfo &first = *edges.front();
+  if (first.kind != SyncEdgeKind::Ready)
+    return false;
+  for (const SyncEdgeInfo *e : edges) {
+    if (e->kind != SyncEdgeKind::Ready)
+      return false;
+    if (e->logicalGroupId != first.logicalGroupId)
+      return false;
+    if (e->resourceKey != first.resourceKey)
+      return false;
+    if (e->memory != first.memory)
+      return false;
+    if (e->producedVersion != first.producedVersion)
+      return false;
+    if (e->sourceEventIdx != first.sourceEventIdx)
+      return false;
+    if (e->sourceOwner != first.sourceOwner)
+      return false;
+    if (e->asyncPayload != first.asyncPayload)
+      return false;
+  }
+  return true;
+}
+
+// Combine B safety: same target + producedVersion + targetOwner; each
+// source owner contributes at most one done edge; identical memory + group.
+bool combineDoneFaninSafe(ArrayRef<const SyncEdgeInfo *> edges) {
+  if (edges.empty())
+    return false;
+  const SyncEdgeInfo &first = *edges.front();
+  if (first.kind != SyncEdgeKind::Done)
+    return false;
+  llvm::SmallSet<std::optional<PartitionId>, 4> seenSourceOwners;
+  for (const SyncEdgeInfo *e : edges) {
+    if (e->kind != SyncEdgeKind::Done)
+      return false;
+    if (e->logicalGroupId != first.logicalGroupId)
+      return false;
+    if (e->resourceKey != first.resourceKey)
+      return false;
+    if (e->memory != first.memory)
+      return false;
+    if (e->producedVersion != first.producedVersion)
+      return false;
+    if (e->targetEventIdx != first.targetEventIdx)
+      return false;
+    if (e->targetOwner != first.targetOwner)
+      return false;
+    if (!seenSourceOwners.insert(e->sourceOwner).second)
+      return false;
+  }
+  return true;
+}
+
+// Combine C safety: for this resource the graph is a strict linear chain.
+// Each edge has 1 source / 1 target, no Ready fanouts and no Done fanins.
+bool combineLinearChainSafe(const ResourceSyncEdges &edges) {
+  // Count Ready edges per (sourceEventIdx, producedVersion).
+  std::map<std::pair<unsigned, uint64_t>, unsigned> readyCount;
+  // Count Done edges per (targetEventIdx, producedVersion).
+  std::map<std::pair<unsigned, uint64_t>, unsigned> doneCount;
+  for (const SyncEdgeInfo &edge : edges.edges) {
+    if (edge.kind == SyncEdgeKind::Ready)
+      ++readyCount[{edge.sourceEventIdx, edge.producedVersion}];
+    else if (edge.kind == SyncEdgeKind::Done)
+      ++doneCount[{edge.targetEventIdx, edge.producedVersion}];
+  }
+  for (auto &kv : readyCount)
+    if (kv.second > 1)
+      return false;
+  for (auto &kv : doneCount)
+    if (kv.second > 1)
+      return false;
+  return true;
+}
+
+ResourceSyncGroups
+optimizeResourceSyncEdges(const ResourceSyncEdges &input) {
+  ResourceSyncGroups out;
+  out.resourceKey = input.resourceKey;
+  if (input.edges.empty())
+    return out;
+
+  // Bucket Ready edges by (sourceEventIdx, producedVersion).
+  std::map<std::pair<unsigned, uint64_t>, SmallVector<unsigned, 2>> readyBuckets;
+  // Bucket Done edges by (targetEventIdx, producedVersion).
+  std::map<std::pair<unsigned, uint64_t>, SmallVector<unsigned, 2>> doneBuckets;
+  SmallVector<unsigned, 4> singletons;
+
+  for (auto [idx, edge] : llvm::enumerate(input.edges)) {
+    switch (edge.kind) {
+    case SyncEdgeKind::Ready:
+      readyBuckets[{edge.sourceEventIdx, edge.producedVersion}].push_back(
+          static_cast<unsigned>(idx));
+      break;
+    case SyncEdgeKind::Done:
+      doneBuckets[{edge.targetEventIdx, edge.producedVersion}].push_back(
+          static_cast<unsigned>(idx));
+      break;
+    case SyncEdgeKind::Handoff:
+      singletons.push_back(static_cast<unsigned>(idx));
+      break;
+    }
+  }
+
+  // Combine C check: if linear chain across the whole resource, every group
+  // is going to be a 1:1 Singleton anyway (no fanout, no fanin). Tag those
+  // singletons as LinearChain for the emitter so it can pick the compact
+  // shape.
+  bool linearChain = combineLinearChainSafe(input);
+
+  auto makeGroup = [&](SyncGroupKind kind, ArrayRef<unsigned> edgeIdxs) {
+    SyncGroupInfo group;
+    group.kind = kind;
+    const SyncEdgeInfo &first = input.edges[edgeIdxs.front()];
+    group.logicalGroupId = first.logicalGroupId;
+    group.resourceKey = first.resourceKey;
+    group.memory = first.memory;
+    group.producedVersion = first.producedVersion;
+    group.edgeIdxs.assign(edgeIdxs.begin(), edgeIdxs.end());
+    out.groups.push_back(std::move(group));
+  };
+
+  for (auto &kv : readyBuckets) {
+    SmallVector<const SyncEdgeInfo *, 2> ptrs;
+    for (unsigned idx : kv.second)
+      ptrs.push_back(&input.edges[idx]);
+    if (kv.second.size() > 1 && combineReadyFanoutSafe(ptrs)) {
+      makeGroup(SyncGroupKind::ReadyFanout, kv.second);
+    } else {
+      for (unsigned idx : kv.second)
+        makeGroup(linearChain ? SyncGroupKind::LinearChain
+                              : SyncGroupKind::Singleton,
+                  ArrayRef<unsigned>(&idx, 1));
+    }
+  }
+  for (auto &kv : doneBuckets) {
+    SmallVector<const SyncEdgeInfo *, 2> ptrs;
+    for (unsigned idx : kv.second)
+      ptrs.push_back(&input.edges[idx]);
+    if (kv.second.size() > 1 && combineDoneFaninSafe(ptrs)) {
+      makeGroup(SyncGroupKind::DoneFanin, kv.second);
+    } else {
+      for (unsigned idx : kv.second)
+        makeGroup(linearChain ? SyncGroupKind::LinearChain
+                              : SyncGroupKind::Singleton,
+                  ArrayRef<unsigned>(&idx, 1));
+    }
+  }
+  for (unsigned idx : singletons)
+    makeGroup(linearChain ? SyncGroupKind::LinearChain
+                          : SyncGroupKind::Singleton,
+              ArrayRef<unsigned>(&idx, 1));
+
+  return out;
+}
+
+// v4 §Final Combine Subpass entry point: run combine A/B/C per resource.
+GroupOptSyncDag optimizeSyncEdgesForFanoutFanin(const GroupRawSyncDag &raw) {
+  GroupOptSyncDag opt;
+  for (auto &kv : raw.byResource)
+    opt.byResource.emplace(kv.first, optimizeResourceSyncEdges(kv.second));
+  return opt;
+}
+
 // v4 §Structured Region Ownership: produce one ResourceOwnershipPlan per
 // distinct resourceKey in the group. Pure; no IR mutation.
 GroupOwnershipPlan buildOwnershipPlan(BufferGroup &group, triton::FuncOp funcOp) {
@@ -2130,9 +2336,11 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
   for (auto [idx, group] : llvm::enumerate(groups))
     rawSyncDags.push_back(buildRawSyncDag(group, ownershipPlans[idx]));
 
-  // Phase 5 (opt-sync-dag) is currently subsumed inside emitSemaphores
-  // during v4 bring-up. It will become an explicit phase running
-  // optimizeSyncEdgesForFanoutFanin over the SyncEdgeInfo records.
+  // Phase 5: opt-sync-dag — fanout/fanin combine over the raw SyncEdges.
+  SmallVector<GroupOptSyncDag, 0> optSyncDags;
+  optSyncDags.reserve(groups.size());
+  for (const GroupRawSyncDag &raw : rawSyncDags)
+    optSyncDags.push_back(optimizeSyncEdgesForFanoutFanin(raw));
 
   // Phase 6: debug dump (NVWS_INSERT_SEMA_DUMP_DAG=1).
   for (BufferGroup &group : groups)
