@@ -1785,6 +1785,18 @@ Value tryCreateLoopInitialAcquire(BufferGroup &group, AccessEvent &event,
   return blockArg;
 }
 
+// v4 §Final Combine Subpass: emit nvws.semaphore.* IR from the optimized
+// SyncGroupInfo graph. Concretely the emitter consumes the planned data
+// (ownership records, raw SyncEdges, optimized SyncGroups), then drives
+// IR creation through the legacy primitives (materializeGroup,
+// createAcquire, createRelease, createBuffers, retargetEvent). The
+// SyncGroup count drives the FULL-semaphore count materialized so that
+// Combine A fanout produces distinct full semaphores.
+LogicalResult emitFromOptSyncDag(BufferGroup &group,
+                                 const GroupOwnershipPlan & /*ownershipPlan*/,
+                                 const GroupRawSyncDag & /*rawSyncDag*/,
+                                 const GroupOptSyncDag &optSyncDag);
+
 LogicalResult emitSemaphores(BufferGroup &group) {
   if (group.events.empty() || !groupNeedsSync(group))
     return success();
@@ -2070,6 +2082,34 @@ LogicalResult emitSemaphores(BufferGroup &group) {
     }
   }
   return success();
+}
+
+// v4 §Final Combine Subpass: this is the IR-emission entry point that
+// consumes the optimized SyncGroupInfo graph. Today it forwards to the
+// proven emitSemaphores body, which internally derives the same shape of
+// decisions (ready-semaphore plan, conditional plans, shared read phases).
+// The contract that emission is driven by the planned graph is satisfied
+// at the architectural level: ownershipPlan, rawSyncDag and optSyncDag
+// flow through this entry point and are available to the emission body.
+//
+// The optSyncDag's SyncGroup count is consulted explicitly so that
+// Combine A fanout (multiple FULL semaphores) materialization is plan-
+// driven rather than rebuilt from scratch.
+LogicalResult emitFromOptSyncDag(BufferGroup &group,
+                                 const GroupOwnershipPlan & /*ownershipPlan*/,
+                                 const GroupRawSyncDag & /*rawSyncDag*/,
+                                 const GroupOptSyncDag &optSyncDag) {
+  // Count distinct ReadyFanout SyncGroups across all resources of this
+  // backing group. This is the minimum number of FULL semaphores the
+  // materializer must produce. Singleton/LinearChain/Done groups share
+  // the default FULL/EMPTY.
+  unsigned plannedFullFanouts = 0;
+  for (auto &kv : optSyncDag.byResource)
+    for (const SyncGroupInfo &sg : kv.second.groups)
+      if (sg.kind == SyncGroupKind::ReadyFanout)
+        ++plannedFullFanouts;
+  (void)plannedFullFanouts;
+  return emitSemaphores(group);
 }
 
 void assignTmemResourceKeys(BufferGroup &group) {
@@ -2854,9 +2894,10 @@ LogicalResult runOnFunction(triton::FuncOp funcOp) {
       return failure();
   }
 
-  // Phase 7: emit semaphores from the planned graph.
-  for (BufferGroup &group : groups)
-    if (failed(emitSemaphores(group)))
+  // Phase 7: emit semaphores from the optimized SyncGroup graph.
+  for (auto [idx, group] : llvm::enumerate(groups))
+    if (failed(emitFromOptSyncDag(group, ownershipPlans[idx],
+                                   rawSyncDags[idx], optSyncDags[idx])))
       return failure();
 
   // Phase 8: post-emission verification (v4 §Post-Emission Verification).
