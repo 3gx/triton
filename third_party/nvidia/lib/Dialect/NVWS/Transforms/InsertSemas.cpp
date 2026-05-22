@@ -1,15 +1,18 @@
-// v4 commit 2: discovery + ACCESS DAG + OWNERSHIP DAG (dump-only).
+// v4 commit 3: discovery + ACCESS DAG + OWNERSHIP DAG + RAW-SYNC DAG
+// (dump-only).
 //
 // Per meta2nvws-plan/per-edge-sema-plan.v4.md Implementation Plan, this
-// commit adds the second stage of the v4 pipeline:
+// commit adds the third stage of the v4 pipeline:
 //
 //   discover backing buffers
 //     -> build ACCESS DAG per buffer
 //     -> build OWNERSHIP DAG per (logicalGroupId, resourceKey)
+//     -> derive RAW-SYNC DAG per (logicalGroupId, resourceKey)
 //
 // The pass mutates no IR. It prints the backing-buffer list, the ACCESS
-// DAG per buffer, and a structured region OWNERSHIP DAG per backing
-// resource to stderr for manual verification.
+// DAG per buffer, a structured region OWNERSHIP DAG per backing resource,
+// and a raw per-edge SYNC DAG per backing resource to stderr for manual
+// verification.
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Visitors.h"
@@ -23,6 +26,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -461,6 +465,25 @@ static LogicalResult collectEvents(BufferGroup &group, triton::FuncOp funcOp) {
 // Dump (commit 1 stage output).
 // ---------------------------------------------------------------------------
 
+// Anchor's WS-loop scope tag (v4 §Debug DAG Dumps display rule).
+//   - If the anchor IS a WS-tagged scf.for op, the anchor IS the WS scope.
+//   - Otherwise, the WS scope is the nearest enclosing WS-tagged scf.for
+//     ancestor (not counting the anchor itself, even if the anchor is an
+//     intrinsic-tag event).
+// This is the key difference from `tryGetWsTag`: an intrinsic-tag event
+// at func depth has no enclosing WS scope, so its rows print in tagged
+// form, while the same event nested inside its WS-loop prints untagged.
+static std::optional<int> getAnchorWsScopeTag(Operation *op) {
+  if (!op) return std::nullopt;
+  if (isa<scf::ForOp>(op) && hasWarpSpecializeTag(op))
+    return *getWarpSpecializeTag(op);
+  Operation *p = op->getParentOfType<scf::ForOp>();
+  while (p && !hasWarpSpecializeTag(p))
+    p = p->getParentOfType<scf::ForOp>();
+  if (!p) return std::nullopt;
+  return *getWarpSpecializeTag(p);
+}
+
 // Context-sensitive owner display (v4 §Debug DAG Dumps).
 //
 // - root/external → "root"
@@ -473,7 +496,7 @@ static std::string ownerStr(Operation *anchor,
   if (!owner) return "root";
   std::string s;
   llvm::raw_string_ostream os(s);
-  auto anchorTag = anchor ? tryGetWsTag(anchor) : std::nullopt;
+  auto anchorTag = anchor ? getAnchorWsScopeTag(anchor) : std::nullopt;
   if (anchorTag && *anchorTag == owner->second)
     os << "{" << owner->first << "}";
   else
@@ -844,6 +867,304 @@ planResource(triton::FuncOp funcOp, unsigned groupIdx, BufferGroup &group,
 }
 
 // ---------------------------------------------------------------------------
+// v4 §Dependency Edges / §Planned SyncEdgeInfo (commit 3).
+// Raw per-edge synchronization graph derived from the per-resource
+// OWNERSHIP-DAG. One edge per cross-owner dependency. No IR mutation.
+// ---------------------------------------------------------------------------
+
+enum class SyncEdgeKind { Ready, Done, Handoff };
+enum class SemaState { Full, Empty };
+
+static StringRef stateStr(SemaState s) {
+  return s == SemaState::Full ? "FULL" : "EMPTY";
+}
+
+// One raw cross-owner edge. v4 §Planned SyncEdgeInfo subset; the full
+// SyncEdgeInfo (planned release/acquire anchors, async payload, carrier
+// token, backing data buffers) is materialized in later commits when the
+// pass starts emitting IR.
+struct SyncEdge {
+  std::string name;
+  SyncEdgeKind kind = SyncEdgeKind::Ready;
+  SemaState state = SemaState::Full;
+  // srcOp = null for the initial writable permit.
+  Operation *srcOp = nullptr;
+  Operation *dstOp = nullptr;
+  std::optional<PartitionId> srcOwner;
+  std::optional<PartitionId> dstOwner;
+  // Anchor region + position used by the dump. v4 §Debug DAG Dumps places
+  // release/acquire rows either inline next to the source/target access
+  // rows (same region) or at the deeper region's entry/exit (cross-region).
+  enum class Position { InLine, AtEntry, AtExit };
+  Region *anchorRegion = nullptr;
+  Position position = Position::InLine;
+};
+
+struct SyncPlan {
+  ResourceId resource{0, 0};
+  unsigned groupIdx = 0;
+  SmallVector<unsigned, 4> memberIndices;
+  SmallVector<SyncEdge> edges;
+  // Per-access-op incoming/outgoing edge indices. Only InLine edges are
+  // indexed here; cross-region edges live in entry/exit maps.
+  DenseMap<Operation *, SmallVector<unsigned, 2>> incomingByAccess;
+  DenseMap<Operation *, SmallVector<unsigned, 2>> outgoingByAccess;
+  // Per-region entry/exit edge indices (cross-region case).
+  DenseMap<Region *, SmallVector<unsigned, 2>> entryEdges;
+  DenseMap<Region *, SmallVector<unsigned, 2>> exitEdges;
+  // Ops with at least one touch for this resource (access rows in dump).
+  DenseSet<Operation *> accessOps;
+  // Initial permit edge (S_init). Anchored at funcDirectAnchor inside
+  // initialAnchorRegion: printed immediately before that op at the region's
+  // depth.
+  std::optional<unsigned> initialEdgeIdx;
+  Region *initialAnchorRegion = nullptr;
+  Operation *initialAnchorBeforeOp = nullptr;
+};
+
+static bool touchReads(const AccessTouch &t) { return hasRead(t.effect); }
+static bool touchWrites(const AccessTouch &t) { return hasWrite(t.effect); }
+
+static const AccessTouch *
+findTouchForResource(const AccessEvent &event, int64_t resourceKey) {
+  for (const AccessTouch &t : event.touches)
+    if (t.resourceKey == resourceKey) return &t;
+  return nullptr;
+}
+
+// True iff `event` reads/writes the resource identified by `resourceKey`.
+static bool eventConsumes(const AccessEvent &event, int64_t resourceKey) {
+  if (auto *t = findTouchForResource(event, resourceKey))
+    return touchReads(*t);
+  return false;
+}
+static bool eventProduces(const AccessEvent &event, int64_t resourceKey) {
+  if (auto *t = findTouchForResource(event, resourceKey))
+    return touchWrites(*t);
+  return false;
+}
+
+// Anchor region computation for a cross-region raw sync edge. Returns the
+// deepest unshared region (closer to dst when dst is deeper, closer to src
+// when src is deeper) and the position to render the edge rows.
+static std::pair<Region *, SyncEdge::Position>
+computeAnchor(Operation *srcOp, Operation *dstOp) {
+  Region *regSrc = srcOp ? srcOp->getParentRegion() : nullptr;
+  Region *regDst = dstOp ? dstOp->getParentRegion() : nullptr;
+  if (regSrc == regDst)
+    return {regSrc, SyncEdge::Position::InLine};
+
+  // Case A: regDst is descendant of regSrc.
+  for (Region *r = regDst; r; ) {
+    Operation *parentOp = r->getParentOp();
+    if (!parentOp) break;
+    Region *parentReg = parentOp->getParentRegion();
+    if (parentReg == regSrc)
+      return {r, SyncEdge::Position::AtEntry};
+    r = parentReg;
+  }
+  // Case B: regSrc is descendant of regDst.
+  for (Region *r = regSrc; r; ) {
+    Operation *parentOp = r->getParentOp();
+    if (!parentOp) break;
+    Region *parentReg = parentOp->getParentRegion();
+    if (parentReg == regDst)
+      return {r, SyncEdge::Position::AtExit};
+    r = parentReg;
+  }
+  // Case C: neither descends from the other (sibling regions under a
+  // common ancestor — e.g., events both inside different branches of an
+  // outer scf.if). Not exercised by v4 examples; fall back to inline at
+  // src side so the edge is at least visible.
+  return {regSrc, SyncEdge::Position::InLine};
+}
+
+// Initial-permit anchor: walk up from `dstOp` until we hit `funcBody`.
+// The function-direct-child op containing dstOp is the row we render the
+// initial acquire before. For loop bodies this hoists the initial permit
+// out of the loop, matching v4 example 5 (S_alpha_done acquired before
+// scf.for).
+static Operation *findInitialAnchorOp(Operation *dstOp, Region &funcBody) {
+  Operation *cur = dstOp;
+  while (cur && cur->getParentRegion() != &funcBody) {
+    Operation *p = cur->getParentOp();
+    if (!p) break;
+    cur = p;
+  }
+  return cur;
+}
+
+static std::string formatOwnerPair(Operation *anchor,
+                                   std::optional<PartitionId> src,
+                                   std::optional<PartitionId> dst) {
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  if (src)
+    os << ownerStr(anchor, src);
+  else
+    os << "init";
+  os << " -> " << ownerStr(anchor, dst);
+  return s;
+}
+
+static std::string makeEdgeName(SyncEdgeKind kind,
+                                std::optional<PartitionId> srcOwner,
+                                std::optional<PartitionId> dstOwner,
+                                unsigned serial) {
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  char prefix = kind == SyncEdgeKind::Ready
+                    ? 'R'
+                    : (kind == SyncEdgeKind::Done ? 'D' : 'H');
+  os << "S_" << prefix << "_";
+  if (srcOwner)
+    os << srcOwner->first;
+  else
+    os << "root";
+  os << "_";
+  if (dstOwner)
+    os << dstOwner->first;
+  else
+    os << "root";
+  os << "_e" << serial;
+  return s;
+}
+
+// Add an edge to `sp` and wire it into per-op / per-region indices. InLine
+// edges are anchored directly to the source/target access ops; region
+// entry/exit edges are anchored to the deeper region only.
+static unsigned recordEdge(SyncPlan &sp, SyncEdge edge) {
+  unsigned idx = sp.edges.size();
+  if (edge.position == SyncEdge::Position::InLine) {
+    if (edge.srcOp) sp.outgoingByAccess[edge.srcOp].push_back(idx);
+    if (edge.dstOp) sp.incomingByAccess[edge.dstOp].push_back(idx);
+  } else if (edge.position == SyncEdge::Position::AtEntry) {
+    sp.entryEdges[edge.anchorRegion].push_back(idx);
+  } else if (edge.position == SyncEdge::Position::AtExit) {
+    sp.exitEdges[edge.anchorRegion].push_back(idx);
+  }
+  sp.edges.push_back(std::move(edge));
+  return idx;
+}
+
+static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
+                              triton::FuncOp funcOp) {
+  SyncPlan sp;
+  sp.resource = rp.resource;
+  sp.groupIdx = rp.groupIdx;
+  sp.memberIndices = rp.memberIndices;
+
+  // Events touching this resource, in program order.
+  SmallVector<const AccessEvent *> events;
+  for (const AccessEvent &e : group.events)
+    if (findTouchForResource(e, rp.resource.second)) {
+      events.push_back(&e);
+      sp.accessOps.insert(e.op);
+    }
+
+  // Per-resource version-tracking state.
+  SmallVector<const AccessEvent *, 4> versionProducers;
+  SmallVector<const AccessEvent *, 4> versionConsumers;
+  unsigned serial = 0;
+
+  auto sameOwner = [](const std::optional<PartitionId> &a,
+                      const std::optional<PartitionId> &b) {
+    if (!a && !b) return true;
+    if (!a || !b) return false;
+    return *a == *b;
+  };
+
+  for (const AccessEvent *E : events) {
+    bool consumes = eventConsumes(*E, rp.resource.second);
+    bool produces = eventProduces(*E, rp.resource.second);
+
+    if (consumes) {
+      // Ready edges from each current-version producer with different owner.
+      for (const AccessEvent *P : versionProducers) {
+        if (sameOwner(P->owner, E->owner)) continue;
+        SyncEdge edge;
+        edge.kind = SyncEdgeKind::Ready;
+        edge.state = SemaState::Full;
+        edge.srcOp = P->op;
+        edge.dstOp = E->op;
+        edge.srcOwner = P->owner;
+        edge.dstOwner = E->owner;
+        edge.name = makeEdgeName(edge.kind, P->owner, E->owner, serial++);
+        std::tie(edge.anchorRegion, edge.position) =
+            computeAnchor(P->op, E->op);
+        recordEdge(sp, edge);
+      }
+    }
+
+    if (produces) {
+      // E retires the current version. Done edges from each consumer with
+      // different owner; if no consumers, handoff edges from producers
+      // with different owner (writer->writer no read fanout).
+      if (!versionConsumers.empty()) {
+        for (const AccessEvent *C : versionConsumers) {
+          if (sameOwner(C->owner, E->owner)) continue;
+          SyncEdge edge;
+          edge.kind = SyncEdgeKind::Done;
+          edge.state = SemaState::Empty;
+          edge.srcOp = C->op;
+          edge.dstOp = E->op;
+          edge.srcOwner = C->owner;
+          edge.dstOwner = E->owner;
+          edge.name = makeEdgeName(edge.kind, C->owner, E->owner, serial++);
+          std::tie(edge.anchorRegion, edge.position) =
+              computeAnchor(C->op, E->op);
+          recordEdge(sp, edge);
+        }
+      } else if (!consumes) {
+        for (const AccessEvent *P : versionProducers) {
+          if (sameOwner(P->owner, E->owner)) continue;
+          SyncEdge edge;
+          edge.kind = SyncEdgeKind::Handoff;
+          edge.state = SemaState::Empty;
+          edge.srcOp = P->op;
+          edge.dstOp = E->op;
+          edge.srcOwner = P->owner;
+          edge.dstOwner = E->owner;
+          edge.name = makeEdgeName(edge.kind, P->owner, E->owner, serial++);
+          std::tie(edge.anchorRegion, edge.position) =
+              computeAnchor(P->op, E->op);
+          recordEdge(sp, edge);
+        }
+      }
+      versionProducers.clear();
+      versionConsumers.clear();
+      versionProducers.push_back(E);
+    } else if (consumes) {
+      versionConsumers.push_back(E);
+    }
+  }
+
+  // Initial writable/readable permit (v4 §Initial Writable Permit). One
+  // S_init per (logicalGroupId, resourceKey).
+  if (!events.empty()) {
+    const AccessEvent *first = events.front();
+    bool firstProduces = eventProduces(*first, rp.resource.second);
+    SyncEdge init;
+    init.kind = SyncEdgeKind::Handoff;
+    init.state = firstProduces ? SemaState::Empty : SemaState::Full;
+    init.name = "S_init";
+    init.srcOp = nullptr;
+    init.dstOp = first->op;
+    init.srcOwner = std::nullopt;
+    init.dstOwner = first->owner;
+    init.position = SyncEdge::Position::InLine;
+    sp.initialAnchorRegion = &funcOp.getBody();
+    sp.initialAnchorBeforeOp =
+        findInitialAnchorOp(first->op, funcOp.getBody());
+    init.anchorRegion = sp.initialAnchorRegion;
+    sp.edges.push_back(std::move(init));
+    sp.initialEdgeIdx = sp.edges.size() - 1;
+  }
+
+  return sp;
+}
+
+// ---------------------------------------------------------------------------
 // OWNERSHIP-DAG dump (commit 2 stage output).
 // ---------------------------------------------------------------------------
 
@@ -939,7 +1260,184 @@ static void dumpOwnershipDag(ResourcePlan &plan, BufferGroup &group,
 }
 
 // ---------------------------------------------------------------------------
-// Top-level pipeline (commit 2 stage).
+// RAW-SYNC-DAG dump (commit 3 stage output).
+// Same region-tree shape as OWNERSHIP-DAG; raw per-edge semaphore rows
+// rendered inline as siblings (acquires before access; releases as
+// children after access) or at region entry/exit when the edge crosses
+// a control-flow boundary.
+// ---------------------------------------------------------------------------
+
+static void renderAcquireRow(unsigned depth, Operation *anchor,
+                             const SyncEdge &edge) {
+  llvm::errs() << treePrefix(depth) << "|- a  " << edge.name
+               << "  acquire " << stateStr(edge.state) << "  "
+               << ownerStr(anchor, edge.dstOwner) << "\n";
+}
+
+static void renderReleaseRow(unsigned depth, Operation *anchor,
+                             const SyncEdge &edge) {
+  llvm::errs() << treePrefix(depth) << "|- r  " << edge.name
+               << "  release " << stateStr(edge.state) << "  "
+               << formatOwnerPair(anchor, edge.srcOwner, edge.dstOwner)
+               << "\n";
+}
+
+// Print inline incoming acquires for the access op (same depth as the
+// access row, immediately before it).
+static void printInlineIncoming(Operation *op, SyncPlan &sp, unsigned depth) {
+  auto it = sp.incomingByAccess.find(op);
+  if (it == sp.incomingByAccess.end()) return;
+  for (unsigned idx : it->second)
+    renderAcquireRow(depth, op, sp.edges[idx]);
+}
+
+// Print inline outgoing releases for the access op (depth+1, as children).
+static void printInlineOutgoing(Operation *op, SyncPlan &sp, unsigned depth) {
+  auto it = sp.outgoingByAccess.find(op);
+  if (it == sp.outgoingByAccess.end()) return;
+  for (unsigned idx : it->second)
+    renderReleaseRow(depth + 1, op, sp.edges[idx]);
+}
+
+// Print region-entry edges (release then acquire) at the region's content
+// depth.
+static void printRegionEntry(Region &region, SyncPlan &sp, unsigned depth) {
+  auto it = sp.entryEdges.find(&region);
+  if (it == sp.entryEdges.end()) return;
+  for (unsigned idx : it->second) {
+    const SyncEdge &edge = sp.edges[idx];
+    renderReleaseRow(depth, edge.dstOp, edge);
+    renderAcquireRow(depth, edge.dstOp, edge);
+  }
+}
+
+// Print region-exit edges at the region's content depth (used right
+// before the region's terminator).
+static void printRegionExit(Region &region, SyncPlan &sp, unsigned depth) {
+  auto it = sp.exitEdges.find(&region);
+  if (it == sp.exitEdges.end()) return;
+  for (unsigned idx : it->second) {
+    const SyncEdge &edge = sp.edges[idx];
+    renderReleaseRow(depth, edge.srcOp, edge);
+    renderAcquireRow(depth, edge.dstOp, edge);
+  }
+}
+
+static void dumpRawSyncBlock(Block &block, SyncPlan &sp, BufferGroup &group,
+                             unsigned depth);
+
+static void dumpRawSyncRegion(Region &region, SyncPlan &sp,
+                              BufferGroup &group, unsigned depth) {
+  printRegionEntry(region, sp, depth);
+  for (Block &b : region) dumpRawSyncBlock(b, sp, group, depth);
+}
+
+static void dumpRawSyncBlock(Block &block, SyncPlan &sp, BufferGroup &group,
+                             unsigned depth) {
+  for (Operation &op : block) {
+    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      // Same subtree-has-events gating as OWNERSHIP-DAG.
+      bool show = false;
+      forOp.walk([&](Operation *o) -> WalkResult {
+        if (sp.accessOps.contains(o)) {
+          show = true;
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
+      if (!show && !sp.entryEdges.count(&forOp.getRegion()) &&
+          !sp.exitEdges.count(&forOp.getRegion()))
+        continue;
+      // Initial permit anchored before this for-op?
+      if (sp.initialEdgeIdx && sp.initialAnchorBeforeOp == &op &&
+          sp.initialAnchorRegion == block.getParent())
+        renderAcquireRow(depth, &op, sp.edges[*sp.initialEdgeIdx]);
+      llvm::errs() << treePrefix(depth) << "|- " << forOpLabel(forOp)
+                   << "                              structural\n";
+      dumpRawSyncRegion(forOp.getRegion(), sp, group, depth + 1);
+      continue;
+    }
+    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      bool show = false;
+      ifOp->walk([&](Operation *o) -> WalkResult {
+        if (sp.accessOps.contains(o)) {
+          show = true;
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
+      if (!show && !sp.entryEdges.count(&ifOp.getThenRegion()) &&
+          !sp.exitEdges.count(&ifOp.getThenRegion()) &&
+          !sp.entryEdges.count(&ifOp.getElseRegion()) &&
+          !sp.exitEdges.count(&ifOp.getElseRegion()))
+        continue;
+      if (sp.initialEdgeIdx && sp.initialAnchorBeforeOp == &op &&
+          sp.initialAnchorRegion == block.getParent())
+        renderAcquireRow(depth, &op, sp.edges[*sp.initialEdgeIdx]);
+      llvm::errs() << treePrefix(depth)
+                   << "|- scf.if                               structural\n";
+      llvm::errs() << treePrefix(depth + 1) << "|- then region\n";
+      dumpRawSyncRegion(ifOp.getThenRegion(), sp, group, depth + 2);
+      llvm::errs() << treePrefix(depth + 1) << "|- else region\n";
+      if (!ifOp.getElseRegion().empty())
+        dumpRawSyncRegion(ifOp.getElseRegion(), sp, group, depth + 2);
+      continue;
+    }
+    if (auto yieldOp = dyn_cast<scf::YieldOp>(op)) {
+      // Render any region-exit edges immediately before the terminator.
+      Region *parentRegion = yieldOp->getParentRegion();
+      if (parentRegion) printRegionExit(*parentRegion, sp, depth);
+      continue;
+    }
+    if (!sp.accessOps.contains(&op)) continue;
+    auto useIt = sp.incomingByAccess.find(&op);
+    // Initial-permit acquire when this op is the func-direct anchor.
+    if (sp.initialEdgeIdx && sp.initialAnchorBeforeOp == &op &&
+        sp.initialAnchorRegion == block.getParent())
+      renderAcquireRow(depth, &op, sp.edges[*sp.initialEdgeIdx]);
+    // Inline incoming acquires (excluding the initial permit row which
+    // was just rendered).
+    if (useIt != sp.incomingByAccess.end()) {
+      for (unsigned idx : useIt->second) {
+        const SyncEdge &edge = sp.edges[idx];
+        if (!edge.srcOp) continue; // initial permit handled above
+        renderAcquireRow(depth, &op, edge);
+      }
+    }
+    // Find the touch + render the access row.
+    AccessEvent *event = nullptr;
+    for (AccessEvent &e : group.events)
+      if (e.op == &op) {
+        event = &e;
+        break;
+      }
+    const AccessTouch *touch =
+        event ? findTouchForResource(*event, sp.resource.second) : nullptr;
+    if (touch) {
+      bool reads = touchReads(*touch);
+      bool writes = touchWrites(*touch);
+      llvm::errs() << treePrefix(depth) << "|- "
+                   << accessKindChar(reads, writes) << "  m"
+                   << touch->memberIdx << "  " << op.getName().getStringRef()
+                   << "  " << ownerStr(&op, event->owner) << "\n";
+    }
+    // Outgoing releases as children.
+    printInlineOutgoing(&op, sp, depth);
+  }
+}
+
+static void dumpRawSyncDag(SyncPlan &sp, BufferGroup &group,
+                           triton::FuncOp funcOp) {
+  llvm::errs() << "RAW-SYNC-DAG buffer.id=" << sp.resource.first
+               << " resourceKey=" << sp.resource.second << " edges="
+               << sp.edges.size() << "\n";
+  llvm::errs() << "|- func region @" << funcOp.getName() << "\n";
+  for (Block &b : funcOp.getBody())
+    dumpRawSyncBlock(b, sp, group, /*depth=*/1);
+}
+
+// ---------------------------------------------------------------------------
+// Top-level pipeline (commit 3 stage).
 // ---------------------------------------------------------------------------
 
 static LogicalResult runOnFunction(triton::FuncOp funcOp) {
@@ -963,9 +1461,9 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp) {
   DenseMap<Operation *, unsigned> rank;
   buildProgramOrderRank(funcOp, rank);
 
-  // Dump (commit 2: discovery + ACCESS DAG + OWNERSHIP DAG).
-  llvm::errs()
-      << "==== NVWS InsertSemas (commit 2: discovery + ACCESS DAG + OWNERSHIP DAG) ====\n";
+  // Dump (commit 3: discovery + ACCESS DAG + OWNERSHIP DAG + RAW-SYNC DAG).
+  llvm::errs() << "==== NVWS InsertSemas (commit 3: discovery + ACCESS DAG + "
+                  "OWNERSHIP DAG + RAW-SYNC DAG) ====\n";
   llvm::errs() << "function: " << funcOp.getName() << "\n";
   llvm::errs() << "backing buffers: " << groups.size() << "\n";
   for (auto en : llvm::enumerate(groups)) {
@@ -979,6 +1477,8 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp) {
                                        static_cast<unsigned>(en.index()),
                                        group, key, rank);
       dumpOwnershipDag(plan, group, funcOp);
+      SyncPlan sp = buildSyncPlan(group, plan, funcOp);
+      dumpRawSyncDag(sp, group, funcOp);
     }
   }
   llvm::errs() << "\n";
