@@ -1,0 +1,108 @@
+==== NVWS InsertSemas (commit 1: discovery + ACCESS DAG) ====
+function: _attn_fwd_persist
+backing buffers: 10
+NVWS-SEMA-DAG buffer.id=4 memory=tmem
+  members: m0(offset=64,extent=1,resourceKey=2) m1(offset=66,extent=1,resourceKey=2) m2(offset=65,extent=1,resourceKey=2) m3(offset=0,extent=128,resourceKey=2) m4(offset=0,extent=128,resourceKey=4)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- scf.for
+|  |  |- W  m3  ttng.tc_gen5_mma {1}
+|  |  |- R  m3  ttng.tmem_load {5}
+|  |  |- W  m0  ttng.tmem_store {5}
+|  |  |- R  m0  ttng.tmem_load {0}
+|  |  |- W  m4  ttng.tmem_alloc {5}
+|  |  |- R  m4  ttng.tc_gen5_mma {1}
+|  |- W  m2  ttng.tmem_store {5}
+|  |- W  m1  ttng.tmem_store {5}
+|  |- R  m1  ttng.tmem_load {0}
+|  |- R  m2  ttng.tmem_load {0}
+NVWS-SEMA-DAG buffer.id=5 memory=tmem
+  members: m0(offset=64,extent=1,resourceKey=2) m1(offset=66,extent=1,resourceKey=2) m2(offset=65,extent=1,resourceKey=2) m3(offset=0,extent=128,resourceKey=2) m4(offset=0,extent=128,resourceKey=4)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- scf.for
+|  |  |- W  m3  ttng.tc_gen5_mma {1}
+|  |  |- R  m3  ttng.tmem_load {4}
+|  |  |- W  m0  ttng.tmem_store {4}
+|  |  |- R  m0  ttng.tmem_load {0}
+|  |  |- W  m4  ttng.tmem_alloc {4}
+|  |  |- R  m4  ttng.tc_gen5_mma {1}
+|  |- W  m2  ttng.tmem_store {4}
+|  |- W  m1  ttng.tmem_store {4}
+|  |- R  m1  ttng.tmem_load {0}
+|  |- R  m2  ttng.tmem_load {0}
+NVWS-SEMA-DAG buffer.id=2 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- W  m0  ttng.tmem_alloc {0}
+|  |- scf.for
+|  |  |- R  m0  ttng.tmem_load {0}
+|  |  |- W  m0  ttng.tmem_store {0}
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |- R  m0  ttng.tmem_load {0}
+NVWS-SEMA-DAG buffer.id=3 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- W  m0  ttng.tmem_alloc {0}
+|  |- scf.for
+|  |  |- R  m0  ttng.tmem_load {0}
+|  |  |- W  m0  ttng.tmem_store {0}
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |- R  m0  ttng.tmem_load {0}
+NVWS-SEMA-DAG buffer.id=0 memory=local
+  members: m0(offset=0,extent=1,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- W  m0  nvws.descriptor_load {3}
+|  |- scf.for
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+NVWS-SEMA-DAG buffer.id=1 memory=local
+  members: m0(offset=0,extent=1,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- W  m0  nvws.descriptor_load {3}
+|  |- scf.for
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+NVWS-SEMA-DAG buffer.id=2 memory=local
+  members: m0(offset=0,extent=1,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- scf.for
+|  |  |- W  m0  nvws.descriptor_load {3}
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+NVWS-SEMA-DAG buffer.id=3 memory=local
+  members: m0(offset=0,extent=1,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- scf.for
+|  |  |- W  m0  nvws.descriptor_load {3}
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+NVWS-SEMA-DAG buffer.id=4 memory=local
+  members: m0(offset=0,extent=1,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- scf.for
+|  |- W  m0  ttg.local_store {0}
+|  |- R  m0  ttg.local_load {2}
+NVWS-SEMA-DAG buffer.id=5 memory=local
+  members: m0(offset=0,extent=1,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- scf.for
+|  |- W  m0  ttg.local_store {0}
+|  |- R  m0  ttg.local_load {2}
+
