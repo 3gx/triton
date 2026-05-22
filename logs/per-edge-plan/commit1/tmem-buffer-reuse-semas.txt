@@ -1,0 +1,89 @@
+==== NVWS InsertSemas (commit 1: discovery + ACCESS DAG) ====
+function: sourceful_tokenless_alias
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=7 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0) m1(offset=64,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tmem_alloc {1}
+|  |- R  m0  ttng.tmem_load {1}
+|  |- W  m1  ttng.tmem_alloc {0}
+|  |- R  m1  ttng.tmem_load {0}
+
+==== NVWS InsertSemas (commit 1: discovery + ACCESS DAG) ====
+function: same_owner_alias_no_semaphore
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=8 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0) m1(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tmem_alloc {1}
+|  |- R  m0  ttng.tmem_load {1}
+|  |- W  m1  ttng.tmem_alloc {1}
+|  |- R  m1  ttng.tmem_load {1}
+
+==== NVWS InsertSemas (commit 1: discovery + ACCESS DAG) ====
+function: loop_token_slot_alias
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=9 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0) m1(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tmem_store {1}
+|  |- R  m1  ttng.tmem_load {0}
+
+==== NVWS InsertSemas (commit 1: discovery + ACCESS DAG) ====
+function: if_branch_alias
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=10 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0) m1(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- scf.if
+|  |  |- W  m0  ttng.tmem_store {1}
+|  |  |- R  m1  ttng.tmem_load {0}
+|  |  |- R  m0  ttng.tmem_load {1}
+|  |  |- W  m1  ttng.tmem_store {0}
+|  |- W  m0  ttng.tmem_store {1}
+|  |- R  m1  ttng.tmem_load {0}
+
+==== NVWS InsertSemas (commit 1: discovery + ACCESS DAG) ====
+function: accumulator_and_operand_alias_same_partition
+backing buffers: 2
+NVWS-SEMA-DAG buffer.id=11 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0) m1(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tc_gen5_mma {1}
+|  |- W  m1  ttng.tmem_alloc {2}
+|  |- R  m1  ttng.tc_gen5_mma {1}
+|  |- R  m0  ttng.tmem_load {1}
+NVWS-SEMA-DAG buffer.id=12 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tc_gen5_mma {1}
+
+==== NVWS InsertSemas (commit 1: discovery + ACCESS DAG) ====
+function: singleton_staged_alloc_preserves_buffer_attrs
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=13 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- W  m0  ttng.tmem_store root
+|- scf.for
+|  |- W  m0  ttng.tc_gen5_mma {1}
+|  |- R  m0  ttng.tmem_load {0}
+
+==== NVWS InsertSemas (commit 1: discovery + ACCESS DAG) ====
+function: n_owner_alias_sequence
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=14 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0) m1(offset=64,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tmem_alloc {0}
+|  |- R  m0  ttng.tmem_load {1}
+|  |- W  m1  ttng.tmem_alloc {2}
+|  |- R  m1  ttng.tmem_load {0}
+

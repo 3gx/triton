@@ -1,0 +1,40 @@
+==== NVWS InsertSemas (commit 1: discovery + ACCESS DAG) ====
+function: tmem_single_producer_multi_consumer_fanout
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=300 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tmem_store {0}
+|  |- R  m0  ttng.tmem_load {1}
+|  |- R  m0  ttng.tmem_load {2}
+|  |- W  m0  ttng.tmem_store {0}
+
+==== NVWS InsertSemas (commit 1: discovery + ACCESS DAG) ====
+function: tmem_qk_alpha_pacc_three_member_edges
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=301 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0) m1(offset=64,extent=1,resourceKey=0) m2(offset=0,extent=128,resourceKey=2)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tmem_store {1}
+|  |- R  m0  ttng.tmem_load {5}
+|  |- W  m1  ttng.tmem_store {5}
+|  |- R  m1  ttng.tmem_load {0}
+|  |- W  m2  ttng.tmem_alloc {5}
+|  |- R  m2  ttng.tc_gen5_mma {1}
+|  |- W  m0  ttng.tc_gen5_mma {1}
+|  |- W  m0  ttng.tmem_store {1}
+
+==== NVWS InsertSemas (commit 1: discovery + ACCESS DAG) ====
+function: tmem_non_overlapping_members_no_semaphore
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=302 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0) m1(offset=256,extent=128,resourceKey=1)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tmem_alloc {0}
+|  |- R  m0  ttng.tmem_load {0}
+|  |- W  m1  ttng.tmem_alloc {1}
+|  |- R  m1  ttng.tmem_load {1}
+

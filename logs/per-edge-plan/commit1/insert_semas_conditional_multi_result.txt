@@ -1,0 +1,22 @@
+==== NVWS InsertSemas (commit 1: discovery + ACCESS DAG) ====
+function: conditional_multi_result_if_token
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=0 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tc_gen5_mma {1}
+|  |- scf.if
+|  |  |- R  m0  ttng.tmem_load {0}
+
+==== NVWS InsertSemas (commit 1: discovery + ACCESS DAG) ====
+function: guarded_tokenless_if_deferred_initial_acquire
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=0 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|  |- scf.for
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |- R  m0  ttng.tmem_load {0}
+
