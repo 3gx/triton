@@ -114,7 +114,7 @@ void AutomaticWarpSpecialization::runOnOperation() {
   addPassWithPartitionVerifier(createNVWSInsertAllocas());
   NVWSMemoryPlannerOptions memoryPlannerOptions;
   memoryPlannerOptions.numBuffers = numStages;
-  // addPassWithPartitionVerifier(createNVWSMemoryPlanner(memoryPlannerOptions));
+  addPassWithPartitionVerifier(createNVWSMemoryPlanner(memoryPlannerOptions));
   addPassWithPartitionVerifier(createNVWSInsertSemas());
   addPassWithPartitionVerifier(createNVWSLowerSemaphore({numStages}));
   pm.addPass(createTritonGPUPartitionLoops());
