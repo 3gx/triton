@@ -458,6 +458,9 @@ OWNERSHIP-DAG backing=qk_0
 Dump requirements:
 
 - preserve `scf.for` and `scf.if` nesting
+- a warp-specialized `scf.for` (carries `ttg.warp_specialize.tag`) renders
+  as `scf.for (WS, tag=N)` where N is its tag value, in both `ACCESS-DAG`
+  and `OWNERSHIP-DAG`. A plain `scf.for` (no WS tag) renders as `scf.for`.
 - keep vertical tree lines through nested region bodies
 - the function region is never annotated. A `func region @<name>` row
   carries no entry/exit owner — partition numbers are scoped to a

@@ -491,6 +491,17 @@ static std::string treePrefix(unsigned depth) {
   return s;
 }
 
+// WS-tagged scf.for renders as "scf.for (WS, tag=N)"; plain scf.for as
+// just "scf.for".
+static std::string forOpLabel(scf::ForOp forOp) {
+  if (!hasWarpSpecializeTag(forOp))
+    return "scf.for";
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  os << "scf.for (WS, tag=" << *getWarpSpecializeTag(forOp) << ")";
+  return s;
+}
+
 // v4 §Debug DAG Dumps: a regioned op is included only when its subtree
 // contains at least one event for the group/resource being printed.
 static bool accessSubtreeHasEvent(
@@ -512,7 +523,7 @@ static void dumpAccessDagBlock(Block &block, BufferGroup &group,
   for (Operation &op : block) {
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       if (!accessSubtreeHasEvent(&op, eventIdxByOp)) continue;
-      llvm::errs() << treePrefix(depth) << "|- scf.for\n";
+      llvm::errs() << treePrefix(depth) << "|- " << forOpLabel(forOp) << "\n";
       for (Block &b : forOp.getRegion())
         dumpAccessDagBlock(b, group, eventIdxByOp, depth + 1);
       continue;
@@ -858,8 +869,8 @@ static void dumpOwnershipBlock(Block &block, ResourcePlan &plan,
   for (Operation &op : block) {
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       if (!regionHasEvents(forOp.getRegion(), plan)) continue;
-      llvm::errs() << treePrefix(depth)
-                   << "|- scf.for                              structural\n";
+      llvm::errs() << treePrefix(depth) << "|- " << forOpLabel(forOp)
+                   << "                              structural\n";
       auto &bodyRec = plan.regionOwners[&forOp.getRegion()];
       llvm::errs() << treePrefix(depth + 1) << "|- "
                    << formatRegionLine(&op, "body region", bodyRec) << "\n";
