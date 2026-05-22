@@ -50,21 +50,40 @@ to stderr so the user can verify each stage by eye. lit tests fail
 during commits 1–4 and that is expected. At commit 5 the pass becomes a
 real transform and lit takes over.
 
-After every commit the user runs the pass manually on a chosen test
-input and reads the stderr dump:
+After every commit the verification protocol is:
+
+1. The agent reads the pass output (stderr dump) for every test in the
+   verification set, compares it against the corresponding `.mlir` input
+   IR, and confirms the dump correctly reflects what's in the input. The
+   agent reports findings before proceeding.
+
+2. Once the agent is satisfied the output is correct, the agent runs the
+   pass on every file in the verification set and saves the **verbatim
+   stderr** to
+   `logs/per-edge-plan/commit<N>/<basename-of-mlir>.txt`. The user can
+   then open each `.mlir` input and the matching `.txt` log side-by-side
+   for independent review.
+
+The verification set:
+
+- every file matching `test/NVWS/insert_semas*.mlir`
+- plus `test/NVWS/tmem-buffer-reuse-semas.mlir`
+
+The verbatim-capture command per file:
 
 ```bash
 cd build/cmake.linux-x86_64-cpython-3.12/
 ninja triton-opt
 
 bin/triton-opt \
-    test/NVWS/insert_semas_per_edge_tmem.mlir \
+    test/NVWS/<file>.mlir \
     -split-input-file -allow-unregistered-dialect \
-    --nvws-insert-semas 2>&1 >/dev/null
+    --nvws-insert-semas 2>logs/per-edge-plan/commit<N>/<file>.txt \
+    >/dev/null
 ```
 
-(Replace the input file with whatever case is being inspected.
-`2>&1 >/dev/null` keeps the dump on stderr visible and discards the IR.)
+`2>...` captures stderr (the dump); `>/dev/null` discards stdout (the
+transformed IR, which equals the input during commits 0–4).
 
 ### Commit 0 — Empty pass
 
