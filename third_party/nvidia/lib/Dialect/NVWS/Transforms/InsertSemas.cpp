@@ -1,12 +1,15 @@
-// v4 commit 1: discovery + ACCESS DAG (dump-only).
+// v4 commit 2: discovery + ACCESS DAG + OWNERSHIP DAG (dump-only).
 //
 // Per meta2nvws-plan/per-edge-sema-plan.v4.md Implementation Plan, this
-// commit adds the first stage of the v4 pipeline:
+// commit adds the second stage of the v4 pipeline:
 //
-//   discover backing buffers  →  build ACCESS DAG per buffer
+//   discover backing buffers
+//     -> build ACCESS DAG per buffer
+//     -> build OWNERSHIP DAG per (logicalGroupId, resourceKey)
 //
-// The pass mutates no IR. It prints the backing-buffer list and the
-// ACCESS DAG per buffer to stderr for manual verification.
+// The pass mutates no IR. It prints the backing-buffer list, the ACCESS
+// DAG per buffer, and a structured region OWNERSHIP DAG per backing
+// resource to stderr for manual verification.
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Visitors.h"
@@ -494,8 +497,7 @@ static void dumpBackingGroupHeader(BufferGroup &group) {
   llvm::errs() << "\n";
 }
 
-static void dumpGroup(BufferGroup &group, triton::FuncOp funcOp) {
-  dumpBackingGroupHeader(group);
+static void dumpAccessDag(BufferGroup &group, triton::FuncOp funcOp) {
   DenseMap<Operation *, unsigned> eventIdxByOp;
   for (auto [idx, event] : llvm::enumerate(group.events))
     eventIdxByOp[event.op] = static_cast<unsigned>(idx);
@@ -505,7 +507,303 @@ static void dumpGroup(BufferGroup &group, triton::FuncOp funcOp) {
 }
 
 // ---------------------------------------------------------------------------
-// Top-level pipeline (commit 1 stage).
+// v4 §Structured Region Ownership data model (commit 2).
+// Per-resource side plan. The authoritative ownership state is this plan,
+// not anything in IR. v4 plan: "Do not write ownership markers into IR as
+// the source of truth."
+// ---------------------------------------------------------------------------
+
+using ResourceId = std::pair<int64_t /*logicalGroupId*/, int64_t /*resourceKey*/>;
+
+struct RegionOwnership {
+  std::optional<PartitionId> entry;
+  std::optional<PartitionId> exit;
+  bool carried = false;
+};
+
+struct ResourcePlan {
+  ResourceId resource{0, 0};
+  unsigned groupIdx = 0;
+  // Members of `groups[groupIdx]` that share this resourceKey.
+  SmallVector<unsigned, 4> memberIndices;
+  // RegionOwnership per Region (function body, scf.if then/else,
+  // scf.for body).
+  DenseMap<Region *, RegionOwnership> regionOwners;
+  // Direct-use owner per AccessEvent op that touches this resource.
+  DenseMap<Operation *, std::optional<PartitionId>> useOwner;
+  // Index into AccessEvent::touches of the touch that hit this resource
+  // (used to render the right member name in the dump).
+  DenseMap<Operation *, unsigned> useTouchIdx;
+  // scf.yield owner stamp for loop bodies that carry this resource.
+  DenseMap<Operation *, std::optional<PartitionId>> yieldOwner;
+};
+
+// ---------------------------------------------------------------------------
+// Helpers used by the planner.
+// ---------------------------------------------------------------------------
+
+static void buildProgramOrderRank(triton::FuncOp funcOp,
+                                  DenseMap<Operation *, unsigned> &rank) {
+  rank.clear();
+  unsigned i = 0;
+  funcOp.walk([&](Operation *op) { rank[op] = i++; });
+}
+
+static unsigned maxRankInSubtree(Operation *op,
+                                 const DenseMap<Operation *, unsigned> &rank) {
+  unsigned mx = rank.lookup(op);
+  op->walk([&](Operation *o) {
+    auto it = rank.find(o);
+    if (it != rank.end()) mx = std::max(mx, it->second);
+  });
+  return mx;
+}
+
+namespace {
+
+// Recursive region-ownership planner (v4 §Structured Region Ownership).
+// One Planner per ResourcePlan.
+struct Planner {
+  triton::FuncOp funcOp;
+  ResourcePlan &plan;
+  const DenseMap<Operation *, unsigned> &rank;
+  // Events touching this resource, sorted by program order.
+  SmallVector<Operation *> orderedEventOps;
+
+  Planner(triton::FuncOp f, ResourcePlan &p,
+          const DenseMap<Operation *, unsigned> &r)
+      : funcOp(f), plan(p), rank(r) {}
+
+  // First event (by program order) anywhere inside `region`.
+  std::optional<PartitionId> firstEventOwnerIn(Region &region) {
+    Operation *foundOp = nullptr;
+    region.walk<WalkOrder::PreOrder>([&](Operation *op) -> WalkResult {
+      if (plan.useOwner.find(op) != plan.useOwner.end()) {
+        foundOp = op;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    if (!foundOp) return std::nullopt;
+    return plan.useOwner.find(foundOp)->second;
+  }
+
+  // Owner of next event in program order that is not inside `op`'s subtree.
+  // Used to decide if an scf.if branch must move ownership before the if
+  // (v4: "Move ownership before the region when ... the continuation after
+  // the region requires the new owner.").
+  std::optional<PartitionId> nextEventOwnerAfter(Operation *op) {
+    unsigned cutoff = maxRankInSubtree(op, rank);
+    for (Operation *evOp : orderedEventOps)
+      if (rank.lookup(evOp) > cutoff)
+        return plan.useOwner.find(evOp)->second;
+    return std::nullopt;
+  }
+
+  // Plan `region`. Returns the chosen exit owner. For loop bodies
+  // (isLoopBody=true) entry == exit == carried owner.
+  std::optional<PartitionId> planRegion(Region &region,
+                                        std::optional<PartitionId> entry,
+                                        bool isLoopBody = false);
+};
+
+std::optional<PartitionId>
+Planner::planRegion(Region &region, std::optional<PartitionId> entry,
+                    bool isLoopBody) {
+  RegionOwnership rec;
+  rec.entry = entry;
+  rec.carried = isLoopBody;
+
+  std::optional<PartitionId> current = entry;
+  if (isLoopBody) {
+    // Loop-body carried owner: pick the first use inside the body. The
+    // body's natural last use may differ from this; a handoff back to
+    // `current` before scf.yield is required (raw-sync edge, commit 3).
+    auto firstInside = firstEventOwnerIn(region);
+    if (firstInside) current = firstInside;
+    rec.entry = current;
+  }
+
+  for (Block &block : region) {
+    for (Operation &op : block) {
+      if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+        // v4: "For scf.if, assign then-region and else-region owners
+        // independently, then reconcile branch exit owners to the chosen
+        // post-if owner/state." We choose post-if owner from the next
+        // use after the scf.if in any enclosing scope; if none, preserve
+        // the incoming owner.
+        auto postIf = nextEventOwnerAfter(&op);
+        std::optional<PartitionId> branchOwner = postIf ? postIf : current;
+
+        planRegion(ifOp.getThenRegion(), branchOwner,
+                   /*isLoopBody=*/false);
+        plan.regionOwners[&ifOp.getThenRegion()].entry = branchOwner;
+        plan.regionOwners[&ifOp.getThenRegion()].exit = branchOwner;
+
+        // Always emit a record for the else region (even if empty: the
+        // logical "empty else returns to branchOwner" must appear in the
+        // OWNERSHIP-DAG dump per v4 examples).
+        RegionOwnership elseRec{branchOwner, branchOwner, /*carried=*/false};
+        plan.regionOwners[&ifOp.getElseRegion()] = elseRec;
+        if (!ifOp.getElseRegion().empty()) {
+          planRegion(ifOp.getElseRegion(), branchOwner,
+                     /*isLoopBody=*/false);
+          plan.regionOwners[&ifOp.getElseRegion()].entry = branchOwner;
+          plan.regionOwners[&ifOp.getElseRegion()].exit = branchOwner;
+        }
+        current = branchOwner;
+        continue;
+      }
+      if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+        planRegion(forOp.getRegion(), current, /*isLoopBody=*/true);
+        RegionOwnership bodyRec =
+            plan.regionOwners.lookup(&forOp.getRegion());
+        current = bodyRec.exit;
+        continue;
+      }
+      if (auto yieldOp = dyn_cast<scf::YieldOp>(op)) {
+        if (isLoopBody)
+          plan.yieldOwner[yieldOp.getOperation()] = rec.entry;
+        continue;
+      }
+      auto useIt = plan.useOwner.find(&op);
+      if (useIt != plan.useOwner.end())
+        current = useIt->second;
+    }
+  }
+
+  rec.exit = isLoopBody ? rec.entry : current;
+  plan.regionOwners[&region] = rec;
+  return rec.exit;
+}
+
+} // namespace
+
+static ResourcePlan
+planResource(triton::FuncOp funcOp, unsigned groupIdx, BufferGroup &group,
+             int64_t resourceKey,
+             const DenseMap<Operation *, unsigned> &rank) {
+  ResourcePlan plan;
+  plan.resource = {group.logicalId, resourceKey};
+  plan.groupIdx = groupIdx;
+  for (auto [idx, member] : llvm::enumerate(group.members))
+    if (member.resourceKey == resourceKey)
+      plan.memberIndices.push_back(static_cast<unsigned>(idx));
+
+  for (AccessEvent &event : group.events) {
+    for (auto [tIdx, touch] : llvm::enumerate(event.touches)) {
+      if (touch.resourceKey == resourceKey) {
+        plan.useOwner[event.op] = event.owner;
+        plan.useTouchIdx[event.op] = static_cast<unsigned>(tIdx);
+        break;
+      }
+    }
+  }
+
+  Planner planner(funcOp, plan, rank);
+  for (auto &kv : plan.useOwner)
+    planner.orderedEventOps.push_back(kv.first);
+  llvm::sort(planner.orderedEventOps, [&](Operation *a, Operation *b) {
+    return rank.lookup(a) < rank.lookup(b);
+  });
+
+  // v4: function-region entry owner == first-use owner so the first
+  // writer/sourceful-write acquires the initial writable permit. Example 1
+  // (`@fanout`) and example 5 (`@qk_alpha_acc`) require this.
+  std::optional<PartitionId> funcEntry;
+  if (!planner.orderedEventOps.empty())
+    funcEntry = plan.useOwner.find(planner.orderedEventOps.front())->second;
+  planner.planRegion(funcOp.getBody(), funcEntry, /*isLoopBody=*/false);
+  return plan;
+}
+
+// ---------------------------------------------------------------------------
+// OWNERSHIP-DAG dump (commit 2 stage output).
+// ---------------------------------------------------------------------------
+
+static std::string formatRegionLine(StringRef label,
+                                    const RegionOwnership &rec) {
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  os << label << "  entry " << ownerStr(rec.entry) << " exit "
+     << ownerStr(rec.exit);
+  if (rec.carried) os << " carried";
+  return s;
+}
+
+static void dumpOwnershipBlock(Block &block, ResourcePlan &plan,
+                               BufferGroup &group, unsigned depth) {
+  for (Operation &op : block) {
+    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      llvm::errs() << treePrefix(depth)
+                   << "|- scf.for                              structural\n";
+      auto &bodyRec = plan.regionOwners[&forOp.getRegion()];
+      llvm::errs() << treePrefix(depth + 1) << "|- "
+                   << formatRegionLine("body region", bodyRec) << "\n";
+      for (Block &b : forOp.getRegion())
+        dumpOwnershipBlock(b, plan, group, depth + 2);
+      continue;
+    }
+    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      llvm::errs() << treePrefix(depth)
+                   << "|- scf.if                               structural\n";
+      auto &thenRec = plan.regionOwners[&ifOp.getThenRegion()];
+      llvm::errs() << treePrefix(depth + 1) << "|- "
+                   << formatRegionLine("then region", thenRec) << "\n";
+      for (Block &b : ifOp.getThenRegion())
+        dumpOwnershipBlock(b, plan, group, depth + 2);
+      auto &elseRec = plan.regionOwners[&ifOp.getElseRegion()];
+      llvm::errs() << treePrefix(depth + 1) << "|- "
+                   << formatRegionLine("else region", elseRec) << "\n";
+      if (!ifOp.getElseRegion().empty())
+        for (Block &b : ifOp.getElseRegion())
+          dumpOwnershipBlock(b, plan, group, depth + 2);
+      continue;
+    }
+    if (auto yieldOp = dyn_cast<scf::YieldOp>(op)) {
+      auto it = plan.yieldOwner.find(yieldOp.getOperation());
+      if (it != plan.yieldOwner.end())
+        llvm::errs() << treePrefix(depth)
+                     << "|- scf.yield                            owner "
+                     << ownerStr(it->second) << "\n";
+      continue;
+    }
+    auto useIt = plan.useOwner.find(&op);
+    if (useIt == plan.useOwner.end()) continue;
+    unsigned tIdx = plan.useTouchIdx.lookup(&op);
+    AccessEvent *event = nullptr;
+    for (AccessEvent &e : group.events)
+      if (e.op == &op) {
+        event = &e;
+        break;
+      }
+    if (!event || tIdx >= event->touches.size()) continue;
+    AccessTouch &touch = event->touches[tIdx];
+    bool reads = hasRead(touch.effect);
+    bool writes = hasWrite(touch.effect);
+    llvm::errs() << treePrefix(depth) << "|- "
+                 << accessKindChar(reads, writes) << "  m" << touch.memberIdx
+                 << "  " << op.getName().getStringRef() << "  use "
+                 << ownerStr(useIt->second) << "\n";
+  }
+}
+
+static void dumpOwnershipDag(ResourcePlan &plan, BufferGroup &group,
+                             triton::FuncOp funcOp) {
+  llvm::errs() << "OWNERSHIP-DAG buffer.id=" << plan.resource.first
+               << " resourceKey=" << plan.resource.second << " members:";
+  for (unsigned idx : plan.memberIndices) llvm::errs() << " m" << idx;
+  llvm::errs() << "\n";
+  auto &funcRec = plan.regionOwners[&funcOp.getBody()];
+  std::string label = "func region @";
+  label += funcOp.getName().str();
+  llvm::errs() << "|- " << formatRegionLine(label, funcRec) << "\n";
+  for (Block &b : funcOp.getBody())
+    dumpOwnershipBlock(b, plan, group, /*depth=*/1);
+}
+
+// ---------------------------------------------------------------------------
+// Top-level pipeline (commit 2 stage).
 // ---------------------------------------------------------------------------
 
 static LogicalResult runOnFunction(triton::FuncOp funcOp) {
@@ -525,12 +823,28 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp) {
   for (BufferGroup &group : groups)
     if (failed(collectEvents(group, funcOp))) return failure();
 
-  // Dump (commit 1: list of buffers + ACCESS DAG per buffer).
-  llvm::errs() << "==== NVWS InsertSemas (commit 1: discovery + ACCESS DAG) ===="
-               << "\n";
+  // Phase 3: build program-order rank, used by the ownership planner.
+  DenseMap<Operation *, unsigned> rank;
+  buildProgramOrderRank(funcOp, rank);
+
+  // Dump (commit 2: discovery + ACCESS DAG + OWNERSHIP DAG).
+  llvm::errs()
+      << "==== NVWS InsertSemas (commit 2: discovery + ACCESS DAG + OWNERSHIP DAG) ====\n";
   llvm::errs() << "function: " << funcOp.getName() << "\n";
   llvm::errs() << "backing buffers: " << groups.size() << "\n";
-  for (BufferGroup &group : groups) dumpGroup(group, funcOp);
+  for (auto en : llvm::enumerate(groups)) {
+    BufferGroup &group = en.value();
+    dumpBackingGroupHeader(group);
+    dumpAccessDag(group, funcOp);
+    std::set<int64_t> keys;
+    for (auto &m : group.members) keys.insert(m.resourceKey);
+    for (int64_t key : keys) {
+      ResourcePlan plan = planResource(funcOp,
+                                       static_cast<unsigned>(en.index()),
+                                       group, key, rank);
+      dumpOwnershipDag(plan, group, funcOp);
+    }
+  }
   llvm::errs() << "\n";
 
   return success();

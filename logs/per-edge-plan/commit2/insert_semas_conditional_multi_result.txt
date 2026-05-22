@@ -1,0 +1,42 @@
+==== NVWS InsertSemas (commit 2: discovery + ACCESS DAG + OWNERSHIP DAG) ====
+function: conditional_multi_result_if_token
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=0 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tc_gen5_mma {1}
+|  |- scf.if
+|  |  |- R  m0  ttng.tmem_load {0}
+OWNERSHIP-DAG buffer.id=0 resourceKey=0 members: m0
+|- func region @conditional_multi_result_if_token  entry {1} exit {1}
+|  |- scf.for                              structural
+|  |  |- body region  entry {1} exit {1} carried
+|  |  |  |- W  m0  ttng.tc_gen5_mma  use {1}
+|  |  |  |- scf.if                               structural
+|  |  |  |  |- then region  entry {1} exit {1}
+|  |  |  |  |  |- R  m0  ttng.tmem_load  use {0}
+|  |  |  |  |- else region  entry {1} exit {1}
+|  |  |  |- scf.yield                            owner {1}
+
+==== NVWS InsertSemas (commit 2: discovery + ACCESS DAG + OWNERSHIP DAG) ====
+function: guarded_tokenless_if_deferred_initial_acquire
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=0 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|  |- scf.for
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |- R  m0  ttng.tmem_load {0}
+OWNERSHIP-DAG buffer.id=0 resourceKey=0 members: m0
+|- func region @guarded_tokenless_if_deferred_initial_acquire  entry {1} exit {1}
+|  |- scf.if                               structural
+|  |  |- then region  entry {1} exit {1}
+|  |  |  |- scf.for                              structural
+|  |  |  |  |- body region  entry {1} exit {1} carried
+|  |  |  |  |  |- W  m0  ttng.tc_gen5_mma  use {1}
+|  |  |  |  |  |- R  m0  ttng.tmem_load  use {0}
+|  |  |  |  |  |- scf.yield                            owner {1}
+|  |  |- else region  entry {1} exit {1}
+

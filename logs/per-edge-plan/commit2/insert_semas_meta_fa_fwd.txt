@@ -1,0 +1,284 @@
+==== NVWS InsertSemas (commit 2: discovery + ACCESS DAG + OWNERSHIP DAG) ====
+function: _attn_fwd_persist
+backing buffers: 10
+NVWS-SEMA-DAG buffer.id=4 memory=tmem
+  members: m0(offset=64,extent=1,resourceKey=2) m1(offset=66,extent=1,resourceKey=2) m2(offset=65,extent=1,resourceKey=2) m3(offset=0,extent=128,resourceKey=2) m4(offset=0,extent=128,resourceKey=4)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- scf.for
+|  |  |- W  m3  ttng.tc_gen5_mma {1}
+|  |  |- R  m3  ttng.tmem_load {5}
+|  |  |- W  m0  ttng.tmem_store {5}
+|  |  |- R  m0  ttng.tmem_load {0}
+|  |  |- W  m4  ttng.tmem_alloc {5}
+|  |  |- R  m4  ttng.tc_gen5_mma {1}
+|  |- W  m2  ttng.tmem_store {5}
+|  |- W  m1  ttng.tmem_store {5}
+|  |- R  m1  ttng.tmem_load {0}
+|  |- R  m2  ttng.tmem_load {0}
+OWNERSHIP-DAG buffer.id=4 resourceKey=2 members: m0 m1 m2 m3
+|- func region @_attn_fwd_persist  entry {1} exit {1}
+|  |- scf.if                               structural
+|  |  |- then region  entry {1} exit {1}
+|  |  |- else region  entry {1} exit {1}
+|  |- scf.for                              structural
+|  |  |- body region  entry {1} exit {1} carried
+|  |  |  |- scf.for                              structural
+|  |  |  |  |- body region  entry {1} exit {1} carried
+|  |  |  |  |  |- W  m3  ttng.tc_gen5_mma  use {1}
+|  |  |  |  |  |- R  m3  ttng.tmem_load  use {5}
+|  |  |  |  |  |- W  m0  ttng.tmem_store  use {5}
+|  |  |  |  |  |- R  m0  ttng.tmem_load  use {0}
+|  |  |  |  |  |- scf.yield                            owner {1}
+|  |  |  |- W  m2  ttng.tmem_store  use {5}
+|  |  |  |- W  m1  ttng.tmem_store  use {5}
+|  |  |  |- R  m1  ttng.tmem_load  use {0}
+|  |  |  |- R  m2  ttng.tmem_load  use {0}
+|  |  |  |- scf.yield                            owner {1}
+OWNERSHIP-DAG buffer.id=4 resourceKey=4 members: m4
+|- func region @_attn_fwd_persist  entry {5} exit {5}
+|  |- scf.if                               structural
+|  |  |- then region  entry {5} exit {5}
+|  |  |- else region  entry {5} exit {5}
+|  |- scf.for                              structural
+|  |  |- body region  entry {5} exit {5} carried
+|  |  |  |- scf.for                              structural
+|  |  |  |  |- body region  entry {5} exit {5} carried
+|  |  |  |  |  |- W  m4  ttng.tmem_alloc  use {5}
+|  |  |  |  |  |- R  m4  ttng.tc_gen5_mma  use {1}
+|  |  |  |  |  |- scf.yield                            owner {5}
+|  |  |  |- scf.yield                            owner {5}
+NVWS-SEMA-DAG buffer.id=5 memory=tmem
+  members: m0(offset=64,extent=1,resourceKey=2) m1(offset=66,extent=1,resourceKey=2) m2(offset=65,extent=1,resourceKey=2) m3(offset=0,extent=128,resourceKey=2) m4(offset=0,extent=128,resourceKey=4)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- scf.for
+|  |  |- W  m3  ttng.tc_gen5_mma {1}
+|  |  |- R  m3  ttng.tmem_load {4}
+|  |  |- W  m0  ttng.tmem_store {4}
+|  |  |- R  m0  ttng.tmem_load {0}
+|  |  |- W  m4  ttng.tmem_alloc {4}
+|  |  |- R  m4  ttng.tc_gen5_mma {1}
+|  |- W  m2  ttng.tmem_store {4}
+|  |- W  m1  ttng.tmem_store {4}
+|  |- R  m1  ttng.tmem_load {0}
+|  |- R  m2  ttng.tmem_load {0}
+OWNERSHIP-DAG buffer.id=5 resourceKey=2 members: m0 m1 m2 m3
+|- func region @_attn_fwd_persist  entry {1} exit {1}
+|  |- scf.if                               structural
+|  |  |- then region  entry {1} exit {1}
+|  |  |- else region  entry {1} exit {1}
+|  |- scf.for                              structural
+|  |  |- body region  entry {1} exit {1} carried
+|  |  |  |- scf.for                              structural
+|  |  |  |  |- body region  entry {1} exit {1} carried
+|  |  |  |  |  |- W  m3  ttng.tc_gen5_mma  use {1}
+|  |  |  |  |  |- R  m3  ttng.tmem_load  use {4}
+|  |  |  |  |  |- W  m0  ttng.tmem_store  use {4}
+|  |  |  |  |  |- R  m0  ttng.tmem_load  use {0}
+|  |  |  |  |  |- scf.yield                            owner {1}
+|  |  |  |- W  m2  ttng.tmem_store  use {4}
+|  |  |  |- W  m1  ttng.tmem_store  use {4}
+|  |  |  |- R  m1  ttng.tmem_load  use {0}
+|  |  |  |- R  m2  ttng.tmem_load  use {0}
+|  |  |  |- scf.yield                            owner {1}
+OWNERSHIP-DAG buffer.id=5 resourceKey=4 members: m4
+|- func region @_attn_fwd_persist  entry {4} exit {4}
+|  |- scf.if                               structural
+|  |  |- then region  entry {4} exit {4}
+|  |  |- else region  entry {4} exit {4}
+|  |- scf.for                              structural
+|  |  |- body region  entry {4} exit {4} carried
+|  |  |  |- scf.for                              structural
+|  |  |  |  |- body region  entry {4} exit {4} carried
+|  |  |  |  |  |- W  m4  ttng.tmem_alloc  use {4}
+|  |  |  |  |  |- R  m4  ttng.tc_gen5_mma  use {1}
+|  |  |  |  |  |- scf.yield                            owner {4}
+|  |  |  |- scf.yield                            owner {4}
+NVWS-SEMA-DAG buffer.id=2 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- W  m0  ttng.tmem_alloc {0}
+|  |- scf.for
+|  |  |- R  m0  ttng.tmem_load {0}
+|  |  |- W  m0  ttng.tmem_store {0}
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |- R  m0  ttng.tmem_load {0}
+OWNERSHIP-DAG buffer.id=2 resourceKey=0 members: m0
+|- func region @_attn_fwd_persist  entry {0} exit {0}
+|  |- scf.if                               structural
+|  |  |- then region  entry {0} exit {0}
+|  |  |- else region  entry {0} exit {0}
+|  |- scf.for                              structural
+|  |  |- body region  entry {0} exit {0} carried
+|  |  |  |- W  m0  ttng.tmem_alloc  use {0}
+|  |  |  |- scf.for                              structural
+|  |  |  |  |- body region  entry {0} exit {0} carried
+|  |  |  |  |  |- R  m0  ttng.tmem_load  use {0}
+|  |  |  |  |  |- W  m0  ttng.tmem_store  use {0}
+|  |  |  |  |  |- W  m0  ttng.tc_gen5_mma  use {1}
+|  |  |  |  |  |- scf.yield                            owner {0}
+|  |  |  |- R  m0  ttng.tmem_load  use {0}
+|  |  |  |- scf.yield                            owner {0}
+NVWS-SEMA-DAG buffer.id=3 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- W  m0  ttng.tmem_alloc {0}
+|  |- scf.for
+|  |  |- R  m0  ttng.tmem_load {0}
+|  |  |- W  m0  ttng.tmem_store {0}
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |- R  m0  ttng.tmem_load {0}
+OWNERSHIP-DAG buffer.id=3 resourceKey=0 members: m0
+|- func region @_attn_fwd_persist  entry {0} exit {0}
+|  |- scf.if                               structural
+|  |  |- then region  entry {0} exit {0}
+|  |  |- else region  entry {0} exit {0}
+|  |- scf.for                              structural
+|  |  |- body region  entry {0} exit {0} carried
+|  |  |  |- W  m0  ttng.tmem_alloc  use {0}
+|  |  |  |- scf.for                              structural
+|  |  |  |  |- body region  entry {0} exit {0} carried
+|  |  |  |  |  |- R  m0  ttng.tmem_load  use {0}
+|  |  |  |  |  |- W  m0  ttng.tmem_store  use {0}
+|  |  |  |  |  |- W  m0  ttng.tc_gen5_mma  use {1}
+|  |  |  |  |  |- scf.yield                            owner {0}
+|  |  |  |- R  m0  ttng.tmem_load  use {0}
+|  |  |  |- scf.yield                            owner {0}
+NVWS-SEMA-DAG buffer.id=0 memory=local
+  members: m0(offset=0,extent=1,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- W  m0  nvws.descriptor_load {3}
+|  |- scf.for
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+OWNERSHIP-DAG buffer.id=0 resourceKey=0 members: m0
+|- func region @_attn_fwd_persist  entry {3} exit {3}
+|  |- scf.if                               structural
+|  |  |- then region  entry {3} exit {3}
+|  |  |- else region  entry {3} exit {3}
+|  |- scf.for                              structural
+|  |  |- body region  entry {3} exit {3} carried
+|  |  |  |- W  m0  nvws.descriptor_load  use {3}
+|  |  |  |- scf.for                              structural
+|  |  |  |  |- body region  entry {1} exit {1} carried
+|  |  |  |  |  |- R  m0  ttng.tc_gen5_mma  use {1}
+|  |  |  |  |  |- scf.yield                            owner {1}
+|  |  |  |- scf.yield                            owner {3}
+NVWS-SEMA-DAG buffer.id=1 memory=local
+  members: m0(offset=0,extent=1,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- W  m0  nvws.descriptor_load {3}
+|  |- scf.for
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+OWNERSHIP-DAG buffer.id=1 resourceKey=0 members: m0
+|- func region @_attn_fwd_persist  entry {3} exit {3}
+|  |- scf.if                               structural
+|  |  |- then region  entry {3} exit {3}
+|  |  |- else region  entry {3} exit {3}
+|  |- scf.for                              structural
+|  |  |- body region  entry {3} exit {3} carried
+|  |  |  |- W  m0  nvws.descriptor_load  use {3}
+|  |  |  |- scf.for                              structural
+|  |  |  |  |- body region  entry {1} exit {1} carried
+|  |  |  |  |  |- R  m0  ttng.tc_gen5_mma  use {1}
+|  |  |  |  |  |- scf.yield                            owner {1}
+|  |  |  |- scf.yield                            owner {3}
+NVWS-SEMA-DAG buffer.id=2 memory=local
+  members: m0(offset=0,extent=1,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- scf.for
+|  |  |- W  m0  nvws.descriptor_load {3}
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+OWNERSHIP-DAG buffer.id=2 resourceKey=0 members: m0
+|- func region @_attn_fwd_persist  entry {3} exit {3}
+|  |- scf.if                               structural
+|  |  |- then region  entry {3} exit {3}
+|  |  |- else region  entry {3} exit {3}
+|  |- scf.for                              structural
+|  |  |- body region  entry {3} exit {3} carried
+|  |  |  |- scf.for                              structural
+|  |  |  |  |- body region  entry {3} exit {3} carried
+|  |  |  |  |  |- W  m0  nvws.descriptor_load  use {3}
+|  |  |  |  |  |- R  m0  ttng.tc_gen5_mma  use {1}
+|  |  |  |  |  |- R  m0  ttng.tc_gen5_mma  use {1}
+|  |  |  |  |  |- scf.yield                            owner {3}
+|  |  |  |- scf.yield                            owner {3}
+NVWS-SEMA-DAG buffer.id=3 memory=local
+  members: m0(offset=0,extent=1,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- scf.for
+|  |  |- W  m0  nvws.descriptor_load {3}
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+OWNERSHIP-DAG buffer.id=3 resourceKey=0 members: m0
+|- func region @_attn_fwd_persist  entry {3} exit {3}
+|  |- scf.if                               structural
+|  |  |- then region  entry {3} exit {3}
+|  |  |- else region  entry {3} exit {3}
+|  |- scf.for                              structural
+|  |  |- body region  entry {3} exit {3} carried
+|  |  |  |- scf.for                              structural
+|  |  |  |  |- body region  entry {3} exit {3} carried
+|  |  |  |  |  |- W  m0  nvws.descriptor_load  use {3}
+|  |  |  |  |  |- R  m0  ttng.tc_gen5_mma  use {1}
+|  |  |  |  |  |- R  m0  ttng.tc_gen5_mma  use {1}
+|  |  |  |  |  |- scf.yield                            owner {3}
+|  |  |  |- scf.yield                            owner {3}
+NVWS-SEMA-DAG buffer.id=4 memory=local
+  members: m0(offset=0,extent=1,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- scf.for
+|  |- W  m0  ttg.local_store {0}
+|  |- R  m0  ttg.local_load {2}
+OWNERSHIP-DAG buffer.id=4 resourceKey=0 members: m0
+|- func region @_attn_fwd_persist  entry {0} exit {0}
+|  |- scf.if                               structural
+|  |  |- then region  entry {0} exit {0}
+|  |  |- else region  entry {0} exit {0}
+|  |- scf.for                              structural
+|  |  |- body region  entry {0} exit {0} carried
+|  |  |  |- scf.for                              structural
+|  |  |  |  |- body region  entry {0} exit {0} carried
+|  |  |  |  |  |- scf.yield                            owner {0}
+|  |  |  |- W  m0  ttg.local_store  use {0}
+|  |  |  |- R  m0  ttg.local_load  use {2}
+|  |  |  |- scf.yield                            owner {0}
+NVWS-SEMA-DAG buffer.id=5 memory=local
+  members: m0(offset=0,extent=1,resourceKey=0)
+ACCESS-DAG
+|- scf.if
+|- scf.for
+|  |- scf.for
+|  |- W  m0  ttg.local_store {0}
+|  |- R  m0  ttg.local_load {2}
+OWNERSHIP-DAG buffer.id=5 resourceKey=0 members: m0
+|- func region @_attn_fwd_persist  entry {0} exit {0}
+|  |- scf.if                               structural
+|  |  |- then region  entry {0} exit {0}
+|  |  |- else region  entry {0} exit {0}
+|  |- scf.for                              structural
+|  |  |- body region  entry {0} exit {0} carried
+|  |  |  |- scf.for                              structural
+|  |  |  |  |- body region  entry {0} exit {0} carried
+|  |  |  |  |  |- scf.yield                            owner {0}
+|  |  |  |- W  m0  ttg.local_store  use {0}
+|  |  |  |- R  m0  ttg.local_load  use {2}
+|  |  |  |- scf.yield                            owner {0}
+

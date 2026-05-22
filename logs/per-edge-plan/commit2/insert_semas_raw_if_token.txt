@@ -1,0 +1,35 @@
+==== NVWS InsertSemas (commit 2: discovery + ACCESS DAG + OWNERSHIP DAG) ====
+function: raw_edge_token_carried_if
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=401 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0) m1(offset=256,extent=128,resourceKey=1)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tmem_store {0}
+|  |- scf.if
+|  |  |- R  m0  ttng.tmem_load {1}
+|  |- W  m0  ttng.tmem_store {0}
+|  |- W  m1  ttng.tmem_store {0}
+|  |- R  m1  ttng.tmem_load {2}
+OWNERSHIP-DAG buffer.id=401 resourceKey=0 members: m0
+|- func region @raw_edge_token_carried_if  entry {0} exit {0}
+|  |- scf.for                              structural
+|  |  |- body region  entry {0} exit {0} carried
+|  |  |  |- W  m0  ttng.tmem_store  use {0}
+|  |  |  |- scf.if                               structural
+|  |  |  |  |- then region  entry {0} exit {0}
+|  |  |  |  |  |- R  m0  ttng.tmem_load  use {1}
+|  |  |  |  |- else region  entry {0} exit {0}
+|  |  |  |- W  m0  ttng.tmem_store  use {0}
+|  |  |  |- scf.yield                            owner {0}
+OWNERSHIP-DAG buffer.id=401 resourceKey=1 members: m1
+|- func region @raw_edge_token_carried_if  entry {0} exit {0}
+|  |- scf.for                              structural
+|  |  |- body region  entry {0} exit {0} carried
+|  |  |  |- scf.if                               structural
+|  |  |  |  |- then region  entry {0} exit {0}
+|  |  |  |  |- else region  entry {0} exit {0}
+|  |  |  |- W  m1  ttng.tmem_store  use {0}
+|  |  |  |- R  m1  ttng.tmem_load  use {2}
+|  |  |  |- scf.yield                            owner {0}
+

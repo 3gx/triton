@@ -1,0 +1,160 @@
+==== NVWS InsertSemas (commit 2: discovery + ACCESS DAG + OWNERSHIP DAG) ====
+function: sourceful_tokenless_alias
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=7 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0) m1(offset=64,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tmem_alloc {1}
+|  |- R  m0  ttng.tmem_load {1}
+|  |- W  m1  ttng.tmem_alloc {0}
+|  |- R  m1  ttng.tmem_load {0}
+OWNERSHIP-DAG buffer.id=7 resourceKey=0 members: m0 m1
+|- func region @sourceful_tokenless_alias  entry {1} exit {1}
+|  |- scf.for                              structural
+|  |  |- body region  entry {1} exit {1} carried
+|  |  |  |- W  m0  ttng.tmem_alloc  use {1}
+|  |  |  |- R  m0  ttng.tmem_load  use {1}
+|  |  |  |- W  m1  ttng.tmem_alloc  use {0}
+|  |  |  |- R  m1  ttng.tmem_load  use {0}
+|  |  |  |- scf.yield                            owner {1}
+
+==== NVWS InsertSemas (commit 2: discovery + ACCESS DAG + OWNERSHIP DAG) ====
+function: same_owner_alias_no_semaphore
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=8 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0) m1(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tmem_alloc {1}
+|  |- R  m0  ttng.tmem_load {1}
+|  |- W  m1  ttng.tmem_alloc {1}
+|  |- R  m1  ttng.tmem_load {1}
+OWNERSHIP-DAG buffer.id=8 resourceKey=0 members: m0 m1
+|- func region @same_owner_alias_no_semaphore  entry {1} exit {1}
+|  |- scf.for                              structural
+|  |  |- body region  entry {1} exit {1} carried
+|  |  |  |- W  m0  ttng.tmem_alloc  use {1}
+|  |  |  |- R  m0  ttng.tmem_load  use {1}
+|  |  |  |- W  m1  ttng.tmem_alloc  use {1}
+|  |  |  |- R  m1  ttng.tmem_load  use {1}
+|  |  |  |- scf.yield                            owner {1}
+
+==== NVWS InsertSemas (commit 2: discovery + ACCESS DAG + OWNERSHIP DAG) ====
+function: loop_token_slot_alias
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=9 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0) m1(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tmem_store {1}
+|  |- R  m1  ttng.tmem_load {0}
+OWNERSHIP-DAG buffer.id=9 resourceKey=0 members: m0 m1
+|- func region @loop_token_slot_alias  entry {1} exit {1}
+|  |- scf.for                              structural
+|  |  |- body region  entry {1} exit {1} carried
+|  |  |  |- W  m0  ttng.tmem_store  use {1}
+|  |  |  |- R  m1  ttng.tmem_load  use {0}
+|  |  |  |- scf.yield                            owner {1}
+
+==== NVWS InsertSemas (commit 2: discovery + ACCESS DAG + OWNERSHIP DAG) ====
+function: if_branch_alias
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=10 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0) m1(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- scf.if
+|  |  |- W  m0  ttng.tmem_store {1}
+|  |  |- R  m1  ttng.tmem_load {0}
+|  |  |- R  m0  ttng.tmem_load {1}
+|  |  |- W  m1  ttng.tmem_store {0}
+|  |- W  m0  ttng.tmem_store {1}
+|  |- R  m1  ttng.tmem_load {0}
+OWNERSHIP-DAG buffer.id=10 resourceKey=0 members: m0 m1
+|- func region @if_branch_alias  entry {1} exit {1}
+|  |- scf.for                              structural
+|  |  |- body region  entry {1} exit {1} carried
+|  |  |  |- scf.if                               structural
+|  |  |  |  |- then region  entry {1} exit {1}
+|  |  |  |  |  |- W  m0  ttng.tmem_store  use {1}
+|  |  |  |  |  |- R  m1  ttng.tmem_load  use {0}
+|  |  |  |  |- else region  entry {1} exit {1}
+|  |  |  |  |  |- R  m0  ttng.tmem_load  use {1}
+|  |  |  |  |  |- W  m1  ttng.tmem_store  use {0}
+|  |  |  |- W  m0  ttng.tmem_store  use {1}
+|  |  |  |- R  m1  ttng.tmem_load  use {0}
+|  |  |  |- scf.yield                            owner {1}
+
+==== NVWS InsertSemas (commit 2: discovery + ACCESS DAG + OWNERSHIP DAG) ====
+function: accumulator_and_operand_alias_same_partition
+backing buffers: 2
+NVWS-SEMA-DAG buffer.id=11 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0) m1(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tc_gen5_mma {1}
+|  |- W  m1  ttng.tmem_alloc {2}
+|  |- R  m1  ttng.tc_gen5_mma {1}
+|  |- R  m0  ttng.tmem_load {1}
+OWNERSHIP-DAG buffer.id=11 resourceKey=0 members: m0 m1
+|- func region @accumulator_and_operand_alias_same_partition  entry {1} exit {1}
+|  |- scf.for                              structural
+|  |  |- body region  entry {1} exit {1} carried
+|  |  |  |- W  m0  ttng.tc_gen5_mma  use {1}
+|  |  |  |- W  m1  ttng.tmem_alloc  use {2}
+|  |  |  |- R  m1  ttng.tc_gen5_mma  use {1}
+|  |  |  |- R  m0  ttng.tmem_load  use {1}
+|  |  |  |- scf.yield                            owner {1}
+NVWS-SEMA-DAG buffer.id=12 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tc_gen5_mma {1}
+OWNERSHIP-DAG buffer.id=12 resourceKey=0 members: m0
+|- func region @accumulator_and_operand_alias_same_partition  entry {1} exit {1}
+|  |- scf.for                              structural
+|  |  |- body region  entry {1} exit {1} carried
+|  |  |  |- W  m0  ttng.tc_gen5_mma  use {1}
+|  |  |  |- scf.yield                            owner {1}
+
+==== NVWS InsertSemas (commit 2: discovery + ACCESS DAG + OWNERSHIP DAG) ====
+function: singleton_staged_alloc_preserves_buffer_attrs
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=13 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- W  m0  ttng.tmem_store root
+|- scf.for
+|  |- W  m0  ttng.tc_gen5_mma {1}
+|  |- R  m0  ttng.tmem_load {0}
+OWNERSHIP-DAG buffer.id=13 resourceKey=0 members: m0
+|- func region @singleton_staged_alloc_preserves_buffer_attrs  entry root exit {1}
+|  |- W  m0  ttng.tmem_store  use root
+|  |- scf.for                              structural
+|  |  |- body region  entry {1} exit {1} carried
+|  |  |  |- W  m0  ttng.tc_gen5_mma  use {1}
+|  |  |  |- R  m0  ttng.tmem_load  use {0}
+|  |  |  |- scf.yield                            owner {1}
+
+==== NVWS InsertSemas (commit 2: discovery + ACCESS DAG + OWNERSHIP DAG) ====
+function: n_owner_alias_sequence
+backing buffers: 1
+NVWS-SEMA-DAG buffer.id=14 memory=tmem
+  members: m0(offset=0,extent=128,resourceKey=0) m1(offset=64,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for
+|  |- W  m0  ttng.tmem_alloc {0}
+|  |- R  m0  ttng.tmem_load {1}
+|  |- W  m1  ttng.tmem_alloc {2}
+|  |- R  m1  ttng.tmem_load {0}
+OWNERSHIP-DAG buffer.id=14 resourceKey=0 members: m0 m1
+|- func region @n_owner_alias_sequence  entry {0} exit {0}
+|  |- scf.for                              structural
+|  |  |- body region  entry {0} exit {0} carried
+|  |  |  |- W  m0  ttng.tmem_alloc  use {0}
+|  |  |  |- R  m0  ttng.tmem_load  use {1}
+|  |  |  |- W  m1  ttng.tmem_alloc  use {2}
+|  |  |  |- R  m1  ttng.tmem_load  use {0}
+|  |  |  |- scf.yield                            owner {0}
+
