@@ -97,6 +97,16 @@ struct AccessTouch {
 struct AccessEvent {
   Operation *op = nullptr;
   std::optional<PartitionId> owner;
+  // The op that supplies this event's wsTag (v4 §Debug DAG Dumps scope
+  // barrier rule):
+  //   - nullptr if the event has no wsTag (owner is root/external).
+  //   - == op itself if the op carries `ttg.warp_specialize.tag` directly
+  //     on itself (intrinsic; self-named scope).
+  //   - the enclosing WS-tagged scf.for otherwise (extrinsic).
+  // Owner propagation: an extrinsic owner only propagates to regions
+  // inside the body of `tagSourceOp`. An intrinsic owner propagates to
+  // any region. A root owner propagates everywhere.
+  Operation *tagSourceOp = nullptr;
   SmallVector<AccessTouch, 2> touches;
   bool sourcefulAllocStore = false;
 };
@@ -108,7 +118,7 @@ struct BufferGroup {
   SmallVector<BufferMember> members;
   DenseMap<Value, AliasInfo> aliases;
   SmallVector<Operation *> aliasOps;
-  SmallVector<AccessEvent> events;
+  SmallVector<AccessEvent, 0> events;
 
   bool isTmem() const { return memory == MemorySpaceKind::Tmem; }
 };
@@ -122,6 +132,20 @@ static std::optional<int> tryGetWsTag(Operation *op) {
     op = op->getParentOfType<scf::ForOp>();
   if (!op) return std::nullopt;
   return *getWarpSpecializeTag(op);
+}
+
+// v4 §Debug DAG Dumps scope barrier rule: the op that supplies `op`'s
+// wsTag, used to constrain owner propagation.
+//   - nullptr: op has no WS context (root/external).
+//   - op itself: op carries `ttg.warp_specialize.tag` directly (intrinsic).
+//   - the enclosing WS-tagged scf.for: extrinsic — bound to that for-loop.
+static Operation *getTagSourceOp(Operation *op) {
+  if (!op) return nullptr;
+  if (hasWarpSpecializeTag(op)) return op;
+  Operation *p = op->getParentOfType<scf::ForOp>();
+  while (p && !hasWarpSpecializeTag(p))
+    p = p->getParentOfType<scf::ForOp>();
+  return p;
 }
 
 static std::optional<PartitionId> getPartitionId(Operation *op, int pos = 0) {
@@ -382,6 +406,7 @@ static LogicalResult collectEvents(BufferGroup &group, triton::FuncOp funcOp) {
     AccessEvent event;
     event.op = op;
     event.owner = getPartitionId(op);
+    event.tagSourceOp = event.owner ? getTagSourceOp(op) : nullptr;
 
     if (group.isTmem()) {
       if (auto allocOp = dyn_cast<TMEMAllocOp>(op)) {
@@ -436,9 +461,24 @@ static LogicalResult collectEvents(BufferGroup &group, triton::FuncOp funcOp) {
 // Dump (commit 1 stage output).
 // ---------------------------------------------------------------------------
 
-static std::string ownerStr(std::optional<PartitionId> owner) {
+// Context-sensitive owner display (v4 §Debug DAG Dumps).
+//
+// - root/external → "root"
+// - row anchored inside the same WS-tagged for-loop as the owner's wsTag
+//   → "{<partition>}" (tag implicit)
+// - row anchored outside any WS for-loop, or in a different WS for-loop
+//   → "{@<wsTag>.<partition>}" (tag explicit)
+static std::string ownerStr(Operation *anchor,
+                            std::optional<PartitionId> owner) {
   if (!owner) return "root";
-  return "{" + std::to_string(owner->first) + "}";
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  auto anchorTag = anchor ? tryGetWsTag(anchor) : std::nullopt;
+  if (anchorTag && *anchorTag == owner->second)
+    os << "{" << owner->first << "}";
+  else
+    os << "{@" << owner->second << "." << owner->first << "}";
+  return s;
 }
 
 static char accessKindChar(bool reads, bool writes) {
@@ -451,17 +491,34 @@ static std::string treePrefix(unsigned depth) {
   return s;
 }
 
+// v4 §Debug DAG Dumps: a regioned op is included only when its subtree
+// contains at least one event for the group/resource being printed.
+static bool accessSubtreeHasEvent(
+    Operation *op, DenseMap<Operation *, unsigned> &eventIdxByOp) {
+  bool found = false;
+  op->walk([&](Operation *o) -> WalkResult {
+    if (eventIdxByOp.count(o)) {
+      found = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return found;
+}
+
 static void dumpAccessDagBlock(Block &block, BufferGroup &group,
                                DenseMap<Operation *, unsigned> &eventIdxByOp,
                                unsigned depth) {
   for (Operation &op : block) {
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      if (!accessSubtreeHasEvent(&op, eventIdxByOp)) continue;
       llvm::errs() << treePrefix(depth) << "|- scf.for\n";
       for (Block &b : forOp.getRegion())
         dumpAccessDagBlock(b, group, eventIdxByOp, depth + 1);
       continue;
     }
     if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      if (!accessSubtreeHasEvent(&op, eventIdxByOp)) continue;
       llvm::errs() << treePrefix(depth) << "|- scf.if\n";
       for (Block &b : ifOp.getThenRegion())
         dumpAccessDagBlock(b, group, eventIdxByOp, depth + 1);
@@ -480,7 +537,7 @@ static void dumpAccessDagBlock(Block &block, BufferGroup &group,
                    << accessKindChar(reads, writes) << "  "
                    << "m" << touch.memberIdx << "  "
                    << op.getName().getStringRef() << " "
-                   << ownerStr(event.owner) << "\n";
+                   << ownerStr(&op, event.owner) << "\n";
     }
   }
 }
@@ -519,6 +576,10 @@ struct RegionOwnership {
   std::optional<PartitionId> entry;
   std::optional<PartitionId> exit;
   bool carried = false;
+  // True iff this region (or any nested region) contains at least one
+  // event for the resource this plan is tracking. v4: a regioned op
+  // (scf.if, scf.for) is annotated only when its subtree has access.
+  bool hasEventsInSubtree = false;
 };
 
 struct ResourcePlan {
@@ -531,12 +592,34 @@ struct ResourcePlan {
   DenseMap<Region *, RegionOwnership> regionOwners;
   // Direct-use owner per AccessEvent op that touches this resource.
   DenseMap<Operation *, std::optional<PartitionId>> useOwner;
+  // tagSourceOp per AccessEvent op, mirrored from AccessEvent for fast
+  // in-scope filtering inside the Planner.
+  DenseMap<Operation *, Operation *> useTagSource;
   // Index into AccessEvent::touches of the touch that hit this resource
   // (used to render the right member name in the dump).
   DenseMap<Operation *, unsigned> useTouchIdx;
   // scf.yield owner stamp for loop bodies that carry this resource.
   DenseMap<Operation *, std::optional<PartitionId>> yieldOwner;
 };
+
+// v4 §Debug DAG Dumps scope barrier rule. An event with owner anchored
+// at `tagSourceOp` propagates to a region `r` iff:
+//   - tagSourceOp is null (root), or
+//   - tagSourceOp == event.op (intrinsic; op self-names its scope), or
+//   - tagSourceOp is r's parent op or an ancestor of r's parent op
+//     (r is inside the body of the WS-tagged for-loop that supplies the
+//     tag).
+static bool isEventInScopeForRegion(Operation *tagSourceOp,
+                                    Operation *eventOp, Region *region) {
+  if (!tagSourceOp) return true;
+  if (tagSourceOp == eventOp) return true;
+  Operation *parent = region->getParentOp();
+  while (parent) {
+    if (parent == tagSourceOp) return true;
+    parent = parent->getParentOp();
+  }
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers used by the planner.
@@ -574,29 +657,38 @@ struct Planner {
           const DenseMap<Operation *, unsigned> &r)
       : funcOp(f), plan(p), rank(r) {}
 
-  // First event (by program order) anywhere inside `region`.
+  // First in-scope event (by program order) anywhere inside `region`.
+  // v4 §Debug DAG Dumps scope-barrier rule: an event is in-scope for the
+  // body region of a WS-tagged scf.for, but not for ancestor regions
+  // outside that for-loop.
   std::optional<PartitionId> firstEventOwnerIn(Region &region) {
     Operation *foundOp = nullptr;
     region.walk<WalkOrder::PreOrder>([&](Operation *op) -> WalkResult {
-      if (plan.useOwner.find(op) != plan.useOwner.end()) {
-        foundOp = op;
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
+      if (plan.useOwner.find(op) == plan.useOwner.end())
+        return WalkResult::advance();
+      Operation *tagSource = plan.useTagSource.lookup(op);
+      if (!isEventInScopeForRegion(tagSource, op, &region))
+        return WalkResult::advance();
+      foundOp = op;
+      return WalkResult::interrupt();
     });
     if (!foundOp) return std::nullopt;
     return plan.useOwner.find(foundOp)->second;
   }
 
-  // Owner of next event in program order that is not inside `op`'s subtree.
-  // Used to decide if an scf.if branch must move ownership before the if
-  // (v4: "Move ownership before the region when ... the continuation after
-  // the region requires the new owner.").
-  std::optional<PartitionId> nextEventOwnerAfter(Operation *op) {
+  // Owner of next in-scope event for `contextRegion`, in program order
+  // after `op`'s subtree. Used to choose the branchOwner for an scf.if
+  // sitting inside `contextRegion`.
+  std::optional<PartitionId> nextEventOwnerAfter(Operation *op,
+                                                 Region &contextRegion) {
     unsigned cutoff = maxRankInSubtree(op, rank);
-    for (Operation *evOp : orderedEventOps)
-      if (rank.lookup(evOp) > cutoff)
-        return plan.useOwner.find(evOp)->second;
+    for (Operation *evOp : orderedEventOps) {
+      if (rank.lookup(evOp) <= cutoff) continue;
+      Operation *tagSource = plan.useTagSource.lookup(evOp);
+      if (!isEventInScopeForRegion(tagSource, evOp, &contextRegion))
+        continue;
+      return plan.useOwner.find(evOp)->second;
+    }
     return std::nullopt;
   }
 
@@ -613,6 +705,7 @@ Planner::planRegion(Region &region, std::optional<PartitionId> entry,
   RegionOwnership rec;
   rec.entry = entry;
   rec.carried = isLoopBody;
+  bool subtreeHasEvents = false;
 
   std::optional<PartitionId> current = entry;
   if (isLoopBody) {
@@ -627,12 +720,10 @@ Planner::planRegion(Region &region, std::optional<PartitionId> entry,
   for (Block &block : region) {
     for (Operation &op : block) {
       if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-        // v4: "For scf.if, assign then-region and else-region owners
-        // independently, then reconcile branch exit owners to the chosen
-        // post-if owner/state." We choose post-if owner from the next
-        // use after the scf.if in any enclosing scope; if none, preserve
-        // the incoming owner.
-        auto postIf = nextEventOwnerAfter(&op);
+        // v4: scf.if branch owner = post-if next-use in this region;
+        // filtered to events in-scope for *this* region (the one
+        // containing the scf.if).
+        auto postIf = nextEventOwnerAfter(&op, region);
         std::optional<PartitionId> branchOwner = postIf ? postIf : current;
 
         planRegion(ifOp.getThenRegion(), branchOwner,
@@ -640,10 +731,9 @@ Planner::planRegion(Region &region, std::optional<PartitionId> entry,
         plan.regionOwners[&ifOp.getThenRegion()].entry = branchOwner;
         plan.regionOwners[&ifOp.getThenRegion()].exit = branchOwner;
 
-        // Always emit a record for the else region (even if empty: the
-        // logical "empty else returns to branchOwner" must appear in the
-        // OWNERSHIP-DAG dump per v4 examples).
-        RegionOwnership elseRec{branchOwner, branchOwner, /*carried=*/false};
+        // Always emit a record for the else region (even if empty).
+        RegionOwnership elseRec{branchOwner, branchOwner, /*carried=*/false,
+                                /*hasEventsInSubtree=*/false};
         plan.regionOwners[&ifOp.getElseRegion()] = elseRec;
         if (!ifOp.getElseRegion().empty()) {
           planRegion(ifOp.getElseRegion(), branchOwner,
@@ -651,14 +741,30 @@ Planner::planRegion(Region &region, std::optional<PartitionId> entry,
           plan.regionOwners[&ifOp.getElseRegion()].entry = branchOwner;
           plan.regionOwners[&ifOp.getElseRegion()].exit = branchOwner;
         }
-        current = branchOwner;
+        bool thenHas =
+            plan.regionOwners[&ifOp.getThenRegion()].hasEventsInSubtree;
+        bool elseHas =
+            plan.regionOwners[&ifOp.getElseRegion()].hasEventsInSubtree;
+        if (thenHas || elseHas) {
+          subtreeHasEvents = true;
+          current = branchOwner;
+        }
         continue;
       }
       if (auto forOp = dyn_cast<scf::ForOp>(op)) {
         planRegion(forOp.getRegion(), current, /*isLoopBody=*/true);
         RegionOwnership bodyRec =
             plan.regionOwners.lookup(&forOp.getRegion());
-        current = bodyRec.exit;
+        if (bodyRec.hasEventsInSubtree) {
+          subtreeHasEvents = true;
+          // v4 scope-barrier rule: a WS-tagged scf.for is a scope
+          // boundary. Its body owners are anchored to the for-loop and
+          // do not propagate to the parent region. A plain scf.for
+          // shares its parent's scope so its body exit owner is
+          // in-scope for the parent and may propagate.
+          if (!hasWarpSpecializeTag(&op))
+            current = bodyRec.exit;
+        }
         continue;
       }
       if (auto yieldOp = dyn_cast<scf::YieldOp>(op)) {
@@ -667,12 +773,21 @@ Planner::planRegion(Region &region, std::optional<PartitionId> entry,
         continue;
       }
       auto useIt = plan.useOwner.find(&op);
-      if (useIt != plan.useOwner.end())
-        current = useIt->second;
+      if (useIt != plan.useOwner.end()) {
+        subtreeHasEvents = true;
+        // Only update `current` when this event is in scope for the
+        // region we're planning. Out-of-scope events still count for
+        // transitive presence (subtreeHasEvents) but do not propagate
+        // their owner across the WS scope barrier.
+        Operation *tagSource = plan.useTagSource.lookup(&op);
+        if (isEventInScopeForRegion(tagSource, &op, &region))
+          current = useIt->second;
+      }
     }
   }
 
   rec.exit = isLoopBody ? rec.entry : current;
+  rec.hasEventsInSubtree = subtreeHasEvents;
   plan.regionOwners[&region] = rec;
   return rec.exit;
 }
@@ -694,6 +809,7 @@ planResource(triton::FuncOp funcOp, unsigned groupIdx, BufferGroup &group,
     for (auto [tIdx, touch] : llvm::enumerate(event.touches)) {
       if (touch.resourceKey == resourceKey) {
         plan.useOwner[event.op] = event.owner;
+        plan.useTagSource[event.op] = event.tagSourceOp;
         plan.useTouchIdx[event.op] = static_cast<unsigned>(tIdx);
         break;
       }
@@ -707,13 +823,12 @@ planResource(triton::FuncOp funcOp, unsigned groupIdx, BufferGroup &group,
     return rank.lookup(a) < rank.lookup(b);
   });
 
-  // v4: function-region entry owner == first-use owner so the first
-  // writer/sourceful-write acquires the initial writable permit. Example 1
-  // (`@fanout`) and example 5 (`@qk_alpha_acc`) require this.
-  std::optional<PartitionId> funcEntry;
-  if (!planner.orderedEventOps.empty())
-    funcEntry = plan.useOwner.find(planner.orderedEventOps.front())->second;
-  planner.planRegion(funcOp.getBody(), funcEntry, /*isLoopBody=*/false);
+  // v4: the function region is never annotated, so we don't seed it with
+  // a precomputed entry owner. The planner threads in-scope events
+  // (root + intrinsic-tagged) through `current` if any exist; otherwise
+  // function-region entry/exit stay nullopt.
+  planner.planRegion(funcOp.getBody(), /*entry=*/std::nullopt,
+                     /*isLoopBody=*/false);
   return plan;
 }
 
@@ -721,40 +836,51 @@ planResource(triton::FuncOp funcOp, unsigned groupIdx, BufferGroup &group,
 // OWNERSHIP-DAG dump (commit 2 stage output).
 // ---------------------------------------------------------------------------
 
-static std::string formatRegionLine(StringRef label,
+static std::string formatRegionLine(Operation *anchor, StringRef label,
                                     const RegionOwnership &rec) {
   std::string s;
   llvm::raw_string_ostream os(s);
-  os << label << "  entry " << ownerStr(rec.entry) << " exit "
-     << ownerStr(rec.exit);
+  os << label << "  entry " << ownerStr(anchor, rec.entry) << " exit "
+     << ownerStr(anchor, rec.exit);
   if (rec.carried) os << " carried";
   return s;
+}
+
+// v4: a regioned op is annotated only when its subtree carries at least
+// one access for this resource.
+static bool regionHasEvents(Region &region, ResourcePlan &plan) {
+  auto it = plan.regionOwners.find(&region);
+  return it != plan.regionOwners.end() && it->second.hasEventsInSubtree;
 }
 
 static void dumpOwnershipBlock(Block &block, ResourcePlan &plan,
                                BufferGroup &group, unsigned depth) {
   for (Operation &op : block) {
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      if (!regionHasEvents(forOp.getRegion(), plan)) continue;
       llvm::errs() << treePrefix(depth)
                    << "|- scf.for                              structural\n";
       auto &bodyRec = plan.regionOwners[&forOp.getRegion()];
       llvm::errs() << treePrefix(depth + 1) << "|- "
-                   << formatRegionLine("body region", bodyRec) << "\n";
+                   << formatRegionLine(&op, "body region", bodyRec) << "\n";
       for (Block &b : forOp.getRegion())
         dumpOwnershipBlock(b, plan, group, depth + 2);
       continue;
     }
     if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      bool thenHas = regionHasEvents(ifOp.getThenRegion(), plan);
+      bool elseHas = regionHasEvents(ifOp.getElseRegion(), plan);
+      if (!thenHas && !elseHas) continue;
       llvm::errs() << treePrefix(depth)
                    << "|- scf.if                               structural\n";
       auto &thenRec = plan.regionOwners[&ifOp.getThenRegion()];
       llvm::errs() << treePrefix(depth + 1) << "|- "
-                   << formatRegionLine("then region", thenRec) << "\n";
+                   << formatRegionLine(&op, "then region", thenRec) << "\n";
       for (Block &b : ifOp.getThenRegion())
         dumpOwnershipBlock(b, plan, group, depth + 2);
       auto &elseRec = plan.regionOwners[&ifOp.getElseRegion()];
       llvm::errs() << treePrefix(depth + 1) << "|- "
-                   << formatRegionLine("else region", elseRec) << "\n";
+                   << formatRegionLine(&op, "else region", elseRec) << "\n";
       if (!ifOp.getElseRegion().empty())
         for (Block &b : ifOp.getElseRegion())
           dumpOwnershipBlock(b, plan, group, depth + 2);
@@ -765,7 +891,7 @@ static void dumpOwnershipBlock(Block &block, ResourcePlan &plan,
       if (it != plan.yieldOwner.end())
         llvm::errs() << treePrefix(depth)
                      << "|- scf.yield                            owner "
-                     << ownerStr(it->second) << "\n";
+                     << ownerStr(&op, it->second) << "\n";
       continue;
     }
     auto useIt = plan.useOwner.find(&op);
@@ -784,7 +910,7 @@ static void dumpOwnershipBlock(Block &block, ResourcePlan &plan,
     llvm::errs() << treePrefix(depth) << "|- "
                  << accessKindChar(reads, writes) << "  m" << touch.memberIdx
                  << "  " << op.getName().getStringRef() << "  use "
-                 << ownerStr(useIt->second) << "\n";
+                 << ownerStr(&op, useIt->second) << "\n";
   }
 }
 
@@ -794,10 +920,9 @@ static void dumpOwnershipDag(ResourcePlan &plan, BufferGroup &group,
                << " resourceKey=" << plan.resource.second << " members:";
   for (unsigned idx : plan.memberIndices) llvm::errs() << " m" << idx;
   llvm::errs() << "\n";
-  auto &funcRec = plan.regionOwners[&funcOp.getBody()];
-  std::string label = "func region @";
-  label += funcOp.getName().str();
-  llvm::errs() << "|- " << formatRegionLine(label, funcRec) << "\n";
+  // v4: the function region is never annotated. Print only the header
+  // row with the function name; no entry/exit ownership annotation.
+  llvm::errs() << "|- func region @" << funcOp.getName() << "\n";
   for (Block &b : funcOp.getBody())
     dumpOwnershipBlock(b, plan, group, /*depth=*/1);
 }

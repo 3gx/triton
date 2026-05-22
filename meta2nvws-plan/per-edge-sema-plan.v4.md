@@ -459,11 +459,41 @@ Dump requirements:
 
 - preserve `scf.for` and `scf.if` nesting
 - keep vertical tree lines through nested region bodies
-- print ownership partitions as `{<partition>}` or `root`; include the warp
-  specialization tag only when needed to disambiguate, e.g. `{@0.1}`
+- the function region is never annotated. A `func region @<name>` row
+  carries no entry/exit owner — partition numbers are scoped to a
+  warp-specialized for-loop and the function sits outside any such loop.
+- print ownership partitions on region/use rows as `{<partition>}` or
+  `root`. A row anchored inside a warp-specialized for-loop prints the
+  partition alone; a row anchored outside any warp-specialized for-loop
+  must include both the warp specialization tag and the partition, e.g.
+  `{@0.1}`. Partition-only display outside any warp-specialized loop is
+  invalid: the partition number is unanchored without the tag identifying
+  which warp-specialized loop defined it.
+- a regioned op (`scf.if`, `scf.for`) is included in `OWNERSHIP-DAG` only
+  when at least one access to the current backing resource exists somewhere
+  in its subtree — directly inside its region or at any nested depth. If no
+  access exists anywhere in subtree, the regioned op and its region rows are
+  omitted entirely. The same rule applies to `RAW-SYNC-DAG` and
+  `OPT-SYNC-DAG`.
+- owner propagation respects the warp-specialized for-loop as a scope
+  barrier. An access whose `wsTag` is supplied by an enclosing
+  warp-specialized `scf.for` (extrinsic) only propagates to region
+  annotations *inside the body of that same `scf.for`*. It never escapes
+  to ancestor regions. Two narrow exceptions:
+  - **Root events** (op carries no partition annotation at all): propagate
+    freely across all regions, displayed as `root`.
+  - **Intrinsic-tag events** (op carries `ttg.partition` AND
+    `ttg.warp_specialize.tag` directly on itself, as in
+    `strip_partition_attrs_outside_ws.mlir`): the op self-names which
+    WS-loop's partition system it belongs to, so its owner propagates to
+    any region. Displayed with tagged form `{@<tag>.<partition>}` on rows
+    outside that WS-loop, untagged on rows inside it.
 - in `OWNERSHIP-DAG`, print one tree per backing resource
 - in each ownership tree, print the partition owner/state on every
-  function/then/else/body region, yield, and direct memory use line
+  then/else/body region, yield, and direct memory use line that is
+  printed (subject to the no-access-no-row rule and scope-barrier rule
+  above). Regions whose subtree has transitive access but no in-scope
+  events display `entry root exit root`.
 - print release/acquire owner partitions directly on the sync marker line
 - use only `R` and `W` for memory access rows; MMAv5 accumulator updates are `W`
 - use `r` for semaphore release/signal rows and `a` for semaphore acquire/wait
