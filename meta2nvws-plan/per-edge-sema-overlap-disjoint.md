@@ -280,3 +280,99 @@ semaphores translate into extra runtime cost. The natural place to
 land this is between RAW-SYNC and OPT-SYNC, before the emitter
 materializes any IR. Until then, the limitation is documented here
 and union-find stays.
+
+## Verified Scope Analysis — Defer-Now vs. Refactor-Now
+
+Performed by direct code inspection of
+`third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemas.cpp` to
+determine whether the atom-based refactor is a small localized change
+(deferrable) or a structural one (block on it now).
+
+### Sites touching `resourceKey` (16 occurrences in `InsertSemas.cpp`)
+
+| Role                                            | Refactor impact                                              |
+|-------------------------------------------------|--------------------------------------------------------------|
+| `BufferMember.resourceKey: int64_t`             | type change to `SmallVector<int64_t> atomKeys`               |
+| `AccessTouch.resourceKey: int64_t`              | same                                                         |
+| `addTouch` copy member → touch                  | trivial (copy vector)                                        |
+| `assignTmemResourceKeys` union-find             | rewrite to endpoint-sweep + per-member atom enumeration      |
+| `makeLocalGroup` single-member init             | trivial                                                      |
+| `dumpBackingGroupHeader` format string          | trivial format change                                        |
+| `ResourceId = pair<groupId, key>` typedef       | unchanged — `key` becomes "atom" but still `int64_t`         |
+| `planResource(group, key)` filter (2 sites)     | `member.resourceKey == key` → `contains(atomKeys, key)`      |
+| `runOnFunction` per-resource loop               | same loop, fed from union of atom sets across members        |
+| Comments and dump-format strings (4 sites)      | text only                                                    |
+
+### What changes
+
+- 2 struct field types: `int64_t → SmallVector<int64_t>`.
+- 1 function body rewrite: `assignTmemResourceKeys` →
+  `assignTmemAtoms` (sweep endpoints, partition into maximal
+  non-overlapping intervals, list per member the atoms it covers).
+- 1 filter primitive at 2 sites: equality (`==`) → set-membership.
+- Element-type-distinct guard (currently inside union-find) becomes:
+  members with different element types occupy disjoint atom-id
+  namespaces. Same complexity.
+
+### What does NOT change
+
+- `ResourcePlan` struct shape — still per-`(groupId, key)`.
+- `Planner` algorithm (`firstEventOwnerIn`, `nextEventOwnerAfter`,
+  `planRegion`, in-scope filtering via `isEventInScopeForRegion`,
+  WS-tagged-`scf.for` scope barrier) — operates on
+  `useOwner`/`useTagSource` per resource, unchanged.
+- Region-ownership walk, OWNERSHIP-DAG dump structure (still one tree
+  per `(groupId, key)`).
+- `ResourceId` typedef and `runOnFunction`'s per-resource loop.
+- Pass entry point, gating, event collection, alias chain.
+
+### Verified LoC estimate
+
+~60–80 lines of changes in `InsertSemas.cpp`. No new files, no new
+dependencies, no architectural shifts.
+
+### Impact on commits 3–5
+
+Verified against the v4 plan text:
+
+- v4 §Physical Conflict Key already treats `resourceKey` as an opaque
+  key carried alongside `(logicalGroupId, versionId)`. Plan text does
+  NOT require equivalence-class semantics.
+- Per-edge sync graph (commit 3), fanout/fanin combiner (commit 4),
+  and emitter (commit 5) iterate over keys without caring how the keys
+  were derived. The same code path works for atoms.
+- The only observable difference downstream at commit 5: emit one
+  `nvws.semaphore.create` per atom instead of per equivalence class.
+  Emitter shape is unchanged.
+
+### Currently-passing lit tests pinned to per-equivalence-class behavior
+
+Zero. The `nvws.semaphore.create`/`acquire`/`release` CHECK lines in
+existing tests are already failing during commits 1–4 (per the v4
+plan's dump-only contract). They only start matching at commit 5, so
+any model change folds into the normal commit-5 lit-test work anyway.
+
+### Unverified risk (honest)
+
+Commits 3–5 are not yet written. I cannot confirm by code inspection
+that they will not introduce a data structure that *assumes* the key
+is a single union-find label. I can confirm:
+
+- The v4 plan text doesn't require it.
+- The current code doesn't require it.
+- The opaqueness of `resourceKey` in commit-1/commit-2 code paths is
+  consistent with atom-keyed semantics.
+
+Whether the implementation drifts when written is a question only the
+implementation will answer.
+
+### Verified recommendation
+
+**Defer.** The refactor is local (~60–80 LoC, no architectural
+change), the v4 plan text already supports atom-keyed semantics, no
+currently-passing test pins the old behavior, and the natural place to
+land it is between RAW-SYNC (commit 3) and OPT-SYNC (commit 4) — or
+co-landed with commit 5 — where the extra semaphore count first
+becomes observable. Doing it now versus later costs the same number
+of edited lines; the difference is whether the test-output churn is
+absorbed now or as part of commit 5's normal lit-test pass.
