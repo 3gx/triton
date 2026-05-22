@@ -14,7 +14,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
     %cst_0 = arith.constant dense<1.000000e+00> : tensor<128x128xf32, #blocked>
     // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc {buffer.id = 7 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32
-    // CHECK-NEXT: [[BBUF:%.*]] = ttng.tmem_alloc {buffer.id = 7 : i32, buffer.offset = 64 : i32} : () -> !ttg.memdesc<1x128x128xf32
+    // CHECK-NEXT: [[BBUF:%.*]] = ttng.tmem_alloc {buffer.id = 7 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32
     // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]], [[BBUF]] true
     // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]], [[BBUF]] false
     // CHECK-NEXT: scf.for
@@ -29,7 +29,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // CHECK-NEXT: nvws.semaphore.release [[FULL]], [[ATOK]] [#nvws.async_op<none>] {ttg.partition = array<i32: 1>}
       %va, %ta = ttng.tmem_load %a[] {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
       "use"(%va) {ttg.partition = array<i32: 1>} : (tensor<128x128xf32, #blocked>) -> ()
-      %b = ttng.tmem_alloc %cst_0 {buffer.id = 7 : i32, buffer.offset = 64 : i32, ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %b = ttng.tmem_alloc %cst_0 {buffer.id = 7 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       // CHECK-NEXT: [[BTOK:%.*]] = nvws.semaphore.acquire [[FULL]] {ttg.partition = array<i32: 0>}
       // CHECK-NEXT: [[BVIEW:%.*]]:2 = nvws.semaphore.buffer [[FULL]], [[BTOK]] {ttg.partition = array<i32: 0>}
       // CHECK-NEXT: [[TRUE0:%.*]] = arith.constant {ttg.partition = array<i32: 0>} true
@@ -261,7 +261,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %cst1 = arith.constant dense<1.000000e+00> : tensor<128x128xf32, #blocked>
     %r = scf.for %iv = %lb to %ub step %step iter_args(%i = %c0) -> (i32) : i32 {
       // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc {buffer.id = 14 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32
-      // CHECK-NEXT: [[BBUF:%.*]] = ttng.tmem_alloc {buffer.id = 14 : i32, buffer.offset = 64 : i32} : () -> !ttg.memdesc<1x128x128xf32
+      // CHECK-NEXT: [[BBUF:%.*]] = ttng.tmem_alloc {buffer.id = 14 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32
       // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]], [[BBUF]] true
       // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]], [[BBUF]] false
       %a = ttng.tmem_alloc %cst0 {buffer.id = 14 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
@@ -275,7 +275,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // CHECK-NEXT: {{.*}}, {{.*}} = ttng.tmem_load [[VIEW1]]#0[] {ttg.partition = array<i32: 1>}
       %va, %ta = ttng.tmem_load %a[] {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
       "use"(%va) {ttg.partition = array<i32: 1>} : (tensor<128x128xf32, #blocked>) -> ()
-      %b = ttng.tmem_alloc %cst1 {buffer.id = 14 : i32, buffer.offset = 64 : i32, ttg.partition = array<i32: 2>} : (tensor<128x128xf32, #blocked>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %b = ttng.tmem_alloc %cst1 {buffer.id = 14 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 2>} : (tensor<128x128xf32, #blocked>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       // CHECK-NEXT: "use"
       // CHECK-NEXT: nvws.semaphore.release [[EMPTY]], [[TOK1]] [#nvws.async_op<none>] {ttg.partition = array<i32: 1>}
       // CHECK-NEXT: [[TOK2:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 2>}
