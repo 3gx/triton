@@ -1139,14 +1139,10 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
       return false;
     };
 
-    bool emittedAny = false;
     for (const AccessEvent *C : bodyConsumers) {
       if (sameOwner(C->owner, carriedOwner)) continue;
       Region *yieldReg = pickYieldRegion(C);
-      if (alreadyClosed(C->op, yieldReg)) {
-        emittedAny = true;  // covered by inner pass
-        continue;
-      }
+      if (alreadyClosed(C->op, yieldReg)) continue;
       SyncEdge edge;
       edge.name = makeEdgeName(serial++);
       edge.srcOp = C->op;
@@ -1154,9 +1150,12 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
       edge.srcOwner = C->owner;
       edge.dstOwner = carriedOwner;
       recordEdge(sp, edge);
-      emittedAny = true;
     }
-    if (!emittedAny && bodyProducer &&
+    // Producer-handoff close: only when there were NO consumers at all
+    // (any partition). Same-partition consumers already order the
+    // next-iter access via program order on their shared partition, so
+    // an extra writer->writer handoff would over-synchronize.
+    if (bodyConsumers.empty() && bodyProducer &&
         !sameOwner(bodyProducer->owner, carriedOwner)) {
       Region *yieldReg = pickYieldRegion(bodyProducer);
       if (!alreadyClosed(bodyProducer->op, yieldReg)) {
