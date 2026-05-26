@@ -502,24 +502,38 @@ Dump requirements:
 - use `r` for semaphore release/signal rows and `a` for semaphore acquire/wait
   rows
 - do not print `ready`, `done`, `sync`, or `RW` labels
-- indent semaphore marker lines as children of the nearest access/control-flow
-  line, with the semaphore kind column and semaphore-name column aligned to the
-  access kind/member columns: `|  |- W  qk_0 ...` followed by
-  `|  |  r  S_qk ...`
+- do not print a separate `FULL`/`EMPTY` state column on `r`/`a` rows. The
+  state is fully determined by the semaphore name: ready-edge semaphores
+  back FULL signals and use a name with prefix `R_` or `S_R_`, while
+  done/handoff-edge semaphores back EMPTY signals and use a name with
+  prefix `D_`/`H_` or `S_D_`/`S_H_`. The opt-sync stage may collapse these
+  to two shared names per resource (e.g. `S_full` and `S_empty`). Because
+  the state is in the name, repeating it as a column is redundant noise.
+- render `R`/`W` (access), `r` (release), and `a` (acquire) rows that
+  belong to the same block at the **same tree depth**. A release row is
+  not a child of its access row; it is a sibling that follows the access
+  inside the same block. Acquire rows are siblings positioned before the
+  access they gate, also at the same depth. The convention is
+  `|  |- W m0 ...` followed by `|  |- r S_... ...` followed by
+  `|  |- a S_... ...` followed by `|  |- R m0 ...`, all at one consistent
+  prefix.
 - enforce the alignment mechanically in the printer:
-  - access rows use the fixed prefix `|  |- <kind><two spaces><member>`
-  - semaphore rows use the fixed prefix
-    `|  |  <r/a><two spaces><semaphore-name>`
-  - the `r`/`a` semaphore kind must be in the same column as the `R`/`W` access
-    kind, and the first character of the semaphore name must be in the same
-    column as the first character of the member name on access rows
-  - memory member names are lowercase, while semaphore names start with an
-    uppercase letter, e.g. `qk_0` vs `S_qk`
-  - the operation column must be aligned across memory and semaphore rows, e.g.
-    `ttng.tc_gen5_mma`, `ttng.tmem_load`, `release`, and `acquire` start in the
-    same column inside a tree depth
-  - do not hand-pad each row independently in a way that can drift by one
-    character
+  - every row inside a block uses the fixed prefix `<tree>|- <kind>`,
+    where `<kind>` is one of `R`, `W`, `r`, `a`, `scf.for`, `scf.if`,
+    `then region`, `else region`, `body region`, `scf.yield`, or
+    `func region`.
+  - the `R`/`W`/`r`/`a` kind character must be in the same column for
+    every row at a given tree depth.
+  - the first character of the semaphore name must be in the same column
+    as the first character of the member name on access rows at that
+    depth (`m0` vs `S_qk`).
+  - memory member names are lowercase, while semaphore names start with
+    an uppercase letter, e.g. `qk_0` vs `S_qk`.
+  - the operation column must be aligned across memory and semaphore
+    rows at a given tree depth, e.g. `ttng.tc_gen5_mma`, `ttng.tmem_load`,
+    `release`, and `acquire` start in the same column.
+  - do not hand-pad each row independently in a way that can drift by
+    one character.
 - print member name/index and access kind
 - print stage/cluster when present
 - print sync markers exactly where the planner intends release/acquire
@@ -648,36 +662,36 @@ Raw-sync DAG:
 
 ```text
 RAW-SYNC-DAG backing=%alloc
-|- a S_init acquire EMPTY                {1}
-|- W %alloc  ttg.local_store            {1}
-|  |- r R_1_5 release FULL              {1} -> {5}
-|  |- r R_1_6 release FULL              {1} -> {6}
-|- a R_1_5 acquire FULL                 {5}
-|- R %alloc  ttg.local_load             {5}
-|  |- r D_5_7 release EMPTY             {5} -> {7}
-|- a R_1_6 acquire FULL                 {6}
-|- R %alloc  ttg.local_load             {6}
-|  |- r D_6_7 release EMPTY             {6} -> {7}
-|- a D_5_7 acquire EMPTY                {7}
-|- a D_6_7 acquire EMPTY                {7}
-|- W %alloc  ttg.local_store            {7}
+|- a S_init  acquire             {1}
+|- W %alloc  ttg.local_store     {1}
+|- r R_1_5   release             {1} -> {5}
+|- r R_1_6   release             {1} -> {6}
+|- a R_1_5   acquire             {5}
+|- R %alloc  ttg.local_load      {5}
+|- r D_5_7   release             {5} -> {7}
+|- a R_1_6   acquire             {6}
+|- R %alloc  ttg.local_load      {6}
+|- r D_6_7   release             {6} -> {7}
+|- a D_5_7   acquire             {7}
+|- a D_6_7   acquire             {7}
+|- W %alloc  ttg.local_store     {7}
 ```
 
 Optimized-sync DAG:
 
 ```text
 OPT-SYNC-DAG backing=%alloc
-|- a S_empty acquire EMPTY               {1}
-|- W %alloc  ttg.local_store            {1}
-|  |- r S_full release FULL             {1} -> {{5},{6}}
-|- a S_full acquire FULL                {5}
-|- R %alloc  ttg.local_load             {5}
-|  |- r S_empty release EMPTY           {5} -> {7}
-|- a S_full acquire FULL                {6}
-|- R %alloc  ttg.local_load             {6}
-|  |- r S_empty release EMPTY           {6} -> {7}
-|- a S_empty acquire EMPTY pending={{5},{6}} {7}
-|- W %alloc  ttg.local_store            {7}
+|- a S_empty acquire             {1}
+|- W %alloc  ttg.local_store     {1}
+|- r S_full  release             {1} -> {{5},{6}}
+|- a S_full  acquire             {5}
+|- R %alloc  ttg.local_load      {5}
+|- r S_empty release             {5} -> {7}
+|- a S_full  acquire             {6}
+|- R %alloc  ttg.local_load      {6}
+|- r S_empty release             {6} -> {7}
+|- a S_empty acquire  pending={{5},{6}}  {7}
+|- W %alloc  ttg.local_store     {7}
 ```
 
 ### Example 2: Conditional-Only If Consumption
@@ -715,34 +729,34 @@ Raw-sync DAG:
 
 ```text
 RAW-SYNC-DAG backing=%alloc
-|- a S_init acquire EMPTY                {1}
-|- W %alloc  ttg.local_store             {1}
-|- scf.if %cond                          structural
-|  |- then region                        entry {1} exit {1}
-|  |  |- r S_then_full release FULL      {1} -> {2}
-|  |  |- a S_then_full acquire FULL      {2}
-|  |  |- R %alloc  ttg.local_load        {2}
-|  |  |- r S_then_empty release EMPTY    {2} -> {1}
-|  |  |- a S_then_empty acquire EMPTY    {1}
-|  |- else region                        entry {1} exit {1}
-|- W %alloc  ttg.local_store             {1}
+|- a S_init       acquire             {1}
+|- W %alloc       ttg.local_store     {1}
+|- scf.if %cond                              structural
+|  |- then region                            entry {1} exit {1}
+|  |  |- r S_then_full  release             {1} -> {2}
+|  |  |- a S_then_full  acquire             {2}
+|  |  |- R %alloc       ttg.local_load      {2}
+|  |  |- r S_then_empty release             {2} -> {1}
+|  |  |- a S_then_empty acquire             {1}
+|  |- else region                            entry {1} exit {1}
+|- W %alloc       ttg.local_store     {1}
 ```
 
 Optimized-sync DAG:
 
 ```text
 OPT-SYNC-DAG backing=%alloc
-|- a S_empty acquire EMPTY               {1}
-|- W %alloc  ttg.local_store             {1}
-|- scf.if %cond                          structural
-|  |- then region                        entry {1} exit {1}
-|  |  |- r S_then_full release FULL      {1} -> {2}
-|  |  |- a S_then_full acquire FULL      {2}
-|  |  |- R %alloc  ttg.local_load        {2}
-|  |  |- r S_then_empty release EMPTY    {2} -> {1}
-|  |  |- a S_then_empty acquire EMPTY    {1}
-|  |- else region                        entry {1} exit {1}
-|- W %alloc  ttg.local_store             {1}
+|- a S_empty      acquire             {1}
+|- W %alloc       ttg.local_store     {1}
+|- scf.if %cond                              structural
+|  |- then region                            entry {1} exit {1}
+|  |  |- r S_then_full  release             {1} -> {2}
+|  |  |- a S_then_full  acquire             {2}
+|  |  |- R %alloc       ttg.local_load      {2}
+|  |  |- r S_then_empty release             {2} -> {1}
+|  |  |- a S_then_empty acquire             {1}
+|  |- else region                            entry {1} exit {1}
+|- W %alloc       ttg.local_store     {1}
 ```
 
 ### Example 3: If Consumption Continues After Join
@@ -782,36 +796,36 @@ Raw-sync DAG:
 
 ```text
 RAW-SYNC-DAG backing=%alloc
-|- a S_empty acquire EMPTY               {1}
-|- W %alloc  ttg.local_store             {1}
-|  |- r S_full release FULL              {1} -> {2}
-|- a S_full acquire FULL                 {2}
+|- a S_empty  acquire             {1}
+|- W %alloc   ttg.local_store     {1}
+|- r S_full   release             {1} -> {2}
+|- a S_full   acquire             {2}
 |- scf.if %cond                          structural
 |  |- then region                        entry {2} exit {2}
 |  |  |- R %alloc  ttg.local_load        {2}
 |  |- else region                        entry {2} exit {2}
-|- R %alloc  ttg.local_load              {2}
-|  |- r S_empty release EMPTY            {2} -> {1}
-|- a S_empty acquire EMPTY               {1}
-|- W %alloc  ttg.local_store             {1}
+|- R %alloc   ttg.local_load      {2}
+|- r S_empty  release             {2} -> {1}
+|- a S_empty  acquire             {1}
+|- W %alloc   ttg.local_store     {1}
 ```
 
 Optimized-sync DAG:
 
 ```text
 OPT-SYNC-DAG backing=%alloc
-|- a S_empty acquire EMPTY               {1}
-|- W %alloc  ttg.local_store             {1}
-|  |- r S_full release FULL              {1} -> {2}
-|- a S_full acquire FULL                 {2}
+|- a S_empty  acquire             {1}
+|- W %alloc   ttg.local_store     {1}
+|- r S_full   release             {1} -> {2}
+|- a S_full   acquire             {2}
 |- scf.if %cond                          structural
 |  |- then region                        entry {2} exit {2}
 |  |  |- R %alloc  ttg.local_load        {2}
 |  |- else region                        entry {2} exit {2}
-|- R %alloc  ttg.local_load              {2}
-|  |- r S_empty release EMPTY            {2} -> {1}
-|- a S_empty acquire EMPTY               {1}
-|- W %alloc  ttg.local_store             {1}
+|- R %alloc   ttg.local_load      {2}
+|- r S_empty  release             {2} -> {1}
+|- a S_empty  acquire             {1}
+|- W %alloc   ttg.local_store     {1}
 ```
 
 ### Example 4: For Body With Nested Conditional Use
@@ -858,44 +872,44 @@ Raw-sync DAG:
 
 ```text
 RAW-SYNC-DAG backing=%alloc
-|- a S_empty acquire EMPTY               {1}
-|- W %alloc  ttg.local_store             {1}
-|- scf.for %i = %c0 to %n step %c1       structural
-|  |- body region                        entry {1} exit {1} carried
-|  |  |- W %alloc  ttg.local_store       {1}
-|  |  |- scf.if %cond                    structural
-|  |  |  |- then region                  entry {1} exit {1}
-|  |  |  |  |- r S_then_full release FULL   {1} -> {2}
-|  |  |  |  |- a S_then_full acquire FULL   {2}
-|  |  |  |  |- R %alloc  ttg.local_load     {2}
-|  |  |  |  |- r S_then_empty release EMPTY {2} -> {1}
-|  |  |  |  |- a S_then_empty acquire EMPTY {1}
-|  |  |  |- else region                  entry {1} exit {1}
-|  |  |- W %alloc  ttg.local_store       {1}
-|  |  |- scf.yield                       owner {1}
-|- W %alloc  ttg.local_store             {1}
+|- a S_empty      acquire             {1}
+|- W %alloc       ttg.local_store     {1}
+|- scf.for %i = %c0 to %n step %c1            structural
+|  |- body region                             entry {1} exit {1} carried
+|  |  |- W %alloc  ttg.local_store      {1}
+|  |  |- scf.if %cond                         structural
+|  |  |  |- then region                       entry {1} exit {1}
+|  |  |  |  |- r S_then_full  release        {1} -> {2}
+|  |  |  |  |- a S_then_full  acquire        {2}
+|  |  |  |  |- R %alloc       ttg.local_load {2}
+|  |  |  |  |- r S_then_empty release        {2} -> {1}
+|  |  |  |  |- a S_then_empty acquire        {1}
+|  |  |  |- else region                       entry {1} exit {1}
+|  |  |- W %alloc  ttg.local_store      {1}
+|  |  |- scf.yield                            owner {1}
+|- W %alloc       ttg.local_store     {1}
 ```
 
 Optimized-sync DAG:
 
 ```text
 OPT-SYNC-DAG backing=%alloc
-|- a S_empty acquire EMPTY               {1}
-|- W %alloc  ttg.local_store             {1}
-|- scf.for %i = %c0 to %n step %c1       structural
-|  |- body region                        entry {1} exit {1} carried
-|  |  |- W %alloc  ttg.local_store       {1}
-|  |  |- scf.if %cond                    structural
-|  |  |  |- then region                  entry {1} exit {1}
-|  |  |  |  |- r S_then_full release FULL   {1} -> {2}
-|  |  |  |  |- a S_then_full acquire FULL   {2}
-|  |  |  |  |- R %alloc  ttg.local_load     {2}
-|  |  |  |  |- r S_then_empty release EMPTY {2} -> {1}
-|  |  |  |  |- a S_then_empty acquire EMPTY {1}
-|  |  |  |- else region                  entry {1} exit {1}
-|  |  |- W %alloc  ttg.local_store       {1}
-|  |  |- scf.yield                       owner {1}
-|- W %alloc  ttg.local_store             {1}
+|- a S_empty      acquire             {1}
+|- W %alloc       ttg.local_store     {1}
+|- scf.for %i = %c0 to %n step %c1            structural
+|  |- body region                             entry {1} exit {1} carried
+|  |  |- W %alloc  ttg.local_store      {1}
+|  |  |- scf.if %cond                         structural
+|  |  |  |- then region                       entry {1} exit {1}
+|  |  |  |  |- r S_then_full  release        {1} -> {2}
+|  |  |  |  |- a S_then_full  acquire        {2}
+|  |  |  |  |- R %alloc       ttg.local_load {2}
+|  |  |  |  |- r S_then_empty release        {2} -> {1}
+|  |  |  |  |- a S_then_empty acquire        {1}
+|  |  |  |- else region                       entry {1} exit {1}
+|  |  |- W %alloc  ttg.local_store      {1}
+|  |  |- scf.yield                            owner {1}
+|- W %alloc       ttg.local_store     {1}
 ```
 
 ### Example 5: qk/alpha/pacc Shared TMEM Group
@@ -949,64 +963,64 @@ Raw-sync DAG:
 
 ```text
 RAW-SYNC-DAG backing=qk_alpha_slot
-|- a S_alpha_done acquire EMPTY          {1}
-|- scf.for %i = %c0 to %n step %c1       structural
-|  |- body region                        entry {1} exit {1} carried
-|  |  |- W qk_0      tc_gen5_mma         {1}
-|  |  |  |- r S_qk_ready release FULL    {1} -> {5}
-|  |  |- a S_qk_ready acquire FULL       {5}
-|  |  |- R qk_0      tmem_load           {5}
-|  |  |- W alpha_0   tmem_store          {5}
-|  |  |  |- r S_alpha_ready release FULL {5} -> {0}
-|  |  |- a S_alpha_ready acquire FULL    {0}
-|  |  |- R alpha_0   tmem_load           {0}
-|  |  |  |- r S_alpha_done release EMPTY {0} -> {1}
-|  |  |- a S_alpha_done acquire EMPTY    {1}
-|  |  |- scf.yield                       owner {1}
+|- a S_alpha_done   acquire             {1}
+|- scf.for %i = %c0 to %n step %c1              structural
+|  |- body region                               entry {1} exit {1} carried
+|  |  |- W qk_0         tc_gen5_mma     {1}
+|  |  |- r S_qk_ready   release         {1} -> {5}
+|  |  |- a S_qk_ready   acquire         {5}
+|  |  |- R qk_0         tmem_load       {5}
+|  |  |- W alpha_0      tmem_store      {5}
+|  |  |- r S_alpha_ready release        {5} -> {0}
+|  |  |- a S_alpha_ready acquire        {0}
+|  |  |- R alpha_0      tmem_load       {0}
+|  |  |- r S_alpha_done release         {0} -> {1}
+|  |  |- a S_alpha_done acquire         {1}
+|  |  |- scf.yield                              owner {1}
 
 RAW-SYNC-DAG backing=acc_slot
-|- a S_acc_empty acquire EMPTY           {5}
-|- scf.for %i = %c0 to %n step %c1       structural
-|  |- body region                        entry {5} exit {5} carried
-|  |  |- W acc_0     tmem_store          {5}
-|  |  |  |- r S_acc_ready release FULL   {5} -> {1}
-|  |  |- a S_acc_ready acquire FULL      {1}
-|  |  |- W acc_0     tc_gen5_mma         {1}
-|  |  |  |- r S_acc_empty release EMPTY  {1} -> {5}
-|  |  |- a S_acc_empty acquire EMPTY     {5}
-|  |  |- scf.yield                       owner {5}
+|- a S_acc_empty    acquire             {5}
+|- scf.for %i = %c0 to %n step %c1              structural
+|  |- body region                               entry {5} exit {5} carried
+|  |  |- W acc_0        tmem_store      {5}
+|  |  |- r S_acc_ready  release         {5} -> {1}
+|  |  |- a S_acc_ready  acquire         {1}
+|  |  |- W acc_0        tc_gen5_mma     {1}
+|  |  |- r S_acc_empty  release         {1} -> {5}
+|  |  |- a S_acc_empty  acquire         {5}
+|  |  |- scf.yield                              owner {5}
 ```
 
 Optimized-sync DAG:
 
 ```text
 OPT-SYNC-DAG backing=qk_alpha_slot
-|- a S_alpha_done acquire EMPTY          {1}
-|- scf.for %i = %c0 to %n step %c1       structural
-|  |- body region                        entry {1} exit {1} carried
-|  |  |- W qk_0      tc_gen5_mma         {1}
-|  |  |  |- r S_qk_ready release FULL    {1} -> {5}
-|  |  |- a S_qk_ready acquire FULL       {5}
-|  |  |- R qk_0      tmem_load           {5}
-|  |  |- W alpha_0   tmem_store          {5}
-|  |  |  |- r S_alpha_ready release FULL {5} -> {0}
-|  |  |- a S_alpha_ready acquire FULL    {0}
-|  |  |- R alpha_0   tmem_load           {0}
-|  |  |  |- r S_alpha_done release EMPTY {0} -> {1}
-|  |  |- a S_alpha_done acquire EMPTY    {1}
-|  |  |- scf.yield                       owner {1}
+|- a S_alpha_done   acquire             {1}
+|- scf.for %i = %c0 to %n step %c1              structural
+|  |- body region                               entry {1} exit {1} carried
+|  |  |- W qk_0         tc_gen5_mma     {1}
+|  |  |- r S_qk_ready   release         {1} -> {5}
+|  |  |- a S_qk_ready   acquire         {5}
+|  |  |- R qk_0         tmem_load       {5}
+|  |  |- W alpha_0      tmem_store      {5}
+|  |  |- r S_alpha_ready release        {5} -> {0}
+|  |  |- a S_alpha_ready acquire        {0}
+|  |  |- R alpha_0      tmem_load       {0}
+|  |  |- r S_alpha_done release         {0} -> {1}
+|  |  |- a S_alpha_done acquire         {1}
+|  |  |- scf.yield                              owner {1}
 
 OPT-SYNC-DAG backing=acc_slot
-|- a S_acc_empty acquire EMPTY           {5}
-|- scf.for %i = %c0 to %n step %c1       structural
-|  |- body region                        entry {5} exit {5} carried
-|  |  |- W acc_0     tmem_store          {5}
-|  |  |  |- r S_acc_ready release FULL   {5} -> {1}
-|  |  |- a S_acc_ready acquire FULL      {1}
-|  |  |- W acc_0     tc_gen5_mma         {1}
-|  |  |  |- r S_acc_empty release EMPTY  {1} -> {5}
-|  |  |- a S_acc_empty acquire EMPTY     {5}
-|  |  |- scf.yield                       owner {5}
+|- a S_acc_empty    acquire             {5}
+|- scf.for %i = %c0 to %n step %c1              structural
+|  |- body region                               entry {5} exit {5} carried
+|  |  |- W acc_0        tmem_store      {5}
+|  |  |- r S_acc_ready  release         {5} -> {1}
+|  |  |- a S_acc_ready  acquire         {1}
+|  |  |- W acc_0        tc_gen5_mma     {1}
+|  |  |- r S_acc_empty  release         {1} -> {5}
+|  |  |- a S_acc_empty  acquire         {5}
+|  |  |- scf.yield                              owner {5}
 ```
 
 `S_acc_ready` and `S_alpha_done` both target partition `{1}`, but they protect
