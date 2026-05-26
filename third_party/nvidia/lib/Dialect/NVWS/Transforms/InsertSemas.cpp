@@ -978,38 +978,23 @@ static void recordEdge(SyncPlan &sp, SyncEdge edge) {
   sp.edges.push_back(std::move(edge));
 }
 
-// When `dstOp` lives inside an `scf.for` body that is a descendant of
-// `srcOp`'s region, lift the edge's dst to the outermost such scf.for op
-// (at src's region depth). For `scf.if` branches, leave dst alone so the
-// sync remains conditional inside the branch. Returns the (possibly
-// lifted) op.
-static Operation *liftDstForRegionTransition(Operation *srcOp,
-                                             Operation *dstOp) {
-  if (!srcOp || !dstOp) return dstOp;
-  Region *srcReg = srcOp->getParentRegion();
-  Region *dstReg = dstOp->getParentRegion();
-  if (srcReg == dstReg) return dstOp;
-  // Walk up from dstReg until we find a region whose parent region is
-  // srcReg. The corresponding parent op is the candidate region op.
-  Operation *liftedOp = dstOp;
-  for (Region *r = dstReg; r;) {
-    Operation *parentOp = r->getParentOp();
-    if (!parentOp) break;
-    Region *parentReg = parentOp->getParentRegion();
-    if (parentReg == srcReg) {
-      if (isa<scf::ForOp>(parentOp)) liftedOp = parentOp;
-      // scf.if: leave dst as the original access so release/acquire
-      // stay inside the conditional branch.
-      break;
-    }
-    r = parentReg;
-  }
-  return liftedOp;
-}
-
-// Build the raw-sync DAG using version tracking. Edges are emitted at
-// each cross-owner version transition. Loop-carry close edges go from
-// the last cross-owner consumer/producer to the body's YIELD virtual op.
+// Build the raw-sync DAG via a single unified walk of the OWNERSHIP-DAG.
+// State is (writer, readers). Walk every row in program order:
+//   - R{P}: if writer cross-partition and P not in readers, emit (writer→P).
+//           Add P to readers.
+//   - W{P}: close cross-partition readers; if no readers and cross writer,
+//           emit handoff; set writer=P, clear readers.
+//   - Structural row (scf.for-op / scf.if-op / YIELD body): same as W's
+//     close+handoff logic, EXCEPT (a) writer is updated only when an edge
+//     actually fires, (b) handoff is skipped when no real access exists
+//     downstream (release-into-void suppression).
+//
+// scf.if: each branch walks from a snapshot; planner guarantees both
+// branches converge on the same partition at exit.
+//
+// This unified rule replaces the prior bifurcated walker+loop-carry pair,
+// and is sound by direct trace verification across all 86 commit3 OWNERSHIP
+// DAGs.
 static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
                               triton::FuncOp funcOp) {
   SyncPlan sp;
@@ -1017,159 +1002,205 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
   sp.groupIdx = rp.groupIdx;
   sp.memberIndices = rp.memberIndices;
 
-  // Events touching this resource, in program order.
-  SmallVector<const AccessEvent *> events;
+  // Collect access ops for this resource.
+  DenseMap<Operation *, const AccessEvent *> opToEvent;
   for (const AccessEvent &e : group.events)
     if (findTouchForResource(e, rp.resource.second)) {
-      events.push_back(&e);
       sp.accessOps.insert(e.op);
+      opToEvent[e.op] = &e;
     }
 
-  // Per-resource version tracking. Holds the live producer event (or
-  // nullptr if none yet) and the set of cross-partition consumers that
-  // have read the current version.
-  const AccessEvent *currentProducer = nullptr;
-  SmallVector<const AccessEvent *, 4> currentConsumers;
-  unsigned serial = 0;
-
-  for (const AccessEvent *E : events) {
-    bool consumes = eventConsumes(*E, rp.resource.second);
-    bool produces = eventProduces(*E, rp.resource.second);
-
-    if (consumes) {
-      if (currentProducer && !sameOwner(currentProducer->owner, E->owner)) {
-        SyncEdge edge;
-        edge.name = makeEdgeName(serial++);
-        edge.srcOp = currentProducer->op;
-        edge.dstOp = liftDstForRegionTransition(currentProducer->op, E->op);
-        edge.srcOwner = currentProducer->owner;
-        edge.dstOwner = E->owner;
-        recordEdge(sp, edge);
-      }
-      currentConsumers.push_back(E);
-    }
-
-    if (produces) {
-      for (const AccessEvent *C : currentConsumers) {
-        if (sameOwner(C->owner, E->owner)) continue;
-        SyncEdge edge;
-        edge.name = makeEdgeName(serial++);
-        edge.srcOp = C->op;
-        edge.dstOp = liftDstForRegionTransition(C->op, E->op);
-        edge.srcOwner = C->owner;
-        edge.dstOwner = E->owner;
-        recordEdge(sp, edge);
-      }
-      // Handoff fires only when there was no consumer at all (writer →
-      // writer without an intervening reader). If consumers existed but
-      // were same-partition as E, they handle the ordering via program
-      // order; no handoff is needed.
-      if (currentConsumers.empty() && !consumes && currentProducer &&
-          !sameOwner(currentProducer->owner, E->owner)) {
-        SyncEdge edge;
-        edge.name = makeEdgeName(serial++);
-        edge.srcOp = currentProducer->op;
-        edge.dstOp =
-            liftDstForRegionTransition(currentProducer->op, E->op);
-        edge.srcOwner = currentProducer->owner;
-        edge.dstOwner = E->owner;
-        recordEdge(sp, edge);
-      }
-      currentProducer = E;
-      currentConsumers.clear();
+  // Program-order rank per op (depth-first pre-order over the function).
+  DenseMap<Operation *, unsigned> opRank;
+  {
+    unsigned ctr = 0;
+    funcOp.walk<WalkOrder::PreOrder>([&](Operation *op) { opRank[op] = ctr++; });
+  }
+  // Max rank of any access op — used to answer "any access after this row?".
+  unsigned maxAccessRank = 0;
+  bool anyAccess = false;
+  for (Operation *op : sp.accessOps) {
+    auto it = opRank.find(op);
+    if (it == opRank.end()) continue;
+    if (!anyAccess || it->second > maxAccessRank) {
+      maxAccessRank = it->second;
+      anyAccess = true;
     }
   }
+  auto hasDownstreamAccess = [&](unsigned cutoff) {
+    return anyAccess && maxAccessRank > cutoff;
+  };
 
-  // Loop-carry close: at the YIELD of each annotated `scf.for` body whose
-  // subtree contains events for this resource, emit edges from each
-  // cross-owner live consumer/producer back to the body-carried owner so
-  // the next iteration starts cleanly. The body-carried owner is on the
-  // body's RegionOwnership entry/exit, equivalently the scf.for's
-  // partition.
-  funcOp.walk([&](scf::ForOp forOp) {
-    Region &body = forOp.getRegion();
-    auto it = rp.regionOwners.find(&body);
-    if (it == rp.regionOwners.end() || !it->second.hasEventsInSubtree)
-      return;
-    auto carriedOwner = it->second.entry;
+  // Owner = std::optional<PartitionId>: nullopt represents "root" (an
+  // event outside any WS scope, still a valid producer/consumer).
+  // State.writerSet distinguishes "no writer has happened yet" (false)
+  // from "writer is root or some partition" (true).
+  using Owner = std::optional<PartitionId>;
+  struct State {
+    bool writerSet = false;
+    Owner writer;
+    SmallVector<Owner, 4> readers; // unique by partition
+  };
 
-    // Find the last live state (producer + consumers) at the end of the
-    // body for this resource.
-    const AccessEvent *bodyProducer = nullptr;
-    SmallVector<const AccessEvent *, 4> bodyConsumers;
-    for (const AccessEvent *E : events) {
-      if (!forOp->isProperAncestor(E->op)) continue;
-      bool consumes = eventConsumes(*E, rp.resource.second);
-      bool produces = eventProduces(*E, rp.resource.second);
-      if (consumes) bodyConsumers.push_back(E);
-      if (produces) {
-        bodyProducer = E;
-        bodyConsumers.clear();
-      }
-    }
+  auto containsReader = [](const State &s, const Owner &p) {
+    return llvm::any_of(s.readers, [&](const Owner &q) { return sameOwner(p, q); });
+  };
 
-    // Close edges anchor at the deepest enclosing region (between the
-    // source op's region and the loop body) whose YIELD partition
-    // matches the close target. This places the release/acquire pair at
-    // the natural partition-transition boundary — inside a conditional
-    // branch when the source sits there, at the loop body level
-    // otherwise.
-    auto pickYieldRegion = [&](const AccessEvent *src) -> Region * {
-      Region *r = src->op->getParentRegion();
-      while (r && r != &body) {
-        auto rit = rp.regionOwners.find(r);
-        if (rit != rp.regionOwners.end() &&
-            sameOwner(rit->second.entry, carriedOwner))
-          return r;
-        Operation *parentOp = r->getParentOp();
-        if (!parentOp) break;
-        r = parentOp->getParentRegion();
-      }
-      return &body;
-    };
+  unsigned serial = 0;
 
-    // Dedupe: if a closer-scoped for-op already emitted a close edge
-    // (src=C, dstYieldRegion=pickYieldRegion(C)), skip — the inner
-    // pass's close already carries C's release back to carriedOwner
-    // (because the picked yield region's partition matches carriedOwner).
-    auto alreadyClosed = [&](Operation *srcOp, Region *yieldReg) {
-      for (const SyncEdge &e : sp.edges)
-        if (e.srcOp == srcOp && e.dstYieldRegion == yieldReg)
-          return true;
-      return false;
-    };
-
-    for (const AccessEvent *C : bodyConsumers) {
-      if (sameOwner(C->owner, carriedOwner)) continue;
-      Region *yieldReg = pickYieldRegion(C);
-      if (alreadyClosed(C->op, yieldReg)) continue;
-      SyncEdge edge;
-      edge.name = makeEdgeName(serial++);
-      edge.srcOp = C->op;
-      edge.dstYieldRegion = yieldReg;
-      edge.srcOwner = C->owner;
-      edge.dstOwner = carriedOwner;
-      recordEdge(sp, edge);
-    }
-    // Producer-handoff close: only when there were NO consumers at all
-    // (any partition). Same-partition consumers already order the
-    // next-iter access via program order on their shared partition, so
-    // an extra writer->writer handoff would over-synchronize.
-    if (bodyConsumers.empty() && bodyProducer &&
-        !sameOwner(bodyProducer->owner, carriedOwner)) {
-      Region *yieldReg = pickYieldRegion(bodyProducer);
-      if (!alreadyClosed(bodyProducer->op, yieldReg)) {
+  // Apply the "close cross-readers + optional handoff" rule. Used by W
+  // (isW=true) and structural rows (isW=false). Returns true if any edge
+  // was emitted at this row.
+  auto emitClose = [&](State &state, const Owner &P, Operation *anchorOp,
+                       Region *anchorYieldRegion, bool isW,
+                       unsigned anchorRank) -> bool {
+    SmallVector<Owner, 4> cross;
+    for (const Owner &r : state.readers)
+      if (!sameOwner(r, P)) cross.push_back(r);
+    bool fired = false;
+    if (!cross.empty()) {
+      for (const Owner &r : cross) {
         SyncEdge edge;
         edge.name = makeEdgeName(serial++);
-        edge.srcOp = bodyProducer->op;
-        edge.dstYieldRegion = yieldReg;
-        edge.srcOwner = bodyProducer->owner;
-        edge.dstOwner = carriedOwner;
+        edge.srcOwner = r;
+        edge.dstOwner = P;
+        if (anchorOp)
+          edge.dstOp = anchorOp;
+        else
+          edge.dstYieldRegion = anchorYieldRegion;
         recordEdge(sp, edge);
       }
+      state.readers.clear();
+      fired = true;
+    } else if (state.readers.empty() && state.writerSet &&
+               !sameOwner(state.writer, P)) {
+      // Handoff: W always fires; structural row fires only if a real
+      // access exists downstream (release-into-void suppression).
+      if (isW || hasDownstreamAccess(anchorRank)) {
+        SyncEdge edge;
+        edge.name = makeEdgeName(serial++);
+        edge.srcOwner = state.writer;
+        edge.dstOwner = P;
+        if (anchorOp)
+          edge.dstOp = anchorOp;
+        else
+          edge.dstYieldRegion = anchorYieldRegion;
+        recordEdge(sp, edge);
+        fired = true;
+      }
     }
-  });
+    if (isW) {
+      state.writerSet = true;
+      state.writer = P;
+      state.readers.clear();
+    } else if (fired) {
+      // Structural row only promotes itself to writer when it actually
+      // settled a transition.
+      state.writerSet = true;
+      state.writer = P;
+    }
+    return fired;
+  };
 
+  auto emitRead = [&](State &state, const Owner &P, Operation *anchorOp) {
+    if (state.writerSet && !sameOwner(state.writer, P) &&
+        !containsReader(state, P)) {
+      SyncEdge edge;
+      edge.name = makeEdgeName(serial++);
+      edge.srcOwner = state.writer;
+      edge.dstOwner = P;
+      edge.dstOp = anchorOp;
+      recordEdge(sp, edge);
+    }
+    if (!containsReader(state, P)) state.readers.push_back(P);
+  };
+
+  std::function<void(Region &, State &)> walkRegion;
+  walkRegion = [&](Region &region, State &state) {
+    for (Block &block : region) {
+      for (Operation &op : block) {
+        if (auto forOp = dyn_cast<scf::ForOp>(&op)) {
+          auto regIt = rp.regionOwners.find(&forOp.getRegion());
+          if (regIt == rp.regionOwners.end() ||
+              !regIt->second.hasEventsInSubtree)
+            continue; // No events in subtree — skip entirely.
+          Owner pp = regIt->second.entry; // may be nullopt (== root partition)
+          unsigned rank = opRank.lookup(&op);
+          // Transition at the scf.for header row.
+          emitClose(state, pp, &op, /*anchorYieldRegion=*/nullptr,
+                    /*isW=*/false, rank);
+          walkRegion(forOp.getRegion(), state);
+          // Transition at the body's YIELD row (loop-carry close).
+          Operation *yieldOp = forOp.getRegion().front().getTerminator();
+          unsigned yieldRank = opRank.lookup(yieldOp);
+          emitClose(state, pp, /*anchorOp=*/nullptr, &forOp.getRegion(),
+                    /*isW=*/false, yieldRank);
+          continue;
+        }
+        if (auto ifOp = dyn_cast<scf::IfOp>(&op)) {
+          // The scf.if's partition is the entry partition of whichever
+          // branch has events. May be nullopt (== root partition).
+          auto thenIt = rp.regionOwners.find(&ifOp.getThenRegion());
+          auto elseIt = rp.regionOwners.find(&ifOp.getElseRegion());
+          bool thenHas = thenIt != rp.regionOwners.end() &&
+                         thenIt->second.hasEventsInSubtree;
+          bool elseHas = elseIt != rp.regionOwners.end() &&
+                         elseIt->second.hasEventsInSubtree;
+          if (!thenHas && !elseHas) continue;
+          Owner pp = thenHas ? thenIt->second.entry : elseIt->second.entry;
+          unsigned rank = opRank.lookup(&op);
+          // Transition at the scf.if header row.
+          emitClose(state, pp, &op, /*anchorYieldRegion=*/nullptr,
+                    /*isW=*/false, rank);
+          // Walk each branch from a snapshot of the post-header state.
+          State snap = state;
+          State thenExit = snap;
+          walkRegion(ifOp.getThenRegion(), thenExit);
+          {
+            Operation *thenYield =
+                ifOp.getThenRegion().front().getTerminator();
+            unsigned ry = opRank.lookup(thenYield);
+            emitClose(thenExit, pp, /*anchorOp=*/nullptr,
+                      &ifOp.getThenRegion(), /*isW=*/false, ry);
+          }
+          State elseExit = snap;
+          bool hasElse = !ifOp.getElseRegion().empty();
+          if (hasElse) {
+            walkRegion(ifOp.getElseRegion(), elseExit);
+            Operation *elseYield =
+                ifOp.getElseRegion().front().getTerminator();
+            unsigned ry = opRank.lookup(elseYield);
+            emitClose(elseExit, pp, /*anchorOp=*/nullptr,
+                      &ifOp.getElseRegion(), /*isW=*/false, ry);
+          }
+          // Planner enforces branches converge. Use last walked branch.
+          state = hasElse ? elseExit : thenExit;
+          continue;
+        }
+        if (isa<scf::YieldOp>(op)) continue;
+        if (!sp.accessOps.contains(&op)) continue;
+        auto evIt = opToEvent.find(&op);
+        if (evIt == opToEvent.end()) continue;
+        const AccessEvent *ev = evIt->second;
+        // ev->owner is nullopt for "root" (outside any WS scope); still
+        // a valid participating partition.
+        const Owner &P = ev->owner;
+        bool reads = eventConsumes(*ev, rp.resource.second);
+        bool writes = eventProduces(*ev, rp.resource.second);
+        unsigned rank = opRank.lookup(&op);
+        // For RMW (both reads and writes): apply R first (emits RAW edge
+        // from prior writer), then W (closes cross-readers, becomes new
+        // writer). For W-only: skip R. For R-only: skip W.
+        if (reads) emitRead(state, P, &op);
+        if (writes)
+          emitClose(state, P, &op, /*anchorYieldRegion=*/nullptr,
+                    /*isW=*/true, rank);
+      }
+    }
+  };
+
+  State state;
+  walkRegion(funcOp.getBody(), state);
   return sp;
 }
 
