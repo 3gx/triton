@@ -439,20 +439,27 @@ tree lines through loop bodies, and print owner/partition on every access,
 release, and acquire. The full authoritative shapes are the end-to-end examples
 below. The key ownership rule is that the ownership view is printed from the
 side `RegionOwnership` plan, not from IR markers. It prints one tree per backing
-resource. Each line prints the partition that owns that resource at the
-corresponding function/then/else/body region, yield, or direct memory use:
+resource. Every annotated region renders explicit virtual `ENTER` and `YIELD`
+rows at the same depth as the access rows inside that region. The function
+region is never annotated and has no `ENTER`/`YIELD`. The region header line
+(`body region`, `then region`, `else region`) carries no `entry/exit` columns
+— the partition is on the `ENTER`/`YIELD` rows directly. Invariant: for every
+region, `ENTER.partition == YIELD.partition`:
 
 ```text
 OWNERSHIP-DAG backing=qk_0
-|- scf.for %offsetkv_y        structural
-|  |- body region             entry {1} exit {1} carried
-|  |  |- W qk_0  tc_gen5_mma  use {1}
-|  |  |- R qk_0  tmem_load    use {5}
-|  |  |- scf.if %cond         structural
-|  |  |  |- then region       entry {1} exit {1}
-|  |  |  |  |- R qk_0         use {5}
-|  |  |  |- else region       entry {1} exit {1}
-|  |  |- scf.yield            owner {1}
+|- func region @example
+|  |- scf.for %offsetkv_y        structural
+|  |  |- body region                          carried
+|  |  |  |- ENTER {1}
+|  |  |  |- W qk_0  tc_gen5_mma  use {1}
+|  |  |  |- R qk_0  tmem_load    use {5}
+|  |  |  |- scf.if %cond         structural
+|  |  |  |  |- then region
+|  |  |  |  |  |- ENTER {1}
+|  |  |  |  |  |- R qk_0         use {5}
+|  |  |  |  |  |- YIELD {1}
+|  |  |  |- YIELD {1}
 ```
 
 Dump requirements:
@@ -478,6 +485,32 @@ Dump requirements:
   access exists anywhere in subtree, the regioned op and its region rows are
   omitted entirely. The same rule applies to `RAW-SYNC-DAG` and
   `OPT-SYNC-DAG`.
+- every annotated region (`scf.for` body, `scf.if` then/else) renders an
+  explicit virtual `ENTER <partition>` row as its first child and a
+  virtual `YIELD <partition>` row as its last child, both at the same
+  tree depth as the access rows inside that region. The region header
+  line (`body region`, `then region`, `else region`) carries no
+  `entry/exit` columns — the partition information lives on the
+  `ENTER`/`YIELD` rows. A `body region` header still carries `carried`
+  when the loop body is loop-carried for this resource.
+- invariant for every annotated region: `ENTER.partition ==
+  YIELD.partition`. This is the same property the planner used to call
+  "entry == exit"; expressing it as two virtual ops lets the raw-sync
+  walker treat loop carry and branch reconciliation as ordinary
+  cross-owner edges to / from `YIELD` rather than a separate synthesis
+  pass.
+- the function region is never annotated and has no `ENTER`/`YIELD`. A
+  `func region @<name>` row remains a single header with no partition
+  column.
+- if a `scf.if` has no else region in IR, the `else region` row and its
+  `ENTER`/`YIELD` are omitted. Empty else regions present in IR but
+  containing no events for this resource still render the `else region`
+  header plus `ENTER <partition>` and `YIELD <partition>` (with the same
+  partition both sides per the invariant).
+- `ENTER`/`YIELD` rows do NOT appear in the `ACCESS-DAG`. The
+  `ACCESS-DAG` lists memory accesses only. `ENTER`/`YIELD` are an
+  ownership-and-sync construct and appear in `OWNERSHIP-DAG`,
+  `RAW-SYNC-DAG`, and `OPT-SYNC-DAG`.
 - owner propagation respects the warp-specialized for-loop as a scope
   barrier. An access whose `wsTag` is supplied by an enclosing
   warp-specialized `scf.for` (extrinsic) only propagates to region
@@ -492,11 +525,11 @@ Dump requirements:
     any region. Displayed with tagged form `{@<tag>.<partition>}` on rows
     outside that WS-loop, untagged on rows inside it.
 - in `OWNERSHIP-DAG`, print one tree per backing resource
-- in each ownership tree, print the partition owner/state on every
-  then/else/body region, yield, and direct memory use line that is
-  printed (subject to the no-access-no-row rule and scope-barrier rule
-  above). Regions whose subtree has transitive access but no in-scope
-  events display `entry root exit root`.
+- in each ownership tree, print the partition owner on every
+  `ENTER`/`YIELD` row and on every direct memory use line (subject to
+  the no-access-no-row rule and scope-barrier rule above). Regions whose
+  subtree has transitive access but no in-scope events display `ENTER
+  root` and `YIELD root`.
 - print release/acquire owner partitions directly on the sync marker line
 - use only `R` and `W` for memory access rows; MMAv5 accumulator updates are `W`
 - use `r` for semaphore release/signal rows and `a` for semaphore acquire/wait
@@ -519,9 +552,12 @@ Dump requirements:
   prefix.
 - enforce the alignment mechanically in the printer:
   - every row inside a block uses the fixed prefix `<tree>|- <kind>`,
-    where `<kind>` is one of `R`, `W`, `r`, `a`, `scf.for`, `scf.if`,
-    `then region`, `else region`, `body region`, `scf.yield`, or
-    `func region`.
+    where `<kind>` is one of `R`, `W`, `r`, `a`, `ENTER`, `YIELD`,
+    `scf.for`, `scf.if`, `then region`, `else region`, `body region`, or
+    `func region`. There is no separate `scf.yield` row; `YIELD` (the
+    virtual region-exit op) replaces it in `OWNERSHIP-DAG`,
+    `RAW-SYNC-DAG`, and `OPT-SYNC-DAG`. The `ACCESS-DAG` never prints
+    `ENTER`/`YIELD`.
   - the `R`/`W`/`r`/`a` kind character must be in the same column for
     every row at a given tree depth.
   - the first character of the semaphore name must be in the same column
@@ -560,6 +596,15 @@ owner domain.
 The access DAG creates dependency facts, not partition-pair channels. After
 structured region ownership is assigned, those facts become raw `SyncEdge`s for
 the required owner transitions.
+
+The walker treats virtual `ENTER` and `YIELD` rows as ordinary events in
+the per-resource program-order stream, with their partition annotations
+acting like access owners (but with no `consumes`/`produces` effect).
+This is what lets loop-carry and branch-reconciliation closing edges
+emerge naturally from the same cross-owner transition rule used for real
+accesses: when the last real access in a region has a different owner
+than that region's `YIELD`, the walker emits a cross-owner edge from the
+access to the `YIELD`. No separate synthesis pass is needed.
 
 Required edge classes:
 
@@ -649,7 +694,7 @@ Ownership DAG:
 
 ```text
 OWNERSHIP-DAG backing=%alloc
-|- func region @fanout                  entry {1} exit {7}
+|- func region @fanout
 |  |- %alloc = ttg.local_alloc          backing
 |  |- W %alloc  ttg.local_store         use {1}
 |  |- R %alloc  ttg.local_load          use {5}
@@ -657,6 +702,9 @@ OWNERSHIP-DAG backing=%alloc
 |  |- W %alloc  ttg.local_store         use {7}
 |  |- return
 ```
+
+(There are no annotated regions in this example — all accesses sit
+directly in the function region — so no `ENTER`/`YIELD` rows appear.)
 
 Raw-sync DAG:
 
@@ -714,13 +762,17 @@ Ownership DAG:
 
 ```text
 OWNERSHIP-DAG backing=%alloc
-|- func region @if_cond_only             entry {1} exit {1}
+|- func region @if_cond_only
 |  |- %alloc = ttg.local_alloc           backing
 |  |- W %alloc  ttg.local_store          use {1}
 |  |- scf.if %cond                       structural
-|  |  |- then region                     entry {1} exit {1}
+|  |  |- then region
+|  |  |  |- ENTER {1}
 |  |  |  |- R %alloc  ttg.local_load     use {2}
-|  |  |- else region                     entry {1} exit {1}
+|  |  |  |- YIELD {1}
+|  |  |- else region
+|  |  |  |- ENTER {1}
+|  |  |  |- YIELD {1}
 |  |- W %alloc  ttg.local_store          use {1}
 |  |- return
 ```
@@ -732,13 +784,17 @@ RAW-SYNC-DAG backing=%alloc
 |- a S_init       acquire             {1}
 |- W %alloc       ttg.local_store     {1}
 |- scf.if %cond                              structural
-|  |- then region                            entry {1} exit {1}
+|  |- then region
+|  |  |- ENTER {1}
 |  |  |- r S_then_full  release             {1} -> {2}
 |  |  |- a S_then_full  acquire             {2}
 |  |  |- R %alloc       ttg.local_load      {2}
 |  |  |- r S_then_empty release             {2} -> {1}
 |  |  |- a S_then_empty acquire             {1}
-|  |- else region                            entry {1} exit {1}
+|  |  |- YIELD {1}
+|  |- else region
+|  |  |- ENTER {1}
+|  |  |- YIELD {1}
 |- W %alloc       ttg.local_store     {1}
 ```
 
@@ -749,13 +805,17 @@ OPT-SYNC-DAG backing=%alloc
 |- a S_empty      acquire             {1}
 |- W %alloc       ttg.local_store     {1}
 |- scf.if %cond                              structural
-|  |- then region                            entry {1} exit {1}
+|  |- then region
+|  |  |- ENTER {1}
 |  |  |- r S_then_full  release             {1} -> {2}
 |  |  |- a S_then_full  acquire             {2}
 |  |  |- R %alloc       ttg.local_load      {2}
 |  |  |- r S_then_empty release             {2} -> {1}
 |  |  |- a S_then_empty acquire             {1}
-|  |- else region                            entry {1} exit {1}
+|  |  |- YIELD {1}
+|  |- else region
+|  |  |- ENTER {1}
+|  |  |- YIELD {1}
 |- W %alloc       ttg.local_store     {1}
 ```
 
@@ -780,13 +840,17 @@ Ownership DAG:
 
 ```text
 OWNERSHIP-DAG backing=%alloc
-|- func region @if_post_consume          entry {1} exit {1}
+|- func region @if_post_consume
 |  |- %alloc = ttg.local_alloc           backing
 |  |- W %alloc  ttg.local_store          use {1}
 |  |- scf.if %cond                       structural
-|  |  |- then region                     entry {2} exit {2}
+|  |  |- then region
+|  |  |  |- ENTER {2}
 |  |  |  |- R %alloc  ttg.local_load     use {2}
-|  |  |- else region                     entry {2} exit {2}
+|  |  |  |- YIELD {2}
+|  |  |- else region
+|  |  |  |- ENTER {2}
+|  |  |  |- YIELD {2}
 |  |- R %alloc  ttg.local_load           use {2}
 |  |- W %alloc  ttg.local_store          use {1}
 |  |- return
@@ -801,9 +865,13 @@ RAW-SYNC-DAG backing=%alloc
 |- r S_full   release             {1} -> {2}
 |- a S_full   acquire             {2}
 |- scf.if %cond                          structural
-|  |- then region                        entry {2} exit {2}
+|  |- then region
+|  |  |- ENTER {2}
 |  |  |- R %alloc  ttg.local_load        {2}
-|  |- else region                        entry {2} exit {2}
+|  |  |- YIELD {2}
+|  |- else region
+|  |  |- ENTER {2}
+|  |  |- YIELD {2}
 |- R %alloc   ttg.local_load      {2}
 |- r S_empty  release             {2} -> {1}
 |- a S_empty  acquire             {1}
@@ -819,9 +887,13 @@ OPT-SYNC-DAG backing=%alloc
 |- r S_full   release             {1} -> {2}
 |- a S_full   acquire             {2}
 |- scf.if %cond                          structural
-|  |- then region                        entry {2} exit {2}
+|  |- then region
+|  |  |- ENTER {2}
 |  |  |- R %alloc  ttg.local_load        {2}
-|  |- else region                        entry {2} exit {2}
+|  |  |- YIELD {2}
+|  |- else region
+|  |  |- ENTER {2}
+|  |  |- YIELD {2}
 |- R %alloc   ttg.local_load      {2}
 |- r S_empty  release             {2} -> {1}
 |- a S_empty  acquire             {1}
@@ -852,18 +924,23 @@ Ownership DAG:
 
 ```text
 OWNERSHIP-DAG backing=%alloc
-|- func region @loop_if                  entry {1} exit {1}
+|- func region @loop_if
 |  |- %alloc = ttg.local_alloc           backing
 |  |- W %alloc  ttg.local_store          use {1}
 |  |- scf.for %i = %c0 to %n step %c1    structural
-|  |  |- body region                     entry {1} exit {1} carried
+|  |  |- body region                                       carried
+|  |  |  |- ENTER {1}
 |  |  |  |- W %alloc  ttg.local_store    use {1}
 |  |  |  |- scf.if %cond                 structural
-|  |  |  |  |- then region               entry {1} exit {1}
+|  |  |  |  |- then region
+|  |  |  |  |  |- ENTER {1}
 |  |  |  |  |  |- R %alloc               use {2}
-|  |  |  |  |- else region               entry {1} exit {1}
+|  |  |  |  |  |- YIELD {1}
+|  |  |  |  |- else region
+|  |  |  |  |  |- ENTER {1}
+|  |  |  |  |  |- YIELD {1}
 |  |  |  |- W %alloc  ttg.local_store    use {1}
-|  |  |  |- scf.yield                    owner {1}
+|  |  |  |- YIELD {1}
 |  |- W %alloc  ttg.local_store          use {1}
 |  |- return
 ```
@@ -875,18 +952,23 @@ RAW-SYNC-DAG backing=%alloc
 |- a S_empty      acquire             {1}
 |- W %alloc       ttg.local_store     {1}
 |- scf.for %i = %c0 to %n step %c1            structural
-|  |- body region                             entry {1} exit {1} carried
+|  |- body region                                          carried
+|  |  |- ENTER {1}
 |  |  |- W %alloc  ttg.local_store      {1}
 |  |  |- scf.if %cond                         structural
-|  |  |  |- then region                       entry {1} exit {1}
+|  |  |  |- then region
+|  |  |  |  |- ENTER {1}
 |  |  |  |  |- r S_then_full  release        {1} -> {2}
 |  |  |  |  |- a S_then_full  acquire        {2}
 |  |  |  |  |- R %alloc       ttg.local_load {2}
 |  |  |  |  |- r S_then_empty release        {2} -> {1}
 |  |  |  |  |- a S_then_empty acquire        {1}
-|  |  |  |- else region                       entry {1} exit {1}
+|  |  |  |  |- YIELD {1}
+|  |  |  |- else region
+|  |  |  |  |- ENTER {1}
+|  |  |  |  |- YIELD {1}
 |  |  |- W %alloc  ttg.local_store      {1}
-|  |  |- scf.yield                            owner {1}
+|  |  |- YIELD {1}
 |- W %alloc       ttg.local_store     {1}
 ```
 
@@ -897,18 +979,23 @@ OPT-SYNC-DAG backing=%alloc
 |- a S_empty      acquire             {1}
 |- W %alloc       ttg.local_store     {1}
 |- scf.for %i = %c0 to %n step %c1            structural
-|  |- body region                             entry {1} exit {1} carried
+|  |- body region                                          carried
+|  |  |- ENTER {1}
 |  |  |- W %alloc  ttg.local_store      {1}
 |  |  |- scf.if %cond                         structural
-|  |  |  |- then region                       entry {1} exit {1}
+|  |  |  |- then region
+|  |  |  |  |- ENTER {1}
 |  |  |  |  |- r S_then_full  release        {1} -> {2}
 |  |  |  |  |- a S_then_full  acquire        {2}
 |  |  |  |  |- R %alloc       ttg.local_load {2}
 |  |  |  |  |- r S_then_empty release        {2} -> {1}
 |  |  |  |  |- a S_then_empty acquire        {1}
-|  |  |  |- else region                       entry {1} exit {1}
+|  |  |  |  |- YIELD {1}
+|  |  |  |- else region
+|  |  |  |  |- ENTER {1}
+|  |  |  |  |- YIELD {1}
 |  |  |- W %alloc  ttg.local_store      {1}
-|  |  |- scf.yield                            owner {1}
+|  |  |- YIELD {1}
 |- W %alloc       ttg.local_store     {1}
 ```
 
@@ -941,22 +1028,24 @@ Ownership DAGs:
 
 ```text
 OWNERSHIP-DAG backing=qk_alpha_slot
-|- func region @qk_alpha_acc             entry {1} exit {1}
+|- func region @qk_alpha_acc
 |  |- scf.for %i = %c0 to %n step %c1    structural
-|  |  |- body region                     entry {1} exit {1} carried
+|  |  |- body region                                       carried
+|  |  |  |- ENTER {1}
 |  |  |  |- W qk_0     tc_gen5_mma       use {1}
 |  |  |  |- R qk_0     tmem_load         use {5}
 |  |  |  |- W alpha_0  tmem_store        use {5}
 |  |  |  |- R alpha_0  tmem_load         use {0}
-|  |  |  |- scf.yield                    owner {1}
+|  |  |  |- YIELD {1}
 
 OWNERSHIP-DAG backing=acc_slot
-|- func region @qk_alpha_acc             entry {5} exit {5}
+|- func region @qk_alpha_acc
 |  |- scf.for %i = %c0 to %n step %c1    structural
-|  |  |- body region                     entry {5} exit {5} carried
+|  |  |- body region                                       carried
+|  |  |  |- ENTER {5}
 |  |  |  |- W acc_0    tmem_store        use {5}
 |  |  |  |- W acc_0    tc_gen5_mma       use {1}
-|  |  |  |- scf.yield                    owner {5}
+|  |  |  |- YIELD {5}
 ```
 
 Raw-sync DAG:
@@ -965,7 +1054,8 @@ Raw-sync DAG:
 RAW-SYNC-DAG backing=qk_alpha_slot
 |- a S_alpha_done   acquire             {1}
 |- scf.for %i = %c0 to %n step %c1              structural
-|  |- body region                               entry {1} exit {1} carried
+|  |- body region                                          carried
+|  |  |- ENTER {1}
 |  |  |- W qk_0         tc_gen5_mma     {1}
 |  |  |- r S_qk_ready   release         {1} -> {5}
 |  |  |- a S_qk_ready   acquire         {5}
@@ -976,19 +1066,20 @@ RAW-SYNC-DAG backing=qk_alpha_slot
 |  |  |- R alpha_0      tmem_load       {0}
 |  |  |- r S_alpha_done release         {0} -> {1}
 |  |  |- a S_alpha_done acquire         {1}
-|  |  |- scf.yield                              owner {1}
+|  |  |- YIELD {1}
 
 RAW-SYNC-DAG backing=acc_slot
 |- a S_acc_empty    acquire             {5}
 |- scf.for %i = %c0 to %n step %c1              structural
-|  |- body region                               entry {5} exit {5} carried
+|  |- body region                                          carried
+|  |  |- ENTER {5}
 |  |  |- W acc_0        tmem_store      {5}
 |  |  |- r S_acc_ready  release         {5} -> {1}
 |  |  |- a S_acc_ready  acquire         {1}
 |  |  |- W acc_0        tc_gen5_mma     {1}
 |  |  |- r S_acc_empty  release         {1} -> {5}
 |  |  |- a S_acc_empty  acquire         {5}
-|  |  |- scf.yield                              owner {5}
+|  |  |- YIELD {5}
 ```
 
 Optimized-sync DAG:
@@ -997,7 +1088,8 @@ Optimized-sync DAG:
 OPT-SYNC-DAG backing=qk_alpha_slot
 |- a S_alpha_done   acquire             {1}
 |- scf.for %i = %c0 to %n step %c1              structural
-|  |- body region                               entry {1} exit {1} carried
+|  |- body region                                          carried
+|  |  |- ENTER {1}
 |  |  |- W qk_0         tc_gen5_mma     {1}
 |  |  |- r S_qk_ready   release         {1} -> {5}
 |  |  |- a S_qk_ready   acquire         {5}
@@ -1008,19 +1100,20 @@ OPT-SYNC-DAG backing=qk_alpha_slot
 |  |  |- R alpha_0      tmem_load       {0}
 |  |  |- r S_alpha_done release         {0} -> {1}
 |  |  |- a S_alpha_done acquire         {1}
-|  |  |- scf.yield                              owner {1}
+|  |  |- YIELD {1}
 
 OPT-SYNC-DAG backing=acc_slot
 |- a S_acc_empty    acquire             {5}
 |- scf.for %i = %c0 to %n step %c1              structural
-|  |- body region                               entry {5} exit {5} carried
+|  |- body region                                          carried
+|  |  |- ENTER {5}
 |  |  |- W acc_0        tmem_store      {5}
 |  |  |- r S_acc_ready  release         {5} -> {1}
 |  |  |- a S_acc_ready  acquire         {1}
 |  |  |- W acc_0        tc_gen5_mma     {1}
 |  |  |- r S_acc_empty  release         {1} -> {5}
 |  |  |- a S_acc_empty  acquire         {5}
-|  |  |- scf.yield                              owner {5}
+|  |  |- YIELD {5}
 ```
 
 `S_acc_ready` and `S_alpha_done` both target partition `{1}`, but they protect
