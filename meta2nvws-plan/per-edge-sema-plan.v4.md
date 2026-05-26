@@ -638,6 +638,49 @@ Required edge classes:
 - handoff edge: a write in one owner is followed by a write in another owner
   without an intervening read fanout
 
+### Edge Classification Rule
+
+For each cross-owner edge between adjacent rows X (partition `Px`) and Y
+(partition `Py`) in the augmented per-resource program-order stream
+(`Px != Py`), classify by looking through virtual rows to the nearest
+real access on each side:
+
+- `src_effect` = effect of the last real access by partition `Px` at or
+  before X.
+  - X is `R` ⇒ `READ`.
+  - X is `W` ⇒ `WRITE`.
+  - X is `RW` (e.g. MMAv5 with `useAccumulator=true`) ⇒ `WRITE` (RW
+    leaves the slot freshly written).
+  - X is a virtual row (`ENTER`, `YIELD`, `scf.for`, `scf.if`) ⇒ look
+    back along the stream for the nearest real access whose partition
+    is `Px` and use its effect.
+
+- `dst_effect` = effect of the first real access by partition `Py` at or
+  after Y.
+  - Y is `R` ⇒ `READ`.
+  - Y is `W` ⇒ `WRITE`.
+  - Y is `RW` ⇒ `READ` (RW enters by consuming the prior version).
+  - Y is a virtual row ⇒ look forward along the stream for the nearest
+    real access whose partition is `Py`. For a loop-body `YIELD`, "next"
+    wraps to the next iteration's first real access of the carried
+    partition (`scf.for.partition == body.ENTER.partition ==
+    body.YIELD.partition`).
+
+- Edge kind/state:
+  - `WRITE → READ` ⇒ **ready** (state FULL). Semaphore name prefix
+    `R_`/`S_R_`.
+  - `READ → WRITE` ⇒ **done** (state EMPTY). Name prefix `D_`/`S_D_`.
+  - `WRITE → WRITE` (no intervening consumer) ⇒ **handoff** (state
+    EMPTY). Name prefix `H_`/`S_H_`.
+  - `READ → READ` (no intervening producer, same live version) ⇒
+    **ready** (state FULL). Chained-reader case; rare.
+
+There is no separate synthesis pass and no special case for RW-last
+events. The augmented stream with explicit region-op partitions and
+ENTER/YIELD virtual rows makes every cross-owner transition naturally
+visible, and the look-through convention resolves all virtual rows
+without ambiguity.
+
 The implementation should coalesce same-owner read events of the same
 `(logicalGroupId, resourceKey, producedVersion)` into one reader phase before
 emitting semaphore edges. This keeps one release per owner per phase and matches
