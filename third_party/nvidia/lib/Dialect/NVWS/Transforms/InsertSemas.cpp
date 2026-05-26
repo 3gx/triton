@@ -1094,10 +1094,7 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
     auto carriedOwner = it->second.entry;
 
     // Find the last live state (producer + consumers) at the end of the
-    // body for this resource. We re-walk events in this for-loop's
-    // subtree to compute it locally — the global currentProducer/
-    // currentConsumers at the very end of `events` may not correspond
-    // to this specific for-loop.
+    // body for this resource.
     const AccessEvent *bodyProducer = nullptr;
     SmallVector<const AccessEvent *, 4> bodyConsumers;
     for (const AccessEvent *E : events) {
@@ -1111,16 +1108,49 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
       }
     }
 
-    // Close edges: from each cross-owner consumer to YIELD, or from the
-    // last producer to YIELD if no consumers remain and the producer is
-    // cross-owner from the carried owner.
+    // Close edges anchor at the deepest enclosing region (between the
+    // source op's region and the loop body) whose YIELD partition
+    // matches the close target. This places the release/acquire pair at
+    // the natural partition-transition boundary — inside a conditional
+    // branch when the source sits there, at the loop body level
+    // otherwise.
+    auto pickYieldRegion = [&](const AccessEvent *src) -> Region * {
+      Region *r = src->op->getParentRegion();
+      while (r && r != &body) {
+        auto rit = rp.regionOwners.find(r);
+        if (rit != rp.regionOwners.end() &&
+            sameOwner(rit->second.entry, carriedOwner))
+          return r;
+        Operation *parentOp = r->getParentOp();
+        if (!parentOp) break;
+        r = parentOp->getParentRegion();
+      }
+      return &body;
+    };
+
+    // Dedupe: if a closer-scoped for-op already emitted a close edge
+    // (src=C, dstYieldRegion=pickYieldRegion(C)), skip — the inner
+    // pass's close already carries C's release back to carriedOwner
+    // (because the picked yield region's partition matches carriedOwner).
+    auto alreadyClosed = [&](Operation *srcOp, Region *yieldReg) {
+      for (const SyncEdge &e : sp.edges)
+        if (e.srcOp == srcOp && e.dstYieldRegion == yieldReg)
+          return true;
+      return false;
+    };
+
     bool emittedAny = false;
     for (const AccessEvent *C : bodyConsumers) {
       if (sameOwner(C->owner, carriedOwner)) continue;
+      Region *yieldReg = pickYieldRegion(C);
+      if (alreadyClosed(C->op, yieldReg)) {
+        emittedAny = true;  // covered by inner pass
+        continue;
+      }
       SyncEdge edge;
       edge.name = makeEdgeName(serial++);
       edge.srcOp = C->op;
-      edge.dstYieldRegion = &body;
+      edge.dstYieldRegion = yieldReg;
       edge.srcOwner = C->owner;
       edge.dstOwner = carriedOwner;
       recordEdge(sp, edge);
@@ -1128,13 +1158,16 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
     }
     if (!emittedAny && bodyProducer &&
         !sameOwner(bodyProducer->owner, carriedOwner)) {
-      SyncEdge edge;
-      edge.name = makeEdgeName(serial++);
-      edge.srcOp = bodyProducer->op;
-      edge.dstYieldRegion = &body;
-      edge.srcOwner = bodyProducer->owner;
-      edge.dstOwner = carriedOwner;
-      recordEdge(sp, edge);
+      Region *yieldReg = pickYieldRegion(bodyProducer);
+      if (!alreadyClosed(bodyProducer->op, yieldReg)) {
+        SyncEdge edge;
+        edge.name = makeEdgeName(serial++);
+        edge.srcOp = bodyProducer->op;
+        edge.dstYieldRegion = yieldReg;
+        edge.srcOwner = bodyProducer->owner;
+        edge.dstOwner = carriedOwner;
+        recordEdge(sp, edge);
+      }
     }
   });
 
