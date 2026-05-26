@@ -19,6 +19,7 @@
 #include "mlir/Pass/Pass.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
+#include "triton/Analysis/BufferRegion.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
@@ -191,11 +192,12 @@ static int64_t getBufferOffset(Operation *op) {
   return getI64Attr(op, kBufferOffsetAttrName).value_or(0);
 }
 
-static int64_t getTmemColumnExtent(MemDescType type) {
-  // Approximation: TMEM extent = product of last-two dims for column width.
-  auto shape = type.getShape();
-  if (shape.size() < 2) return 1;
-  return shape[shape.size() - 1];
+// Layout-correct extent. Delegates to `mlir::triton::getMemDescSize` so
+// TMEM allocs report columns (from tensor_memory_encoding) and SMEM
+// allocs report bytes (product(shape) * elementBitWidth/8). The
+// `buffer.offset` attr on each alloc is in the same native unit.
+static int64_t getAllocExtent(MemDescType type) {
+  return static_cast<int64_t>(mlir::triton::getMemDescSize(type));
 }
 
 static bool intervalsOverlap(int64_t aLo, int64_t aHi, int64_t bLo,
@@ -286,7 +288,11 @@ static void addTouch(BufferGroup &group, AccessEvent &event, Value v,
 // overlap share a resourceKey.
 // ---------------------------------------------------------------------------
 
-static void assignTmemResourceKeys(BufferGroup &group) {
+// Union-find members of one buffer.id group by overlap in their native
+// (memory-space) interval [offset, offset + size). Works uniformly for
+// TMEM (columns) and SMEM (bytes) because `getAllocExtent` selects the
+// right unit per memory space.
+static void assignResourceKeys(BufferGroup &group) {
   SmallVector<int64_t> parent(group.members.size());
   for (auto [idx, _] : llvm::enumerate(group.members)) parent[idx] = idx;
   std::function<int64_t(int64_t)> find = [&](int64_t i) -> int64_t {
@@ -319,10 +325,11 @@ static void assignTmemResourceKeys(BufferGroup &group) {
 // and ttg.local_alloc, uniformly. v4 §Uniform Access-DAG Builder.
 // ---------------------------------------------------------------------------
 
-static BufferGroup makeTmemGroup(int64_t logicalId,
-                                 MutableArrayRef<TMEMAllocOp> allocs) {
+template <typename AllocOpT>
+static BufferGroup makeGroup(MemorySpaceKind memory, int64_t logicalId,
+                             MutableArrayRef<AllocOpT> allocs) {
   BufferGroup group;
-  group.memory = MemorySpaceKind::Tmem;
+  group.memory = memory;
   group.logicalId = logicalId;
   for (auto [idx, allocOp] : llvm::enumerate(allocs)) {
     auto type = cast<MemDescType>(allocOp.getResult().getType());
@@ -331,24 +338,12 @@ static BufferGroup makeTmemGroup(int64_t logicalId,
     member.value = allocOp.getResult();
     member.type = type;
     member.offset = getBufferOffset(allocOp);
-    member.extent = getTmemColumnExtent(type);
+    member.extent = getAllocExtent(type);
     group.aliases.insert(
         {allocOp.getResult(), AliasInfo{static_cast<unsigned>(idx), {}}});
     group.members.push_back(member);
   }
-  assignTmemResourceKeys(group);
-  return group;
-}
-
-static BufferGroup makeLocalGroup(int64_t logicalId, LocalAllocOp allocOp) {
-  BufferGroup group;
-  group.memory = MemorySpaceKind::Local;
-  group.logicalId = logicalId;
-  auto type = cast<MemDescType>(allocOp.getResult().getType());
-  group.members.push_back(
-      {allocOp, allocOp.getResult(), type, /*offset=*/0, /*extent=*/1,
-       /*resourceKey=*/0});
-  group.aliases.insert({allocOp.getResult(), AliasInfo{0, {}}});
+  assignResourceKeys(group);
   return group;
 }
 
@@ -359,27 +354,31 @@ collectAllBackingGroups(triton::FuncOp funcOp) {
 
   // TMEM: group by buffer.id.
   llvm::MapVector<int64_t, SmallVector<TMEMAllocOp>> tmemBuckets;
-  DenseMap<Operation *, int64_t> tmemSynthetic;
   funcOp.walk([&](TMEMAllocOp allocOp) {
     if (isSemaphoreBackingAlloc(allocOp)) return;
     std::optional<int64_t> id = getBufferId(allocOp);
-    if (!id) {
-      tmemSynthetic[allocOp.getOperation()] = nextSyntheticId++;
-      id = tmemSynthetic[allocOp.getOperation()];
-    }
-    tmemBuckets[*id].push_back(allocOp);
+    int64_t key = id.value_or(nextSyntheticId++);
+    tmemBuckets[key].push_back(allocOp);
   });
   for (auto &[id, allocs] : tmemBuckets)
-    groups.push_back(makeTmemGroup(id, allocs));
+    groups.push_back(makeGroup<TMEMAllocOp>(MemorySpaceKind::Tmem, id, allocs));
 
-  // Local: one group per LocalAllocOp.
+  // Local: group by buffer.id (same pattern as TMEM). Allocs without a
+  // buffer.id attr get a fresh synthetic id so they remain singleton
+  // groups. Members within a shared buffer.id bucket whose
+  // [offset, offset+extent) intervals overlap union into one resourceKey.
+  llvm::MapVector<int64_t, SmallVector<LocalAllocOp>> localBuckets;
   funcOp.walk([&](LocalAllocOp allocOp) {
     if (isSemaphoreBackingAlloc(allocOp)) return;
     if (!isLocalSemaphoreBackingType(cast<MemDescType>(allocOp.getType())))
       return;
-    int64_t id = getBufferId(allocOp).value_or(nextSyntheticId++);
-    groups.push_back(makeLocalGroup(id, allocOp));
+    std::optional<int64_t> id = getBufferId(allocOp);
+    int64_t key = id.value_or(nextSyntheticId++);
+    localBuckets[key].push_back(allocOp);
   });
+  for (auto &[id, allocs] : localBuckets)
+    groups.push_back(
+        makeGroup<LocalAllocOp>(MemorySpaceKind::Local, id, allocs));
 
   return groups;
 }
