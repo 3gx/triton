@@ -1466,6 +1466,101 @@ The fanout/fanin optimizer consumes planned `SyncEdgeInfo` and produces planned
 `nvws.semaphore.release` ops. Debug metadata should stay in side data or debug
 dump state, not in IR.
 
+### Stage/Cluster Assignment for Emitted Sync Ops
+
+Stage/cluster is not derived by `InsertSemas.cpp`. Every input access op
+already carries `tt.loop.stage` / `tt.loop.cluster` attrs (set earlier by
+`AssignStagePhase` / pipelining). The emit step **reads those attrs off the
+anchor access op** and stamps them onto every newly-inserted
+`nvws.semaphore.*` op via `createInto(..., stageCluster, ...)`. There is
+no analysis, no schedule deserialization, and no derivation.
+
+#### Per-op-type rule for newly-inserted sync ops
+
+Commit 5 inserts exactly four NVWS op kinds. The rule is fixed per op kind
+and per anchor:
+
+1. **`nvws.semaphore.create`** (one EMPTY + one FULL per `SyncGroup`, or one
+   pair per Combine-C linear chain). Emitted **outside any WS scf.for** at
+   the function-entry / outer-WS-loop insertion point.
+   - **Stage/cluster: NONE.** These ops live above the pipelined region and
+     are not subject to a loop schedule. Do not stamp `tt.loop.stage` /
+     `tt.loop.cluster`.
+
+2. **`nvws.semaphore.acquire`** (token producer; inserted immediately before
+   the anchor access op, or at the YIELD virtual row of a region).
+   - Real-op anchor (`acquireBeforeOp[dstOp]`):
+     `stageCluster = getStageCluster(dstOp)`.
+   - YIELD-anchor (`acquireBeforeYield[region]`):
+     `stageCluster = cache[dstOwner]`, where `cache[dstOwner]` is the last
+     stage/cluster seen on the destination partition during the in-region
+     walk.
+
+3. **`nvws.semaphore.buffer`** (memdesc view consumer; inserted between an
+   acquire and the rewritten memory op on the same access).
+   - **Stage/cluster: identical to the acquire that produced its input
+     token.** Use `getStageCluster(dstOp)` for real-op anchors and
+     `cache[dstOwner]` for YIELD anchors. This matches the rule used by
+     `InsertTmemSemaphore.cpp::getBuffer` (line ~716, ~1157).
+
+4. **`nvws.semaphore.release`** (token consumer; inserted immediately after
+   the producer access op, or at the YIELD virtual row of a region).
+   - Real-op anchor (`releaseAfterOp[srcOp]` / `releaseBeforeOp[dstOp]`
+     when the anchor is the same access being protected):
+     `stageCluster = getStageCluster(srcOp)`.
+   - YIELD-anchor (`releaseBeforeYield[region]` / `releaseAfterYield[region]`):
+     `stageCluster = cache[srcOwner]`, where `cache[srcOwner]` is the last
+     stage/cluster seen on the source partition during the in-region walk.
+
+#### Initial writable permit (sourceful-alloc preamble)
+
+When a `(logicalGroupId, resourceKey)` has a sourceful first writer
+(`sourcefulAllocStore == true`), commit 5 emits, immediately before the
+sourceful alloc op:
+
+- `nvws.semaphore.acquire EMPTY` → `nvws.semaphore.buffer EMPTY, tok` →
+  `*_store(allocOp.getSrc(), buf)`
+
+All three of these emitted ops use `stageCluster = getStageCluster(allocOp)`.
+
+#### Per-resource walk cache
+
+The emit step maintains a small `DenseMap<PartitionId, StageCluster>` that
+is updated by **every access op** the walk visits, before any sync op for
+that access is emitted:
+
+```text
+cache[ev.owner] = getStageCluster(ev.op)   // applied at each AccessEvent
+```
+
+This cache is the **sole** source of stage/cluster for YIELD-anchored sync
+ops. By the time the walk reaches the region's YIELD virtual row, the
+cache holds the cluster of the last in-region access by each partition.
+
+#### Fallback
+
+If `getStageCluster(anchorOp)` returns `std::nullopt` and the cache has no
+entry for the anchor's owner, omit `tt.loop.stage` / `tt.loop.cluster` on
+the emitted op. This matches the behavior of `InsertTmemSemaphore.cpp` for
+unpipelined anchors and is well-defined: `createInto(..., stageCluster=nullopt, ...)`
+does not stamp the attrs.
+
+#### Carrier token plumbing
+
+Token threading through `scf.for` iter_args and `scf.if` results does not
+itself carry stage/cluster. Only the materialized acquire / buffer / release
+ops do. The iter_arg / result is an SSA value of `!ttg.async.token` type
+and is unschedulable.
+
+#### Verifier hook (post-emission)
+
+The post-emission verifier (§Post-Emission Verification) must check that
+every newly-emitted `nvws.semaphore.{acquire,buffer,release}` op inside a
+pipelined scf.for has `tt.loop.stage` + `tt.loop.cluster` attrs **when its
+anchor access op carries them**. A missing stage/cluster on an emitted op
+when the anchor carries one is a hard pass diagnostic, not a silent
+defect.
+
 ## Final Combine Subpass
 
 Add a final DAG-level optimization step inside `InsertSemas.cpp`, before
