@@ -643,6 +643,213 @@ The implementation should coalesce same-owner read events of the same
 emitting semaphore edges. This keeps one release per owner per phase and matches
 pending-count lowering semantics.
 
+### Raw DAG Edge Model — One Counter Per Edge
+
+The `RAW-SYNC-DAG` does NOT classify edges with FULL/EMPTY state and does
+NOT use producer/consumer framing. Every cross-owner edge is a single
+ordering counter:
+
+- counter initial value = 0
+- source partition `release`s after its op (counter += 1)
+- destination partition `acquire`s before its op (counter -= 1; blocks
+  while 0)
+
+That is the entire semantic. The edge enforces "source op done before
+destination op starts" — nothing more. Edges with shared sources or
+shared destinations remain separate counters in the raw DAG.
+
+Edges are derived from version tracking (not adjacent-row scan): the
+walker maintains the current version's producer and the running set of
+that version's cross-partition consumers. On each event:
+
+- consumer arrives ⇒ emit one edge from the cross-partition producer to
+  this consumer; add to consumer set.
+- writer arrives ⇒ retire the current version: emit one edge from each
+  cross-partition consumer to this writer (or, if no consumers, one
+  edge from the cross-partition producer); start a new version with
+  this writer as producer.
+
+Concurrent readers in the same version produce NO edge between
+themselves — they are independent.
+
+#### Example 1 — simple loop, two partitions
+
+Input IR shape:
+
+```mlir
+scf.for %i ... attrs = {tt.warp_specialize, tag = 0} {
+  ttg.local_store %v, %m0   { ttg.partition = 0 }    // W, partition {0}
+  ttg.local_load %m0        { ttg.partition = 1 }    // R, partition {1}
+}
+```
+
+ACCESS-DAG (accesses only; no region-op partitions, no ENTER/YIELD):
+
+```text
+ACCESS-DAG buffer.id=N
+|- func region @example1
+|  |- scf.for (WS, tag=0)
+|  |  |- W m0  ttg.local_store  {0}
+|  |  |- R m0  ttg.local_load   {1}
+```
+
+OWNERSHIP-DAG:
+
+```text
+OWNERSHIP-DAG buffer.id=N resourceKey=K
+|- func region @example1
+|  |- scf.for (WS, tag=0) {0}
+|  |  |- ENTER {0}
+|  |  |- W m0  ttg.local_store  use {0}
+|  |  |- R m0  ttg.local_load   use {1}
+|  |  |- YIELD {0}
+```
+
+RAW-SYNC-DAG (per-edge counters, no FULL/EMPTY):
+
+```text
+RAW-SYNC-DAG buffer.id=N resourceKey=K
+|- func region @example1
+|  |- scf.for (WS, tag=0) {0}
+|  |  |- ENTER {0}
+|  |  |- W m0  ttg.local_store  {0}
+|  |  |- r S_e0  release  {0} -> {1}
+|  |  |- a S_e0  acquire  {1}
+|  |  |- R m0  ttg.local_load   {1}
+|  |  |- r S_e1  release  {1} -> {0}
+|  |  |- a S_e1  acquire  {0}
+|  |  |- YIELD {0}
+```
+
+Two edges. `S_e0` enforces "W{0} done before R{1} reads". `S_e1`
+enforces "R{1} done before next-iter W{0} overwrites" (the loop carry,
+naturally produced because YIELD's partition `{0}` differs from
+R{1}'s partition).
+
+OPT-SYNC-DAG: nothing combines (each src/dst pair is unique). Identical
+to RAW-SYNC-DAG.
+
+```text
+OPT-SYNC-DAG buffer.id=N resourceKey=K
+|- func region @example1
+|  |- scf.for (WS, tag=0) {0}
+|  |  |- ENTER {0}
+|  |  |- W m0  ttg.local_store  {0}
+|  |  |- r S_e0  release  {0} -> {1}
+|  |  |- a S_e0  acquire  {1}
+|  |  |- R m0  ttg.local_load   {1}
+|  |  |- r S_e1  release  {1} -> {0}
+|  |  |- a S_e1  acquire  {0}
+|  |  |- YIELD {0}
+```
+
+#### Example 2 — fanout/fanin, five partitions
+
+Input IR shape:
+
+```mlir
+scf.for %i ... attrs = {tt.warp_specialize, tag = 0} {
+  ttg.local_store %v0, %m0  { ttg.partition = 0 }   // W{0}
+  ttg.local_load %m0        { ttg.partition = 1 }   // R{1}
+  ttg.local_load %m0        { ttg.partition = 2 }   // R{2}
+  ttg.local_load %m0        { ttg.partition = 3 }   // R{3}
+  ttg.local_store %v1, %m0  { ttg.partition = 4 }   // W{4}
+}
+```
+
+ACCESS-DAG:
+
+```text
+ACCESS-DAG buffer.id=N
+|- func region @example2
+|  |- scf.for (WS, tag=0)
+|  |  |- W m0  ttg.local_store  {0}
+|  |  |- R m0  ttg.local_load   {1}
+|  |  |- R m0  ttg.local_load   {2}
+|  |  |- R m0  ttg.local_load   {3}
+|  |  |- W m0  ttg.local_store  {4}
+```
+
+OWNERSHIP-DAG (body's loop-carried owner is `{0}` — the partition that
+opens each iteration with its W):
+
+```text
+OWNERSHIP-DAG buffer.id=N resourceKey=K
+|- func region @example2
+|  |- scf.for (WS, tag=0) {0}
+|  |  |- ENTER {0}
+|  |  |- W m0  ttg.local_store  use {0}
+|  |  |- R m0  ttg.local_load   use {1}
+|  |  |- R m0  ttg.local_load   use {2}
+|  |  |- R m0  ttg.local_load   use {3}
+|  |  |- W m0  ttg.local_store  use {4}
+|  |  |- YIELD {0}
+```
+
+RAW-SYNC-DAG — seven independent counters:
+
+```text
+RAW-SYNC-DAG buffer.id=N resourceKey=K
+|- func region @example2
+|  |- scf.for (WS, tag=0) {0}
+|  |  |- ENTER {0}
+|  |  |- W m0  ttg.local_store  {0}
+|  |  |- r S_e0  release  {0} -> {1}
+|  |  |- r S_e1  release  {0} -> {2}
+|  |  |- r S_e2  release  {0} -> {3}
+|  |  |- a S_e0  acquire  {1}
+|  |  |- R m0  ttg.local_load   {1}
+|  |  |- r S_e3  release  {1} -> {4}
+|  |  |- a S_e1  acquire  {2}
+|  |  |- R m0  ttg.local_load   {2}
+|  |  |- r S_e4  release  {2} -> {4}
+|  |  |- a S_e2  acquire  {3}
+|  |  |- R m0  ttg.local_load   {3}
+|  |  |- r S_e5  release  {3} -> {4}
+|  |  |- a S_e3  acquire  {4}
+|  |  |- a S_e4  acquire  {4}
+|  |  |- a S_e5  acquire  {4}
+|  |  |- W m0  ttg.local_store  {4}
+|  |  |- r S_e6  release  {4} -> {0}
+|  |  |- a S_e6  acquire  {0}
+|  |  |- YIELD {0}
+```
+
+Note that R{1}, R{2}, R{3} have NO edges between them — they are
+concurrent readers of the same version produced by W{0}. The walker
+emits W{0}→R{i} (three edges from the producer, one per consumer) and
+R{i}→W{4} (three edges to the next writer, one per reader). There is no
+R→R edge.
+
+OPT-SYNC-DAG — at the opt stage, edges from the same source to many
+destinations (fanout) or from many sources to the same destination
+(fanin) may combine into one shared counter with pending-count
+semantics, retaining the original ordering. Combining is a separate
+design problem; the raw DAG above does not need any combine
+classification to be correct.
+
+### Cautionary Note — Do Not Re-Introduce FULL/EMPTY Classification In Raw DAG
+
+The raw DAG is intentionally simple: per-edge counter, no kind label,
+no FULL/EMPTY column, no producer/consumer framing. The walker only
+needs the version-tracking rule (single writer owner exclusive,
+multiple reader owners permitted concurrently) to know where edges go.
+The textbook FULL/EMPTY producer/consumer model is a TWO-SHARED-COUNTER
+optimization that belongs to the opt-sync stage when many edges
+collapse via pending counts. Applying it to the raw DAG over-engineers
+the structure and obscures the actual data dependency.
+
+In particular:
+
+- do NOT add `ready`/`done`/`handoff` kind labels to raw edge rows.
+- do NOT add a FULL/EMPTY state column.
+- do NOT classify the edge by what kind of access X and Y are; the edge
+  is just "X must complete before Y starts", regardless.
+- do NOT special-case any access type (e.g. MMAv5). Every access is
+  either `R` (provably read-only — `ttng.tmem_load`, `ttg.local_load`,
+  etc.) or `W` (everything else: store, alloc-with-source, mma,
+  descriptor load, etc.).
+
 ## Control Flow Rules
 
 Control flow is resolved by structured region ownership, not by the combine
