@@ -19,7 +19,6 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
-#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Visitors.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
@@ -680,6 +679,9 @@ struct ResourcePlan {
   // Index into AccessEvent::touches of the touch that hit this resource
   // (used to render the right member name in the dump).
   DenseMap<Operation *, unsigned> useTouchIdx;
+  // All per-member touches that hit this resource. Mixed-effect terminal ops can
+  // read one member and write another member in the same physical conflict class.
+  DenseMap<Operation *, SmallVector<unsigned, 2>> useTouchIdxs;
   // scf.yield owner stamp for loop bodies that carry this resource.
   DenseMap<Operation *, std::optional<PartitionId>> yieldOwner;
 };
@@ -888,12 +890,16 @@ planResource(triton::FuncOp funcOp, unsigned groupIdx, BufferGroup &group,
       plan.memberIndices.push_back(static_cast<unsigned>(idx));
 
   for (AccessEvent &event : group.events) {
+    bool found = false;
     for (auto [tIdx, touch] : llvm::enumerate(event.touches)) {
       if (touch.resourceKey == resourceKey) {
-        plan.useOwner[event.op] = event.owner;
-        plan.useTagSource[event.op] = event.tagSourceOp;
-        plan.useTouchIdx[event.op] = static_cast<unsigned>(tIdx);
-        break;
+        if (!found) {
+          plan.useOwner[event.op] = event.owner;
+          plan.useTagSource[event.op] = event.tagSourceOp;
+          plan.useTouchIdx[event.op] = static_cast<unsigned>(tIdx);
+          found = true;
+        }
+        plan.useTouchIdxs[event.op].push_back(static_cast<unsigned>(tIdx));
       }
     }
   }
@@ -999,22 +1005,31 @@ struct SyncPlan {
 static bool touchReads(const AccessTouch &t) { return hasRead(t.effect); }
 static bool touchWrites(const AccessTouch &t) { return hasWrite(t.effect); }
 
-static const AccessTouch *
-findTouchForResource(const AccessEvent &event, int64_t resourceKey) {
+static void collectTouchesForResource(
+    const AccessEvent &event, int64_t resourceKey,
+    SmallVectorImpl<const AccessTouch *> &touches) {
   for (const AccessTouch &t : event.touches)
-    if (t.resourceKey == resourceKey) return &t;
-  return nullptr;
+    if (t.resourceKey == resourceKey)
+      touches.push_back(&t);
+}
+
+static bool eventTouchesResource(const AccessEvent &event, int64_t resourceKey) {
+  return llvm::any_of(event.touches, [&](const AccessTouch &t) {
+    return t.resourceKey == resourceKey;
+  });
 }
 
 // True iff `event` reads/writes the resource identified by `resourceKey`.
 static bool eventConsumes(const AccessEvent &event, int64_t resourceKey) {
-  if (auto *t = findTouchForResource(event, resourceKey))
-    return touchReads(*t);
+  for (const AccessTouch &t : event.touches)
+    if (t.resourceKey == resourceKey && touchReads(t))
+      return true;
   return false;
 }
 static bool eventProduces(const AccessEvent &event, int64_t resourceKey) {
-  if (auto *t = findTouchForResource(event, resourceKey))
-    return touchWrites(*t);
+  for (const AccessTouch &t : event.touches)
+    if (t.resourceKey == resourceKey && touchWrites(t))
+      return true;
   return false;
 }
 
@@ -1119,7 +1134,7 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
   // Collect access ops for this resource.
   DenseMap<Operation *, const AccessEvent *> opToEvent;
   for (const AccessEvent &e : group.events)
-    if (findTouchForResource(e, rp.resource.second)) {
+    if (eventTouchesResource(e, rp.resource.second)) {
       sp.accessOps.insert(e.op);
       opToEvent[e.op] = &e;
     }
@@ -1208,17 +1223,21 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
     edge.asyncPayload = getAsyncPayload(edge.srcOp);
     if (edge.srcOp) {
       auto it = opToEvent.find(edge.srcOp);
-      if (it != opToEvent.end())
-        if (const AccessTouch *touch =
-                findTouchForResource(*it->second, rp.resource.second))
+      if (it != opToEvent.end()) {
+        SmallVector<const AccessTouch *, 4> touches;
+        collectTouchesForResource(*it->second, rp.resource.second, touches);
+        for (const AccessTouch *touch : touches)
           edge.touches.push_back(*touch);
+      }
     }
     if (edge.dstOp) {
       auto it = opToEvent.find(edge.dstOp);
-      if (it != opToEvent.end())
-        if (const AccessTouch *touch =
-                findTouchForResource(*it->second, rp.resource.second))
+      if (it != opToEvent.end()) {
+        SmallVector<const AccessTouch *, 4> touches;
+        collectTouchesForResource(*it->second, rp.resource.second, touches);
+        for (const AccessTouch *touch : touches)
           edge.touches.push_back(*touch);
+      }
     }
   };
 
@@ -1477,6 +1496,11 @@ struct OptSyncDag {
   DenseMap<Operation *, SmallVector<unsigned, 2>> acquireBeforeOp;
   DenseMap<Region *, SmallVector<unsigned, 2>> acquireBeforeYield;
   DenseSet<Operation *> accessOps;
+  // Planned CFG token-threading requirements. These are derived from OPT-SYNC
+  // anchors at structured op/yield boundaries before emission; the emitter only
+  // materializes the planned iter_args/results.
+  DenseSet<Operation *> threadForOps;
+  DenseSet<Operation *> threadIfOps;
 };
 
 static std::string makeGroupName(unsigned serial) {
@@ -1748,6 +1772,30 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, BufferGroup &group) {
     }
     }
   }
+
+  auto markThreadedOp = [&](Operation *op) {
+    if (!op) return;
+    if (isa<scf::ForOp>(op))
+      dag.threadForOps.insert(op);
+    else if (isa<scf::IfOp>(op))
+      dag.threadIfOps.insert(op);
+  };
+  auto markOpAnchors = [&](const DenseMap<Operation *, SmallVector<unsigned, 2>>
+                               &anchors) {
+    for (auto &kv : anchors)
+      markThreadedOp(kv.first);
+  };
+  auto markYieldAnchors =
+      [&](const DenseMap<Region *, SmallVector<unsigned, 2>> &anchors) {
+        for (auto &kv : anchors)
+          markThreadedOp(kv.first->getParentOp());
+      };
+  markOpAnchors(dag.releaseBeforeOp);
+  markOpAnchors(dag.acquireBeforeOp);
+  markOpAnchors(dag.releaseAfterOp);
+  markYieldAnchors(dag.releaseBeforeYield);
+  markYieldAnchors(dag.acquireBeforeYield);
+  markYieldAnchors(dag.releaseAfterYield);
   return dag;
 }
 
@@ -1859,10 +1907,13 @@ static Value createSemaphore(OpBuilder &b, Location loc,
   return op.getResult();
 }
 
-struct ResourceSemaphores {
+struct SyncGroupSemaphores {
   Value empty;
-  Value linearFull;
-  DenseMap<unsigned, Value> fullByGroup;
+  Value full;
+};
+
+struct ResourceSemaphores {
+  DenseMap<unsigned, SyncGroupSemaphores> byGroup;
 };
 
 static const AccessEvent *findEvent(BufferGroup &group, Operation *op) {
@@ -1925,26 +1976,43 @@ static ResourceSemaphores createResourceSemaphores(const OptSyncDag &dag,
   b.setInsertionPoint(anchor);
   ResourceSemaphores semas;
   Location loc = group.members.front().allocOp->getLoc();
-  semas.empty = createSemaphore(b, loc, backing, /*released=*/true);
+
+  std::optional<unsigned> initialIdx;
+  std::optional<unsigned> linearIdx;
   for (auto [idx, syncGroup] : llvm::enumerate(dag.groups)) {
-    bool needsFull = false;
     if (syncGroup.kind == SyncGroupKind::InitialEmpty)
-      needsFull = false;
-    else if (syncGroup.kind == SyncGroupKind::ReadyFanout)
-      needsFull = true;
-    else if (syncGroup.kind == SyncGroupKind::LinearChain)
-      needsFull = true;
-    else if (syncGroup.kind == SyncGroupKind::Singleton) {
-      const SyncEdge &edge = sp.edges[syncGroup.edgeIdxs.front()];
-      needsFull = !edgeUsesEmpty(edge, group, dag.resource.second);
-    }
-    if (!needsFull) continue;
-    Value full = createSemaphore(b, loc, backing, /*released=*/false);
+      initialIdx = static_cast<unsigned>(idx);
     if (syncGroup.kind == SyncGroupKind::LinearChain)
-      semas.linearFull = full;
-    else
-      semas.fullByGroup[static_cast<unsigned>(idx)] = full;
+      linearIdx = static_cast<unsigned>(idx);
   }
+
+  bool shareInitialWithLinear = false;
+  if (initialIdx && linearIdx) {
+    const SyncGroup &initial = dag.groups[*initialIdx];
+    const SyncGroup &linear = dag.groups[*linearIdx];
+    if (!linear.edgeIdxs.empty()) {
+      const SyncEdge &firstEdge = sp.edges[linear.edgeIdxs.front()];
+      shareInitialWithLinear =
+          initial.initialOp && firstEdge.srcOp == initial.initialOp &&
+          firstEdge.srcYieldRegion == nullptr &&
+          sameOwner(firstEdge.srcOwner, initial.initialOwner);
+    }
+  }
+
+  for (auto [idx, syncGroup] : llvm::enumerate(dag.groups)) {
+    unsigned groupIdx = static_cast<unsigned>(idx);
+    if (shareInitialWithLinear && initialIdx && groupIdx == *initialIdx)
+      continue;
+    bool emptyInitiallyReleased =
+        syncGroup.kind == SyncGroupKind::InitialEmpty ||
+        syncGroup.kind == SyncGroupKind::LinearChain;
+    SyncGroupSemaphores pair;
+    pair.empty = createSemaphore(b, loc, backing, emptyInitiallyReleased);
+    pair.full = createSemaphore(b, loc, backing, /*released=*/false);
+    semas.byGroup[groupIdx] = pair;
+  }
+  if (shareInitialWithLinear && initialIdx && linearIdx)
+    semas.byGroup[*initialIdx] = semas.byGroup.lookup(*linearIdx);
   return semas;
 }
 
@@ -2004,21 +2072,22 @@ static Value getSemaphoreForGroup(unsigned groupIdx, const SyncEdge *edge,
                                   BufferGroup &group,
                                   ResourceSemaphores &semas) {
   const SyncGroup &syncGroup = dag.groups[groupIdx];
+  SyncGroupSemaphores pair = semas.byGroup.lookup(groupIdx);
   switch (syncGroup.kind) {
   case SyncGroupKind::InitialEmpty:
-    return semas.empty;
+    return pair.empty;
   case SyncGroupKind::DoneFanin:
-    return semas.empty;
+    return pair.empty;
   case SyncGroupKind::ReadyFanout:
-    return semas.fullByGroup.lookup(groupIdx);
+    return pair.full;
   case SyncGroupKind::LinearChain:
     return edge && edgeUsesEmpty(*edge, group, dag.resource.second)
-               ? semas.empty
-               : semas.linearFull;
+               ? pair.empty
+               : pair.full;
   case SyncGroupKind::Singleton:
     if (edge && edgeUsesEmpty(*edge, group, dag.resource.second))
-      return semas.empty;
-    return semas.fullByGroup.lookup(groupIdx);
+      return pair.empty;
+    return pair.full;
   }
   llvm_unreachable("unhandled sync group kind");
 }
@@ -2105,24 +2174,9 @@ static bool regionContainsAccess(Region &region, const OptSyncDag &dag) {
   return found;
 }
 
-static bool regionHasYieldSync(Region &region, const OptSyncDag &dag) {
-  return dag.releaseBeforeYield.count(&region) ||
-         dag.acquireBeforeYield.count(&region) ||
-         dag.releaseAfterYield.count(&region);
-}
-
-static const AccessTouch *touchForEvent(const AccessEvent &event,
-                                        const OptSyncDag &dag) {
-  return findTouchForResource(event, dag.resource.second);
-}
-
 static ArrayAttr asyncPayloadArray(OpBuilder &b, AsyncOp payload) {
   return b.getArrayAttr(
       SmallVector<Attribute>{AsyncOpAttr::get(b.getContext(), payload)});
-}
-
-static Value poisonToken(OpBuilder &b, Location loc) {
-  return ub::PoisonOp::create(b, loc, b.getType<AsyncTokenType>());
 }
 
 static SmallVector<Type, 4> getSemaphoreBufferViewTypes(BufferGroup &group,
@@ -2321,14 +2375,16 @@ static void eraseUnusedOriginals(BufferGroup &group) {
 }
 
 static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
-                                     const AccessTouch &touch,
+                                     ArrayRef<const AccessTouch *> touches,
                                      ArrayRef<AcquireRecord> acquires,
                                      BufferGroup &group,
                                      const OptSyncDag &dag,
                                      const GroupBacking &backing,
                                      EmitState &state) {
   Operation *op = event.op;
-  bool writes = touchWrites(touch);
+  bool writes = llvm::any_of(touches, [](const AccessTouch *touch) {
+    return touchWrites(*touch);
+  });
 
   Value sem;
   Value token;
@@ -2351,13 +2407,19 @@ static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
                           stageCluster, group, backing, writes);
   SmallVector<Value, 4> buffers(bufferOp.getBuffers().begin(),
                                 bufferOp.getBuffers().end());
-  if (touch.memberIdx >= buffers.size())
-    return op->emitError("nvws-insert-semas: semaphore buffer member index out "
-                         "of range");
-  Value accessBuffer = materializeAliasForBuffer(b, touch, buffers[touch.memberIdx]);
+  state.eventBuffers[op] = buffers;
   Operation *retargetOp = op;
 
   if (auto tmemAlloc = dyn_cast<TMEMAllocOp>(op)) {
+    if (touches.size() != 1)
+      return op->emitError("nvws-insert-semas: sourceful TMEM alloc has "
+                           "multiple touches for one resource");
+    const AccessTouch &touch = *touches.front();
+    if (touch.memberIdx >= buffers.size())
+      return op->emitError("nvws-insert-semas: semaphore buffer member index out "
+                           "of range");
+    Value accessBuffer =
+        materializeAliasForBuffer(b, touch, buffers[touch.memberIdx]);
     if (Value src = tmemAlloc.getSrc()) {
       auto vTrue = createIntoPartition<arith::ConstantIntOp>(
           b, op->getLoc(), {event.owner, getStageCluster(op)}, true, 1);
@@ -2367,7 +2429,20 @@ static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
       retargetOp = store.getOperation();
       replaceUsesExcept(tmemAlloc.getResult(), accessBuffer, store);
     }
+    state.emittedBuffers.push_back(EmittedBufferRecord{
+        op, retargetOp, bufferOp.getOperation(), sem, token, accessBuffer,
+        state.eventBuffers[op], touch.memberIdx,
+        expectedStampedStage(event.owner, stageCluster)});
   } else if (auto localAlloc = dyn_cast<LocalAllocOp>(op)) {
+    if (touches.size() != 1)
+      return op->emitError("nvws-insert-semas: sourceful local alloc has "
+                           "multiple touches for one resource");
+    const AccessTouch &touch = *touches.front();
+    if (touch.memberIdx >= buffers.size())
+      return op->emitError("nvws-insert-semas: semaphore buffer member index out "
+                           "of range");
+    Value accessBuffer =
+        materializeAliasForBuffer(b, touch, buffers[touch.memberIdx]);
     if (Value src = localAlloc.getSrc()) {
       if (Operation *def = src.getDefiningOp();
           def && isa<triton::DescriptorLoadOp, triton::DescriptorGatherOp>(def)) {
@@ -2389,21 +2464,34 @@ static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
       }
       replaceUsesExcept(localAlloc.getResult(), accessBuffer, retargetOp);
     }
+    state.emittedBuffers.push_back(EmittedBufferRecord{
+        op, retargetOp, bufferOp.getOperation(), sem, token, accessBuffer,
+        state.eventBuffers[op], touch.memberIdx,
+        expectedStampedStage(event.owner, stageCluster)});
   } else {
-    for (OpOperand &operand : op->getOpOperands())
-      if (operand.get() == touch.accessValue)
-        operand.set(accessBuffer);
+    SmallVector<std::pair<OpOperand *, Value>, 4> replacements;
+    for (const AccessTouch *touch : touches) {
+      if (touch->memberIdx >= buffers.size())
+        return op->emitError("nvws-insert-semas: semaphore buffer member index "
+                             "out of range");
+      Value accessBuffer =
+          materializeAliasForBuffer(b, *touch, buffers[touch->memberIdx]);
+      for (OpOperand &operand : op->getOpOperands())
+        if (operand.get() == touch->accessValue)
+          replacements.push_back({&operand, accessBuffer});
+      state.emittedBuffers.push_back(EmittedBufferRecord{
+          op, retargetOp, bufferOp.getOperation(), sem, token, accessBuffer,
+          state.eventBuffers[op], touch->memberIdx,
+          expectedStampedStage(event.owner, stageCluster)});
+    }
+    for (auto [operand, accessBuffer] : replacements)
+      operand->set(accessBuffer);
     replaceTokenOperands(op, token);
   }
 
   replaceTokenResults(op, token);
   state.eventToken[op] = token;
   state.eventSemaphore[op] = sem;
-  state.eventBuffers[op] = std::move(buffers);
-  state.emittedBuffers.push_back(EmittedBufferRecord{
-      op, retargetOp, bufferOp.getOperation(), sem, token, accessBuffer,
-      state.eventBuffers[op], touch.memberIdx,
-      expectedStampedStage(event.owner, stageCluster)});
   state.protectedAccesses.insert(op);
   state.knownCarrierTokens.insert(token);
   state.currentToken = token;
@@ -2412,8 +2500,8 @@ static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
   return success();
 }
 
-static Value lookupReleaseToken(OpBuilder &b, Location loc, const SyncEdge *edge,
-                                EmitState &state) {
+static FailureOr<Value> lookupReleaseToken(Location loc, const SyncEdge *edge,
+                                           EmitState &state) {
   if (edge && edge->srcOp) {
     auto it = state.eventToken.find(edge->srcOp);
     if (it != state.eventToken.end())
@@ -2421,28 +2509,34 @@ static Value lookupReleaseToken(OpBuilder &b, Location loc, const SyncEdge *edge
   }
   if (state.currentToken)
     return state.currentToken;
-  return poisonToken(b, loc);
+  emitError(loc, "nvws-insert-semas: planned release has no carrier token "
+                 "producer");
+  return failure();
 }
 
-static void emitReleaseForGroup(OpBuilder &b, Location loc,
-                                SyncAnchorKind kind, Operation *anchor,
-                                Region *yieldRegion, unsigned groupIdx,
-                                const OptSyncDag &dag, const SyncPlan &sp,
-                                BufferGroup &group, EmitState &state,
-                                StageCluster stageCluster) {
+static LogicalResult emitReleaseForGroup(OpBuilder &b, Location loc,
+                                         SyncAnchorKind kind, Operation *anchor,
+                                         Region *yieldRegion, unsigned groupIdx,
+                                         const OptSyncDag &dag,
+                                         const SyncPlan &sp, BufferGroup &group,
+                                         EmitState &state,
+                                         StageCluster stageCluster) {
   const SyncGroup &syncGroup = dag.groups[groupIdx];
   const SyncEdge *edge =
       findEdgeForAnchor(syncGroup, sp, kind, anchor, yieldRegion);
   Value sem = getSemaphoreForGroup(groupIdx, edge, dag, sp, group, state.semas);
-  Value token = lookupReleaseToken(b, loc, edge, state);
+  FailureOr<Value> token = lookupReleaseToken(loc, edge, state);
+  if (failed(token))
+    return failure();
   std::optional<PartitionId> owner = edge ? edge->srcOwner : std::nullopt;
   Operation *payloadOp = edge ? edge->srcOp : nullptr;
   SemaphoreReleaseOp release =
-      emitRelease(b, loc, sem, token, owner, stageCluster,
+      emitRelease(b, loc, sem, *token, owner, stageCluster,
                   edge ? edge->asyncPayload : getAsyncPayload(payloadOp));
   state.emittedReleases.push_back(EmittedSyncRecord{
-      groupIdx, kind, anchor, yieldRegion, release.getOperation(), sem, token,
+      groupIdx, kind, anchor, yieldRegion, release.getOperation(), sem, *token,
       expectedStampedStage(owner, stageCluster)});
+  return success();
 }
 
 static AcquireRecord emitAcquireForGroup(OpBuilder &b, Location loc,
@@ -2471,54 +2565,57 @@ static AcquireRecord emitAcquireForGroup(OpBuilder &b, Location loc,
   return AcquireRecord{groupIdx, sem, token, owner};
 }
 
-static SmallVector<AcquireRecord, 2>
+static LogicalResult
 emitBeforeOpSync(Operation *anchor, const OptSyncDag &dag, const SyncPlan &sp,
-                 BufferGroup &group, EmitState &state) {
-  SmallVector<AcquireRecord, 2> acquires;
+                 BufferGroup &group, EmitState &state,
+                 SmallVectorImpl<AcquireRecord> &acquires) {
   OpBuilder b(anchor);
   b.setInsertionPoint(anchor);
   auto rIt = dag.releaseBeforeOp.find(anchor);
   if (rIt != dag.releaseBeforeOp.end())
     for (unsigned gi : rIt->second)
-      emitReleaseForGroup(b, anchor->getLoc(), SyncAnchorKind::ReleaseBeforeOp,
-                          anchor, nullptr, gi, dag, sp, group, state,
-                          getStageCluster(anchor));
+      if (failed(emitReleaseForGroup(
+              b, anchor->getLoc(), SyncAnchorKind::ReleaseBeforeOp, anchor,
+              nullptr, gi, dag, sp, group, state, getStageCluster(anchor))))
+        return failure();
   auto aIt = dag.acquireBeforeOp.find(anchor);
   if (aIt != dag.acquireBeforeOp.end())
     for (unsigned gi : aIt->second)
       acquires.push_back(emitAcquireForGroup(
           b, anchor->getLoc(), SyncAnchorKind::AcquireBeforeOp, anchor, nullptr,
           gi, dag, sp, group, state, getStageCluster(anchor)));
-  return acquires;
+  return success();
 }
 
-static void emitAfterOpSync(Operation *anchor, Operation *insertAfter,
-                            const OptSyncDag &dag,
-                            const SyncPlan &sp, BufferGroup &group,
-                            EmitState &state) {
+static LogicalResult emitAfterOpSync(Operation *anchor, Operation *insertAfter,
+                                     const OptSyncDag &dag,
+                                     const SyncPlan &sp, BufferGroup &group,
+                                     EmitState &state) {
   auto rIt = dag.releaseAfterOp.find(anchor);
-  if (rIt == dag.releaseAfterOp.end()) return;
+  if (rIt == dag.releaseAfterOp.end()) return success();
   Operation *releaseAfter = insertAfter;
   if (!group.isTmem() && isa<LocalLoadOp>(insertAfter))
     releaseAfter = latestTransitiveConsumer(insertAfter);
   OpBuilder b(releaseAfter);
   b.setInsertionPointAfter(releaseAfter);
   for (unsigned gi : rIt->second)
-    emitReleaseForGroup(b, insertAfter->getLoc(), SyncAnchorKind::ReleaseAfterOp,
-                        anchor, nullptr, gi, dag, sp, group, state,
-                        getStageCluster(insertAfter));
+    if (failed(emitReleaseForGroup(
+            b, insertAfter->getLoc(), SyncAnchorKind::ReleaseAfterOp, anchor,
+            nullptr, gi, dag, sp, group, state, getStageCluster(insertAfter))))
+      return failure();
+  return success();
 }
 
-static void emitAfterOpSync(Operation *anchor, const OptSyncDag &dag,
-                            const SyncPlan &sp, BufferGroup &group,
-                            EmitState &state) {
-  emitAfterOpSync(anchor, anchor, dag, sp, group, state);
+static LogicalResult emitAfterOpSync(Operation *anchor, const OptSyncDag &dag,
+                                     const SyncPlan &sp, BufferGroup &group,
+                                     EmitState &state) {
+  return emitAfterOpSync(anchor, anchor, dag, sp, group, state);
 }
 
-static SmallVector<AcquireRecord, 2>
+static LogicalResult
 emitBeforeYieldSync(Operation *yieldOp, Region *region, const OptSyncDag &dag,
-                    const SyncPlan &sp, BufferGroup &group, EmitState &state) {
-  SmallVector<AcquireRecord, 2> acquires;
+                    const SyncPlan &sp, BufferGroup &group, EmitState &state,
+                    SmallVectorImpl<AcquireRecord> &acquires) {
   OpBuilder b(yieldOp);
   b.setInsertionPoint(yieldOp);
   auto rIt = dag.releaseBeforeYield.find(region);
@@ -2527,12 +2624,11 @@ emitBeforeYieldSync(Operation *yieldOp, Region *region, const OptSyncDag &dag,
       const SyncEdge *edge =
           findEdgeForAnchor(dag.groups[gi], sp,
                             SyncAnchorKind::ReleaseBeforeYield, nullptr, region);
-      emitReleaseForGroup(b, yieldOp->getLoc(),
-                          SyncAnchorKind::ReleaseBeforeYield, nullptr, region,
-                          gi, dag, sp, group, state,
-                          stageForYieldOwner(edge ? edge->srcOwner
-                                                  : std::nullopt,
-                                             state));
+      if (failed(emitReleaseForGroup(
+              b, yieldOp->getLoc(), SyncAnchorKind::ReleaseBeforeYield, nullptr,
+              region, gi, dag, sp, group, state,
+              stageForYieldOwner(edge ? edge->srcOwner : std::nullopt, state))))
+        return failure();
     }
   auto aIt = dag.acquireBeforeYield.find(region);
   if (aIt != dag.acquireBeforeYield.end())
@@ -2551,37 +2647,32 @@ emitBeforeYieldSync(Operation *yieldOp, Region *region, const OptSyncDag &dag,
       const SyncEdge *edge =
           findEdgeForAnchor(dag.groups[gi], sp,
                             SyncAnchorKind::ReleaseAfterYield, nullptr, region);
-      emitReleaseForGroup(b, yieldOp->getLoc(), SyncAnchorKind::ReleaseAfterYield,
-                          nullptr, region, gi, dag, sp, group, state,
-                          stageForYieldOwner(edge ? edge->srcOwner
-                                                  : std::nullopt,
-                                             state));
+      if (failed(emitReleaseForGroup(
+              b, yieldOp->getLoc(), SyncAnchorKind::ReleaseAfterYield, nullptr,
+              region, gi, dag, sp, group, state,
+              stageForYieldOwner(edge ? edge->srcOwner : std::nullopt, state))))
+        return failure();
     }
-  return acquires;
+  return success();
 }
 
 static bool shouldThreadForRegion(scf::ForOp forOp, const OptSyncDag &dag) {
-  return regionContainsAccess(forOp.getRegion(), dag) ||
-         regionHasYieldSync(forOp.getRegion(), dag) ||
-         dag.releaseBeforeOp.count(forOp.getOperation()) ||
-         dag.acquireBeforeOp.count(forOp.getOperation()) ||
-         dag.releaseAfterOp.count(forOp.getOperation());
+  return dag.threadForOps.contains(forOp.getOperation());
 }
 
 static bool shouldThreadIfRegion(scf::IfOp ifOp, const OptSyncDag &dag) {
-  return regionContainsAccess(ifOp.getThenRegion(), dag) ||
-         regionContainsAccess(ifOp.getElseRegion(), dag) ||
-         regionHasYieldSync(ifOp.getThenRegion(), dag) ||
-         regionHasYieldSync(ifOp.getElseRegion(), dag) ||
-         dag.releaseBeforeOp.count(ifOp.getOperation()) ||
-         dag.acquireBeforeOp.count(ifOp.getOperation()) ||
-         dag.releaseAfterOp.count(ifOp.getOperation());
+  return dag.threadIfOps.contains(ifOp.getOperation());
 }
 
-static scf::ForOp threadCarrierThroughFor(OpBuilder &b, scf::ForOp forOp,
-                                          EmitState &state) {
-  Value init = state.currentToken ? state.currentToken
-                                  : poisonToken(b, forOp.getLoc());
+static FailureOr<scf::ForOp> threadCarrierThroughFor(OpBuilder &b,
+                                                     scf::ForOp forOp,
+                                                     EmitState &state) {
+  if (!state.currentToken) {
+    forOp.emitError("nvws-insert-semas: planned scf.for carrier threading has "
+                    "no token producer at loop entry");
+    return failure();
+  }
+  Value init = state.currentToken;
   unsigned oldNumResults = forOp.getNumResults();
   auto oldPartitionIds =
       hasPartition(forOp) ? getPartitionIds(forOp) : SetVector<int>();
@@ -2770,7 +2861,7 @@ static LogicalResult verifyPlanBeforeEmission(triton::FuncOp funcOp,
       return op->emitError("nvws-insert-semas: verifier: planned access has no "
                            "ownership record");
     const AccessEvent *event = findEvent(group, op);
-    if (!event || !findTouchForResource(*event, dag.resource.second))
+    if (!event || !eventTouchesResource(*event, dag.resource.second))
       return op->emitError("nvws-insert-semas: verifier: planned access has no "
                            "touch for this resource");
   }
@@ -3193,35 +3284,45 @@ static LogicalResult verifyPostEmission(const OptSyncDag &dag, BufferGroup &grou
   for (Operation *op : dag.accessOps) {
     const AccessEvent *event = findEvent(group, op);
     if (!event) continue;
-    const AccessTouch *touch = touchForEvent(*event, dag);
-    if (!touch) continue;
+    SmallVector<const AccessTouch *, 4> touches;
+    collectTouchesForResource(*event, dag.resource.second, touches);
+    if (touches.empty()) continue;
     if (!state.protectedAccesses.contains(op))
       return op->emitError("nvws-insert-semas: post-emission verifier: "
                            "planned access was not rewritten through "
                            "nvws.semaphore.buffer");
-    auto bufferIt =
-        llvm::find_if(state.emittedBuffers, [&](const EmittedBufferRecord &rec) {
-          return rec.accessOp == op;
-        });
-    if (bufferIt == state.emittedBuffers.end())
-      return op->emitError("nvws-insert-semas: post-emission verifier: "
-                           "planned access has no semaphore.buffer op");
-    if (bufferIt->memberIdx != touch->memberIdx ||
-        bufferIt->memberIdx >= bufferIt->buffers.size())
-      return bufferIt->bufferOp->emitError(
-          "nvws-insert-semas: post-emission verifier: semaphore.buffer member "
-          "does not match planned touch");
-    if (!operationUsesValue(bufferIt->retargetOp, bufferIt->accessBuffer))
-      return bufferIt->retargetOp->emitError(
-          "nvws-insert-semas: post-emission verifier: planned memory access "
-          "does not use the planned nvws.semaphore.buffer result");
-    if (!state.knownCarrierTokens.contains(bufferIt->token))
-      return bufferIt->bufferOp->emitError(
-          "nvws-insert-semas: post-emission verifier: semaphore.buffer token "
-          "does not trace to a planned acquire");
-    if (failed(verifyStageCluster(bufferIt->bufferOp,
-                                  bufferIt->expectedStageCluster)))
-      return failure();
+    SmallVector<unsigned, 4> consumedRecords;
+    for (const AccessTouch *touch : touches) {
+      auto bufferIt =
+          llvm::find_if(state.emittedBuffers, [&](const EmittedBufferRecord &rec) {
+            if (rec.accessOp != op || rec.memberIdx != touch->memberIdx)
+              return false;
+            unsigned recordIdx = static_cast<unsigned>(&rec - state.emittedBuffers.data());
+            return !llvm::is_contained(consumedRecords, recordIdx);
+          });
+      if (bufferIt == state.emittedBuffers.end())
+        return op->emitError("nvws-insert-semas: post-emission verifier: "
+                             "planned access has no semaphore.buffer op for a "
+                             "planned member touch");
+      unsigned recordIdx =
+          static_cast<unsigned>(&*bufferIt - state.emittedBuffers.data());
+      consumedRecords.push_back(recordIdx);
+      if (bufferIt->memberIdx >= bufferIt->buffers.size())
+        return bufferIt->bufferOp->emitError(
+            "nvws-insert-semas: post-emission verifier: semaphore.buffer member "
+            "does not match planned touch");
+      if (!operationUsesValue(bufferIt->retargetOp, bufferIt->accessBuffer))
+        return bufferIt->retargetOp->emitError(
+            "nvws-insert-semas: post-emission verifier: planned memory access "
+            "does not use the planned nvws.semaphore.buffer result");
+      if (!state.knownCarrierTokens.contains(bufferIt->token))
+        return bufferIt->bufferOp->emitError(
+            "nvws-insert-semas: post-emission verifier: semaphore.buffer token "
+            "does not trace to a planned acquire");
+      if (failed(verifyStageCluster(bufferIt->bufferOp,
+                                    bufferIt->expectedStageCluster)))
+        return failure();
+    }
   }
 
   for (const ThreadRecord &record : state.threadedTokens)
@@ -3257,25 +3358,29 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
                                        EmitState &state) {
   for (Operation &op : llvm::make_early_inc_range(block)) {
     if (isa<scf::YieldOp>(op)) {
-      emitBeforeYieldSync(&op, op.getParentRegion(), dag, sp, group, state);
+      SmallVector<AcquireRecord, 2> yieldAcquires;
+      if (failed(emitBeforeYieldSync(&op, op.getParentRegion(), dag, sp, group,
+                                     state, yieldAcquires)))
+        return failure();
       continue;
     }
 
     AccessEvent *event = nullptr;
-    const AccessTouch *touch = nullptr;
+    SmallVector<const AccessTouch *, 4> touches;
     if (dag.accessOps.contains(&op)) {
       for (AccessEvent &candidate : group.events)
         if (candidate.op == &op) {
           event = &candidate;
-          touch = findTouchForResource(candidate, dag.resource.second);
+          collectTouchesForResource(candidate, dag.resource.second, touches);
           break;
         }
       if (event && event->owner)
         state.stageCache[*event->owner] = getStageCluster(&op);
     }
 
-    SmallVector<AcquireRecord, 2> acquires =
-        emitBeforeOpSync(&op, dag, sp, group, state);
+    SmallVector<AcquireRecord, 2> acquires;
+    if (failed(emitBeforeOpSync(&op, dag, sp, group, state, acquires)))
+      return failure();
 
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       Operation *oldForOp = forOp.getOperation();
@@ -3284,7 +3389,11 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
       bool threaded = shouldThreadForRegion(forOp, dag);
       OpBuilder loopBuilder(forOp);
       if (threaded) {
-        activeForOp = threadCarrierThroughFor(loopBuilder, forOp, bodyState);
+        FailureOr<scf::ForOp> threadedFor =
+            threadCarrierThroughFor(loopBuilder, forOp, bodyState);
+        if (failed(threadedFor))
+          return failure();
+        activeForOp = *threadedFor;
       }
       if (failed(emitResourceRegion(activeForOp.getRegion(), dag, sp, plan,
                                     group, backing, bodyState)))
@@ -3294,10 +3403,11 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
             activeForOp.getBody()->getTerminator());
         closeCarrierForLoop(activeForOp, bodyState, state, ownerAtYield);
       } else {
-        state = bodyState;
+        mergeProtectedAccesses(state, bodyState);
       }
-      emitAfterOpSync(oldForOp, activeForOp.getOperation(), dag, sp, group,
-                      state);
+      if (failed(emitAfterOpSync(oldForOp, activeForOp.getOperation(), dag, sp,
+                                 group, state)))
+        return failure();
       continue;
     }
     if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
@@ -3311,9 +3421,15 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
           hasPartition(ifOp) ? getPartitionOutputs(ifOp)
                              : SmallVector<SetVector<int>, 4>();
       if (threaded) {
+        if (ifOp.getElseRegion().empty())
+          return ifOp.emitError(
+              "nvws-insert-semas: planned scf.if carrier threading requires "
+              "an else path producer");
         OpBuilder ifBuilder(ifOp);
         activeIfOp = threadCarrierThroughIf(ifBuilder, ifOp);
       }
+      Value incomingToken = state.currentToken;
+      Value incomingSemaphore = state.currentSemaphore;
       EmitState thenState = state;
       if (failed(emitResourceRegion(activeIfOp.getThenRegion(), dag, sp, plan,
                                     group, backing, thenState)))
@@ -3324,13 +3440,14 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
                                     group, backing, elseState)))
         return failure();
       if (threaded) {
-        OpBuilder ifBuilder(activeIfOp);
-        Value thenToken = thenState.currentToken
-                              ? thenState.currentToken
-                              : poisonToken(ifBuilder, activeIfOp.getLoc());
-        Value elseToken = elseState.currentToken
-                              ? elseState.currentToken
-                              : poisonToken(ifBuilder, activeIfOp.getLoc());
+        Value thenToken =
+            thenState.currentToken ? thenState.currentToken : incomingToken;
+        Value elseToken =
+            elseState.currentToken ? elseState.currentToken : incomingToken;
+        if (!thenToken || !elseToken)
+          return activeIfOp.emitError(
+              "nvws-insert-semas: planned scf.if carrier threading has no "
+              "token producer on every path");
         appendTokenToYield(activeIfOp.thenYield(), thenToken);
         appendTokenToYield(activeIfOp.elseYield(), elseToken);
         thenState.knownCarrierTokens.insert(thenToken);
@@ -3349,28 +3466,31 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
         mergeProtectedAccesses(state, thenState);
         mergeProtectedAccesses(state, elseState);
         state.currentToken = activeIfOp.getResult(oldNumResults);
+        if (!state.currentSemaphore)
+          state.currentSemaphore = incomingSemaphore;
         state.knownCarrierTokens.insert(state.currentToken);
         state.threadedTokens.push_back({activeIfOp.getOperation(),
                                         state.currentToken, outOwner,
                                         ThreadRecordKind::IfResult});
       } else {
-        state = !activeIfOp.getElseRegion().empty() ? elseState : thenState;
         mergeProtectedAccesses(state, thenState);
         mergeProtectedAccesses(state, elseState);
       }
-      emitAfterOpSync(oldIfOp, activeIfOp.getOperation(), dag, sp, group,
-                      state);
+      if (failed(emitAfterOpSync(oldIfOp, activeIfOp.getOperation(), dag, sp,
+                                 group, state)))
+        return failure();
       continue;
     }
 
-    if (event && touch) {
+    if (event && !touches.empty()) {
       OpBuilder b(&op);
       b.setInsertionPoint(&op);
-      if (failed(emitAccessEvent(b, *event, *touch, acquires, group, dag,
+      if (failed(emitAccessEvent(b, *event, touches, acquires, group, dag,
                                  backing, state)))
         return failure();
     }
-    emitAfterOpSync(&op, dag, sp, group, state);
+    if (failed(emitAfterOpSync(&op, dag, sp, group, state)))
+      return failure();
   }
   return success();
 }
@@ -3491,13 +3611,22 @@ static void dumpOwnershipBlock(Block &block, ResourcePlan &plan,
         break;
       }
     if (!event || tIdx >= event->touches.size()) continue;
-    AccessTouch &touch = event->touches[tIdx];
-    bool reads = hasRead(touch.effect);
-    bool writes = hasWrite(touch.effect);
-    llvm::errs() << treePrefix(depth) << "|- "
-                 << accessKindChar(reads, writes) << "  m" << touch.memberIdx
-                 << "  " << op.getName().getStringRef() << "  use "
-                 << ownerStr(&op, useIt->second) << "\n";
+    SmallVector<unsigned, 1> fallbackTouchIdx{tIdx};
+    auto allTouchIdxs = plan.useTouchIdxs.find(&op);
+    ArrayRef<unsigned> touchIdxs =
+        allTouchIdxs == plan.useTouchIdxs.end()
+            ? ArrayRef<unsigned>(fallbackTouchIdx)
+            : ArrayRef<unsigned>(allTouchIdxs->second);
+    for (unsigned touchIdx : touchIdxs) {
+      if (touchIdx >= event->touches.size()) continue;
+      AccessTouch &touch = event->touches[touchIdx];
+      bool reads = hasRead(touch.effect);
+      bool writes = hasWrite(touch.effect);
+      llvm::errs() << treePrefix(depth) << "|- "
+                   << accessKindChar(reads, writes) << "  m" << touch.memberIdx
+                   << "  " << op.getName().getStringRef() << "  use "
+                   << ownerStr(&op, useIt->second) << "\n";
+    }
   }
 }
 
@@ -3626,9 +3755,10 @@ static void dumpRawSyncBlock(Block &block, SyncPlan &sp,
         event = &e;
         break;
       }
-    const AccessTouch *touch =
-        event ? findTouchForResource(*event, sp.resource.second) : nullptr;
-    if (touch) {
+    SmallVector<const AccessTouch *, 4> touches;
+    if (event)
+      collectTouchesForResource(*event, sp.resource.second, touches);
+    for (const AccessTouch *touch : touches) {
       bool reads = hasRead(touch->effect);
       bool writes = hasWrite(touch->effect);
       llvm::errs() << treePrefix(depth) << "|- "
@@ -3934,9 +4064,10 @@ static void dumpOptSyncBlock(Block &block, const OptSyncDag &dag,
         event = &e;
         break;
       }
-    const AccessTouch *touch =
-        event ? findTouchForResource(*event, dag.resource.second) : nullptr;
-    if (touch) {
+    SmallVector<const AccessTouch *, 4> touches;
+    if (event)
+      collectTouchesForResource(*event, dag.resource.second, touches);
+    for (const AccessTouch *touch : touches) {
       bool reads = hasRead(touch->effect);
       bool writes = hasWrite(touch->effect);
       llvm::errs() << treePrefix(depth) << "|- "
