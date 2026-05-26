@@ -53,14 +53,13 @@ using namespace triton::nvws;
 // ---------------------------------------------------------------------------
 
 enum class MemorySpaceKind { Tmem, Local };
-enum class AccessEffect { Read, Write, ReadWrite };
+// v4: only two access effects. R is provably read-only ops (tmem_load,
+// local_load). Everything else (store, alloc-with-source, mma regardless
+// of useAccumulator, descriptor load, etc.) is W. There is no ReadWrite.
+enum class AccessEffect { Read, Write };
 
-static bool hasRead(AccessEffect e) {
-  return e == AccessEffect::Read || e == AccessEffect::ReadWrite;
-}
-static bool hasWrite(AccessEffect e) {
-  return e == AccessEffect::Write || e == AccessEffect::ReadWrite;
-}
+static bool hasRead(AccessEffect e) { return e == AccessEffect::Read; }
+static bool hasWrite(AccessEffect e) { return e == AccessEffect::Write; }
 
 // Effective owner per v4 §Effective Owner. nullopt = root/external; not
 // equal to (wsTag=0, partition=0).
@@ -233,15 +232,6 @@ static AsyncOp getAsyncPayload(Operation *op) {
   if (isa<MMAv5OpInterface>(op))
     return AsyncOp::TC5MMA;
   return AsyncOp::NONE;
-}
-
-static bool isConstFalse(Value v) {
-  if (!v) return false;
-  if (auto def = v.getDefiningOp<arith::ConstantOp>()) {
-    if (auto boolAttr = dyn_cast<BoolAttr>(def.getValue()))
-      return !boolAttr.getValue();
-  }
-  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -424,14 +414,16 @@ static LogicalResult collectEvents(BufferGroup &group, triton::FuncOp funcOp) {
       } else if (auto storeOp = dyn_cast<TMEMStoreOp>(op)) {
         addTouch(group, event, storeOp.getDst(), AccessEffect::Write);
       } else if (auto mma = dyn_cast<MMAv5OpInterface>(op)) {
+        // v4: mma is always W on its accumulator regardless of
+        // useAccumulator. The read-side semantics inside mma are handled
+        // by single-partition program order; for cross-owner sync only
+        // the overwrite matters.
         for (Value operand : op->getOperands()) {
           auto alias = lookupAlias(group, operand);
           if (failed(alias)) continue;
-          AccessEffect effect =
-              operand == mma.getAccumulator()
-                  ? (isConstFalse(mma.useAccumulator()) ? AccessEffect::Write
-                                                        : AccessEffect::ReadWrite)
-                  : AccessEffect::Read;
+          AccessEffect effect = operand == mma.getAccumulator()
+                                    ? AccessEffect::Write
+                                    : AccessEffect::Read;
           addTouch(group, event, operand, effect);
         }
       }
@@ -867,37 +859,36 @@ planResource(triton::FuncOp funcOp, unsigned groupIdx, BufferGroup &group,
 }
 
 // ---------------------------------------------------------------------------
-// v4 §Dependency Edges / §Planned SyncEdgeInfo (commit 3).
-// Raw per-edge synchronization graph derived from the per-resource
-// OWNERSHIP-DAG. One edge per cross-owner dependency. No IR mutation.
+// v4 §Dependency Edges / §Raw DAG Edge Model (commit 3, post-revision).
+// Per-edge counter model:
+//   - one counter per cross-owner edge (initial 0)
+//   - source partition releases (counter += 1) after its op
+//   - destination partition acquires (counter -= 1, blocks if 0) before
+//     its op
+//   - no FULL/EMPTY, no ready/done/handoff kind, no S_init
+//   - sequential name "S_e<N>" per resource
+//
+// Edges are derived from version tracking applied to the augmented
+// program-order stream (real accesses + virtual ENTER/YIELD rows + region
+// op partitions). Concurrent readers of the same version produce no edge
+// between themselves. Loop-carry close edges emerge naturally as
+// cross-owner edges whose destination is a YIELD virtual row.
 // ---------------------------------------------------------------------------
 
-enum class SyncEdgeKind { Ready, Done, Handoff };
-enum class SemaState { Full, Empty };
-
-static StringRef stateStr(SemaState s) {
-  return s == SemaState::Full ? "FULL" : "EMPTY";
-}
-
-// One raw cross-owner edge. v4 §Planned SyncEdgeInfo subset; the full
-// SyncEdgeInfo (planned release/acquire anchors, async payload, carrier
-// token, backing data buffers) is materialized in later commits when the
-// pass starts emitting IR.
+// One raw cross-owner edge. Both src and dst can be either a real access
+// op or a virtual marker (region op for entering, region's YIELD for
+// leaving). The renderer decides where to place release/acquire rows
+// based on src/dst classification.
 struct SyncEdge {
-  std::string name;
-  SyncEdgeKind kind = SyncEdgeKind::Ready;
-  SemaState state = SemaState::Full;
-  // srcOp = null for the initial writable permit.
-  Operation *srcOp = nullptr;
-  Operation *dstOp = nullptr;
+  std::string name;            // "S_e<N>"
+  Operation *srcOp = nullptr;  // real access OR region op
+  Operation *dstOp = nullptr;  // real access OR region op
+  // If non-null, src/dst is a YIELD virtual row for this region (the
+  // edge anchors at the region's YIELD point rather than at a real op).
+  Region *srcYieldRegion = nullptr;
+  Region *dstYieldRegion = nullptr;
   std::optional<PartitionId> srcOwner;
   std::optional<PartitionId> dstOwner;
-  // Anchor region + position used by the dump. v4 §Debug DAG Dumps places
-  // release/acquire rows either inline next to the source/target access
-  // rows (same region) or at the deeper region's entry/exit (cross-region).
-  enum class Position { InLine, AtEntry, AtExit };
-  Region *anchorRegion = nullptr;
-  Position position = Position::InLine;
 };
 
 struct SyncPlan {
@@ -905,21 +896,15 @@ struct SyncPlan {
   unsigned groupIdx = 0;
   SmallVector<unsigned, 4> memberIndices;
   SmallVector<SyncEdge> edges;
-  // Per-access-op incoming/outgoing edge indices. Only InLine edges are
-  // indexed here; cross-region edges live in entry/exit maps.
-  DenseMap<Operation *, SmallVector<unsigned, 2>> incomingByAccess;
-  DenseMap<Operation *, SmallVector<unsigned, 2>> outgoingByAccess;
-  // Per-region entry/exit edge indices (cross-region case).
-  DenseMap<Region *, SmallVector<unsigned, 2>> entryEdges;
-  DenseMap<Region *, SmallVector<unsigned, 2>> exitEdges;
+  // For each edge, both the release and the acquire render at the SAME
+  // anchor point: right before the destination's row, at the
+  // destination's tree depth. The anchor is keyed by either the
+  // destination op (real access or region op) or the destination region
+  // (for a YIELD-anchored close edge).
+  DenseMap<Operation *, SmallVector<unsigned, 2>> beforeOp;
+  DenseMap<Region *, SmallVector<unsigned, 2>> beforeYield;
   // Ops with at least one touch for this resource (access rows in dump).
   DenseSet<Operation *> accessOps;
-  // Initial permit edge (S_init). Anchored at funcDirectAnchor inside
-  // initialAnchorRegion: printed immediately before that op at the region's
-  // depth.
-  std::optional<unsigned> initialEdgeIdx;
-  Region *initialAnchorRegion = nullptr;
-  Operation *initialAnchorBeforeOp = nullptr;
 };
 
 static bool touchReads(const AccessTouch &t) { return hasRead(t.effect); }
@@ -944,109 +929,88 @@ static bool eventProduces(const AccessEvent &event, int64_t resourceKey) {
   return false;
 }
 
-// Anchor region computation for a cross-region raw sync edge. Returns the
-// deepest unshared region (closer to dst when dst is deeper, closer to src
-// when src is deeper) and the position to render the edge rows.
-static std::pair<Region *, SyncEdge::Position>
-computeAnchor(Operation *srcOp, Operation *dstOp) {
-  Region *regSrc = srcOp ? srcOp->getParentRegion() : nullptr;
-  Region *regDst = dstOp ? dstOp->getParentRegion() : nullptr;
-  if (regSrc == regDst)
-    return {regSrc, SyncEdge::Position::InLine};
-
-  // Case A: regDst is descendant of regSrc.
-  for (Region *r = regDst; r; ) {
-    Operation *parentOp = r->getParentOp();
-    if (!parentOp) break;
-    Region *parentReg = parentOp->getParentRegion();
-    if (parentReg == regSrc)
-      return {r, SyncEdge::Position::AtEntry};
-    r = parentReg;
-  }
-  // Case B: regSrc is descendant of regDst.
-  for (Region *r = regSrc; r; ) {
-    Operation *parentOp = r->getParentOp();
-    if (!parentOp) break;
-    Region *parentReg = parentOp->getParentRegion();
-    if (parentReg == regDst)
-      return {r, SyncEdge::Position::AtExit};
-    r = parentReg;
-  }
-  // Case C: neither descends from the other (sibling regions under a
-  // common ancestor — e.g., events both inside different branches of an
-  // outer scf.if). Not exercised by v4 examples; fall back to inline at
-  // src side so the edge is at least visible.
-  return {regSrc, SyncEdge::Position::InLine};
-}
-
-// Initial-permit anchor: walk up from `dstOp` until we hit `funcBody`.
-// The function-direct-child op containing dstOp is the row we render the
-// initial acquire before. For loop bodies this hoists the initial permit
-// out of the loop, matching v4 example 5 (S_alpha_done acquired before
-// scf.for).
-static Operation *findInitialAnchorOp(Operation *dstOp, Region &funcBody) {
-  Operation *cur = dstOp;
-  while (cur && cur->getParentRegion() != &funcBody) {
-    Operation *p = cur->getParentOp();
-    if (!p) break;
-    cur = p;
-  }
-  return cur;
-}
-
-static std::string formatOwnerPair(Operation *anchor,
-                                   std::optional<PartitionId> src,
-                                   std::optional<PartitionId> dst) {
+static std::string makeEdgeName(unsigned serial) {
   std::string s;
   llvm::raw_string_ostream os(s);
-  if (src)
-    os << ownerStr(anchor, src);
-  else
-    os << "init";
-  os << " -> " << ownerStr(anchor, dst);
+  os << "S_e" << serial;
   return s;
 }
 
-static std::string makeEdgeName(SyncEdgeKind kind,
-                                std::optional<PartitionId> srcOwner,
-                                std::optional<PartitionId> dstOwner,
-                                unsigned serial) {
-  std::string s;
-  llvm::raw_string_ostream os(s);
-  char prefix = kind == SyncEdgeKind::Ready
-                    ? 'R'
-                    : (kind == SyncEdgeKind::Done ? 'D' : 'H');
-  os << "S_" << prefix << "_";
-  if (srcOwner)
-    os << srcOwner->first;
-  else
-    os << "root";
-  os << "_";
-  if (dstOwner)
-    os << dstOwner->first;
-  else
-    os << "root";
-  os << "_e" << serial;
-  return s;
+static bool sameOwner(const std::optional<PartitionId> &a,
+                      const std::optional<PartitionId> &b) {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return *a == *b;
 }
 
-// Add an edge to `sp` and wire it into per-op / per-region indices. InLine
-// edges are anchored directly to the source/target access ops; region
-// entry/exit edges are anchored to the deeper region only.
-static unsigned recordEdge(SyncPlan &sp, SyncEdge edge) {
+// Return the partition for a region op (scf.for, scf.if) as seen by this
+// resource: it equals the partition of the op's child region's ENTER/
+// YIELD pair for this resource. Computed via the planner's RegionOwnership
+// for one of the op's regions.
+static std::optional<PartitionId>
+regionOpPartition(Operation *op, const ResourcePlan &rp) {
+  if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+    auto it = rp.regionOwners.find(&forOp.getRegion());
+    if (it == rp.regionOwners.end()) return std::nullopt;
+    if (!it->second.hasEventsInSubtree) return std::nullopt;
+    return it->second.entry;
+  }
+  if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+    auto it = rp.regionOwners.find(&ifOp.getThenRegion());
+    if (it != rp.regionOwners.end() && it->second.hasEventsInSubtree)
+      return it->second.entry;
+    auto it2 = rp.regionOwners.find(&ifOp.getElseRegion());
+    if (it2 != rp.regionOwners.end() && it2->second.hasEventsInSubtree)
+      return it2->second.entry;
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+// Record an edge anchored at its destination. Both the release and the
+// acquire render right before the destination's row at the destination's
+// tree depth.
+static void recordEdge(SyncPlan &sp, SyncEdge edge) {
   unsigned idx = sp.edges.size();
-  if (edge.position == SyncEdge::Position::InLine) {
-    if (edge.srcOp) sp.outgoingByAccess[edge.srcOp].push_back(idx);
-    if (edge.dstOp) sp.incomingByAccess[edge.dstOp].push_back(idx);
-  } else if (edge.position == SyncEdge::Position::AtEntry) {
-    sp.entryEdges[edge.anchorRegion].push_back(idx);
-  } else if (edge.position == SyncEdge::Position::AtExit) {
-    sp.exitEdges[edge.anchorRegion].push_back(idx);
-  }
+  if (edge.dstOp)
+    sp.beforeOp[edge.dstOp].push_back(idx);
+  else if (edge.dstYieldRegion)
+    sp.beforeYield[edge.dstYieldRegion].push_back(idx);
   sp.edges.push_back(std::move(edge));
-  return idx;
 }
 
+// When `dstOp` lives inside an `scf.for` body that is a descendant of
+// `srcOp`'s region, lift the edge's dst to the outermost such scf.for op
+// (at src's region depth). For `scf.if` branches, leave dst alone so the
+// sync remains conditional inside the branch. Returns the (possibly
+// lifted) op.
+static Operation *liftDstForRegionTransition(Operation *srcOp,
+                                             Operation *dstOp) {
+  if (!srcOp || !dstOp) return dstOp;
+  Region *srcReg = srcOp->getParentRegion();
+  Region *dstReg = dstOp->getParentRegion();
+  if (srcReg == dstReg) return dstOp;
+  // Walk up from dstReg until we find a region whose parent region is
+  // srcReg. The corresponding parent op is the candidate region op.
+  Operation *liftedOp = dstOp;
+  for (Region *r = dstReg; r;) {
+    Operation *parentOp = r->getParentOp();
+    if (!parentOp) break;
+    Region *parentReg = parentOp->getParentRegion();
+    if (parentReg == srcReg) {
+      if (isa<scf::ForOp>(parentOp)) liftedOp = parentOp;
+      // scf.if: leave dst as the original access so release/acquire
+      // stay inside the conditional branch.
+      break;
+    }
+    r = parentReg;
+  }
+  return liftedOp;
+}
+
+// Build the raw-sync DAG using version tracking. Edges are emitted at
+// each cross-owner version transition. Loop-carry close edges go from
+// the last cross-owner consumer/producer to the body's YIELD virtual op.
 static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
                               triton::FuncOp funcOp) {
   SyncPlan sp;
@@ -1062,104 +1026,118 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
       sp.accessOps.insert(e.op);
     }
 
-  // Per-resource version-tracking state.
-  SmallVector<const AccessEvent *, 4> versionProducers;
-  SmallVector<const AccessEvent *, 4> versionConsumers;
+  // Per-resource version tracking. Holds the live producer event (or
+  // nullptr if none yet) and the set of cross-partition consumers that
+  // have read the current version.
+  const AccessEvent *currentProducer = nullptr;
+  SmallVector<const AccessEvent *, 4> currentConsumers;
   unsigned serial = 0;
-
-  auto sameOwner = [](const std::optional<PartitionId> &a,
-                      const std::optional<PartitionId> &b) {
-    if (!a && !b) return true;
-    if (!a || !b) return false;
-    return *a == *b;
-  };
 
   for (const AccessEvent *E : events) {
     bool consumes = eventConsumes(*E, rp.resource.second);
     bool produces = eventProduces(*E, rp.resource.second);
 
     if (consumes) {
-      // Ready edges from each current-version producer with different owner.
-      for (const AccessEvent *P : versionProducers) {
-        if (sameOwner(P->owner, E->owner)) continue;
+      if (currentProducer && !sameOwner(currentProducer->owner, E->owner)) {
         SyncEdge edge;
-        edge.kind = SyncEdgeKind::Ready;
-        edge.state = SemaState::Full;
-        edge.srcOp = P->op;
-        edge.dstOp = E->op;
-        edge.srcOwner = P->owner;
+        edge.name = makeEdgeName(serial++);
+        edge.srcOp = currentProducer->op;
+        edge.dstOp = liftDstForRegionTransition(currentProducer->op, E->op);
+        edge.srcOwner = currentProducer->owner;
         edge.dstOwner = E->owner;
-        edge.name = makeEdgeName(edge.kind, P->owner, E->owner, serial++);
-        std::tie(edge.anchorRegion, edge.position) =
-            computeAnchor(P->op, E->op);
         recordEdge(sp, edge);
       }
+      currentConsumers.push_back(E);
     }
 
     if (produces) {
-      // E retires the current version. Done edges from each consumer with
-      // different owner; if no consumers, handoff edges from producers
-      // with different owner (writer->writer no read fanout).
-      if (!versionConsumers.empty()) {
-        for (const AccessEvent *C : versionConsumers) {
-          if (sameOwner(C->owner, E->owner)) continue;
-          SyncEdge edge;
-          edge.kind = SyncEdgeKind::Done;
-          edge.state = SemaState::Empty;
-          edge.srcOp = C->op;
-          edge.dstOp = E->op;
-          edge.srcOwner = C->owner;
-          edge.dstOwner = E->owner;
-          edge.name = makeEdgeName(edge.kind, C->owner, E->owner, serial++);
-          std::tie(edge.anchorRegion, edge.position) =
-              computeAnchor(C->op, E->op);
-          recordEdge(sp, edge);
-        }
-      } else if (!consumes) {
-        for (const AccessEvent *P : versionProducers) {
-          if (sameOwner(P->owner, E->owner)) continue;
-          SyncEdge edge;
-          edge.kind = SyncEdgeKind::Handoff;
-          edge.state = SemaState::Empty;
-          edge.srcOp = P->op;
-          edge.dstOp = E->op;
-          edge.srcOwner = P->owner;
-          edge.dstOwner = E->owner;
-          edge.name = makeEdgeName(edge.kind, P->owner, E->owner, serial++);
-          std::tie(edge.anchorRegion, edge.position) =
-              computeAnchor(P->op, E->op);
-          recordEdge(sp, edge);
-        }
+      for (const AccessEvent *C : currentConsumers) {
+        if (sameOwner(C->owner, E->owner)) continue;
+        SyncEdge edge;
+        edge.name = makeEdgeName(serial++);
+        edge.srcOp = C->op;
+        edge.dstOp = liftDstForRegionTransition(C->op, E->op);
+        edge.srcOwner = C->owner;
+        edge.dstOwner = E->owner;
+        recordEdge(sp, edge);
       }
-      versionProducers.clear();
-      versionConsumers.clear();
-      versionProducers.push_back(E);
-    } else if (consumes) {
-      versionConsumers.push_back(E);
+      // Handoff fires only when there was no consumer at all (writer →
+      // writer without an intervening reader). If consumers existed but
+      // were same-partition as E, they handle the ordering via program
+      // order; no handoff is needed.
+      if (currentConsumers.empty() && !consumes && currentProducer &&
+          !sameOwner(currentProducer->owner, E->owner)) {
+        SyncEdge edge;
+        edge.name = makeEdgeName(serial++);
+        edge.srcOp = currentProducer->op;
+        edge.dstOp =
+            liftDstForRegionTransition(currentProducer->op, E->op);
+        edge.srcOwner = currentProducer->owner;
+        edge.dstOwner = E->owner;
+        recordEdge(sp, edge);
+      }
+      currentProducer = E;
+      currentConsumers.clear();
     }
   }
 
-  // Initial writable/readable permit (v4 §Initial Writable Permit). One
-  // S_init per (logicalGroupId, resourceKey).
-  if (!events.empty()) {
-    const AccessEvent *first = events.front();
-    bool firstProduces = eventProduces(*first, rp.resource.second);
-    SyncEdge init;
-    init.kind = SyncEdgeKind::Handoff;
-    init.state = firstProduces ? SemaState::Empty : SemaState::Full;
-    init.name = "S_init";
-    init.srcOp = nullptr;
-    init.dstOp = first->op;
-    init.srcOwner = std::nullopt;
-    init.dstOwner = first->owner;
-    init.position = SyncEdge::Position::InLine;
-    sp.initialAnchorRegion = &funcOp.getBody();
-    sp.initialAnchorBeforeOp =
-        findInitialAnchorOp(first->op, funcOp.getBody());
-    init.anchorRegion = sp.initialAnchorRegion;
-    sp.edges.push_back(std::move(init));
-    sp.initialEdgeIdx = sp.edges.size() - 1;
-  }
+  // Loop-carry close: at the YIELD of each annotated `scf.for` body whose
+  // subtree contains events for this resource, emit edges from each
+  // cross-owner live consumer/producer back to the body-carried owner so
+  // the next iteration starts cleanly. The body-carried owner is on the
+  // body's RegionOwnership entry/exit, equivalently the scf.for's
+  // partition.
+  funcOp.walk([&](scf::ForOp forOp) {
+    Region &body = forOp.getRegion();
+    auto it = rp.regionOwners.find(&body);
+    if (it == rp.regionOwners.end() || !it->second.hasEventsInSubtree)
+      return;
+    auto carriedOwner = it->second.entry;
+
+    // Find the last live state (producer + consumers) at the end of the
+    // body for this resource. We re-walk events in this for-loop's
+    // subtree to compute it locally — the global currentProducer/
+    // currentConsumers at the very end of `events` may not correspond
+    // to this specific for-loop.
+    const AccessEvent *bodyProducer = nullptr;
+    SmallVector<const AccessEvent *, 4> bodyConsumers;
+    for (const AccessEvent *E : events) {
+      if (!forOp->isProperAncestor(E->op)) continue;
+      bool consumes = eventConsumes(*E, rp.resource.second);
+      bool produces = eventProduces(*E, rp.resource.second);
+      if (consumes) bodyConsumers.push_back(E);
+      if (produces) {
+        bodyProducer = E;
+        bodyConsumers.clear();
+      }
+    }
+
+    // Close edges: from each cross-owner consumer to YIELD, or from the
+    // last producer to YIELD if no consumers remain and the producer is
+    // cross-owner from the carried owner.
+    bool emittedAny = false;
+    for (const AccessEvent *C : bodyConsumers) {
+      if (sameOwner(C->owner, carriedOwner)) continue;
+      SyncEdge edge;
+      edge.name = makeEdgeName(serial++);
+      edge.srcOp = C->op;
+      edge.dstYieldRegion = &body;
+      edge.srcOwner = C->owner;
+      edge.dstOwner = carriedOwner;
+      recordEdge(sp, edge);
+      emittedAny = true;
+    }
+    if (!emittedAny && bodyProducer &&
+        !sameOwner(bodyProducer->owner, carriedOwner)) {
+      SyncEdge edge;
+      edge.name = makeEdgeName(serial++);
+      edge.srcOp = bodyProducer->op;
+      edge.dstYieldRegion = &body;
+      edge.srcOwner = bodyProducer->owner;
+      edge.dstOwner = carriedOwner;
+      recordEdge(sp, edge);
+    }
+  });
 
   return sp;
 }
@@ -1168,16 +1146,6 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
 // OWNERSHIP-DAG dump (commit 2 stage output).
 // ---------------------------------------------------------------------------
 
-static std::string formatRegionLine(Operation *anchor, StringRef label,
-                                    const RegionOwnership &rec) {
-  std::string s;
-  llvm::raw_string_ostream os(s);
-  os << label << "  entry " << ownerStr(anchor, rec.entry) << " exit "
-     << ownerStr(anchor, rec.exit);
-  if (rec.carried) os << " carried";
-  return s;
-}
-
 // v4: a regioned op is annotated only when its subtree carries at least
 // one access for this resource.
 static bool regionHasEvents(Region &region, ResourcePlan &plan) {
@@ -1185,47 +1153,83 @@ static bool regionHasEvents(Region &region, ResourcePlan &plan) {
   return it != plan.regionOwners.end() && it->second.hasEventsInSubtree;
 }
 
+// Build region-op label with the carried partition annotation:
+//   `scf.for (WS, tag=N) {P}` for WS-tagged for-ops
+//   `scf.for {P}`              for plain (non-WS) for-ops
+//   `scf.if {P}`               for if-ops
+// The partition is the body.ENTER/YIELD partition (and matches for both
+// branches of scf.if per the invariant).
+static std::string regionOpLabel(Operation *op, const ResourcePlan &plan) {
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+    if (hasWarpSpecializeTag(op))
+      os << "scf.for (WS, tag=" << *getWarpSpecializeTag(op) << ")";
+    else
+      os << "scf.for";
+  } else if (isa<scf::IfOp>(op)) {
+    os << "scf.if";
+  }
+  auto part = regionOpPartition(op, plan);
+  os << " " << ownerStr(op, part);
+  return s;
+}
+
+// Render an `ENTER {P}` or `YIELD {P}` virtual row at the given depth.
+static void renderEnterRow(unsigned depth, Operation *anchor,
+                           std::optional<PartitionId> partition) {
+  llvm::errs() << treePrefix(depth) << "|- ENTER " << ownerStr(anchor, partition)
+               << "\n";
+}
+static void renderYieldRow(unsigned depth, Operation *anchor,
+                           std::optional<PartitionId> partition) {
+  llvm::errs() << treePrefix(depth) << "|- YIELD " << ownerStr(anchor, partition)
+               << "\n";
+}
+
+// ---------------------------------------------------------------------------
+// OWNERSHIP-DAG dump (commit 2/3, new convention).
+// ---------------------------------------------------------------------------
+
+static void dumpOwnershipBlock(Block &block, ResourcePlan &plan,
+                               BufferGroup &group, unsigned depth);
+
+static void dumpOwnershipRegion(Region &region, ResourcePlan &plan,
+                                BufferGroup &group, Operation *anchorOp,
+                                unsigned depth) {
+  auto recIt = plan.regionOwners.find(&region);
+  std::optional<PartitionId> part;
+  if (recIt != plan.regionOwners.end()) part = recIt->second.entry;
+  renderEnterRow(depth, anchorOp, part);
+  for (Block &b : region) dumpOwnershipBlock(b, plan, group, depth);
+  renderYieldRow(depth, anchorOp, part);
+}
+
 static void dumpOwnershipBlock(Block &block, ResourcePlan &plan,
                                BufferGroup &group, unsigned depth) {
   for (Operation &op : block) {
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       if (!regionHasEvents(forOp.getRegion(), plan)) continue;
-      llvm::errs() << treePrefix(depth) << "|- " << forOpLabel(forOp)
-                   << "                              structural\n";
-      auto &bodyRec = plan.regionOwners[&forOp.getRegion()];
-      llvm::errs() << treePrefix(depth + 1) << "|- "
-                   << formatRegionLine(&op, "body region", bodyRec) << "\n";
-      for (Block &b : forOp.getRegion())
-        dumpOwnershipBlock(b, plan, group, depth + 2);
+      llvm::errs() << treePrefix(depth) << "|- " << regionOpLabel(&op, plan)
+                   << "\n";
+      dumpOwnershipRegion(forOp.getRegion(), plan, group, &op, depth + 1);
       continue;
     }
     if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
       bool thenHas = regionHasEvents(ifOp.getThenRegion(), plan);
       bool elseHas = regionHasEvents(ifOp.getElseRegion(), plan);
       if (!thenHas && !elseHas) continue;
-      llvm::errs() << treePrefix(depth)
-                   << "|- scf.if                               structural\n";
-      auto &thenRec = plan.regionOwners[&ifOp.getThenRegion()];
-      llvm::errs() << treePrefix(depth + 1) << "|- "
-                   << formatRegionLine(&op, "then region", thenRec) << "\n";
-      for (Block &b : ifOp.getThenRegion())
-        dumpOwnershipBlock(b, plan, group, depth + 2);
-      auto &elseRec = plan.regionOwners[&ifOp.getElseRegion()];
-      llvm::errs() << treePrefix(depth + 1) << "|- "
-                   << formatRegionLine(&op, "else region", elseRec) << "\n";
-      if (!ifOp.getElseRegion().empty())
-        for (Block &b : ifOp.getElseRegion())
-          dumpOwnershipBlock(b, plan, group, depth + 2);
+      llvm::errs() << treePrefix(depth) << "|- " << regionOpLabel(&op, plan)
+                   << "\n";
+      llvm::errs() << treePrefix(depth + 1) << "|- then\n";
+      dumpOwnershipRegion(ifOp.getThenRegion(), plan, group, &op, depth + 2);
+      if (!ifOp.getElseRegion().empty()) {
+        llvm::errs() << treePrefix(depth + 1) << "|- else\n";
+        dumpOwnershipRegion(ifOp.getElseRegion(), plan, group, &op, depth + 2);
+      }
       continue;
     }
-    if (auto yieldOp = dyn_cast<scf::YieldOp>(op)) {
-      auto it = plan.yieldOwner.find(yieldOp.getOperation());
-      if (it != plan.yieldOwner.end())
-        llvm::errs() << treePrefix(depth)
-                     << "|- scf.yield                            owner "
-                     << ownerStr(&op, it->second) << "\n";
-      continue;
-    }
+    if (isa<scf::YieldOp>(op)) continue; // YIELD is rendered by dumpOwnershipRegion
     auto useIt = plan.useOwner.find(&op);
     if (useIt == plan.useOwner.end()) continue;
     unsigned tIdx = plan.useTouchIdx.lookup(&op);
@@ -1252,91 +1256,69 @@ static void dumpOwnershipDag(ResourcePlan &plan, BufferGroup &group,
                << " resourceKey=" << plan.resource.second << " members:";
   for (unsigned idx : plan.memberIndices) llvm::errs() << " m" << idx;
   llvm::errs() << "\n";
-  // v4: the function region is never annotated. Print only the header
-  // row with the function name; no entry/exit ownership annotation.
+  // v4: the function region is never annotated and has no ENTER/YIELD.
   llvm::errs() << "|- func region @" << funcOp.getName() << "\n";
   for (Block &b : funcOp.getBody())
     dumpOwnershipBlock(b, plan, group, /*depth=*/1);
 }
 
 // ---------------------------------------------------------------------------
-// RAW-SYNC-DAG dump (commit 3 stage output).
-// Same region-tree shape as OWNERSHIP-DAG; raw per-edge semaphore rows
-// rendered inline as siblings (acquires before access; releases as
-// children after access) or at region entry/exit when the edge crosses
-// a control-flow boundary.
+// RAW-SYNC-DAG dump (commit 3, new convention).
+// Same region-tree shape as OWNERSHIP-DAG; per-edge sync rows (r / a)
+// rendered at the same depth as the access rows they sit between. No
+// FULL/EMPTY column; no kind label. Each edge is a single counter
+// `S_e<N>`.
 // ---------------------------------------------------------------------------
 
 static void renderAcquireRow(unsigned depth, Operation *anchor,
                              const SyncEdge &edge) {
-  llvm::errs() << treePrefix(depth) << "|- a  " << edge.name
-               << "  acquire " << stateStr(edge.state) << "  "
+  llvm::errs() << treePrefix(depth) << "|- a  " << edge.name << "  acquire  "
                << ownerStr(anchor, edge.dstOwner) << "\n";
 }
 
 static void renderReleaseRow(unsigned depth, Operation *anchor,
                              const SyncEdge &edge) {
-  llvm::errs() << treePrefix(depth) << "|- r  " << edge.name
-               << "  release " << stateStr(edge.state) << "  "
-               << formatOwnerPair(anchor, edge.srcOwner, edge.dstOwner)
-               << "\n";
+  llvm::errs() << treePrefix(depth) << "|- r  " << edge.name << "  release  "
+               << ownerStr(anchor, edge.srcOwner) << " -> "
+               << ownerStr(anchor, edge.dstOwner) << "\n";
 }
 
-// Print inline incoming acquires for the access op (same depth as the
-// access row, immediately before it).
-static void printInlineIncoming(Operation *op, SyncPlan &sp, unsigned depth) {
-  auto it = sp.incomingByAccess.find(op);
-  if (it == sp.incomingByAccess.end()) return;
-  for (unsigned idx : it->second)
-    renderAcquireRow(depth, op, sp.edges[idx]);
-}
-
-// Print inline outgoing releases for the access op (depth+1, as children).
-static void printInlineOutgoing(Operation *op, SyncPlan &sp, unsigned depth) {
-  auto it = sp.outgoingByAccess.find(op);
-  if (it == sp.outgoingByAccess.end()) return;
-  for (unsigned idx : it->second)
-    renderReleaseRow(depth + 1, op, sp.edges[idx]);
-}
-
-// Print region-entry edges (release then acquire) at the region's content
-// depth.
-static void printRegionEntry(Region &region, SyncPlan &sp, unsigned depth) {
-  auto it = sp.entryEdges.find(&region);
-  if (it == sp.entryEdges.end()) return;
-  for (unsigned idx : it->second) {
+// Print the release+acquire pair for each edge anchored at `key`, in the
+// order they were recorded. Both rows render at the same depth.
+static void printEdgesAt(SmallVector<unsigned, 2> *edgeIdxs, SyncPlan &sp,
+                         Operation *anchor, unsigned depth) {
+  if (!edgeIdxs) return;
+  for (unsigned idx : *edgeIdxs) {
     const SyncEdge &edge = sp.edges[idx];
-    renderReleaseRow(depth, edge.dstOp, edge);
-    renderAcquireRow(depth, edge.dstOp, edge);
+    renderReleaseRow(depth, anchor, edge);
+    renderAcquireRow(depth, anchor, edge);
   }
 }
 
-// Print region-exit edges at the region's content depth (used right
-// before the region's terminator).
-static void printRegionExit(Region &region, SyncPlan &sp, unsigned depth) {
-  auto it = sp.exitEdges.find(&region);
-  if (it == sp.exitEdges.end()) return;
-  for (unsigned idx : it->second) {
-    const SyncEdge &edge = sp.edges[idx];
-    renderReleaseRow(depth, edge.srcOp, edge);
-    renderAcquireRow(depth, edge.dstOp, edge);
-  }
-}
-
-static void dumpRawSyncBlock(Block &block, SyncPlan &sp, BufferGroup &group,
+static void dumpRawSyncBlock(Block &block, SyncPlan &sp,
+                             const ResourcePlan &plan, BufferGroup &group,
                              unsigned depth);
 
 static void dumpRawSyncRegion(Region &region, SyncPlan &sp,
-                              BufferGroup &group, unsigned depth) {
-  printRegionEntry(region, sp, depth);
-  for (Block &b : region) dumpRawSyncBlock(b, sp, group, depth);
+                              const ResourcePlan &plan, BufferGroup &group,
+                              Operation *anchorOp, unsigned depth) {
+  auto recIt = plan.regionOwners.find(&region);
+  std::optional<PartitionId> part;
+  if (recIt != plan.regionOwners.end()) part = recIt->second.entry;
+  renderEnterRow(depth, anchorOp, part);
+  for (Block &b : region) dumpRawSyncBlock(b, sp, plan, group, depth);
+  // YIELD-anchored close edges render right before the YIELD row.
+  auto yIt = sp.beforeYield.find(&region);
+  if (yIt != sp.beforeYield.end())
+    printEdgesAt(&yIt->second, sp, anchorOp, depth);
+  renderYieldRow(depth, anchorOp, part);
 }
 
-static void dumpRawSyncBlock(Block &block, SyncPlan &sp, BufferGroup &group,
+static void dumpRawSyncBlock(Block &block, SyncPlan &sp,
+                             const ResourcePlan &plan, BufferGroup &group,
                              unsigned depth) {
   for (Operation &op : block) {
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-      // Same subtree-has-events gating as OWNERSHIP-DAG.
       bool show = false;
       forOp.walk([&](Operation *o) -> WalkResult {
         if (sp.accessOps.contains(o)) {
@@ -1345,16 +1327,15 @@ static void dumpRawSyncBlock(Block &block, SyncPlan &sp, BufferGroup &group,
         }
         return WalkResult::advance();
       });
-      if (!show && !sp.entryEdges.count(&forOp.getRegion()) &&
-          !sp.exitEdges.count(&forOp.getRegion()))
-        continue;
-      // Initial permit anchored before this for-op?
-      if (sp.initialEdgeIdx && sp.initialAnchorBeforeOp == &op &&
-          sp.initialAnchorRegion == block.getParent())
-        renderAcquireRow(depth, &op, sp.edges[*sp.initialEdgeIdx]);
-      llvm::errs() << treePrefix(depth) << "|- " << forOpLabel(forOp)
-                   << "                              structural\n";
-      dumpRawSyncRegion(forOp.getRegion(), sp, group, depth + 1);
+      if (!show && !sp.beforeYield.count(&forOp.getRegion())) continue;
+      // Edges anchored "before" this region op (release+acquire pair).
+      auto bIt = sp.beforeOp.find(&op);
+      if (bIt != sp.beforeOp.end())
+        printEdgesAt(&bIt->second, sp, &op, depth);
+      // Region-op header row (planner-derived partition).
+      llvm::errs() << treePrefix(depth) << "|- " << regionOpLabel(&op, plan)
+                   << "\n";
+      dumpRawSyncRegion(forOp.getRegion(), sp, plan, group, &op, depth + 1);
       continue;
     }
     if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
@@ -1366,45 +1347,28 @@ static void dumpRawSyncBlock(Block &block, SyncPlan &sp, BufferGroup &group,
         }
         return WalkResult::advance();
       });
-      if (!show && !sp.entryEdges.count(&ifOp.getThenRegion()) &&
-          !sp.exitEdges.count(&ifOp.getThenRegion()) &&
-          !sp.entryEdges.count(&ifOp.getElseRegion()) &&
-          !sp.exitEdges.count(&ifOp.getElseRegion()))
-        continue;
-      if (sp.initialEdgeIdx && sp.initialAnchorBeforeOp == &op &&
-          sp.initialAnchorRegion == block.getParent())
-        renderAcquireRow(depth, &op, sp.edges[*sp.initialEdgeIdx]);
-      llvm::errs() << treePrefix(depth)
-                   << "|- scf.if                               structural\n";
-      llvm::errs() << treePrefix(depth + 1) << "|- then region\n";
-      dumpRawSyncRegion(ifOp.getThenRegion(), sp, group, depth + 2);
-      llvm::errs() << treePrefix(depth + 1) << "|- else region\n";
-      if (!ifOp.getElseRegion().empty())
-        dumpRawSyncRegion(ifOp.getElseRegion(), sp, group, depth + 2);
-      continue;
-    }
-    if (auto yieldOp = dyn_cast<scf::YieldOp>(op)) {
-      // Render any region-exit edges immediately before the terminator.
-      Region *parentRegion = yieldOp->getParentRegion();
-      if (parentRegion) printRegionExit(*parentRegion, sp, depth);
-      continue;
-    }
-    if (!sp.accessOps.contains(&op)) continue;
-    auto useIt = sp.incomingByAccess.find(&op);
-    // Initial-permit acquire when this op is the func-direct anchor.
-    if (sp.initialEdgeIdx && sp.initialAnchorBeforeOp == &op &&
-        sp.initialAnchorRegion == block.getParent())
-      renderAcquireRow(depth, &op, sp.edges[*sp.initialEdgeIdx]);
-    // Inline incoming acquires (excluding the initial permit row which
-    // was just rendered).
-    if (useIt != sp.incomingByAccess.end()) {
-      for (unsigned idx : useIt->second) {
-        const SyncEdge &edge = sp.edges[idx];
-        if (!edge.srcOp) continue; // initial permit handled above
-        renderAcquireRow(depth, &op, edge);
+      if (!show) continue;
+      auto bIt = sp.beforeOp.find(&op);
+      if (bIt != sp.beforeOp.end())
+        printEdgesAt(&bIt->second, sp, &op, depth);
+      llvm::errs() << treePrefix(depth) << "|- " << regionOpLabel(&op, plan)
+                   << "\n";
+      llvm::errs() << treePrefix(depth + 1) << "|- then\n";
+      dumpRawSyncRegion(ifOp.getThenRegion(), sp, plan, group, &op, depth + 2);
+      if (!ifOp.getElseRegion().empty()) {
+        llvm::errs() << treePrefix(depth + 1) << "|- else\n";
+        dumpRawSyncRegion(ifOp.getElseRegion(), sp, plan, group, &op,
+                          depth + 2);
       }
+      continue;
     }
-    // Find the touch + render the access row.
+    if (isa<scf::YieldOp>(op)) continue;
+    if (!sp.accessOps.contains(&op)) continue;
+    // Edges anchored before this access row.
+    auto bIt = sp.beforeOp.find(&op);
+    if (bIt != sp.beforeOp.end())
+      printEdgesAt(&bIt->second, sp, &op, depth);
+    // Access row.
     AccessEvent *event = nullptr;
     for (AccessEvent &e : group.events)
       if (e.op == &op) {
@@ -1414,26 +1378,24 @@ static void dumpRawSyncBlock(Block &block, SyncPlan &sp, BufferGroup &group,
     const AccessTouch *touch =
         event ? findTouchForResource(*event, sp.resource.second) : nullptr;
     if (touch) {
-      bool reads = touchReads(*touch);
-      bool writes = touchWrites(*touch);
+      bool reads = hasRead(touch->effect);
+      bool writes = hasWrite(touch->effect);
       llvm::errs() << treePrefix(depth) << "|- "
                    << accessKindChar(reads, writes) << "  m"
                    << touch->memberIdx << "  " << op.getName().getStringRef()
                    << "  " << ownerStr(&op, event->owner) << "\n";
     }
-    // Outgoing releases as children.
-    printInlineOutgoing(&op, sp, depth);
   }
 }
 
-static void dumpRawSyncDag(SyncPlan &sp, BufferGroup &group,
-                           triton::FuncOp funcOp) {
+static void dumpRawSyncDag(SyncPlan &sp, const ResourcePlan &plan,
+                           BufferGroup &group, triton::FuncOp funcOp) {
   llvm::errs() << "RAW-SYNC-DAG buffer.id=" << sp.resource.first
                << " resourceKey=" << sp.resource.second << " edges="
                << sp.edges.size() << "\n";
   llvm::errs() << "|- func region @" << funcOp.getName() << "\n";
   for (Block &b : funcOp.getBody())
-    dumpRawSyncBlock(b, sp, group, /*depth=*/1);
+    dumpRawSyncBlock(b, sp, plan, group, /*depth=*/1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1478,7 +1440,7 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp) {
                                        group, key, rank);
       dumpOwnershipDag(plan, group, funcOp);
       SyncPlan sp = buildSyncPlan(group, plan, funcOp);
-      dumpRawSyncDag(sp, group, funcOp);
+      dumpRawSyncDag(sp, plan, group, funcOp);
     }
   }
   llvm::errs() << "\n";
