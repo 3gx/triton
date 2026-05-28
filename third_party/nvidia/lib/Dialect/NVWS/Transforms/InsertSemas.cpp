@@ -1923,12 +1923,53 @@ static Operation *getLocalSemaphoreCreateAnchor(BufferGroup &group) {
   return anchor;
 }
 
-static int computeSemaphoreDepth(BufferGroup &group) {
-  if (!group.isTmem()) return 1;
-  for (AccessEvent &event : group.events)
-    if (isa<MMAv5OpInterface>(event.op) && event.op->getParentOfType<scf::ForOp>())
-      return 2;
-  return 1;
+static bool canDoubleBufferAcc(MMAv5OpInterface mmaOp, int numTmemBlocks) {
+  auto tmemDesc = mmaOp.getAccumulator().getType();
+  auto blockM = tmemDesc.getShape()[0];
+  auto blockN = tmemDesc.getShape()[1];
+  constexpr int numTMEMColumns = 512;
+  constexpr int numTMEMRows = 128;
+  if (numTmemBlocks + (blockM * blockN * 2) > numTMEMRows * numTMEMColumns)
+    return false;
+  if (isa<TCGen5MMAScaledOp>(mmaOp) && blockN == 256)
+    return false;
+  return true;
+}
+
+static int computeTmemSemaphoreNumStages(BufferGroup &group, int numTmemBlocks) {
+  bool isMultiStaged = true;
+  for (BufferMember &member : group.members) {
+    auto allocOp = cast<TMEMAllocOp>(member.allocOp);
+    for (auto user : allocOp.getResult().getUsers()) {
+      if (auto mmaOp = dyn_cast<MMAv5OpInterface>(user)) {
+        if (auto loop = dyn_cast<scf::ForOp>(user->getParentOp())) {
+          auto wsLoop = getOuterWSLoop(loop);
+          // Determine if the MMA accumulator can be multibuffered.
+          bool accIsMultiBuffered =
+              // MMAs in subsequent iterations can be overlapped.
+              !nvidia_gpu::hasAccReadModifyWrite(mmaOp, loop) &&
+              // The accumulator is reset at some point, thus allowing
+              // multibuffering.
+              isAccMultibufferingPossible(mmaOp, loop) &&
+              // The user didn't disable it with a flag.
+              !getDisallowAccMultiBuffer(wsLoop) &&
+              canDoubleBufferAcc(mmaOp, numTmemBlocks);
+          isMultiStaged = isMultiStaged && accIsMultiBuffered;
+        }
+      }
+    }
+  }
+  auto numStages = 1 + 1 * isMultiStaged;
+  return numStages;
+}
+
+static void updateNumTmemBlocks(BufferGroup &group, int numStages,
+                                int &numTmemBlocks) {
+  for (BufferMember &member : group.members) {
+    auto shape = member.type.getShape();
+    if (shape.size() >= 2)
+      numTmemBlocks += shape[0] * shape[1] * numStages;
+  }
 }
 
 struct GroupBacking {
@@ -1938,7 +1979,8 @@ struct GroupBacking {
 
 static GroupBacking &
 ensureGroupBacking(BufferGroup &group, unsigned groupIdx,
-                   DenseMap<unsigned, GroupBacking> &backings) {
+                   DenseMap<unsigned, GroupBacking> &backings,
+                   const DenseMap<unsigned, int> &numStagesByGroup) {
   auto it = backings.find(groupIdx);
   if (it != backings.end())
     return it->second;
@@ -1946,7 +1988,13 @@ ensureGroupBacking(BufferGroup &group, unsigned groupIdx,
   GroupBacking backing;
   OpBuilder b(getSemaphoreInsertionAnchor(group));
   b.setInsertionPoint(getSemaphoreInsertionAnchor(group));
-  int depth = computeSemaphoreDepth(group);
+  int depth = 1;
+  if (group.isTmem()) {
+    auto it = numStagesByGroup.find(groupIdx);
+    assert(it != numStagesByGroup.end() &&
+           "TMEM semaphore numStages must be precomputed before emission");
+    depth = it->second;
+  }
   for (BufferMember &member : group.members) {
     MemDescType semBufType = member.type;
     if (group.isTmem()) {
@@ -4063,11 +4111,13 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
 static LogicalResult emitResource(triton::FuncOp funcOp, BufferGroup &group,
                                   const ResourcePlan &plan, const SyncPlan &sp,
                                   const OptSyncDag &dag,
-                                  DenseMap<unsigned, GroupBacking> &backings) {
+                                  DenseMap<unsigned, GroupBacking> &backings,
+                                  const DenseMap<unsigned, int> &numStagesByGroup) {
   if (dag.groups.empty()) return success();
   if (failed(verifyPlanBeforeEmission(funcOp, group, plan, sp, dag)))
     return failure();
-  GroupBacking &backing = ensureGroupBacking(group, dag.groupIdx, backings);
+  GroupBacking &backing =
+      ensureGroupBacking(group, dag.groupIdx, backings, numStagesByGroup);
   EmitState state;
   state.semas = createResourceSemaphores(dag, sp, group, backing);
   if (failed(emitResourceRegion(funcOp.getBody(), dag, sp, plan, group, backing,
@@ -4834,6 +4884,17 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp) {
     llvm::errs() << "backing buffers: " << groups.size() << "\n";
   }
 
+  DenseMap<unsigned, int> numStagesByGroup;
+  int numTmemBlocks = 0;
+  for (auto en : llvm::enumerate(groups)) {
+    BufferGroup &group = en.value();
+    if (!group.isTmem())
+      continue;
+    int numStages = computeTmemSemaphoreNumStages(group, numTmemBlocks);
+    numStagesByGroup[static_cast<unsigned>(en.index())] = numStages;
+    updateNumTmemBlocks(group, numStages, numTmemBlocks);
+  }
+
   DenseMap<unsigned, GroupBacking> backings;
   for (auto en : llvm::enumerate(groups)) {
     BufferGroup &group = en.value();
@@ -4855,7 +4916,8 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp) {
         dumpRawSyncDag(sp, plan, group, funcOp);
         dumpOptSyncDag(opt, sp, plan, group, funcOp);
       }
-      if (failed(emitResource(funcOp, group, plan, sp, opt, backings)))
+      if (failed(emitResource(funcOp, group, plan, sp, opt, backings,
+                              numStagesByGroup)))
         return failure();
     }
     eraseUnusedOriginals(group);
