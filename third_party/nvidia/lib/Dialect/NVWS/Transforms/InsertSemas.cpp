@@ -3106,6 +3106,16 @@ static SetVector<int> partitionSetForValue(Value value) {
   return ids;
 }
 
+static std::optional<int> wsTagForValue(Value value) {
+  if (!value)
+    return std::nullopt;
+  if (auto result = dyn_cast<OpResult>(value))
+    return tryGetWsTag(result.getOwner());
+  if (auto arg = dyn_cast<BlockArgument>(value))
+    return tryGetWsTag(arg.getOwner()->getParentOp());
+  return std::nullopt;
+}
+
 static SetVector<int>
 partitionSetForTokenOrOwner(Value token, std::optional<PartitionId> owner,
                             Operation *fallbackAnchor = nullptr) {
@@ -3142,9 +3152,13 @@ static void addOwnerPartition(Operation *op, std::optional<PartitionId> owner) {
 
 static void setSingleOwnerPartition(Operation *op,
                                     std::optional<PartitionId> owner) {
-  if (!op || hasPartition(op) || !owner)
+  if (!op || !owner)
     return;
-  setPartition(op, partitionSetForOwner(owner));
+  SetVector<int> ids;
+  if (hasPartition(op))
+    ids = getPartitionIds(op);
+  ids.insert(owner->first);
+  setPartition(op, ids);
   setWarpTagOutsideWsLoop(op, owner->second);
 }
 
@@ -3947,8 +3961,11 @@ static LogicalResult emitReleaseForGroup(OpBuilder &b, Location loc,
       }
     }
   }
-  if (useStructuredCarrier && structuredCarrierPartition.size() == 1 && !owner)
+  if (useStructuredCarrier && structuredCarrierPartition.size() == 1 && !owner) {
     setPartition(release.getOperation(), structuredCarrierPartition);
+    if (auto tag = wsTagForValue(state.currentToken))
+      setWarpTagOutsideWsLoop(release.getOperation(), *tag);
+  }
   if (!owner) {
     std::optional<PartitionId> fallbackOwner =
         edge ? edge->dstOwner : std::nullopt;
