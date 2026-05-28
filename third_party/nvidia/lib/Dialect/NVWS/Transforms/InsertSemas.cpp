@@ -1832,6 +1832,7 @@ static bool edgeSrcWrites(const SyncEdge &edge, BufferGroup &group,
 static bool edgeNeedsTerminalReadRelease(const SyncEdge &edge,
                                          BufferGroup &group,
                                          int64_t resourceKey);
+static bool isRootToWsLoopEntryEdge(const SyncEdge &edge, BufferGroup &group);
 
 static bool hasOutgoingEdgeFromOp(const SyncPlan &sp, Operation *op) {
   if (!op)
@@ -2114,6 +2115,10 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, BufferGroup &group) {
       // Release+acquire both at dst (matches RAW model).
       const SyncEdge &e = sp.edges[g.edgeIdxs.front()];
       if (e.dstOp) {
+        if (isRootToWsLoopEntryEdge(e, group)) {
+          dag.threadForOps.insert(e.dstOp);
+          break;
+        }
         dag.releaseBeforeOp[e.dstOp].push_back(gi);
         Operation *acquireAnchor = e.dstOp;
         if (!group.isTmem()) {
@@ -2639,6 +2644,13 @@ static bool edgeSrcWrites(const SyncEdge &edge, BufferGroup &group,
   if (!edge.srcOp) return false;
   const AccessEvent *event = findEvent(group, edge.srcOp);
   return event && eventProduces(*event, resourceKey);
+}
+
+static bool isRootToWsLoopEntryEdge(const SyncEdge &edge, BufferGroup &group) {
+  if (!group.isTmem() || edge.srcOwner || !edge.dstOwner)
+    return false;
+  auto forOp = dyn_cast_or_null<scf::ForOp>(edge.dstOp);
+  return forOp && hasWarpSpecializeTag(forOp.getOperation());
 }
 
 static bool edgeStartsAtRootTmemStoreInitializer(const SyncEdge &edge,
