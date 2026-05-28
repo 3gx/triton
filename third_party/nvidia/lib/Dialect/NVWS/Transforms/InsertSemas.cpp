@@ -18,6 +18,7 @@
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Visitors.h"
 #include "mlir/Pass/Pass.h"
@@ -2613,11 +2614,49 @@ static void replaceTokenResults(Operation *op, Value token) {
       result.replaceAllUsesWith(token);
 }
 
-static void replaceTokenOperands(Operation *op, Value token) {
-  if (!token) return;
-  for (OpOperand &operand : op->getOpOperands())
-    if (isa<AsyncTokenType>(operand.get().getType()))
-      operand.set(token);
+static void poisonTokenResults(OpBuilder &b, Operation *op) {
+  bool hasTokenResult = llvm::any_of(op->getResults(), [](Value result) {
+    return isa<AsyncTokenType>(result.getType());
+  });
+  if (!hasTokenResult)
+    return;
+  OpBuilder::InsertionGuard guard(b);
+  b.setInsertionPoint(op);
+  Value poison =
+      ub::PoisonOp::create(b, op->getLoc(), b.getType<AsyncTokenType>());
+  replaceTokenResults(op, poison);
+}
+
+static bool touchesWrittenAccumulator(ArrayRef<const AccessTouch *> touches,
+                                      Value accumulator) {
+  return llvm::any_of(touches, [&](const AccessTouch *touch) {
+    return touch->accessValue == accumulator && touchWrites(*touch);
+  });
+}
+
+static void clearOwnedTmemTokenOperands(Operation *op) {
+  if (auto tmemLoad = dyn_cast<TMEMLoadOp>(op)) {
+    tmemLoad.getDepMutable().clear();
+    return;
+  }
+  if (auto tmemStore = dyn_cast<TMEMStoreOp>(op)) {
+    tmemStore.getDepMutable().clear();
+    return;
+  }
+  if (auto mma = dyn_cast<MMAv5OpInterface>(op))
+    mma.getAccDepMutable().clear();
+}
+
+static bool accessOwnsAsyncToken(Operation *op,
+                                 ArrayRef<const AccessTouch *> touches,
+                                 BufferGroup &group) {
+  if (!group.isTmem())
+    return false;
+  if (isa<TMEMAllocOp, TMEMLoadOp, TMEMStoreOp>(op))
+    return true;
+  if (auto mma = dyn_cast<MMAv5OpInterface>(op))
+    return touchesWrittenAccumulator(touches, mma.getAccumulator());
+  return false;
 }
 
 static Operation *getBufferDefiningOp(ArrayRef<Value> buffers) {
@@ -2657,6 +2696,7 @@ static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
 
   Value sem;
   Value token;
+  bool ownsAsyncToken = accessOwnsAsyncToken(op, touches, group);
   if (!acquires.empty()) {
     sem = acquires.front().semaphore;
     token = acquires.front().token;
@@ -2775,10 +2815,12 @@ static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
     }
     for (auto [operand, accessBuffer] : replacements)
       operand->set(accessBuffer);
-    replaceTokenOperands(op, token);
+    if (ownsAsyncToken)
+      clearOwnedTmemTokenOperands(op);
   }
 
-  replaceTokenResults(op, token);
+  if (ownsAsyncToken)
+    poisonTokenResults(b, op);
   state.eventToken[op] = token;
   state.eventSemaphore[op] = sem;
   state.protectedAccesses.insert(op);
@@ -3895,7 +3937,7 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
           hasPartition(ifOp) ? getPartitionOutputs(ifOp)
                              : SmallVector<SetVector<int>, 4>();
       bool reuseExistingTokenResult =
-          threaded && oldNumResults == 1 &&
+          threaded && !group.isTmem() && oldNumResults == 1 &&
           isa<AsyncTokenType>(ifOp.getResult(0).getType());
       if (threaded) {
         if (ifOp.getElseRegion().empty())
@@ -4628,6 +4670,131 @@ static void dumpOptSyncDag(const OptSyncDag &dag, const SyncPlan &sp,
     dumpOptSyncBlock(b, dag, sp, plan, group, /*depth=*/1);
 }
 
+static SetVector<int> unionPartitionIds(Operation *lhs, Operation *rhs) {
+  SetVector<int> ids;
+  if (lhs && hasPartition(lhs))
+    addPartitionIds(ids, getPartitionIds(lhs));
+  if (rhs && hasPartition(rhs))
+    addPartitionIds(ids, getPartitionIds(rhs));
+  return ids;
+}
+
+static SetVector<int> subtractPartitionIds(const SetVector<int> &ids,
+                                           const SetVector<int> &excluded) {
+  SetVector<int> result;
+  for (int id : ids)
+    if (!llvm::is_contained(excluded, id))
+      result.insert(id);
+  return result;
+}
+
+static void assignStageIfKnown(OpBuilder &b, Operation *op,
+                               StageCluster stageCluster) {
+  if (stageCluster)
+    setStageCluster(b, op, stageCluster);
+}
+
+static bool semaphoreUsesTmem(Value semaphore) {
+  auto semaType = dyn_cast<SemaphoreType>(semaphore.getType());
+  if (!semaType || semaType.getBaseType().empty())
+    return false;
+  auto memDescType = dyn_cast<MemDescType>(semaType.getBaseType().front());
+  return memDescType &&
+         memDescType.getMemorySpace() ==
+             TensorMemorySpaceAttr::get(semaphore.getContext());
+}
+
+static void splitSemaphoreIfForLoopScheduler(triton::FuncOp funcOp) {
+  SmallVector<scf::IfOp, 4> ifOps;
+  funcOp.walk([&](scf::IfOp ifOp) {
+    if (ifOp.thenBlock()->empty())
+      return;
+    Operation *firstOp = &ifOp.thenBlock()->front();
+    Operation *lastOp = ifOp.thenBlock()->getTerminator()->getPrevNode();
+    auto releaseOp = dyn_cast_or_null<SemaphoreReleaseOp>(firstOp);
+    auto acquireOp = dyn_cast_or_null<SemaphoreAcquireOp>(lastOp);
+    if (releaseOp && acquireOp &&
+        (semaphoreUsesTmem(releaseOp.getSemaphore()) ||
+         semaphoreUsesTmem(acquireOp.getSemaphore())))
+      ifOps.push_back(ifOp);
+  });
+
+  for (scf::IfOp ifOp : ifOps) {
+    OpBuilder b(ifOp);
+    Location loc = ifOp.getLoc();
+
+    b.setInsertionPoint(ifOp);
+    auto exitIf =
+        scf::IfOp::create(b, loc, TypeRange{}, ifOp.getCondition(),
+                          /*withElseRegion=*/false);
+    auto releaseOp = cast<SemaphoreReleaseOp>(&ifOp.thenBlock()->front());
+    releaseOp->moveBefore(exitIf.thenBlock(), exitIf.thenBlock()->begin());
+
+    b.setInsertionPointAfter(ifOp);
+    auto enterIf = scf::IfOp::create(b, loc, TypeRange{b.getType<AsyncTokenType>()},
+                                     ifOp.getCondition(),
+                                     /*withElseRegion=*/true);
+    auto acquireOp = cast<SemaphoreAcquireOp>(
+        ifOp.thenBlock()->getTerminator()->getPrevNode());
+    acquireOp->moveBefore(enterIf.thenBlock(), enterIf.thenBlock()->begin());
+
+    auto pos = findValuePosInRange(ifOp.thenYield()->getOperands(),
+                                   acquireOp.getToken());
+    if (!pos)
+      continue;
+    ifOp.getResult(*pos).replaceAllUsesWith(enterIf.getResult(0));
+
+    b.setInsertionPointToEnd(enterIf.thenBlock());
+    scf::YieldOp::create(b, loc, acquireOp.getToken());
+    b.setInsertionPointToEnd(enterIf.elseBlock());
+    scf::YieldOp::create(b, loc, ifOp.elseYield().getOperand(*pos));
+
+    b.setInsertionPoint(ifOp);
+    Value poison = ub::PoisonOp::create(b, loc, b.getType<AsyncTokenType>());
+    ifOp.thenYield().setOperand(*pos, poison);
+    ifOp.elseYield().setOperand(*pos, poison);
+
+    exitIf->setAttrs(ifOp->getAttrs());
+    enterIf->setAttrs(ifOp->getAttrs());
+    StageCluster releaseStage = getStageCluster(releaseOp);
+    StageCluster acquireStage = getStageCluster(acquireOp);
+    if (!releaseStage)
+      releaseStage = acquireStage;
+    assignStageIfKnown(b, exitIf, releaseStage);
+    assignStageIfKnown(b, enterIf, acquireStage);
+
+    SetVector<int> enterExitIds =
+        unionPartitionIds(releaseOp.getOperation(), acquireOp.getOperation());
+    if (!enterExitIds.empty()) {
+      setPartition(exitIf, enterExitIds);
+      setPartition(enterIf, enterExitIds);
+      setPartitionOutputs(exitIf, {});
+      SmallVector<SetVector<int>, 1> enterOutputs{enterExitIds};
+      setPartitionOutputs(enterIf, enterOutputs);
+    }
+
+    SetVector<int> middleIds;
+    if (hasPartition(ifOp))
+      middleIds = subtractPartitionIds(getPartitionIds(ifOp), enterExitIds);
+    if (middleIds.empty() && ifOp.getNumResults() > 0)
+      middleIds = partitionSetForValue(ifOp.getResult(0));
+    if (!middleIds.empty()) {
+      SetVector<int> ifIds = middleIds;
+      SmallVector<SetVector<int>, 4> outputs;
+      outputs.reserve(ifOp.getNumResults());
+      for (Value result : ifOp.getResults()) {
+        SetVector<int> resultIds = partitionSetForValue(result);
+        if (resultIds.empty())
+          resultIds = middleIds;
+        addPartitionIds(ifIds, resultIds);
+        outputs.push_back(resultIds);
+      }
+      setPartition(ifOp, ifIds);
+      setPartitionOutputs(ifOp, outputs);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Top-level pipeline (commit 5 stage).
 // ---------------------------------------------------------------------------
@@ -4693,6 +4860,7 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp) {
     }
     eraseUnusedOriginals(group);
   }
+  splitSemaphoreIfForLoopScheduler(funcOp);
   if (dumpDag)
     llvm::errs() << "\n";
 
