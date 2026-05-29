@@ -672,6 +672,67 @@ that version's cross-partition consumers. On each event:
 Concurrent readers in the same version produce NO edge between
 themselves — they are independent.
 
+#### Every access begins with an acquire — the initial writable permit
+
+A rewritten access cannot exist without a carrier token. Every access
+lowers to:
+
+```text
+token = nvws.semaphore.acquire(SEM_in)
+view  = nvws.semaphore.buffer(SEM_in, token)
+op(view)                       // the access
+nvws.semaphore.release(SEM_out, token)
+```
+
+So *every* access row in the DAG has an acquire that produces the token
+its `semaphore.buffer` consumes. An access's acquire is the destination
+side of an incoming edge — except the **first** access of a
+`(logicalGroupId, resourceKey)` in program order, which has no incoming
+cross-owner edge. That first access acquires the **initial writable
+permit**: a counter created in the *released* state (initial value =
+depth, not 0), so the very first `acquire` succeeds immediately.
+
+**A RAW-SYNC-DAG that shows the first access with no preceding acquire is
+incomplete and wrong** — there is no token source for its buffer view.
+The entry acquire is a first-class row, not an OPT-stage afterthought.
+
+The initial permit is not a separate special case bolted onto a loop; it
+is the same counter the loop already needs:
+
+- **Cyclic resource** (the last owner hands the buffer back to the first
+  owner across the loop-carry `YIELD`): the loop-carry **back edge *is*
+  the initial permit**. Its counter is created released so iteration 0's
+  entry acquire succeeds; the back-edge `release` re-arms it for the next
+  iteration's entry acquire. Do **not** mint a second counter for the
+  entry — reuse the back edge. Render it as one `acquire <back> root`
+  before the loop (iteration 0) plus the body-tail `release <back>`/
+  `acquire <back>` pair (next iteration).
+- **Acyclic resource** (first and last owner differ, no wrap): the entry
+  acquire consumes a *distinct* initial-permit counter, created released,
+  acquired once before the first access, and released once at the
+  terminal consumer.
+
+#### Edge ownership: release at the source, acquire at the destination
+
+For every cross-owner edge `A -> B` the two ops belong to **different**
+owners — this is the single rule that makes every other case fall out:
+
+- the **release** is owned by `A` (the source/producer of the edge);
+- the **acquire**, the access it guards, and any trailing empty-release
+  are owned by `B` (the destination/consumer).
+
+Each op is stamped with its owner's partition. An op owned by `{P}` but
+emitted **outside** the WS loop additionally carries the loop's
+`ttg.warp_specialize.tag` (see §Region-Boundary Edges) so that
+`--tritongpu-partition-loops` routes it onto `{P}`'s warps. A root-owned
+op outside the loop stays root.
+
+There is no exception for `B = root`: when the destination is root, the
+acquire / access / empty-release are owned by root, and only the producer's
+release carries `{A}`. Stamping the consumer side with the producer's
+partition is a bug (it makes the producer wait on its own ready-signal and
+frees the slot before the reader read it).
+
 #### Example 1 — simple loop, two partitions
 
 Input IR shape:
@@ -710,6 +771,7 @@ RAW-SYNC-DAG (per-edge counters, no FULL/EMPTY):
 ```text
 RAW-SYNC-DAG buffer.id=N resourceKey=K
 |- func region @example1
+|  |- a S_e1  acquire  root
 |  |- scf.for (WS, tag=0) {0}
 |  |  |- ENTER {0}
 |  |  |- W m0  ttg.local_store  {0}
@@ -721,10 +783,16 @@ RAW-SYNC-DAG buffer.id=N resourceKey=K
 |  |  |- YIELD {0}
 ```
 
-Two edges. `S_e0` enforces "W{0} done before R{1} reads". `S_e1`
-enforces "R{1} done before next-iter W{0} overwrites" (the loop carry,
-naturally produced because YIELD's partition `{0}` differs from
-R{1}'s partition).
+Two edges plus the initial permit. `S_e1` is both the loop-carry back edge
+**and** the initial writable permit: it is created **released**, so the
+entry `a S_e1 acquire root` (before the loop) hands the first `W{0}` its
+carrier on iteration 0; the body-tail `r S_e1 release {1} -> {0}` /
+`a S_e1 acquire {0}` pair re-arms and re-acquires it for each subsequent
+iteration. `S_e0` enforces "W{0} done before R{1} reads"; `S_e1` enforces
+"R{1} done before next-iter W{0} overwrites" (the loop carry, naturally
+produced because YIELD's partition `{0}` differs from R{1}'s partition).
+(All-in-loop lowering may fold the root entry acquire and the per-iteration
+reacquire into one acquire at the body top; the logical permit is the same.)
 
 OPT-SYNC-DAG: nothing combines (each src/dst pair is unique). Identical
 to RAW-SYNC-DAG.
@@ -732,6 +800,7 @@ to RAW-SYNC-DAG.
 ```text
 OPT-SYNC-DAG buffer.id=N resourceKey=K
 |- func region @example1
+|  |- a S_e1  acquire  root
 |  |- scf.for (WS, tag=0) {0}
 |  |  |- ENTER {0}
 |  |  |- W m0  ttg.local_store  {0}
@@ -791,6 +860,7 @@ RAW-SYNC-DAG — seven independent counters:
 ```text
 RAW-SYNC-DAG buffer.id=N resourceKey=K
 |- func region @example2
+|  |- a S_e6  acquire  root
 |  |- scf.for (WS, tag=0) {0}
 |  |  |- ENTER {0}
 |  |  |- W m0  ttg.local_store  {0}
@@ -814,6 +884,12 @@ RAW-SYNC-DAG buffer.id=N resourceKey=K
 |  |  |- a S_e6  acquire  {0}
 |  |  |- YIELD {0}
 ```
+
+As in Example 1, the loop-carry back edge `S_e6` ({4}→{0}) is the initial
+writable permit: created **released**, acquired once as `a S_e6 acquire root`
+before the loop (carrier for iteration 0's W{0}), then re-armed by
+`r S_e6 release {4} -> {0}` and re-acquired by `a S_e6 acquire {0}` each
+subsequent iteration.
 
 Note that R{1}, R{2}, R{3} have NO edges between them — they are
 concurrent readers of the same version produced by W{0}. The walker
@@ -896,6 +972,87 @@ semaphore placement.
 If a control-flow pattern cannot be represented safely, emit a hard diagnostic
 before IR mutation. Do not fall back to ping-pong or original token-chain
 scheduling.
+
+### Region-Boundary Edges (root / external / WS-loop entry and exit)
+
+The warp-specialized `scf.for` is a scope boundary: at entry all partition
+warp groups start together (entry is implicitly ordered after the enclosing
+code), and at exit they are joined before the enclosing code continues. Three
+boundary cases follow:
+
+1. **true-root → `{P}` (carrier inherit, NOT an edge).** A producer that is
+   *true root* — an op with **no** partition annotation at all — flowing into a
+   WS-loop partition needs **no** release/acquire: entry ordering already makes
+   its writes visible. The first owner inside the region simply inherits the
+   carrier token of the initial writable permit (threaded through the loop's
+   `iter_args`). No edge is emitted for `root -> {P}`. Verified on
+   `root_entry_accumulator…`, `nested_loop_yes_double_buffer`,
+   `warp_specialize_tma_matmul` (the emit has `CHECK-NOT: release/acquire`
+   between the root store and the loop).
+
+   Example (`warp_specialize_tma_matmul`, the `root -> {1}` entry):
+
+   ```text
+   |- a S0 acquire root             ; initial writable permit (root)
+   |- W m0 ttng.tmem_store root      ; true-root producer (no partition annotation)
+   |- scf.for (WS, tag=0) {1}
+   |  |- ENTER {1}
+   |  |- W m0 ttng.tc_gen5_mma {1}   ; inherits threaded carrier — no root->{1} edge
+   ```
+
+2. **annotated external (no ws tag) → `{P}` (resolves to root → carrier inherit).**
+   A producer carrying a partition annotation but sitting *outside* the loop with
+   **no** `ttg.warp_specialize.tag` (e.g.
+   `local_root_external_distinct_from_ws_tag_zero`) is resolved by `getPartitionId`
+   to **root** (no tag ⇒ `nullopt`; see `InsertSemas.cpp` line 180). It is therefore
+   the *same* situation as case 1 — `root -> {P}` carrier inherit, **no edge**. (An
+   earlier draft modelled it as a real `release`/`acquire` edge — producer release
+   before the loop firing once, consumer acquire inside the loop firing every
+   iteration — which deadlocks 1-vs-N; that wrong model is exactly why carrier
+   inherit is correct.) If the external op *also* carries an intrinsic
+   `ttg.warp_specialize.tag`, `getPartitionId` returns `{@T.P}` (line 181) and it is
+   an **ordinary owner** under the uniform edge rule — not a boundary special case
+   (the `{P} -> root` exit in case 3 is such an intrinsic-tag op).
+
+   Example (`local_root_external_distinct_from_ws_tag_zero`):
+
+   ```text
+   |- a S0 acquire root             ; initial writable permit (root)
+   |- W m0 ttg.local_store root      ; partition attr but no ws tag ⇒ getPartitionId = root
+   |- scf.for (WS, tag=0) {0}
+   |  |- ENTER {0}
+   |  |- R m0 ttg.local_load {0}    ; inherits threaded carrier — no root->{0} edge
+   |  |- YIELD {0}
+   ```
+
+3. **`{P}` → root (region exit, real handoff).** By the uniform ownership rule,
+   the source `{P}` owns the release and the destination root owns the acquire,
+   the access, and the empty-release:
+
+   ```text
+   r S_full release {@T.P} -> root   ; producer {P}: stamped {ttg.partition=P, ws.tag=T}
+   a S_full acquire root             ; consumer root
+   R m0 ttng.tmem_load root          ; consumer root
+   r S_empty release root            ; consumer root frees the slot
+   ```
+
+   Only the producer release is `{P}`; the whole consumer bracket is root.
+
+**Outside-WS-loop tag stamping.** Any sync op owned by `{P}` but emitted
+*outside* the WS loop (e.g. the `{P}`→root producer release placed after the
+loop) must be stamped with `ttg.partition = {P}` **and** the loop's
+`ttg.warp_specialize.tag`, so `--tritongpu-partition-loops` routes it onto
+`{P}`'s warps. Root-owned ops stay unstamped. This is mandatory, not cosmetic:
+
+- a `{P}`-stamped op whose operand is produced inside `{P}`'s partition region
+  (which is `IsolatedFromAbove`) keeps the op co-located with that operand; the
+  same op left root references a value inside an isolated region and the
+  partition-loops pass aborts (`operation destroyed but still has uses`);
+- the producer release lowers to the arrive on `{P}`'s warps (for a
+  `tc5mma`-payload release this is the `tc_gen5_commit`); a root release would
+  arrive on the default warps, decoupling the ready-signal from the producer.
+
+Canonical regression: `test/NVWS/insert_semas_post_ws_read_tag.mlir`.
 
 ## End-to-End Examples
 
@@ -1373,6 +1530,12 @@ gives the first write or sourceful implicit write for a
 `(logicalGroupId, resourceKey)` a carrier token for `nvws.semaphore.buffer` even
 when that write has no incoming cross-owner edge.
 
+The permit is first-class in the RAW-SYNC-DAG, not an emit-time afterthought —
+see §Raw DAG Edge Model → "Every access begins with an acquire". In a **cyclic**
+chain it is **not** a separate semaphore: the loop-carry back edge *is* the
+permit (its counter is created released), so do not mint a second one. A
+**distinct** permit is created only for an acyclic chain (no back edge to reuse).
+
 Minimal shape:
 
 ```text
@@ -1753,6 +1916,104 @@ Required safety checks:
 If any safety check fails, keep the exact per-edge sync groups or emit a hard
 diagnostic if the uncombined per-edge form cannot be represented. Do not fall
 back to target-partition-only ping-pong state.
+
+## Worked Examples — Entry Acquire, Carrier Inherit, Region-Boundary Ownership
+
+These show the combined `SYNC-DAG` (post Combine C: `S_full` = the FULL /
+data-ready semaphore, `S_back` = the EMPTY / writable-permit semaphore; for an
+acyclic chain the distinct permit is `S0` and the data-ready edge is `S1`).
+One op per line. Each obeys the same two rules: every access has a preceding
+acquire (the first one acquires the initial permit), and for each edge the
+release is owned by the source and the acquire/access/empty-release by the
+destination.
+
+### A. `local_sourceful_aliased_buffers` — in-loop cyclic, two owners
+
+```text
+SYNC-DAG buffer.id=400 resourceKey=0          ; cyclic: S_back = back edge = initial permit (released)
+|- a S_back acquire root
+|- scf.for (WS, tag=0) {1}
+|  |- ENTER {1}
+|  |- W m0 ttg.local_alloc {1}
+|  |- R m0 ttg.local_load  {1}
+|  |- r S_full release {1} -> {0}
+|  |- a S_full acquire {0}
+|  |- W m1 ttg.local_alloc {0}
+|  |- R m1 ttg.local_load  {0}
+|  |- r S_back release {0} -> {1}
+|  |- a S_back acquire {1}
+|  |- YIELD {1}
+```
+
+All owners are partitions (no root edge), so the current emit is already
+correct here.
+
+### B. `outer_produced_inner_consumed` — cyclic, consumer in a nested loop
+
+```text
+SYNC-DAG buffer.id=200 resourceKey=0
+|- a S_back acquire root
+|- scf.for (WS, tag=0) {2}
+|  |- ENTER {2}
+|  |- W m0 ttg.local_store {2}
+|  |- r S_full release {2} -> {1}
+|  |- a S_full acquire {1}
+|  |- scf.for {1}
+|  |  |- ENTER {1}
+|  |  |- R m0 ttg.local_load {1}
+|  |  |- YIELD {1}
+|  |- r S_back release {1} -> {2}
+|  |- a S_back acquire {2}
+|  |- YIELD {2}
+```
+
+### C. `nested_loop_yes_double_buffer` — true-root entry + in-loop cycle
+
+```text
+SYNC-DAG buffer.id=0 resourceKey=0
+|- a S_back acquire root
+|- W m0 ttng.tmem_store root
+|- scf.for (WS, tag=0) {2}
+|  |- ENTER {2}
+|  |- W m0 ttng.tmem_store {2}
+|  |- scf.for {2}
+|  |  |- ENTER {2}
+|  |  |- W m0 ttng.tc_gen5_mma {2}
+|  |  |- YIELD {2}
+|  |- r S_full release {2} -> {0}
+|  |- a S_full acquire {0}
+|  |- R m0 ttng.tmem_load {0}
+|  |- r S_back release {0} -> {2}
+|  |- a S_back acquire {2}
+|  |- YIELD {2}
+```
+
+`root -> {2}` is carrier inherit (the root store and the `{2}` store share the
+threaded permit) — **no** release/acquire edge for it.
+
+### D. `warp_specialize_tma_matmul` — acyclic `root -> {1} -> root`
+
+```text
+SYNC-DAG buffer.id=0 resourceKey=0            ; acyclic: distinct permit S0, data-ready edge S1
+|- a S0 acquire root
+|- W m0 ttng.tmem_store root
+|- scf.for (WS, tag=0) {1}
+|  |- ENTER {1}
+|  |- W m0 ttng.tc_gen5_mma {1}
+|  |- YIELD {1}
+|- r S1 release {@0.1} -> root
+|- a S1 acquire root
+|- R m0 ttng.tmem_load root
+|- r S0 release root
+```
+
+`root -> {1}` is carrier inherit (no edge). The `{1} -> root` exit: the
+producer release `r S1 release {@0.1} -> root` is displayed `{@0.1}` (owned by
+`{1}`, stamped `{ttg.partition=1, ws.tag=0}`, emitted outside the loop — the tag
+is shown because the row is outside the WS loop, §Debug DAG Dumps line 511),
+lowering to `{1}`'s
+mma commit; the consumer bracket `a S1 acquire root` / `R m0 ... root` /
+`r S0 release root` is owned by root.
 
 ## Plan Verification and Enablement
 
