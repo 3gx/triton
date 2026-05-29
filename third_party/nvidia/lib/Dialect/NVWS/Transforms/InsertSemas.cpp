@@ -1035,6 +1035,14 @@ struct SyncPlan {
   DenseMap<Region *, SmallVector<unsigned, 2>> beforeYield;
   // Ops with at least one touch for this resource (access rows in dump).
   DenseSet<Operation *> accessOps;
+  // Initial writable permit — RAW-SYNC-DAG dump only; does NOT affect emit.
+  // Rendered as a standalone `a <name> acquire root` before
+  // `initialPermitBeforeOp`. Cyclic chains reuse the loop-carry back edge;
+  // acyclic chains mint a fresh counter and add a terminal
+  // `r <name> release root` after `initialPermitReleaseAfterOp`.
+  std::string initialPermitName;
+  Operation *initialPermitBeforeOp = nullptr;
+  Operation *initialPermitReleaseAfterOp = nullptr;
 };
 
 static bool touchReads(const AccessTouch &t) { return hasRead(t.effect); }
@@ -1462,9 +1470,31 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
             continue; // No events in subtree — skip entirely.
           Owner pp = regIt->second.entry; // may be nullopt (== root partition)
           unsigned rank = opRank.lookup(&op);
-          // Transition at the scf.for header row.
-          emitClose(state, pp, &op, /*anchorYieldRegion=*/nullptr,
-                    /*isW=*/false, rank);
+          // v4 §Region-Boundary Edges: a root/external producer (nullopt
+          // effective owner) entering a warp-specialized loop is
+          // *carrier-inherit*, not a handoff. Region entry already orders
+          // the producer's writes before every partition, so the loop's
+          // entry partition adopts the producer's state with no semaphore
+          // edge. Applies uniformly to true-root and annotated-external
+          // (both have nullopt effective owner). Without this, the
+          // root->{P} edge would emit a bogus handoff (and, for a loop
+          // that re-acquires per iteration against a single pre-loop
+          // release, deadlock).
+          if (hasWarpSpecializeTag(&op) && state.writerSet && !state.writer &&
+              pp.has_value()) {
+            state.writer = pp;
+            state.writerOp = &op;
+            state.writerYieldRegion = nullptr;
+            state.writerEpoch = ++writerEpochCtr;
+            state.readers.clear();
+            state.readerOps.clear();
+            state.readerYields.clear();
+            state.readerEpochs.clear();
+          } else {
+            // Transition at the scf.for header row.
+            emitClose(state, pp, &op, /*anchorYieldRegion=*/nullptr,
+                      /*isW=*/false, rank);
+          }
           walkRegion(forOp.getRegion(), state);
           // Transition at the body's YIELD row (loop-carry close).
           Operation *yieldOp = forOp.getRegion().front().getTerminator();
@@ -1537,6 +1567,64 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
 
   State state;
   walkRegion(funcOp.getBody(), state);
+
+  // -------- Initial writable permit (RAW-SYNC-DAG dump only). ----------
+  // v4 plan "Every access begins with an acquire": the first access of a
+  // semaphore-managed (>=2 distinct owners) resource acquires the initial
+  // writable permit. Cyclic chains reuse the loop-carry back edge into the
+  // loop's entry owner; acyclic chains mint a distinct permit released at the
+  // terminal (top-level) consumer. This only annotates the dump; the emit is
+  // unchanged. Single-owner resources stay bare (no semaphore).
+  {
+    SmallVector<Owner, 4> distinctOwners;
+    Operation *firstAccess = nullptr, *lastAccess = nullptr;
+    unsigned firstRank = 0, lastRank = 0;
+    for (auto &kv : opToEvent) {
+      Operation *op = kv.first;
+      const Owner &o = kv.second->owner;
+      if (!llvm::any_of(distinctOwners,
+                        [&](const Owner &q) { return sameOwner(o, q); }))
+        distinctOwners.push_back(o);
+      unsigned r = opRank.lookup(op);
+      if (!firstAccess || r < firstRank) { firstAccess = op; firstRank = r; }
+      if (!lastAccess || r > lastRank) { lastAccess = op; lastRank = r; }
+    }
+    if (distinctOwners.size() >= 2 && firstAccess) {
+      scf::ForOp wsLoop;
+      for (Operation *p = firstAccess->getParentOp(); p; p = p->getParentOp())
+        if (auto f = dyn_cast<scf::ForOp>(p))
+          if (hasWarpSpecializeTag(f)) wsLoop = f;
+      Operation *anchorOp = wsLoop ? wsLoop.getOperation() : firstAccess;
+      scf::ForOp cycleLoop = wsLoop;
+      if (!cycleLoop)
+        for (Operation *op : sp.accessOps) {
+          scf::ForOp outer;
+          for (Operation *p = op->getParentOp(); p; p = p->getParentOp())
+            if (auto f = dyn_cast<scf::ForOp>(p))
+              if (hasWarpSpecializeTag(f)) outer = f;
+          if (outer) { cycleLoop = outer; break; }
+        }
+      std::optional<PartitionId> loopOwner =
+          cycleLoop ? regionOpPartition(cycleLoop.getOperation(), rp)
+                    : std::nullopt;
+      std::string reuseName;
+      if (cycleLoop && loopOwner)
+        for (const SyncEdge &e : sp.edges)
+          if (e.dstYieldRegion == &cycleLoop.getRegion() &&
+              sameOwner(e.dstOwner, loopOwner)) {
+            reuseName = e.name;
+            break;
+          }
+      sp.initialPermitBeforeOp = anchorOp;
+      if (!reuseName.empty()) {
+        sp.initialPermitName = reuseName; // cyclic: reuse loop-carry back edge
+      } else {
+        sp.initialPermitName = makeEdgeName((unsigned)sp.edges.size()); // mint
+        if (lastAccess && lastAccess->getParentOp() == funcOp.getOperation())
+          sp.initialPermitReleaseAfterOp = lastAccess; // acyclic terminal
+      }
+    }
+  }
   return sp;
 }
 
@@ -1579,6 +1667,12 @@ struct OptSyncDag {
   SmallVector<SyncGroup> groups;
   // Which raw edge belongs to which opt group (parallel to sp.edges).
   SmallVector<unsigned> edgeToGroup;
+  // For Singleton/LinearChain edges: does the edge ride the EMPTY semaphore
+  // (true) or the FULL semaphore (false)? Computed once with `group` in
+  // buildOptSyncDag so the dump renderer can label rows S_empty/S_full to
+  // match the emitted semaphores (and unify the cyclic back-edge with the
+  // initial writable permit). Absent ⇒ not an EMPTY edge.
+  DenseMap<unsigned, bool> edgeRendersEmpty;
   // Where to render the release row(s).
   //   Singleton:    `releaseBeforeOp[dstOp]`        (release+acquire pair
   //                 at dst — matches RAW shape).
@@ -1833,6 +1927,12 @@ static bool edgeNeedsTerminalReadRelease(const SyncEdge &edge,
                                          BufferGroup &group,
                                          int64_t resourceKey);
 static bool isRootToWsLoopEntryEdge(const SyncEdge &edge, BufferGroup &group);
+static bool edgeUsesEmpty(const SyncEdge &edge, BufferGroup &group,
+                          int64_t resourceKey);
+static bool linearChainEdgeUsesEmpty(const SyncGroup &syncGroup,
+                                     const SyncPlan &sp, const OptSyncDag &dag,
+                                     const SyncEdge *edge, BufferGroup &group,
+                                     int64_t resourceKey);
 
 static bool hasOutgoingEdgeFromOp(const SyncPlan &sp, Operation *op) {
   if (!op)
@@ -2406,6 +2506,24 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, BufferGroup &group) {
     unsigned groupIdx = static_cast<unsigned>(idx);
     removeGroupFromOpAnchor(dag.acquireBeforeOp, syncGroup.initialOp, groupIdx);
     addGroupToOpAnchor(dag.acquireBeforeOp, threadedRegionOp, groupIdx);
+  }
+
+  // Per-edge EMPTY/FULL classification for the dump renderer, matching the
+  // emitter's semaphore choice (getSemaphoreForGroup). Computed here because
+  // `group` is in scope; the renderers only have the DAG.
+  for (const SyncGroup &syncGroup : dag.groups) {
+    bool isChain = syncGroup.kind == SyncGroupKind::LinearChain;
+    bool isSingleton = syncGroup.kind == SyncGroupKind::Singleton;
+    if (!isChain && !isSingleton)
+      continue;
+    for (unsigned edgeIdx : syncGroup.edgeIdxs) {
+      bool usesEmpty =
+          isChain ? linearChainEdgeUsesEmpty(syncGroup, sp, dag,
+                                             &sp.edges[edgeIdx], group,
+                                             sp.resource.second)
+                  : edgeUsesEmpty(sp.edges[edgeIdx], group, sp.resource.second);
+      dag.edgeRendersEmpty[edgeIdx] = usesEmpty;
+    }
   }
   return dag;
 }
@@ -5758,13 +5876,13 @@ static void dumpOwnershipDag(ResourcePlan &plan, BufferGroup &group,
 
 static void renderAcquireRow(unsigned depth, Operation *anchor,
                              const SyncEdge &edge) {
-  llvm::errs() << treePrefix(depth) << "a  " << edge.name << "  acquire  "
+  llvm::errs() << treePrefix(depth) << "|- a  " << edge.name << "  acquire  "
                << ownerStr(anchor, edge.dstOwner) << "\n";
 }
 
 static void renderReleaseRow(unsigned depth, Operation *anchor,
                              const SyncEdge &edge) {
-  llvm::errs() << treePrefix(depth) << "r  " << edge.name << "  release  "
+  llvm::errs() << treePrefix(depth) << "|- r  " << edge.name << "  release  "
                << ownerStr(anchor, edge.srcOwner) << " -> "
                << ownerStr(anchor, edge.dstOwner) << "\n";
 }
@@ -5804,6 +5922,10 @@ static void dumpRawSyncBlock(Block &block, SyncPlan &sp,
                              const ResourcePlan &plan, BufferGroup &group,
                              unsigned depth) {
   for (Operation &op : block) {
+    // Initial writable permit acquire, rendered before its anchor op.
+    if (&op == sp.initialPermitBeforeOp && !sp.initialPermitName.empty())
+      llvm::errs() << treePrefix(depth) << "|- a  " << sp.initialPermitName
+                   << "  acquire  root\n";
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       bool show = false;
       forOp.walk([&](Operation *o) -> WalkResult {
@@ -5872,6 +5994,10 @@ static void dumpRawSyncBlock(Block &block, SyncPlan &sp,
                    << touch->memberIdx << "  " << op.getName().getStringRef()
                    << "  " << ownerStr(&op, event->owner) << "\n";
     }
+    // Acyclic initial-permit terminal release, after its last (top-level) access.
+    if (&op == sp.initialPermitReleaseAfterOp && !sp.initialPermitName.empty())
+      llvm::errs() << treePrefix(depth) << "|- r  " << sp.initialPermitName
+                   << "  release  root\n";
   }
 }
 
@@ -5914,101 +6040,99 @@ static std::string ownerSetStr(Operation *anchor,
 
 static void renderOptRelease(unsigned depth, Operation *anchor,
                              const SyncPlan &sp, const OptSyncDag &dag,
-                             unsigned groupIdx) {
+                             unsigned groupIdx, bool afterOp) {
   const SyncGroup &g = dag.groups[groupIdx];
-  StringRef name = g.name;
-  if (g.kind == SyncGroupKind::ReadyFanout)
-    name = "S_full";
-  else if (g.kind == SyncGroupKind::DoneFanin)
-    name = "S_empty";
-  llvm::errs() << treePrefix(depth) << "r  " << name << "  release  ";
+  // ReadyFanout: one shared release "src -> {dst1,dst2,...}".
   if (g.kind == SyncGroupKind::ReadyFanout) {
-    // src -> {{dst1},{dst2},...}: one release row for all consumers.
     const SyncEdge &probe = sp.edges[g.edgeIdxs.front()];
     SmallVector<std::optional<PartitionId>, 4> dsts;
     for (unsigned ei : g.edgeIdxs) dsts.push_back(sp.edges[ei].dstOwner);
-    llvm::errs() << ownerStr(anchor, probe.srcOwner) << " -> "
+    llvm::errs() << treePrefix(depth) << "r  S_full  release  "
+                 << ownerStr(anchor, probe.srcOwner) << " -> "
                  << ownerSetStr(anchor, dsts) << "\n";
     return;
   }
-  // Singleton + DoneFanin + LinearChain contributors: each release row is
-  // per-edge.
-  // Locate the edge whose src anchor matches `anchor`.
-  for (unsigned ei : g.edgeIdxs) {
-    const SyncEdge &e = sp.edges[ei];
-    bool match = false;
-    if (g.kind == SyncGroupKind::Singleton) {
-      // Singleton: release anchored at dst.
-      match = (e.dstOp == anchor) || (e.dstYieldRegion == nullptr ? false
-                                                                   : false);
-      // dstYieldRegion variant handled separately by the region renderer.
-      if (e.dstOp == anchor)
-        match = true;
-    } else { // DoneFanin or LinearChain.
-      match = (e.srcOp == anchor);
-    }
-    if (match) {
-      llvm::errs() << ownerStr(anchor, e.srcOwner) << " -> "
-                   << ownerStr(anchor, e.dstOwner) << "\n";
-      return;
-    }
+  // Per-edge release. Use the same anchor->edge lookup as the emitter so the
+  // dump matches the emitted IR (this handles Singleton/LinearChain plus
+  // scf.if branch-entry and if-join anchoring that simple dst/src matching
+  // misses and would otherwise fall back to the first edge — a wrong row).
+  const SyncEdge *match = findEdgeForAnchor(
+      g, sp, dag,
+      afterOp ? SyncAnchorKind::ReleaseAfterOp
+              : SyncAnchorKind::ReleaseBeforeOp,
+      anchor, /*yieldRegion=*/nullptr);
+  if (!match)
+    match = &sp.edges[g.edgeIdxs.front()];
+  // A release-after-op anchored at the edge's destination (a final read) is
+  // the consumer's terminal EMPTY release, not a copy of the producer edge.
+  bool terminalEmpty =
+      afterOp && match->dstOp == anchor && match->srcOp != anchor;
+  if (terminalEmpty) {
+    // Consumer frees the slot after the final read: an EMPTY release owned by
+    // the reader (the edge destination), not a copy of the producer edge.
+    llvm::errs() << treePrefix(depth) << "r  S_empty  release  "
+                 << ownerStr(anchor, match->dstOwner) << "\n";
+    return;
   }
-  // Fallback: shouldn't happen, but print probe info.
-  const SyncEdge &probe = sp.edges[g.edgeIdxs.front()];
-  llvm::errs() << ownerStr(anchor, probe.srcOwner) << " -> "
-               << ownerStr(anchor, probe.dstOwner) << "\n";
+  StringRef name;
+  if (g.kind == SyncGroupKind::DoneFanin) {
+    name = "S_empty";
+  } else {
+    std::optional<unsigned> mi = findEdgeIndex(sp, match);
+    name = (mi && dag.edgeRendersEmpty.lookup(*mi)) ? "S_empty" : "S_full";
+  }
+  llvm::errs() << treePrefix(depth) << "r  " << name << "  release  "
+               << ownerStr(anchor, match->srcOwner) << " -> "
+               << ownerStr(anchor, match->dstOwner) << "\n";
 }
 
 static void renderOptReleaseYield(unsigned depth, Operation *anchor,
                                   Region *yieldRegion, const SyncPlan &sp,
-                                  const OptSyncDag &dag, unsigned groupIdx) {
+                                  const OptSyncDag &dag, unsigned groupIdx,
+                                  bool beforeYield) {
   const SyncGroup &g = dag.groups[groupIdx];
-  StringRef name = g.name;
-  if (g.kind == SyncGroupKind::ReadyFanout)
-    name = "S_full";
-  else if (g.kind == SyncGroupKind::DoneFanin)
-    name = "S_empty";
-  llvm::errs() << treePrefix(depth) << "r  " << name << "  release  ";
   if (g.kind == SyncGroupKind::ReadyFanout) {
     const SyncEdge &probe = sp.edges[g.edgeIdxs.front()];
     SmallVector<std::optional<PartitionId>, 4> dsts;
     for (unsigned ei : g.edgeIdxs) dsts.push_back(sp.edges[ei].dstOwner);
-    llvm::errs() << ownerStr(anchor, probe.srcOwner) << " -> "
+    llvm::errs() << treePrefix(depth) << "r  S_full  release  "
+                 << ownerStr(anchor, probe.srcOwner) << " -> "
                  << ownerSetStr(anchor, dsts) << "\n";
     return;
   }
+  // A release rendered *before* the YIELD is the dst-anchored loop-carry /
+  // branch-close edge (the partition handing the buffer back at the yield).
+  // A release rendered *after* the YIELD is the src-anchored reader retiring.
+  // Matching on the wrong end falls through to the first-edge fallback and
+  // prints a duplicate / wrong-direction row.
+  const SyncEdge *match = nullptr;
   for (unsigned ei : g.edgeIdxs) {
     const SyncEdge &e = sp.edges[ei];
-    bool match = false;
-    if (g.kind == SyncGroupKind::Singleton)
-      match = (e.dstYieldRegion == yieldRegion);
-    else // DoneFanin or LinearChain.
-      match = (e.srcYieldRegion == yieldRegion);
-    if (match) {
-      llvm::errs() << ownerStr(anchor, e.srcOwner) << " -> "
-                   << ownerStr(anchor, e.dstOwner) << "\n";
-      return;
-    }
+    bool m = beforeYield ? (e.dstYieldRegion == yieldRegion)
+                         : (e.srcYieldRegion == yieldRegion);
+    if (m) { match = &e; break; }
   }
-  const SyncEdge &probe = sp.edges[g.edgeIdxs.front()];
-  llvm::errs() << ownerStr(anchor, probe.srcOwner) << " -> "
-               << ownerStr(anchor, probe.dstOwner) << "\n";
+  if (!match)
+    match = &sp.edges[g.edgeIdxs.front()];
+  StringRef name;
+  if (g.kind == SyncGroupKind::DoneFanin) {
+    name = "S_empty";
+  } else {
+    std::optional<unsigned> mi = findEdgeIndex(sp, match);
+    name = (mi && dag.edgeRendersEmpty.lookup(*mi)) ? "S_empty" : "S_full";
+  }
+  llvm::errs() << treePrefix(depth) << "r  " << name << "  release  "
+               << ownerStr(anchor, match->srcOwner) << " -> "
+               << ownerStr(anchor, match->dstOwner) << "\n";
 }
 
 static void renderOptAcquire(unsigned depth, Operation *anchor,
                              const SyncPlan &sp, const OptSyncDag &dag,
                              unsigned groupIdx) {
   const SyncGroup &g = dag.groups[groupIdx];
-  StringRef name = g.name;
-  if (g.kind == SyncGroupKind::InitialEmpty ||
-      g.kind == SyncGroupKind::DoneFanin)
-    name = "S_empty";
-  else if (g.kind == SyncGroupKind::ReadyFanout)
-    name = "S_full";
-  llvm::errs() << treePrefix(depth) << "a  " << name << "  acquire  ";
   if (g.kind == SyncGroupKind::InitialEmpty) {
-    llvm::errs() << "initial-empty  " << ownerStr(anchor, g.initialOwner)
-                 << "\n";
+    llvm::errs() << treePrefix(depth) << "a  S_empty  acquire  initial-empty  "
+                 << ownerStr(anchor, g.initialOwner) << "\n";
     return;
   }
   if (g.kind == SyncGroupKind::DoneFanin) {
@@ -6016,55 +6140,62 @@ static void renderOptAcquire(unsigned depth, Operation *anchor,
     SmallVector<std::optional<PartitionId>, 4> srcs;
     for (unsigned ei : g.edgeIdxs) srcs.push_back(sp.edges[ei].srcOwner);
     const SyncEdge &probe = sp.edges[g.edgeIdxs.front()];
-    llvm::errs() << "pending=" << ownerSetStr(anchor, srcs) << "  "
+    llvm::errs() << treePrefix(depth) << "a  S_empty  acquire  pending="
+                 << ownerSetStr(anchor, srcs) << "  "
                  << ownerStr(anchor, probe.dstOwner) << "\n";
     return;
   }
-  // Singleton + ReadyFanout: locate the edge whose dst anchor matches.
-  for (unsigned ei : g.edgeIdxs) {
-    const SyncEdge &e = sp.edges[ei];
-    if (e.dstOp == anchor) {
-      llvm::errs() << ownerStr(anchor, e.dstOwner) << "\n";
-      return;
-    }
+  // Singleton + ReadyFanout: use the emitter's anchor lookup so the dump
+  // matches emitted IR (handles scf.if branch-entry / if-join anchoring, not
+  // just a direct dstOp match which would fall back to the first edge).
+  const SyncEdge *match =
+      findEdgeForAnchor(g, sp, dag, SyncAnchorKind::AcquireBeforeOp, anchor,
+                        /*yieldRegion=*/nullptr);
+  if (!match)
+    match = &sp.edges[g.edgeIdxs.front()];
+  StringRef name;
+  if (g.kind == SyncGroupKind::ReadyFanout) {
+    name = "S_full";
+  } else {
+    std::optional<unsigned> mi = findEdgeIndex(sp, match);
+    name = (mi && dag.edgeRendersEmpty.lookup(*mi)) ? "S_empty" : "S_full";
   }
-  const SyncEdge &probe = sp.edges[g.edgeIdxs.front()];
-  llvm::errs() << ownerStr(anchor, probe.dstOwner) << "\n";
+  llvm::errs() << treePrefix(depth) << "a  " << name << "  acquire  "
+               << ownerStr(anchor, match->dstOwner) << "\n";
 }
 
 static void renderOptAcquireYield(unsigned depth, Operation *anchor,
                                   Region *yieldRegion, const SyncPlan &sp,
                                   const OptSyncDag &dag, unsigned groupIdx) {
   const SyncGroup &g = dag.groups[groupIdx];
-  StringRef name = g.name;
-  if (g.kind == SyncGroupKind::InitialEmpty ||
-      g.kind == SyncGroupKind::DoneFanin)
-    name = "S_empty";
-  else if (g.kind == SyncGroupKind::ReadyFanout)
-    name = "S_full";
-  llvm::errs() << treePrefix(depth) << "a  " << name << "  acquire  ";
   if (g.kind == SyncGroupKind::InitialEmpty) {
-    llvm::errs() << "initial-empty  " << ownerStr(anchor, g.initialOwner)
-                 << "\n";
+    llvm::errs() << treePrefix(depth) << "a  S_empty  acquire  initial-empty  "
+                 << ownerStr(anchor, g.initialOwner) << "\n";
     return;
   }
   if (g.kind == SyncGroupKind::DoneFanin) {
     SmallVector<std::optional<PartitionId>, 4> srcs;
     for (unsigned ei : g.edgeIdxs) srcs.push_back(sp.edges[ei].srcOwner);
     const SyncEdge &probe = sp.edges[g.edgeIdxs.front()];
-    llvm::errs() << "pending=" << ownerSetStr(anchor, srcs) << "  "
+    llvm::errs() << treePrefix(depth) << "a  S_empty  acquire  pending="
+                 << ownerSetStr(anchor, srcs) << "  "
                  << ownerStr(anchor, probe.dstOwner) << "\n";
     return;
   }
-  for (unsigned ei : g.edgeIdxs) {
-    const SyncEdge &e = sp.edges[ei];
-    if (e.dstYieldRegion == yieldRegion) {
-      llvm::errs() << ownerStr(anchor, e.dstOwner) << "\n";
-      return;
-    }
+  const SyncEdge *match =
+      findEdgeForAnchor(g, sp, dag, SyncAnchorKind::AcquireBeforeYield,
+                        /*anchor=*/nullptr, yieldRegion);
+  if (!match)
+    match = &sp.edges[g.edgeIdxs.front()];
+  StringRef name;
+  if (g.kind == SyncGroupKind::ReadyFanout) {
+    name = "S_full";
+  } else {
+    std::optional<unsigned> mi = findEdgeIndex(sp, match);
+    name = (mi && dag.edgeRendersEmpty.lookup(*mi)) ? "S_empty" : "S_full";
   }
-  const SyncEdge &probe = sp.edges[g.edgeIdxs.front()];
-  llvm::errs() << ownerStr(anchor, probe.dstOwner) << "\n";
+  llvm::errs() << treePrefix(depth) << "a  " << name << "  acquire  "
+               << ownerStr(anchor, match->dstOwner) << "\n";
 }
 
 // Print rows anchored BEFORE op: release-before, then acquire-before.
@@ -6073,7 +6204,7 @@ static void printOptBeforeOp(const OptSyncDag &dag, const SyncPlan &sp,
   auto rIt = dag.releaseBeforeOp.find(anchor);
   if (rIt != dag.releaseBeforeOp.end())
     for (unsigned gi : rIt->second)
-      renderOptRelease(depth, anchor, sp, dag, gi);
+      renderOptRelease(depth, anchor, sp, dag, gi, /*afterOp=*/false);
   auto aIt = dag.acquireBeforeOp.find(anchor);
   if (aIt != dag.acquireBeforeOp.end())
     for (unsigned gi : aIt->second)
@@ -6087,7 +6218,7 @@ static void printOptAfterOp(const OptSyncDag &dag, const SyncPlan &sp,
   auto rIt = dag.releaseAfterOp.find(anchor);
   if (rIt != dag.releaseAfterOp.end())
     for (unsigned gi : rIt->second)
-      renderOptRelease(depth, anchor, sp, dag, gi);
+      renderOptRelease(depth, anchor, sp, dag, gi, /*afterOp=*/true);
 }
 
 // Same, for YIELD-anchored entries.
@@ -6097,7 +6228,8 @@ static void printOptBeforeYield(const OptSyncDag &dag, const SyncPlan &sp,
   auto rIt = dag.releaseBeforeYield.find(yieldRegion);
   if (rIt != dag.releaseBeforeYield.end())
     for (unsigned gi : rIt->second)
-      renderOptReleaseYield(depth, anchor, yieldRegion, sp, dag, gi);
+      renderOptReleaseYield(depth, anchor, yieldRegion, sp, dag, gi,
+                            /*beforeYield=*/true);
   auto aIt = dag.acquireBeforeYield.find(yieldRegion);
   if (aIt != dag.acquireBeforeYield.end())
     for (unsigned gi : aIt->second)
@@ -6110,7 +6242,8 @@ static void printOptAfterYield(const OptSyncDag &dag, const SyncPlan &sp,
   auto rIt = dag.releaseAfterYield.find(yieldRegion);
   if (rIt != dag.releaseAfterYield.end())
     for (unsigned gi : rIt->second)
-      renderOptReleaseYield(depth, anchor, yieldRegion, sp, dag, gi);
+      renderOptReleaseYield(depth, anchor, yieldRegion, sp, dag, gi,
+                            /*beforeYield=*/false);
 }
 
 static void dumpOptSyncBlock(Block &block, const OptSyncDag &dag,
@@ -6184,24 +6317,35 @@ static void dumpOptSyncBlock(Block &block, const OptSyncDag &dag,
       continue;
     }
     if (isa<scf::YieldOp>(op)) continue;
-    if (!dag.accessOps.contains(&op)) continue;
+    bool isAccess = dag.accessOps.contains(&op);
+    // A non-access op can still be a sync anchor: getIfBranchEntryAnchor picks
+    // the first op of an scf.if branch (often a non-access op) to anchor a
+    // producer release feeding a conditional consumer. Render that op's sync
+    // rows even though it has no access row, otherwise the release is silently
+    // dropped and the consumer's acquire looks orphaned.
+    bool hasAnchor = dag.releaseBeforeOp.count(&op) ||
+                     dag.acquireBeforeOp.count(&op) ||
+                     dag.releaseAfterOp.count(&op);
+    if (!isAccess && !hasAnchor) continue;
     printOptBeforeOp(dag, sp, &op, depth);
-    AccessEvent *event = nullptr;
-    for (AccessEvent &e : group.events)
-      if (e.op == &op) {
-        event = &e;
-        break;
+    if (isAccess) {
+      AccessEvent *event = nullptr;
+      for (AccessEvent &e : group.events)
+        if (e.op == &op) {
+          event = &e;
+          break;
+        }
+      SmallVector<const AccessTouch *, 4> touches;
+      if (event)
+        collectTouchesForResource(*event, dag.resource.second, touches);
+      for (const AccessTouch *touch : touches) {
+        bool reads = hasRead(touch->effect);
+        bool writes = hasWrite(touch->effect);
+        llvm::errs() << treePrefix(depth) << "|- "
+                     << accessKindChar(reads, writes) << "  m"
+                     << touch->memberIdx << "  " << op.getName().getStringRef()
+                     << "  " << ownerStr(&op, event->owner) << "\n";
       }
-    SmallVector<const AccessTouch *, 4> touches;
-    if (event)
-      collectTouchesForResource(*event, dag.resource.second, touches);
-    for (const AccessTouch *touch : touches) {
-      bool reads = hasRead(touch->effect);
-      bool writes = hasWrite(touch->effect);
-      llvm::errs() << treePrefix(depth) << "|- "
-                   << accessKindChar(reads, writes) << "  m"
-                   << touch->memberIdx << "  " << op.getName().getStringRef()
-                   << "  " << ownerStr(&op, event->owner) << "\n";
     }
     printOptAfterOp(dag, sp, &op, depth);
   }

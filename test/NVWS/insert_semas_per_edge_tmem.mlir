@@ -10,7 +10,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // DAG: |- scf.for
   // DAG: |  |- W  m0
   // DAG: RAW-SYNC-DAG
-  // DAG: |  |  r  S0
+  // DAG: |  |  |- r  S0
   // DAG: OPT-SYNC-DAG
   // DAG: |  |  r  S_full
   // DAG: |  |  a  S_empty
