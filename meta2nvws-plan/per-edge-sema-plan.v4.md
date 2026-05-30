@@ -115,7 +115,11 @@ transformed IR, which equals the input during commits 0–4).
 
 ### Commit 4 — + OPT-SYNC DAG
 
-- Build `SyncGroupInfo` via fanout / fanin / linear-chain combines.
+- Build `SyncGroupInfo` via fanout / fanin combines **only**.
+- **Contract: if no fan-in/out combine is made for a resource, its
+  OPT-SYNC DAG MUST be byte-identical to its RAW-SYNC DAG** — same per-edge
+  counter names (`S0`, `S1`, …), same rows, same tree. Linear chains are
+  never renamed to a FULL/EMPTY pair in the DAG.
 - Pass prints: + OPT-SYNC DAG per resource.
 - No IR mutation.
 
@@ -561,9 +565,12 @@ Dump requirements:
   state is fully determined by the semaphore name: ready-edge semaphores
   back FULL signals and use a name with prefix `R_` or `S_R_`, while
   done/handoff-edge semaphores back EMPTY signals and use a name with
-  prefix `D_`/`H_` or `S_D_`/`S_H_`. The opt-sync stage may collapse these
-  to two shared names per resource (e.g. `S_full` and `S_empty`). Because
-  the state is in the name, repeating it as a column is redundant noise.
+  prefix `D_`/`H_` or `S_D_`/`S_H_`. **Only a fan-in/out combine introduces a
+  shared name**: the opt-sync stage may collapse the combined edges to a shared
+  name per resource (e.g. `S_full` for a fanout, `S_empty` for a fanin). A
+  linear chain or singleton is never collapsed to `S_full`/`S_empty` in the DAG
+  — it keeps its per-edge names `S0`, `S1`, … (see the Contract). Because any
+  state is in the name, repeating it as a column is redundant noise.
 - render `R`/`W` (access), `r` (release), and `a` (acquire) rows that
   belong to the same block at the **same tree depth**. A release row is
   not a child of its access row; it is a sibling that follows the access
@@ -586,9 +593,9 @@ Dump requirements:
     every row at a given tree depth.
   - the first character of the semaphore name must be in the same column
     as the first character of the member name on access rows at that
-    depth (`m0` vs `S_qk`).
+    depth (`m0` vs `S0`).
   - memory member names are lowercase, while semaphore names start with
-    an uppercase letter, e.g. `qk_0` vs `S_qk`.
+    an uppercase letter, e.g. `qk_0` vs `S0`.
   - the operation column must be aligned across memory and semaphore
     rows at a given tree depth, e.g. `ttng.tc_gen5_mma`, `ttng.tmem_load`,
     `release`, and `acquire` start in the same column.
@@ -771,24 +778,24 @@ RAW-SYNC-DAG (per-edge counters, no FULL/EMPTY):
 ```text
 RAW-SYNC-DAG buffer.id=N resourceKey=K
 |- func region @example1
-|  |- a S_e1  acquire  root
+|  |- a S1  acquire  root
 |  |- scf.for (WS, tag=0) {0}
 |  |  |- ENTER {0}
 |  |  |- W m0  ttg.local_store  {0}
-|  |  |- r S_e0  release  {0} -> {1}
-|  |  |- a S_e0  acquire  {1}
+|  |  |- r S0  release  {0} -> {1}
+|  |  |- a S0  acquire  {1}
 |  |  |- R m0  ttg.local_load   {1}
-|  |  |- r S_e1  release  {1} -> {0}
-|  |  |- a S_e1  acquire  {0}
+|  |  |- r S1  release  {1} -> {0}
+|  |  |- a S1  acquire  {0}
 |  |  |- YIELD {0}
 ```
 
-Two edges plus the initial permit. `S_e1` is both the loop-carry back edge
+Two edges plus the initial permit. `S1` is both the loop-carry back edge
 **and** the initial writable permit: it is created **released**, so the
-entry `a S_e1 acquire root` (before the loop) hands the first `W{0}` its
-carrier on iteration 0; the body-tail `r S_e1 release {1} -> {0}` /
-`a S_e1 acquire {0}` pair re-arms and re-acquires it for each subsequent
-iteration. `S_e0` enforces "W{0} done before R{1} reads"; `S_e1` enforces
+entry `a S1 acquire root` (before the loop) hands the first `W{0}` its
+carrier on iteration 0; the body-tail `r S1 release {1} -> {0}` /
+`a S1 acquire {0}` pair re-arms and re-acquires it for each subsequent
+iteration. `S0` enforces "W{0} done before R{1} reads"; `S1` enforces
 "R{1} done before next-iter W{0} overwrites" (the loop carry, naturally
 produced because YIELD's partition `{0}` differs from R{1}'s partition).
 (All-in-loop lowering may fold the root entry acquire and the per-iteration
@@ -800,15 +807,15 @@ to RAW-SYNC-DAG.
 ```text
 OPT-SYNC-DAG buffer.id=N resourceKey=K
 |- func region @example1
-|  |- a S_e1  acquire  root
+|  |- a S1  acquire  root
 |  |- scf.for (WS, tag=0) {0}
 |  |  |- ENTER {0}
 |  |  |- W m0  ttg.local_store  {0}
-|  |  |- r S_e0  release  {0} -> {1}
-|  |  |- a S_e0  acquire  {1}
+|  |  |- r S0  release  {0} -> {1}
+|  |  |- a S0  acquire  {1}
 |  |  |- R m0  ttg.local_load   {1}
-|  |  |- r S_e1  release  {1} -> {0}
-|  |  |- a S_e1  acquire  {0}
+|  |  |- r S1  release  {1} -> {0}
+|  |  |- a S1  acquire  {0}
 |  |  |- YIELD {0}
 ```
 
@@ -860,35 +867,35 @@ RAW-SYNC-DAG — seven independent counters:
 ```text
 RAW-SYNC-DAG buffer.id=N resourceKey=K
 |- func region @example2
-|  |- a S_e6  acquire  root
+|  |- a S6  acquire  root
 |  |- scf.for (WS, tag=0) {0}
 |  |  |- ENTER {0}
 |  |  |- W m0  ttg.local_store  {0}
-|  |  |- r S_e0  release  {0} -> {1}
-|  |  |- r S_e1  release  {0} -> {2}
-|  |  |- r S_e2  release  {0} -> {3}
-|  |  |- a S_e0  acquire  {1}
+|  |  |- r S0  release  {0} -> {1}
+|  |  |- r S1  release  {0} -> {2}
+|  |  |- r S2  release  {0} -> {3}
+|  |  |- a S0  acquire  {1}
 |  |  |- R m0  ttg.local_load   {1}
-|  |  |- r S_e3  release  {1} -> {4}
-|  |  |- a S_e1  acquire  {2}
+|  |  |- r S3  release  {1} -> {4}
+|  |  |- a S1  acquire  {2}
 |  |  |- R m0  ttg.local_load   {2}
-|  |  |- r S_e4  release  {2} -> {4}
-|  |  |- a S_e2  acquire  {3}
+|  |  |- r S4  release  {2} -> {4}
+|  |  |- a S2  acquire  {3}
 |  |  |- R m0  ttg.local_load   {3}
-|  |  |- r S_e5  release  {3} -> {4}
-|  |  |- a S_e3  acquire  {4}
-|  |  |- a S_e4  acquire  {4}
-|  |  |- a S_e5  acquire  {4}
+|  |  |- r S5  release  {3} -> {4}
+|  |  |- a S3  acquire  {4}
+|  |  |- a S4  acquire  {4}
+|  |  |- a S5  acquire  {4}
 |  |  |- W m0  ttg.local_store  {4}
-|  |  |- r S_e6  release  {4} -> {0}
-|  |  |- a S_e6  acquire  {0}
+|  |  |- r S6  release  {4} -> {0}
+|  |  |- a S6  acquire  {0}
 |  |  |- YIELD {0}
 ```
 
-As in Example 1, the loop-carry back edge `S_e6` ({4}→{0}) is the initial
-writable permit: created **released**, acquired once as `a S_e6 acquire root`
+As in Example 1, the loop-carry back edge `S6` ({4}→{0}) is the initial
+writable permit: created **released**, acquired once as `a S6 acquire root`
 before the loop (carrier for iteration 0's W{0}), then re-armed by
-`r S_e6 release {4} -> {0}` and re-acquired by `a S_e6 acquire {0}` each
+`r S6 release {4} -> {0}` and re-acquired by `a S6 acquire {0}` each
 subsequent iteration.
 
 Note that R{1}, R{2}, R{3} have NO edges between them — they are
@@ -1030,10 +1037,10 @@ boundary cases follow:
    the access, and the empty-release:
 
    ```text
-   r S_full release {@T.P} -> root   ; producer {P}: stamped {ttg.partition=P, ws.tag=T}
-   a S_full acquire root             ; consumer root
+   r S0 release {@T.P} -> root       ; producer {P}: stamped {ttg.partition=P, ws.tag=T}
+   a S0 acquire root                 ; consumer root
    R m0 ttng.tmem_load root          ; consumer root
-   r S_empty release root            ; consumer root frees the slot
+   r S1 release root                 ; consumer root frees the slot (entry permit S1)
    ```
 
    Only the producer release is `{P}`; the whole consumer bracket is root.
@@ -1098,26 +1105,29 @@ Raw-sync DAG:
 
 ```text
 RAW-SYNC-DAG backing=%alloc
-|- a S_init  acquire             {1}
+|- a S4      acquire             {1}
 |- W %alloc  ttg.local_store     {1}
-|- r R_1_5   release             {1} -> {5}
-|- r R_1_6   release             {1} -> {6}
-|- a R_1_5   acquire             {5}
+|- r S0      release             {1} -> {5}
+|- r S1      release             {1} -> {6}
+|- a S0      acquire             {5}
 |- R %alloc  ttg.local_load      {5}
-|- r D_5_7   release             {5} -> {7}
-|- a R_1_6   acquire             {6}
+|- r S2      release             {5} -> {7}
+|- a S1      acquire             {6}
 |- R %alloc  ttg.local_load      {6}
-|- r D_6_7   release             {6} -> {7}
-|- a D_5_7   acquire             {7}
-|- a D_6_7   acquire             {7}
+|- r S3      release             {6} -> {7}
+|- a S2      acquire             {7}
+|- a S3      acquire             {7}
 |- W %alloc  ttg.local_store     {7}
 ```
+Per-edge: `S0`/`S1` are the fanout `{1}→{5}`/`{1}→{6}`; `S2`/`S3` are the fanin
+`{5}→{7}`/`{6}→{7}`; `S4` is the distinct initial permit (acyclic, ends in a
+write — acquire-only).
 
 Optimized-sync DAG:
 
 ```text
 OPT-SYNC-DAG backing=%alloc
-|- a S_empty acquire             {1}
+|- a S4      acquire             {1}
 |- W %alloc  ttg.local_store     {1}
 |- r S_full  release             {1} -> {{5},{6}}
 |- a S_full  acquire             {5}
@@ -1129,6 +1139,10 @@ OPT-SYNC-DAG backing=%alloc
 |- a S_empty acquire  pending={{5},{6}}  {7}
 |- W %alloc  ttg.local_store     {7}
 ```
+Only the fan-in/out edges change vs RAW: Combine A merges `S0`,`S1` into the
+shared fanout release `S_full`; Combine B merges `S2`,`S3` into the shared fanin
+acquire `S_empty`. The initial permit `S4` is **not** a fan-in/out edge, so it
+stays per-edge (unchanged from RAW).
 
 ### Example 2: Conditional-Only If Consumption
 
@@ -1169,43 +1183,47 @@ Raw-sync DAG:
 
 ```text
 RAW-SYNC-DAG backing=%alloc
-|- a S_init       acquire             {1}
-|- W %alloc       ttg.local_store     {1}
+|- a S2 acquire {1}
+|- W %alloc ttg.local_store {1}
 |- scf.if %cond {1}
 |  |- then
 |  |  |- ENTER {1}
-|  |  |- r S_then_full  release       {1} -> {2}
-|  |  |- a S_then_full  acquire       {2}
-|  |  |- R %alloc       ttg.local_load {2}
-|  |  |- r S_then_empty release       {2} -> {1}
-|  |  |- a S_then_empty acquire       {1}
+|  |  |- r S0 release {1} -> {2}
+|  |  |- a S0 acquire {2}
+|  |  |- R %alloc ttg.local_load {2}
+|  |  |- r S1 release {2} -> {1}
+|  |  |- a S1 acquire {1}
 |  |  |- YIELD {1}
 |  |- else
 |  |  |- ENTER {1}
 |  |  |- YIELD {1}
-|- W %alloc       ttg.local_store     {1}
+|- W %alloc ttg.local_store {1}
 ```
+`S0` = `{1}→{2}`, `S1` = `{2}→{1}` (both inside the then-branch). The entry
+permit `S2` is a **distinct** minted counter, not the back edge: consumption is
+conditional, so `S1` may not fire, and the permit cannot reuse it.
 
 Optimized-sync DAG:
 
 ```text
 OPT-SYNC-DAG backing=%alloc
-|- a S_empty      acquire             {1}
-|- W %alloc       ttg.local_store     {1}
+|- a S2 acquire {1}
+|- W %alloc ttg.local_store {1}
 |- scf.if %cond {1}
 |  |- then
 |  |  |- ENTER {1}
-|  |  |- r S_then_full  release       {1} -> {2}
-|  |  |- a S_then_full  acquire       {2}
-|  |  |- R %alloc       ttg.local_load {2}
-|  |  |- r S_then_empty release       {2} -> {1}
-|  |  |- a S_then_empty acquire       {1}
+|  |  |- r S0 release {1} -> {2}
+|  |  |- a S0 acquire {2}
+|  |  |- R %alloc ttg.local_load {2}
+|  |  |- r S1 release {2} -> {1}
+|  |  |- a S1 acquire {1}
 |  |  |- YIELD {1}
 |  |- else
 |  |  |- ENTER {1}
 |  |  |- YIELD {1}
-|- W %alloc       ttg.local_store     {1}
+|- W %alloc ttg.local_store {1}
 ```
+No fanout/fanin → **identical to RAW**.
 
 ### Example 3: If Consumption Continues After Join
 
@@ -1248,45 +1266,48 @@ Raw-sync DAG:
 
 ```text
 RAW-SYNC-DAG backing=%alloc
-|- a S_empty  acquire             {1}
-|- W %alloc   ttg.local_store     {1}
-|- r S_full   release             {1} -> {2}
-|- a S_full   acquire             {2}
+|- a S1 acquire {1}
+|- W %alloc ttg.local_store {1}
+|- r S0 release {1} -> {2}
+|- a S0 acquire {2}
 |- scf.if %cond {2}
 |  |- then
 |  |  |- ENTER {2}
-|  |  |- R %alloc  ttg.local_load  {2}
+|  |  |- R %alloc ttg.local_load {2}
 |  |  |- YIELD {2}
 |  |- else
 |  |  |- ENTER {2}
 |  |  |- YIELD {2}
-|- R %alloc   ttg.local_load      {2}
-|- r S_empty  release             {2} -> {1}
-|- a S_empty  acquire             {1}
-|- W %alloc   ttg.local_store     {1}
+|- R %alloc ttg.local_load {2}
+|- r S1 release {2} -> {1}
+|- a S1 acquire {1}
+|- W %alloc ttg.local_store {1}
 ```
+`S0` = `{1}→{2}`; `S1` = `{2}→{1}` back edge, reused as the entry permit (the
+post-join read always runs, so `S1` always fires).
 
 Optimized-sync DAG:
 
 ```text
 OPT-SYNC-DAG backing=%alloc
-|- a S_empty  acquire             {1}
-|- W %alloc   ttg.local_store     {1}
-|- r S_full   release             {1} -> {2}
-|- a S_full   acquire             {2}
+|- a S1 acquire {1}
+|- W %alloc ttg.local_store {1}
+|- r S0 release {1} -> {2}
+|- a S0 acquire {2}
 |- scf.if %cond {2}
 |  |- then
 |  |  |- ENTER {2}
-|  |  |- R %alloc  ttg.local_load  {2}
+|  |  |- R %alloc ttg.local_load {2}
 |  |  |- YIELD {2}
 |  |- else
 |  |  |- ENTER {2}
 |  |  |- YIELD {2}
-|- R %alloc   ttg.local_load      {2}
-|- r S_empty  release             {2} -> {1}
-|- a S_empty  acquire             {1}
-|- W %alloc   ttg.local_store     {1}
+|- R %alloc ttg.local_load {2}
+|- r S1 release {2} -> {1}
+|- a S1 acquire {1}
+|- W %alloc ttg.local_store {1}
 ```
+No fanout/fanin → **identical to RAW**.
 
 ### Example 4: For Body With Nested Conditional Use
 
@@ -1336,53 +1357,58 @@ Raw-sync DAG:
 
 ```text
 RAW-SYNC-DAG backing=%alloc
-|- a S_empty      acquire             {1}
-|- W %alloc       ttg.local_store     {1}
+|- a S2 acquire {1}
+|- W %alloc ttg.local_store {1}
 |- scf.for %i = %c0 to %n step %c1 (WS, tag=0) {1}
 |  |- ENTER {1}
-|  |- W %alloc  ttg.local_store      {1}
+|  |- W %alloc ttg.local_store {1}
 |  |- scf.if %cond {1}
 |  |  |- then
 |  |  |  |- ENTER {1}
-|  |  |  |- r S_then_full  release   {1} -> {2}
-|  |  |  |- a S_then_full  acquire   {2}
-|  |  |  |- R %alloc       ttg.local_load {2}
-|  |  |  |- r S_then_empty release   {2} -> {1}
-|  |  |  |- a S_then_empty acquire   {1}
+|  |  |  |- r S0 release {1} -> {2}
+|  |  |  |- a S0 acquire {2}
+|  |  |  |- R %alloc ttg.local_load {2}
+|  |  |  |- r S1 release {2} -> {1}
+|  |  |  |- a S1 acquire {1}
 |  |  |  |- YIELD {1}
 |  |  |- else
 |  |  |  |- ENTER {1}
 |  |  |  |- YIELD {1}
-|  |- W %alloc  ttg.local_store      {1}
+|  |- W %alloc ttg.local_store {1}
 |  |- YIELD {1}
-|- W %alloc       ttg.local_store     {1}
+|- W %alloc ttg.local_store {1}
 ```
+`S0` = `{1}→{2}`, `S1` = `{2}→{1}` (both inside the then-branch); the loop-carry
+`{1}→{1}` is same-owner carrier inherit (no edge). The entry permit `S2` is
+minted distinct — the only `→{1}` edge (`S1`) is conditional, so it cannot be
+reused.
 
 Optimized-sync DAG:
 
 ```text
 OPT-SYNC-DAG backing=%alloc
-|- a S_empty      acquire             {1}
-|- W %alloc       ttg.local_store     {1}
+|- a S2 acquire {1}
+|- W %alloc ttg.local_store {1}
 |- scf.for %i = %c0 to %n step %c1 (WS, tag=0) {1}
 |  |- ENTER {1}
-|  |- W %alloc  ttg.local_store      {1}
+|  |- W %alloc ttg.local_store {1}
 |  |- scf.if %cond {1}
 |  |  |- then
 |  |  |  |- ENTER {1}
-|  |  |  |- r S_then_full  release   {1} -> {2}
-|  |  |  |- a S_then_full  acquire   {2}
-|  |  |  |- R %alloc       ttg.local_load {2}
-|  |  |  |- r S_then_empty release   {2} -> {1}
-|  |  |  |- a S_then_empty acquire   {1}
+|  |  |  |- r S0 release {1} -> {2}
+|  |  |  |- a S0 acquire {2}
+|  |  |  |- R %alloc ttg.local_load {2}
+|  |  |  |- r S1 release {2} -> {1}
+|  |  |  |- a S1 acquire {1}
 |  |  |  |- YIELD {1}
 |  |  |- else
 |  |  |  |- ENTER {1}
 |  |  |  |- YIELD {1}
-|  |- W %alloc  ttg.local_store      {1}
+|  |- W %alloc ttg.local_store {1}
 |  |- YIELD {1}
-|- W %alloc       ttg.local_store     {1}
+|- W %alloc ttg.local_store {1}
 ```
+No fanout/fanin → **identical to RAW**.
 
 ### Example 5: qk/alpha/pacc Shared TMEM Group
 
@@ -1435,70 +1461,75 @@ Raw-sync DAG:
 
 ```text
 RAW-SYNC-DAG backing=qk_alpha_slot
-|- a S_alpha_done   acquire             {1}
+|- a S2 acquire {1}
 |- scf.for %i = %c0 to %n step %c1 (WS, tag=0) {1}
 |  |- ENTER {1}
-|  |- W qk_0         ttng.tc_gen5_mma  {1}
-|  |- r S_qk_ready   release           {1} -> {5}
-|  |- a S_qk_ready   acquire           {5}
-|  |- R qk_0         ttng.tmem_load    {5}
-|  |- W alpha_0      ttng.tmem_store   {5}
-|  |- r S_alpha_ready release          {5} -> {0}
-|  |- a S_alpha_ready acquire          {0}
-|  |- R alpha_0      ttng.tmem_load    {0}
-|  |- r S_alpha_done release           {0} -> {1}
-|  |- a S_alpha_done acquire           {1}
+|  |- W qk_0 ttng.tc_gen5_mma {1}
+|  |- r S0 release {1} -> {5}
+|  |- a S0 acquire {5}
+|  |- R qk_0 ttng.tmem_load {5}
+|  |- W alpha_0 ttng.tmem_store {5}
+|  |- r S1 release {5} -> {0}
+|  |- a S1 acquire {0}
+|  |- R alpha_0 ttng.tmem_load {0}
+|  |- r S2 release {0} -> {1}
+|  |- a S2 acquire {1}
 |  |- YIELD {1}
 
 RAW-SYNC-DAG backing=acc_slot
-|- a S_acc_empty    acquire             {5}
+|- a S1 acquire {5}
 |- scf.for %i = %c0 to %n step %c1 (WS, tag=0) {5}
 |  |- ENTER {5}
-|  |- W acc_0        ttng.tmem_store   {5}
-|  |- r S_acc_ready  release           {5} -> {1}
-|  |- a S_acc_ready  acquire           {1}
-|  |- W acc_0        ttng.tc_gen5_mma  {1}
-|  |- r S_acc_empty  release           {1} -> {5}
-|  |- a S_acc_empty  acquire           {5}
+|  |- W acc_0 ttng.tmem_store {5}
+|  |- r S0 release {5} -> {1}
+|  |- a S0 acquire {1}
+|  |- W acc_0 ttng.tc_gen5_mma {1}
+|  |- r S1 release {1} -> {5}
+|  |- a S1 acquire {5}
 |  |- YIELD {5}
 ```
+Each resource numbers its own edges: `qk_alpha_slot` has `S0`=`{1}→{5}`,
+`S1`=`{5}→{0}`, `S2`=`{0}→{1}` (back edge, reused as entry permit); `acc_slot`
+has `S0`=`{5}→{1}`, `S1`=`{1}→{5}` (back edge, reused as entry permit).
 
 Optimized-sync DAG:
 
 ```text
 OPT-SYNC-DAG backing=qk_alpha_slot
-|- a S_alpha_done   acquire             {1}
+|- a S2 acquire {1}
 |- scf.for %i = %c0 to %n step %c1 (WS, tag=0) {1}
 |  |- ENTER {1}
-|  |- W qk_0         ttng.tc_gen5_mma  {1}
-|  |- r S_qk_ready   release           {1} -> {5}
-|  |- a S_qk_ready   acquire           {5}
-|  |- R qk_0         ttng.tmem_load    {5}
-|  |- W alpha_0      ttng.tmem_store   {5}
-|  |- r S_alpha_ready release          {5} -> {0}
-|  |- a S_alpha_ready acquire          {0}
-|  |- R alpha_0      ttng.tmem_load    {0}
-|  |- r S_alpha_done release           {0} -> {1}
-|  |- a S_alpha_done acquire           {1}
+|  |- W qk_0 ttng.tc_gen5_mma {1}
+|  |- r S0 release {1} -> {5}
+|  |- a S0 acquire {5}
+|  |- R qk_0 ttng.tmem_load {5}
+|  |- W alpha_0 ttng.tmem_store {5}
+|  |- r S1 release {5} -> {0}
+|  |- a S1 acquire {0}
+|  |- R alpha_0 ttng.tmem_load {0}
+|  |- r S2 release {0} -> {1}
+|  |- a S2 acquire {1}
 |  |- YIELD {1}
 
 OPT-SYNC-DAG backing=acc_slot
-|- a S_acc_empty    acquire             {5}
+|- a S1 acquire {5}
 |- scf.for %i = %c0 to %n step %c1 (WS, tag=0) {5}
 |  |- ENTER {5}
-|  |- W acc_0        ttng.tmem_store   {5}
-|  |- r S_acc_ready  release           {5} -> {1}
-|  |- a S_acc_ready  acquire           {1}
-|  |- W acc_0        ttng.tc_gen5_mma  {1}
-|  |- r S_acc_empty  release           {1} -> {5}
-|  |- a S_acc_empty  acquire           {5}
+|  |- W acc_0 ttng.tmem_store {5}
+|  |- r S0 release {5} -> {1}
+|  |- a S0 acquire {1}
+|  |- W acc_0 ttng.tc_gen5_mma {1}
+|  |- r S1 release {1} -> {5}
+|  |- a S1 acquire {5}
 |  |- YIELD {5}
 ```
 
-`S_acc_ready` and `S_alpha_done` both target partition `{1}`, but they protect
-different backing resources and guard different operation sites. The optimized
-graph must keep them separate. A combine rule keyed only by target partition is
-invalid.
+Both resources are linear chains (no fanout/fanin) → **identical to RAW**.
+
+`acc_slot`'s `S0` (`{5}→{1}`) and `qk_alpha_slot`'s `S2` (`{0}→{1}`) both target
+partition `{1}`, but they protect different backing resources and guard
+different operation sites, so they stay distinct per-resource counters. A
+combine rule keyed only by target partition is invalid.
 
 ## Raw Per-Edge Sync Planning
 
@@ -1769,6 +1800,21 @@ The final emitter may materialize:
 The emitter must not introduce new dependency edges, move sync anchors, change
 resource ownership, or make new combine decisions.
 
+### Contract: OPT-SYNC DAG equals RAW-SYNC DAG unless a fan-in/out combine fires
+
+Only two transformations may change the OPT-SYNC DAG relative to the RAW-SYNC
+DAG: **Combine A (ready fanout)** and **Combine B (done fanin)**. Every other
+edge — linear handoff chains, singletons, the initial writable permit, the
+loop-carry back edge — is copied through unchanged: same per-edge counter name
+(`S0`, `S1`, …), same release/acquire rows, same owners, same tree shape.
+
+Therefore, for any resource whose raw edges contain no fanout (one source →
+many destinations) and no fanin (many sources → one destination), the OPT-SYNC
+DAG is **byte-identical** to the RAW-SYNC DAG. There is no FULL/EMPTY renaming
+at the DAG level. The compact two-semaphore FULL/EMPTY realization, where used,
+is an emit-stage (Commit 5) lowering of the per-edge chain and never alters the
+OPT-SYNC DAG dump.
+
 ### Combine A: Ready Fanout
 
 The snippets in the combine subsections are local edge-combine patterns only.
@@ -1852,18 +1898,24 @@ Required safety checks:
 - no merge across unrelated target events even if the target partition is the
   same
 
-### Combine C: Linear Handoff Chain Preservation
+### Emit-stage realization (NOT a DAG combine): linear handoff chain → FULL/EMPTY
 
-For a single live physical resource with a linear ownership sequence, preserve
-the compact one-`EMPTY` / one-`FULL` semaphore shape when it is safe.
+A linear handoff chain is **not** combined in the OPT-SYNC DAG. Per the Contract
+above, a chain with no fan-in/out has an OPT-SYNC DAG byte-identical to its
+RAW-SYNC DAG: per-edge counters (`S0`, `S1`, …), every release and acquire,
+including the loop-carry back-edge reacquire. This subsection describes only how
+**Commit 5 (emit)** may *lower* that per-edge chain onto the compact
+one-`EMPTY` / one-`FULL` two-semaphore shape when it is safe. **It does not
+change the OPT-SYNC DAG dump** — there is no FULL/EMPTY in the DAG for a linear
+chain.
 
-This is required for compatibility with existing linear reuse tests such as
-`@n_owner_alias_sequence` in `test/NVWS/tmem-buffer-reuse-semas.mlir`.
+The compact emit shape is required for compatibility with existing linear reuse
+tests such as `@n_owner_alias_sequence` in
+`test/NVWS/tmem-buffer-reuse-semas.mlir`.
 
 This is not the old ping-pong scheduler. The raw `SyncEdge`s are still derived
-from exact access-DAG dependencies first. The combine only recognizes that the
-edges form a linear chain for one `(logicalGroupId, resourceKey)` and emits the
-compact semaphore shape as an optimization over those exact edges.
+from exact access-DAG dependencies first, and the OPT-SYNC DAG preserves them
+per-edge. Only the *emitted IR* recycles the chain onto two physical semaphores.
 
 Raw chain shape:
 
@@ -1919,59 +1971,61 @@ back to target-partition-only ping-pong state.
 
 ## Worked Examples — Entry Acquire, Carrier Inherit, Region-Boundary Ownership
 
-These show the combined `SYNC-DAG` (post Combine C: `S_full` = the FULL /
-data-ready semaphore, `S_back` = the EMPTY / writable-permit semaphore; for an
-acyclic chain the distinct permit is `S0` and the data-ready edge is `S1`).
-One op per line. Each obeys the same two rules: every access has a preceding
-acquire (the first one acquires the initial permit), and for each edge the
-release is owned by the source and the acquire/access/empty-release by the
-destination.
+These show the `OPT-SYNC-DAG`. **None has a fan-in/out combine, so per the
+Contract each is byte-identical to its `RAW-SYNC-DAG`** — per-edge counters
+`S0`, `S1`, …, no FULL/EMPTY renaming. One op per line. Each obeys the same two
+rules: every access has a preceding acquire (the first one acquires the initial
+permit), and for each edge the release is owned by the source and the
+acquire/access by the destination. The initial writable permit is the row
+`a S<n> acquire root` before the loop — a cyclic chain reuses the loop-carry
+back edge as that permit; an acyclic chain uses a distinct counter released once
+at the terminal consumer.
 
 ### A. `local_sourceful_aliased_buffers` — in-loop cyclic, two owners
 
 ```text
-SYNC-DAG buffer.id=400 resourceKey=0          ; cyclic: S_back = back edge = initial permit (released)
-|- a S_back acquire root
+OPT-SYNC-DAG buffer.id=400 resourceKey=0      ; identical to RAW (no fan-in/out)
+|- a S1 acquire root                          ; S1 = back edge {0}->{1} = initial permit (created released)
 |- scf.for (WS, tag=0) {1}
 |  |- ENTER {1}
 |  |- W m0 ttg.local_alloc {1}
 |  |- R m0 ttg.local_load  {1}
-|  |- r S_full release {1} -> {0}
-|  |- a S_full acquire {0}
+|  |- r S0 release {1} -> {0}
+|  |- a S0 acquire {0}
 |  |- W m1 ttg.local_alloc {0}
 |  |- R m1 ttg.local_load  {0}
-|  |- r S_back release {0} -> {1}
-|  |- a S_back acquire {1}
+|  |- r S1 release {0} -> {1}
+|  |- a S1 acquire {1}
 |  |- YIELD {1}
 ```
 
-All owners are partitions (no root edge), so the current emit is already
-correct here.
+`S0` carries `{1}→{0}`; `S1` is the `{0}→{1}` loop-carry back edge, reused as
+the entry permit (created released). No fan-in/out, so this equals RAW.
 
 ### B. `outer_produced_inner_consumed` — cyclic, consumer in a nested loop
 
 ```text
-SYNC-DAG buffer.id=200 resourceKey=0
-|- a S_back acquire root
+OPT-SYNC-DAG buffer.id=200 resourceKey=0      ; identical to RAW (no fan-in/out)
+|- a S1 acquire root                          ; S1 = back edge {1}->{2} = initial permit
 |- scf.for (WS, tag=0) {2}
 |  |- ENTER {2}
 |  |- W m0 ttg.local_store {2}
-|  |- r S_full release {2} -> {1}
-|  |- a S_full acquire {1}
+|  |- r S0 release {2} -> {1}
+|  |- a S0 acquire {1}
 |  |- scf.for {1}
 |  |  |- ENTER {1}
 |  |  |- R m0 ttg.local_load {1}
 |  |  |- YIELD {1}
-|  |- r S_back release {1} -> {2}
-|  |- a S_back acquire {2}
+|  |- r S1 release {1} -> {2}
+|  |- a S1 acquire {2}
 |  |- YIELD {2}
 ```
 
 ### C. `nested_loop_yes_double_buffer` — true-root entry + in-loop cycle
 
 ```text
-SYNC-DAG buffer.id=0 resourceKey=0
-|- a S_back acquire root
+OPT-SYNC-DAG buffer.id=0 resourceKey=0        ; identical to RAW (no fan-in/out)
+|- a S1 acquire root                          ; S1 = back edge {0}->{2} = initial permit
 |- W m0 ttng.tmem_store root
 |- scf.for (WS, tag=0) {2}
 |  |- ENTER {2}
@@ -1980,11 +2034,11 @@ SYNC-DAG buffer.id=0 resourceKey=0
 |  |  |- ENTER {2}
 |  |  |- W m0 ttng.tc_gen5_mma {2}
 |  |  |- YIELD {2}
-|  |- r S_full release {2} -> {0}
-|  |- a S_full acquire {0}
+|  |- r S0 release {2} -> {0}
+|  |- a S0 acquire {0}
 |  |- R m0 ttng.tmem_load {0}
-|  |- r S_back release {0} -> {2}
-|  |- a S_back acquire {2}
+|  |- r S1 release {0} -> {2}
+|  |- a S1 acquire {2}
 |  |- YIELD {2}
 ```
 
@@ -1994,26 +2048,25 @@ threaded permit) — **no** release/acquire edge for it.
 ### D. `warp_specialize_tma_matmul` — acyclic `root -> {1} -> root`
 
 ```text
-SYNC-DAG buffer.id=0 resourceKey=0            ; acyclic: distinct permit S0, data-ready edge S1
-|- a S0 acquire root
+OPT-SYNC-DAG buffer.id=0 resourceKey=0        ; identical to RAW (no fan-in/out); acyclic: S1 = distinct permit, S0 = data-ready edge
+|- a S1 acquire root
 |- W m0 ttng.tmem_store root
 |- scf.for (WS, tag=0) {1}
 |  |- ENTER {1}
 |  |- W m0 ttng.tc_gen5_mma {1}
 |  |- YIELD {1}
-|- r S1 release {@0.1} -> root
-|- a S1 acquire root
+|- r S0 release {@0.1} -> root
+|- a S0 acquire root
 |- R m0 ttng.tmem_load root
-|- r S0 release root
+|- r S1 release root
 ```
 
-`root -> {1}` is carrier inherit (no edge). The `{1} -> root` exit: the
-producer release `r S1 release {@0.1} -> root` is displayed `{@0.1}` (owned by
-`{1}`, stamped `{ttg.partition=1, ws.tag=0}`, emitted outside the loop — the tag
-is shown because the row is outside the WS loop, §Debug DAG Dumps line 511),
-lowering to `{1}`'s
-mma commit; the consumer bracket `a S1 acquire root` / `R m0 ... root` /
-`r S0 release root` is owned by root.
+`root -> {1}` is carrier inherit (no edge). The `{1} -> root` exit: the producer
+release `r S0 release {@0.1} -> root` is displayed `{@0.1}` (owned by `{1}`,
+stamped `{ttg.partition=1, ws.tag=0}`, emitted outside the loop — the tag is
+shown because the row is outside the WS loop, §Debug DAG Dumps). The consumer
+bracket `a S0 acquire root` / `R m0 ... root` / `r S1 release root` is owned by
+root.
 
 ## Plan Verification and Enablement
 
