@@ -198,9 +198,9 @@ def _host_descriptor_pre_hook(nargs):
 if is_hip():
     NUM_STAGES_OPTIONS = [1]
 elif supports_host_descriptor():
-    NUM_STAGES_OPTIONS = [2]
+    NUM_STAGES_OPTIONS = [1]
 else:
-    NUM_STAGES_OPTIONS = [2]
+    NUM_STAGES_OPTIONS = [1]
 
 configs = [
     triton.Config(
