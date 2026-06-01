@@ -15,8 +15,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // raw-edge scheduler while the first resource exercises an if-carried
       // generated semaphore token.
       // CHECK: [[A:%.*]] = ttng.tmem_alloc {buffer.id = 401 : i32, buffer.offset = 0 : i32}
-      // CHECK-NEXT: [[B:%.*]] = ttng.tmem_alloc {buffer.id = 401 : i32, buffer.offset = 0 : i32}
-      // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[A]], [[B]] true
+      // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[A]], [[A]] true
       %a, %ta = ttng.tmem_alloc {buffer.id = 401 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
       %b, %tb = ttng.tmem_alloc {buffer.id = 401 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
 

@@ -14,9 +14,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
     %cst_0 = arith.constant dense<1.000000e+00> : tensor<128x128xf32, #blocked>
     // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc {buffer.id = 7 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32
-    // CHECK-NEXT: [[BBUF:%.*]] = ttng.tmem_alloc {buffer.id = 7 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32
-    // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]], [[BBUF]] true
-    // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]], [[BBUF]] false
+    // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]], [[ABUF]] true
+    // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]], [[ABUF]] false
     // CHECK-NEXT: [[ATOK:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 1>
     // CHECK-NEXT: scf.for {{.*}} iter_args({{.*}}, [[AITER:%[^ ]+]] = [[ATOK]]) -> (i32, !ttg.async.token)
     %r = scf.for %iv = %lb to %ub step %step iter_args(%i = %c0) -> (i32) : i32 {
@@ -76,9 +75,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
     %true = arith.constant true
     // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc {buffer.id = 9 : i32} : () -> !ttg.memdesc<1x128x128xf32
-    // CHECK-NEXT: [[BBUF:%.*]] = ttng.tmem_alloc {buffer.id = 9 : i32} : () -> !ttg.memdesc<1x128x128xf32
-    // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]], [[BBUF]] true
-    // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]], [[BBUF]] false
+    // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]], [[ABUF]] true
+    // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]], [[ABUF]] false
     // CHECK-NEXT: [[POISON:%.*]] = ub.poison : !ttg.async.token
     // CHECK-NEXT: [[ATOK:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 2 : i32}
     %a, %ta = ttng.tmem_alloc {buffer.id = 9 : i32} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
@@ -112,9 +110,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
     %true = arith.constant true
     // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc {buffer.id = 10 : i32} : () -> !ttg.memdesc<1x128x128xf32
-    // CHECK-NEXT: [[BBUF:%.*]] = ttng.tmem_alloc {buffer.id = 10 : i32} : () -> !ttg.memdesc<1x128x128xf32
-    // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]], [[BBUF]] true
-    // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]], [[BBUF]] false
+    // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]], [[ABUF]] true
+    // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]], [[ABUF]] false
     // CHECK-NEXT: [[ENTRY:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 3 : i32}
     // CHECK-NEXT: [[POISON:%.*]] = ub.poison : !ttg.async.token
     // CHECK-NEXT: scf.for {{.*}} iter_args({{.*}} = {{.*}}, [[ITER:%.*]] = [[ENTRY]])
@@ -181,7 +178,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %cst_1 = arith.constant dense<1.000000e+00> : tensor<128x128xf16, #linear>
     %true = arith.constant true
     // CHECK: [[ACC0:%.*]] = ttng.tmem_alloc {buffer.id = 11 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32
-    // CHECK-NEXT: [[ALIAS:%.*]] = ttng.tmem_alloc {buffer.id = 11 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf16
+    // CHECK-NEXT: [[ALIAS_SUB:%.*]] = ttng.tmem_subslice [[ACC0]] {N = 0 : i32}
+    // CHECK-NEXT: [[ALIAS:%.*]] = ttg.memdesc_reinterpret [[ALIAS_SUB]] : {{.*}} -> !ttg.memdesc<1x128x128xf16
     // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ACC0]], [[ALIAS]] true
     // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ACC0]], [[ALIAS]] false
     // CHECK-NEXT: [[ACC1:%.*]], [[ACC1_TOK:%.*]] = ttng.tmem_alloc {buffer.id = 12 : i32, buffer.offset = 0 : i32}
@@ -263,9 +261,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %cst1 = arith.constant dense<1.000000e+00> : tensor<128x128xf32, #blocked>
     %r = scf.for %iv = %lb to %ub step %step iter_args(%i = %c0) -> (i32) : i32 {
       // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc {buffer.id = 14 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32
-      // CHECK-NEXT: [[BBUF:%.*]] = ttng.tmem_alloc {buffer.id = 14 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32
-      // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]], [[BBUF]] true
-      // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]], [[BBUF]] false
+      // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]], [[ABUF]] true
+      // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]], [[ABUF]] false
       %a = ttng.tmem_alloc %cst0 {buffer.id = 14 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       // CHECK: [[TOK0:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 0>}
       // CHECK-NEXT: [[VIEW0:%.*]]:2 = nvws.semaphore.buffer [[EMPTY]], [[TOK0]] {ttg.partition = array<i32: 0>}

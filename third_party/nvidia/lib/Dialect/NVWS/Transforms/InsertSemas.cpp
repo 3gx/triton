@@ -3844,6 +3844,191 @@ static void eraseUnusedOriginals(BufferGroup &group) {
       member.allocOp->erase();
 }
 
+static bool isEligibleTmemReuseAlloc(TMEMAllocOp allocOp) {
+  if (!getBufferId(allocOp))
+    return false;
+  if (allocOp.getSrc())
+    return false;
+  if (auto token = allocOp.getToken(); token && !token.use_empty())
+    return false;
+
+  auto type = allocOp.getResult().getType();
+  if (type.getRank() < 2)
+    return false;
+  if (!isa<TensorMemorySpaceAttr>(type.getMemorySpace()))
+    return false;
+  if (!isa<TensorMemoryEncodingAttr>(type.getEncoding()))
+    return false;
+
+  return true;
+}
+
+static int64_t getI64AttrOr(Operation *op, StringRef name,
+                            int64_t defaultValue) {
+  return getI64Attr(op, name).value_or(defaultValue);
+}
+
+using TmemReuseKey = std::pair<int64_t, int64_t>;
+
+static TmemReuseKey getTmemReuseKey(TMEMAllocOp allocOp) {
+  return {*getBufferId(allocOp),
+          getI64AttrOr(allocOp, kBufferCopyAttrName, -1)};
+}
+
+struct TmemReuseView {
+  int64_t offset = 0;
+  int64_t sliceSize = 0;
+};
+
+static std::optional<TmemReuseView> getTmemReuseView(
+    TMEMAllocOp representative, TMEMAllocOp duplicate) {
+  if (getBufferOffset(representative) != 0)
+    return std::nullopt;
+
+  auto baseType = representative.getResult().getType();
+  auto duplicateType = duplicate.getResult().getType();
+  if (baseType.getRank() != duplicateType.getRank())
+    return std::nullopt;
+
+  ArrayRef<int64_t> baseShape = baseType.getShape();
+  ArrayRef<int64_t> duplicateShape = duplicateType.getShape();
+  for (int i = 0, e = baseType.getRank() - 1; i < e; ++i)
+    if (baseShape[i] != duplicateShape[i])
+      return std::nullopt;
+
+  int64_t duplicateOffset = getBufferOffset(duplicate);
+  if (duplicateOffset < 0)
+    return std::nullopt;
+
+  int64_t baseBlockN = baseShape.back();
+  int64_t duplicateBlockN = duplicateShape.back();
+  int64_t baseElemWidth = baseType.getElementTypeBitWidth();
+  int64_t duplicateElemWidth = duplicateType.getElementTypeBitWidth();
+
+  int64_t sliceSize = 0;
+  if (baseElemWidth == duplicateElemWidth) {
+    sliceSize = duplicateBlockN;
+  } else if (baseElemWidth == duplicateElemWidth * 2) {
+    if (duplicateBlockN % 2 != 0)
+      return std::nullopt;
+    sliceSize = duplicateBlockN / 2;
+  } else {
+    return std::nullopt;
+  }
+
+  if (sliceSize <= 0 || duplicateOffset + sliceSize > baseBlockN)
+    return std::nullopt;
+
+  return TmemReuseView{duplicateOffset, sliceSize};
+}
+
+static bool canRepresentTmemReuseGroup(TMEMAllocOp representative,
+                                       ArrayRef<TMEMAllocOp> group) {
+  return llvm::all_of(group, [&](TMEMAllocOp duplicate) {
+    return duplicate == representative ||
+           getTmemReuseView(representative, duplicate).has_value();
+  });
+}
+
+static TMEMAllocOp chooseTmemReuseRepresentative(ArrayRef<TMEMAllocOp> group) {
+  for (TMEMAllocOp candidate : group)
+    if (canRepresentTmemReuseGroup(candidate, group))
+      return candidate;
+  return {};
+}
+
+static bool moveRepresentativeBeforeGroup(TMEMAllocOp representative,
+                                          ArrayRef<TMEMAllocOp> group) {
+  Block *block = representative->getBlock();
+  Operation *earliest = representative.getOperation();
+  for (TMEMAllocOp allocOp : group) {
+    if (allocOp->getBlock() != block)
+      return false;
+    if (allocOp->isBeforeInBlock(earliest))
+      earliest = allocOp.getOperation();
+  }
+  if (earliest != representative.getOperation())
+    representative->moveBefore(earliest);
+  return true;
+}
+
+static Value createTmemReuseView(OpBuilder &builder,
+                                 TMEMAllocOp representative,
+                                 TMEMAllocOp duplicate,
+                                 TmemReuseView view) {
+  auto duplicateType = duplicate.getResult().getType();
+  if (representative.getResult().getType() == duplicateType &&
+      view.offset == 0)
+    return representative.getResult();
+
+  builder.setInsertionPoint(duplicate);
+  auto subSlice = TMEMSubSliceOp::create(builder, duplicate.getLoc(),
+                                         representative.getResult(),
+                                         view.offset, view.sliceSize);
+  auto reinterpret = MemDescReinterpretOp::create(
+      builder, duplicate.getLoc(), duplicateType, subSlice);
+  setPartitionFromAnchor(subSlice, duplicate);
+  setPartitionFromAnchor(reinterpret, duplicate);
+  if (StageCluster stageCluster = getStageCluster(duplicate)) {
+    setStageCluster(builder, subSlice, stageCluster);
+    setStageCluster(builder, reinterpret, stageCluster);
+  }
+  return reinterpret.getResult();
+}
+
+static void coalesceTmemAllocsByBufferIdIntoViews(triton::FuncOp funcOp) {
+  SmallVector<TMEMAllocOp> allocs;
+  funcOp.walk([&](TMEMAllocOp allocOp) {
+    if (isEligibleTmemReuseAlloc(allocOp))
+      allocs.push_back(allocOp);
+  });
+
+  llvm::MapVector<TmemReuseKey, SmallVector<TMEMAllocOp>> groups;
+  for (TMEMAllocOp allocOp : allocs)
+    groups[getTmemReuseKey(allocOp)].push_back(allocOp);
+
+  OpBuilder builder(funcOp.getContext());
+  for (auto &entry : groups) {
+    SmallVector<TMEMAllocOp> &group = entry.second;
+    if (group.size() < 2)
+      continue;
+
+    TMEMAllocOp representative = chooseTmemReuseRepresentative(group);
+    if (!representative)
+      continue;
+    if (!moveRepresentativeBeforeGroup(representative, group))
+      continue;
+
+    DominanceInfo domInfo(funcOp);
+    if (!llvm::all_of(group, [&](TMEMAllocOp duplicate) {
+          return duplicate == representative ||
+                 domInfo.dominates(representative.getOperation(),
+                                   duplicate.getOperation());
+        }))
+      continue;
+
+    for (TMEMAllocOp duplicate : group) {
+      if (duplicate == representative)
+        continue;
+      std::optional<TmemReuseView> view =
+          getTmemReuseView(representative, duplicate);
+      if (!view)
+        continue;
+      Value replacement =
+          createTmemReuseView(builder, representative, duplicate, *view);
+      duplicate.getResult().replaceAllUsesWith(replacement);
+    }
+  }
+}
+
+static void eraseDeadTmemAllocs(triton::FuncOp funcOp) {
+  SmallVector<TMEMAllocOp> allocs;
+  funcOp.walk([&](TMEMAllocOp allocOp) { allocs.push_back(allocOp); });
+  for (TMEMAllocOp allocOp : llvm::reverse(allocs))
+    if (allResultsUnused(allocOp))
+      allocOp.erase();
+}
+
 static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
                                      ArrayRef<const AccessTouch *> touches,
                                      ArrayRef<AcquireRecord> acquires,
@@ -7086,6 +7271,8 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp) {
   splitSemaphoreIfForLoopScheduler(funcOp);
   hoistInitialEmptyAcquires(funcOp);
   coalesceSemaphoreForCarriers(funcOp);
+  coalesceTmemAllocsByBufferIdIntoViews(funcOp);
+  eraseDeadTmemAllocs(funcOp);
   if (dumpDag)
     llvm::errs() << "\n";
 

@@ -38,6 +38,30 @@ static bool hasProtocolUsers(SemaphoreCreateOp semaphoreCreate) {
   return !semaphoreCreate.getResult().use_empty();
 }
 
+static bool allLegalSemaphoreBackingUses(Value value,
+                                         llvm::DenseSet<Operation *> &seen);
+
+static bool isLegalSemaphoreBackingUse(Operation *user,
+                                       llvm::DenseSet<Operation *> &seen) {
+  if (isa<SemaphoreCreateOp, gpu::LocalDeallocOp>(user))
+    return true;
+  if (!user->hasTrait<OpTrait::MemDescViewTrait>() &&
+      !isa<triton::nvidia_gpu::TMEMSubSliceOp>(user))
+    return false;
+  if (!seen.insert(user).second)
+    return true;
+  return llvm::all_of(user->getResults(), [&](Value result) {
+    return allLegalSemaphoreBackingUses(result, seen);
+  });
+}
+
+static bool allLegalSemaphoreBackingUses(Value value,
+                                         llvm::DenseSet<Operation *> &seen) {
+  return llvm::all_of(value.getUsers(), [&](Operation *user) {
+    return isLegalSemaphoreBackingUse(user, seen);
+  });
+}
+
 static LogicalResult
 verifySharedBufferPeerTupleInvariant(SemaphoreCreateOp semaphoreCreate) {
   if (!hasProtocolUsers(semaphoreCreate))
@@ -85,10 +109,8 @@ LogicalResult SemaphoreCreateOp::verify() {
   SmallVector<int64_t> dims;
 
   for (auto operand : getOperands()) {
-    SmallVector<Operation *> users(operand.user_begin(), operand.user_end());
-    if (!llvm::all_of(users, [](Operation *op) {
-          return isa<SemaphoreCreateOp, gpu::LocalDeallocOp>(op);
-        })) {
+    llvm::DenseSet<Operation *> seen;
+    if (!allLegalSemaphoreBackingUses(operand, seen)) {
       return emitError("Semaphore buffer is used elsewhere, Semaphore cannot "
                        "guarantee async safety");
     }
