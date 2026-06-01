@@ -48,7 +48,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     } {tt.num_stages = 2 : i32, tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.outputs = [array<i32: 1>], ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
 
     // CHECK: nvws.semaphore.release [[FULL]], {{%.*}} [#nvws.async_op<none>] {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32}
-    // CHECK-NEXT: {{%.*}} = nvws.semaphore.acquire [[FULL]] {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32}
+    // CHECK-NEXT: [[POST:%.*]] = nvws.semaphore.acquire [[FULL]] :
+    // CHECK-NEXT: [[POSTBUF:%.*]] = nvws.semaphore.buffer [[FULL]], [[POST]] :
+    // CHECK-NEXT: {{%.*}}, {{%.*}} = ttng.tmem_load [[POSTBUF]][]
     %out, %out_tok = ttng.tmem_load %acc[%loop] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
     "use"(%out) : (tensor<128x128xf32, #blocked>) -> ()
     tt.return

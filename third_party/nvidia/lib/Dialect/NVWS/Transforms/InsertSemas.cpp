@@ -2092,7 +2092,8 @@ static scf::YieldOp appendToForYield(scf::ForOp forOp,
   return newYield;
 }
 
-static OptSyncDag buildOptSyncDag(const SyncPlan &sp, BufferGroup &group) {
+static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
+                                  BufferGroup &group) {
   OptSyncDag dag;
   dag.resource = sp.resource;
   dag.groupIdx = sp.groupIdx;
@@ -2505,6 +2506,50 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, BufferGroup &group) {
     markEscapingSourceToken(edge.srcOp, dstAnchor);
   }
 
+  auto carriedForRegion = [&](scf::ForOp forOp) {
+    auto it = plan.regionOwners.find(&forOp.getRegion());
+    return it != plan.regionOwners.end() && it->second.carried &&
+           it->second.hasEventsInSubtree &&
+           sameOwner(it->second.entry, it->second.exit);
+  };
+  auto canThreadIfRegion = [&](scf::IfOp ifOp) {
+    if (!ifOp || ifOp.getElseRegion().empty())
+      return false;
+    auto thenIt = plan.regionOwners.find(&ifOp.getThenRegion());
+    auto elseIt = plan.regionOwners.find(&ifOp.getElseRegion());
+    bool thenHas = thenIt != plan.regionOwners.end() &&
+                   thenIt->second.hasEventsInSubtree;
+    bool elseHas = elseIt != plan.regionOwners.end() &&
+                   elseIt->second.hasEventsInSubtree;
+    return thenHas || elseHas;
+  };
+  auto propagateCarriedThreading = [&]() {
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      SmallVector<Operation *, 8> seeds;
+      seeds.append(dag.threadForOps.begin(), dag.threadForOps.end());
+      seeds.append(dag.threadIfOps.begin(), dag.threadIfOps.end());
+      for (Operation *seed : seeds) {
+        Operation *child = seed;
+        for (Operation *parent = seed ? seed->getParentOp() : nullptr; parent;
+             parent = parent->getParentOp()) {
+          if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
+            if (carriedForRegion(forOp) && findFirstAccessAfter(child, dag))
+              changed |= dag.threadForOps.insert(parent).second;
+            child = parent;
+            continue;
+          }
+          if (auto ifOp = dyn_cast<scf::IfOp>(parent)) {
+            if (canThreadIfRegion(ifOp) && findFirstAccessAfter(child, dag))
+              changed |= dag.threadIfOps.insert(parent).second;
+          }
+          child = parent;
+        }
+      }
+    }
+  };
+
   auto removeGroupFromOpAnchor =
       [&](DenseMap<Operation *, SmallVector<unsigned, 2>> &anchors,
           Operation *op, unsigned groupIdx) {
@@ -2552,6 +2597,13 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, BufferGroup &group) {
   for (const SyncGroup &syncGroup : dag.groups)
     if (scf::ForOp forOp = findLinearChainCarrierLoop(syncGroup))
       markThreadedOp(forOp.getOperation());
+
+  // A token may be produced by an inner carried loop and be the ownership state
+  // that an enclosing carried loop must reuse on its next iteration. Those
+  // same-owner reentry requirements are visible in the ownership DAG as
+  // `YIELD {P}` rows, not necessarily as extra sync edges, so promote threading
+  // through all enclosing carried regions before placing the initial acquire.
+  propagateCarriedThreading();
 
   // When the first writer is inside a loop whose resource state is loop-carried,
   // the initial EMPTY acquire must produce the loop-carried carrier before the
@@ -3368,8 +3420,6 @@ static void setSingleOwnerPartition(Operation *op,
   if (!op || !owner)
     return;
   SetVector<int> ids;
-  if (hasPartition(op))
-    ids = getPartitionIds(op);
   ids.insert(owner->first);
   setPartition(op, ids);
   setWarpTagOutsideWsLoop(op, owner->second);
@@ -3384,6 +3434,22 @@ static void setPartitionFromAnchor(Operation *op, Operation *anchor) {
     if (auto tag = tryGetWsTag(anchor))
       setWarpTagOutsideWsLoop(op, *tag);
   }
+}
+
+static bool parentRequiresPartition(Operation *op) {
+  return op && nearestPartitionIds(op->getParentOp()).has_value();
+}
+
+static void setPartitionFromTokenIfParentPartitioned(Operation *op,
+                                                     Value token) {
+  if (!op || hasPartition(op) || !parentRequiresPartition(op))
+    return;
+  auto ids = partitionSetForValue(token);
+  if (ids.size() != 1)
+    return;
+  setPartition(op, ids);
+  if (auto tag = wsTagForValue(token))
+    setWarpTagOutsideWsLoop(op, *tag);
 }
 
 static bool regionContainsAccess(Region &region, const OptSyncDag &dag) {
@@ -3772,6 +3838,8 @@ static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
                             stageCluster, group, backing, touches, writes);
     if (!event.owner)
       setPartitionFromAnchor(bufferOp.getOperation(), op);
+    if (!event.owner)
+      setPartitionFromTokenIfParentPartitioned(bufferOp.getOperation(), token);
     bufferOperation = bufferOp.getOperation();
     buffers.assign(bufferOp.getBuffers().begin(), bufferOp.getBuffers().end());
     state.currentBuffers = buffers;
@@ -3870,6 +3938,9 @@ static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
       state.poisonTokenResultsAfterEmission.push_back({op, poisonAnchor});
     }
   }
+
+  if (!event.owner && retargetOp)
+    setPartitionFromTokenIfParentPartitioned(retargetOp, token);
 
   state.eventToken[op] = token;
   state.eventSemaphore[op] = sem;
@@ -4212,13 +4283,14 @@ static AcquireRecord emitAcquireForGroup(OpBuilder &b, Location loc,
   SemaphoreAcquireOp acquire = emitAcquire(b, loc, sem, owner, stageCluster);
   if (!owner) {
     std::optional<PartitionId> fallbackOwner =
-        edge ? edge->srcOwner : std::nullopt;
+        parentRequiresPartition(acquire.getOperation()) && edge
+            ? edge->srcOwner
+            : std::nullopt;
     setSingleOwnerPartition(acquire.getOperation(), fallbackOwner);
-    if (!fallbackOwner)
-      setPartitionFromAnchor(acquire.getOperation(),
-                             anchor ? anchor
-                                    : (yieldRegion ? yieldRegion->getParentOp()
-                                                   : nullptr));
+    setPartitionFromAnchor(acquire.getOperation(),
+                           anchor ? anchor
+                                  : (yieldRegion ? yieldRegion->getParentOp()
+                                                 : nullptr));
   }
   Value token = acquire.getToken();
   state.emittedAcquires.push_back(EmittedSyncRecord{
@@ -4545,6 +4617,9 @@ static void prebufferLocalRegionEntry(OpBuilder &b, Operation *anchor,
                           touches, /*mutableMemory=*/false);
   if (!acquire.owner)
     setPartitionFromAnchor(bufferOp.getOperation(), anchor);
+  if (!acquire.owner)
+    setPartitionFromTokenIfParentPartitioned(bufferOp.getOperation(),
+                                             acquire.token);
   state.currentBuffers.assign(bufferOp.getBuffers().begin(),
                               bufferOp.getBuffers().end());
 }
@@ -4682,14 +4757,6 @@ static FailureOr<scf::ForOp> threadCarrierThroughFor(OpBuilder &b,
                                                      ArrayRef<unsigned>
                                                          memberIndices,
                                                      int64_t resourceKey) {
-  if (!state.currentToken) {
-    forOp.emitError("nvws-insert-semas: planned scf.for carrier threading has "
-                    "no token producer at loop entry");
-    return failure();
-  }
-  Value init = state.currentToken;
-  SetVector<int> carrierPartition =
-      partitionSetForTokenOrOwner(init, state.currentOwner, forOp.getOperation());
   unsigned oldNumResults = forOp.getNumResults();
   auto oldPartitionIds =
       hasPartition(forOp) ? getPartitionIds(forOp) : SetVector<int>();
@@ -4699,6 +4766,16 @@ static FailureOr<scf::ForOp> threadCarrierThroughFor(OpBuilder &b,
 
   SmallVector<unsigned, 4> reusableSlots =
       findReusableTmemTokenSlots(forOp, group, memberIndices, resourceKey);
+  Value init = state.currentToken;
+  if (!init && !reusableSlots.empty())
+    init = forOp->getOperand(3 + reusableSlots.front());
+  if (!init) {
+    forOp.emitError("nvws-insert-semas: planned scf.for carrier threading has "
+                    "no token producer at loop entry");
+    return failure();
+  }
+  SetVector<int> carrierPartition =
+      partitionSetForTokenOrOwner(init, state.currentOwner, forOp.getOperation());
   if (!reusableSlots.empty()) {
     unsigned carrierSlot = reusableSlots.front();
     Value poison;
@@ -6895,7 +6972,7 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp) {
                                        static_cast<unsigned>(en.index()),
                                        group, key, rank);
       SyncPlan sp = buildSyncPlan(group, plan, funcOp);
-      OptSyncDag opt = buildOptSyncDag(sp, group);
+      OptSyncDag opt = buildOptSyncDag(sp, plan, group);
       if (dumpDag) {
         dumpOwnershipDag(plan, group, funcOp);
         dumpRawSyncDag(sp, plan, group, funcOp);

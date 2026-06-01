@@ -9,12 +9,19 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // LOWER-LABEL: @post_ws_tmem_read_carrier_tag
-  // LOWER: ttng.tmem_load
-  // LOWER-NEXT: [[BAR:%.*]] = ttg.memdesc_index {{.*}} {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32}
-  // LOWER-NEXT: ttng.arrive_barrier [[BAR]], 1 {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32}
+  // LOWER: ttng.tc_gen5_commit {{.*}} {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32}
+  // LOWER: ttng.wait_barrier {{.*}} :
+  // LOWER: [[READ:%.*]] = ttg.memdesc_index {{.*}} : !ttg.memdesc<1x128x128xf32
+  // LOWER: [[OUT:%.*]], {{%.*}} = ttng.tmem_load [[READ]][]
+  // LOWER-NEXT: [[BAR:%.*]] = ttg.memdesc_index {{.*}} : !ttg.memdesc<1x1xi64
+  // LOWER-NEXT: ttng.arrive_barrier [[BAR]], 1
   // PARTITION-LABEL: @post_ws_tmem_read_carrier_tag
   // PARTITION: nvws.warp_group
-  // PARTITION: ttng.arrive_barrier {{.*}} {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32}
+  // PARTITION: ttng.tc_gen5_commit {{.*}} {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32}
+  // PARTITION: [[POST_READ:%.*]] = ttg.memdesc_index {{.*}} : !ttg.memdesc<1x128x128xf32
+  // PARTITION: [[POST_OUT:%.*]], {{%.*}} = ttng.tmem_load [[POST_READ]][]
+  // PARTITION: ttng.arrive_barrier {{.*}}, 1
+  // PARTITION: "use"([[POST_OUT]])
   tt.func @post_ws_tmem_read_carrier_tag(
       %ub: i32,
       %lhs: !ttg.memdesc<128x64xf16, #shared, #smem>,

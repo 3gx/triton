@@ -16,12 +16,14 @@ module attributes {"ttg.num-warps" = 4 : i32} {
       %v = "producer"() {ttg.partition = array<i32: 0>} : () -> !ty
       %c0 = arith.constant {ttg.partition = array<i32: 0>} 0 : i32
       %pv = ttg.memdesc_index %alloc[%c0] {ttg.partition = array<i32: 0>} : !ttg.memdesc<1x1xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-      // CHECK: [[PTOK:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 0>}
+      // CHECK: [[PTOK:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 0>
+      // CHECK: scf.for {{.*}} iter_args([[ITER:%.*]] = [[PTOK]])
+      // CHECK: nvws.semaphore.buffer [[EMPTY]], [[ITER]] {ttg.partition = array<i32: 0>}
       // CHECK: ttg.local_store {{.*}} {ttg.partition = array<i32: 0>}
       ttg.local_store %v, %pv {ttg.partition = array<i32: 0>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
       %cond = "cond"() {ttg.partition = array<i32: 0, 1>} : () -> i1
       // CHECK: scf.if
-      // CHECK-NEXT: nvws.semaphore.release [[FULL]], [[PTOK]] [#nvws.async_op<none>] {ttg.partition = array<i32: 0>}
+      // CHECK-NEXT: nvws.semaphore.release [[FULL]], [[ITER]] [#nvws.async_op<none>] {ttg.partition = array<i32: 0>}
       // CHECK: scf.if
       scf.if %cond {
         %c1 = arith.constant {ttg.partition = array<i32: 1>} 0 : i32
@@ -40,7 +42,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
       %pv2 = ttg.memdesc_index %alloc[%c2] {ttg.partition = array<i32: 0>} : !ttg.memdesc<1x1xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
       // CHECK: [[NEXTTOK:%.*]] = scf.if {{.*}} -> (!ttg.async.token)
       // CHECK-NEXT: [[PTOK2:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 0>}
-      // CHECK: scf.yield {{.*}}[[PTOK]]
+      // CHECK: scf.yield {{.*}}[[ITER]]
       // CHECK: nvws.semaphore.buffer [[EMPTY]], [[NEXTTOK]] {ttg.partition = array<i32: 0>}
       // CHECK-NEXT: ttg.local_store {{.*}} {ttg.partition = array<i32: 0>}
       ttg.local_store %v2, %pv2 {ttg.partition = array<i32: 0>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
@@ -67,7 +69,9 @@ module attributes {"ttg.num-warps" = 4 : i32} {
       %v = "producer"() {ttg.partition = array<i32: 0>} : () -> !ty
       %c0 = arith.constant {ttg.partition = array<i32: 0>} 0 : i32
       %pv = ttg.memdesc_index %alloc[%c0] {ttg.partition = array<i32: 0>} : !ttg.memdesc<1x1xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-      // CHECK: [[PTOK:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 0>}
+      // CHECK: [[PTOK:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 0>
+      // CHECK: scf.for {{.*}} iter_args([[ITER:%.*]] = [[PTOK]])
+      // CHECK: nvws.semaphore.buffer [[EMPTY]], [[ITER]] {ttg.partition = array<i32: 0>}
       ttg.local_store %v, %pv {ttg.partition = array<i32: 0>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
       %cond = "cond"() {ttg.partition = array<i32: 0, 1>} : () -> i1
       // CHECK: scf.if
