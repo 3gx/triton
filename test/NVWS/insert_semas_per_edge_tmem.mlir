@@ -12,8 +12,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // DAG: RAW-SYNC-DAG
   // DAG: |  |  |- r  S0
   // DAG: OPT-SYNC-DAG
-  // DAG: |  |  r  S_full
-  // DAG: |  |  a  S_empty
+  // DAG: |  |  |- r  S_full
+  // DAG: |  |  |- a  S_empty
   // CHECK-LABEL: @tmem_single_producer_multi_consumer_fanout
   tt.func @tmem_single_producer_multi_consumer_fanout(%lb: i32, %ub: i32, %step: i32) {
     %c0 = arith.constant 0 : i32
