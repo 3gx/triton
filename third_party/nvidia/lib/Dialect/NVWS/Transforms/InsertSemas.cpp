@@ -2535,13 +2535,27 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
                    elseIt->second.hasEventsInSubtree;
     return thenHas || elseHas;
   };
+  auto hasEnclosingCarriedFor = [&](Operation *op) {
+    for (Operation *parent = op ? op->getParentOp() : nullptr; parent;
+         parent = parent->getParentOp())
+      if (auto forOp = dyn_cast<scf::ForOp>(parent))
+        if (carriedForRegion(forOp))
+          return true;
+    return false;
+  };
+  auto carrierCrossesIfBoundary = [&](scf::IfOp ifOp) {
+    return hasEnclosingCarriedFor(ifOp.getOperation()) ||
+           findFirstAccessAfter(ifOp.getOperation(), dag);
+  };
   auto propagateCarriedThreading = [&]() {
     // Edge groups and sync anchors are fixed at this point. This pass derives
     // only SSA carrier plumbing from that completed OPT-SYNC-DAG: when a
     // child structured op is already known to carry the semaphore state, every
     // enclosing loop/if that the state crosses must also return it. Re-entry
-    // into a carried loop is itself the next use, so this must not depend on
-    // finding a later access after the child in the same iteration.
+    // into a carried loop is itself the next use, so loop propagation must not
+    // depend on finding a later access after the child in the same iteration.
+    // An if has no re-entry by itself; only thread it when the carrier exits
+    // the if to a later access or to an enclosing carried loop.
     bool changed = true;
     while (changed) {
       changed = false;
@@ -2557,7 +2571,7 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
             continue;
           }
           if (auto ifOp = dyn_cast<scf::IfOp>(parent)) {
-            if (canThreadIfRegion(ifOp))
+            if (canThreadIfRegion(ifOp) && carrierCrossesIfBoundary(ifOp))
               changed |= dag.threadIfOps.insert(parent).second;
           }
         }
@@ -2637,8 +2651,11 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
           threadedRegionOp = parent;
         continue;
       }
-      if (isa<scf::IfOp>(parent) && dag.threadIfOps.contains(parent))
-        threadedRegionOp = parent;
+      // Initial-empty acquire seeds the first writer or a loop carrier. Do not
+      // re-anchor it to an enclosing scf.if: branch-local semaphore creates do
+      // not dominate the parent if.
+      if (isa<scf::IfOp>(parent))
+        continue;
     }
     if (!threadedRegionOp)
       continue;
