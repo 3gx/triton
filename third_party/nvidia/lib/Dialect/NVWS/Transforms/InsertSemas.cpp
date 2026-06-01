@@ -928,8 +928,10 @@ planResource(triton::FuncOp funcOp, unsigned groupIdx, BufferGroup &group,
     for (auto [tIdx, touch] : llvm::enumerate(event.touches)) {
       if (touch.resourceKey == resourceKey) {
         if (!found) {
-          plan.useOwner[event.op] = event.owner;
-          plan.useTagSource[event.op] = event.tagSourceOp;
+          std::optional<PartitionId> owner = getPartitionId(event.op);
+          plan.useOwner[event.op] = owner;
+          plan.useTagSource[event.op] =
+              owner ? getTagSourceOp(event.op) : nullptr;
           plan.useTouchIdx[event.op] = static_cast<unsigned>(tIdx);
           found = true;
         }
