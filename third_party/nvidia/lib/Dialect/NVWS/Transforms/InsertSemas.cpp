@@ -1701,6 +1701,7 @@ struct OptSyncDag {
   DenseMap<unsigned, Operation *> ifYieldJoinAccess;
   DenseMap<unsigned, Operation *> dstBranchEntryAnchor;
   DenseMap<unsigned, Operation *> tmemLoopExitRead;
+  DenseMap<unsigned, Operation *> loopEntryHandoffAccess;
   DenseMap<unsigned, Region *> skippedInitialLoopCarrierRegion;
   DenseSet<unsigned> edgesDeferringToSkippedLoopExit;
   DenseSet<unsigned> terminalLoopReadEdgesDeferringToExit;
@@ -1839,6 +1840,19 @@ static Operation *findFirstAccessAfter(Operation *op, const OptSyncDag &dag) {
       return nestedAccess;
   }
   return nullptr;
+}
+
+static scf::ForOp getContainingWsFor(Operation *op) {
+  if (!op)
+    return {};
+  if (auto forOp = dyn_cast<scf::ForOp>(op))
+    if (hasWarpSpecializeTag(forOp))
+      return forOp;
+  for (auto forOp = op->getParentOfType<scf::ForOp>(); forOp;
+       forOp = forOp->getParentOfType<scf::ForOp>())
+    if (hasWarpSpecializeTag(forOp))
+      return forOp;
+  return {};
 }
 
 static bool operationIsAttached(Operation *op) {
@@ -2238,12 +2252,7 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, BufferGroup &group) {
           }
         }
         dag.acquireBeforeOp[acquireAnchor].push_back(gi);
-        // Terminal consumer frees the slot only for ACYCLIC resources. A cyclic
-        // loop-carry owner's final read needs no release (the same owner
-        // re-enters the loop via carrier inherit) — RAW-SYNC-DAG shows none.
-        // sp.initialPermitReleaseAfterOp is set only for acyclic chains.
-        if (sp.initialPermitReleaseAfterOp &&
-            edgeNeedsTerminalReadRelease(e, group, sp.resource.second) &&
+        if (edgeNeedsTerminalReadRelease(e, group, sp.resource.second) &&
             !hasOutgoingEdgeFromOp(sp, e.dstOp) && !tokenResultIsYielded(e.dstOp))
           dag.releaseAfterOp[e.dstOp].push_back(gi);
       } else if (e.dstYieldRegion) {
@@ -2368,6 +2377,17 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, BufferGroup &group) {
         if (chainEntersLoop && e.dstYieldRegion &&
             !isIfYieldRegion(e.dstYieldRegion)) {
           if (shouldDeferTerminalLoopReadToExit(e, group, sp.resource.second)) {
+            auto forOp = dyn_cast_or_null<scf::ForOp>(
+                e.dstYieldRegion->getParentOp());
+            if (forOp)
+              if (Operation *firstAccess =
+                      findFirstAccessInRegion(forOp.getRegion(), dag)) {
+                dag.loopEntryHandoffAccess[ei] = firstAccess;
+                dag.releaseBeforeOp[firstAccess].push_back(gi);
+                dag.acquireBeforeOp[firstAccess].push_back(gi);
+                dag.threadForOps.insert(forOp.getOperation());
+                continue;
+              }
             dag.terminalLoopReadEdgesDeferringToExit.insert(ei);
             continue;
           }
@@ -2385,6 +2405,17 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, BufferGroup &group) {
         }
         if (e.dstYieldRegion) {
           if (shouldDeferTerminalLoopReadToExit(e, group, sp.resource.second)) {
+            auto forOp = dyn_cast_or_null<scf::ForOp>(
+                e.dstYieldRegion->getParentOp());
+            if (forOp)
+              if (Operation *firstAccess =
+                      findFirstAccessInRegion(forOp.getRegion(), dag)) {
+                dag.loopEntryHandoffAccess[ei] = firstAccess;
+                dag.releaseBeforeOp[firstAccess].push_back(gi);
+                dag.acquireBeforeOp[firstAccess].push_back(gi);
+                dag.threadForOps.insert(forOp.getOperation());
+                continue;
+              }
             dag.terminalLoopReadEdgesDeferringToExit.insert(ei);
             continue;
           }
@@ -2416,11 +2447,7 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, BufferGroup &group) {
                  (isIfYieldRegion(e.dstYieldRegion) ||
                   yieldedAccessTokenRequiresCarrier(e.dstYieldRegion, sp)))
           dag.acquireBeforeYield[e.dstYieldRegion].push_back(gi);
-        // Terminal consumer frees the slot only for ACYCLIC resources; a cyclic
-        // loop-carry owner's final read needs no release (carrier inherit) —
-        // RAW-SYNC-DAG shows none. sp.initialPermitReleaseAfterOp is non-null
-        // only for acyclic chains.
-        if (sp.initialPermitReleaseAfterOp && ei == g.edgeIdxs.back() &&
+        if (ei == g.edgeIdxs.back() &&
             edgeNeedsTerminalReadRelease(e, group, sp.resource.second) &&
             !hasOutgoingEdgeFromOp(sp, e.dstOp) &&
             !tokenResultIsYielded(e.dstOp))
@@ -2496,6 +2523,35 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, BufferGroup &group) {
         if (!llvm::is_contained(groups, groupIdx))
           groups.push_back(groupIdx);
       };
+
+  auto findLinearChainCarrierLoop = [&](const SyncGroup &syncGroup) -> scf::ForOp {
+    if (!group.isTmem() || syncGroup.kind != SyncGroupKind::LinearChain)
+      return {};
+    SmallVector<scf::ForOp, 4> candidates;
+    auto addCandidate = [&](scf::ForOp forOp) {
+      if (forOp && hasWarpSpecializeTag(forOp) &&
+          !llvm::is_contained(candidates, forOp))
+        candidates.push_back(forOp);
+    };
+    for (unsigned edgeIdx : syncGroup.edgeIdxs) {
+      const SyncEdge &edge = sp.edges[edgeIdx];
+      if (auto forOp = dyn_cast_or_null<scf::ForOp>(
+              edge.dstYieldRegion ? edge.dstYieldRegion->getParentOp()
+                                  : nullptr))
+        addCandidate(forOp);
+      addCandidate(getContainingWsFor(edge.srcOp));
+      addCandidate(getContainingWsFor(edge.dstOp));
+    }
+    for (scf::ForOp forOp : candidates)
+      if (findReusableTmemTokenSlot(forOp, group, dag.memberIndices,
+                                    dag.resource.second))
+        return forOp;
+    return {};
+  };
+
+  for (const SyncGroup &syncGroup : dag.groups)
+    if (scf::ForOp forOp = findLinearChainCarrierLoop(syncGroup))
+      markThreadedOp(forOp.getOperation());
 
   // When the first writer is inside a loop whose resource state is loop-carried,
   // the initial EMPTY acquire must produce the loop-carried carrier before the
@@ -2887,8 +2943,14 @@ static bool linearChainEdgeUsesEmpty(const SyncGroup &syncGroup,
       currentEdgeIdx &&
       dag.skippedInitialLoopCarrierRegion.contains(
           dag.edgeToGroup[*currentEdgeIdx]);
+  bool loopEntryHandoff =
+      llvm::any_of(syncGroup.edgeIdxs, [&](unsigned edgeIdx) {
+        return dag.loopEntryHandoffAccess.contains(edgeIdx);
+      });
   for (auto [pos, edgeIdx] : llvm::enumerate(syncGroup.edgeIdxs))
     if (&sp.edges[edgeIdx] == edge) {
+      if (loopEntryHandoff)
+        return (pos % 2) == 0;
       if (skipsInitialLoopCarrier && pos > 0)
         return (pos % 2) == 0;
       return (pos % 2) == 1;
@@ -3034,6 +3096,8 @@ static const SyncEdge *findEdgeForAnchor(const SyncGroup &group,
                                                       : dstBranchIt->second;
     switch (kind) {
     case SyncAnchorKind::AcquireBeforeOp:
+      if (dag.loopEntryHandoffAccess.lookup(ei) == anchor)
+        return &edge;
       if (edge.dstOp == anchor || dstBranchEntry == anchor)
         return &edge;
       break;
@@ -3041,6 +3105,8 @@ static const SyncEdge *findEdgeForAnchor(const SyncGroup &group,
       if (edge.dstYieldRegion == yieldRegion) return &edge;
       break;
     case SyncAnchorKind::ReleaseBeforeOp:
+      if (dag.loopEntryHandoffAccess.lookup(ei) == anchor)
+        return &edge;
       if (edge.dstOp == anchor || dstBranchEntry == anchor)
         return &edge;
       break;
@@ -4345,6 +4411,12 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
     Location loc = forOp.getLoc();
     bool skipsInitialCarrier =
         dag.skippedInitialLoopCarrierRegion.lookup(gi) == region;
+    const SyncEdge *loopEntryHandoffEdge = nullptr;
+    for (unsigned edgeIdx : syncGroup.edgeIdxs)
+      if (dag.loopEntryHandoffAccess.contains(edgeIdx)) {
+        loopEntryHandoffEdge = &sp.edges[edgeIdx];
+        break;
+      }
     bool deferredTerminalLoopRead = llvm::any_of(
         syncGroup.edgeIdxs, [&](unsigned edgeIdx) {
           const SyncEdge &edge = sp.edges[edgeIdx];
@@ -4366,9 +4438,14 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
       }
     }
     std::optional<PartitionId> drainOwner = firstEdge.dstOwner;
+    std::optional<PartitionId> releaseOwner = state.currentOwner;
     AsyncOp drainPayload = AsyncOp::NONE;
     AsyncOp emptyPayload = AsyncOp::NONE;
-    if (skipsInitialCarrier) {
+    if (loopEntryHandoffEdge) {
+      releaseOwner = loopEntryHandoffEdge->srcOwner;
+      drainOwner = loopEntryHandoffEdge->dstOwner;
+      emptyPayload = loopExitPayload();
+    } else if (skipsInitialCarrier) {
       drainOwner = secondEdge.dstOwner;
       drainPayload = loopExitPayload();
     } else if (deferredTerminalLoopRead) {
@@ -4378,13 +4455,13 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
     } else if (isa_and_nonnull<MMAv5OpInterface>(firstEdge.srcOp) &&
                edgeDstReads(firstEdge, group, dag.resource.second) &&
                !edgeDstWrites(firstEdge, group, dag.resource.second)) {
-      drainPayload = firstEdge.asyncPayload;
+      drainPayload = loopExitPayload();
     } else if (isa_and_nonnull<MMAv5OpInterface>(secondEdge.srcOp) &&
                edgeDstReads(secondEdge, group, dag.resource.second) &&
                !edgeDstWrites(secondEdge, group, dag.resource.second)) {
       emptyPayload = secondEdge.asyncPayload;
     }
-    emitRelease(b, loc, pair.full, state.currentToken, state.currentOwner,
+    emitRelease(b, loc, pair.full, state.currentToken, releaseOwner,
                 StageCluster{}, drainPayload);
     SemaphoreAcquireOp acquire =
         emitAcquire(b, loc, pair.full, drainOwner, StageCluster{});

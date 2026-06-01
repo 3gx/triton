@@ -157,25 +157,27 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 module attributes {"ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @local_root_external_distinct_from_ws_tag_zero
   // CHECK: [[ALLOC:%.*]] = ttg.local_alloc
-  // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] true
-  // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ALLOC]] false
   tt.func @local_root_external_distinct_from_ws_tag_zero(%lb: i32, %ub: i32, %step: i32) {
     %alloc = ttg.local_alloc {buffer.id = 202 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
     %v = "producer"() {ttg.partition = array<i32: 0>} : () -> !ty
     %c0 = arith.constant {ttg.partition = array<i32: 0>} 0 : i32
     %pv = ttg.memdesc_index %alloc[%c0] {ttg.partition = array<i32: 0>} : !ttg.memdesc<1x1xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-    // CHECK: [[RTOK:%.*]] = nvws.semaphore.acquire [[EMPTY]]
+    // CHECK-NOT: nvws.semaphore
+    // CHECK: ttg.local_store {{.*}} {ttg.partition = array<i32: 0>}
     ttg.local_store %v, %pv {ttg.partition = array<i32: 0>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-    // CHECK: nvws.semaphore.release [[FULL]], [[RTOK]]
+    // CHECK-NOT: nvws.semaphore
     // CHECK: scf.for
     scf.for %i = %lb to %ub step %step : i32 {
       %c1 = arith.constant {ttg.partition = array<i32: 0>} 0 : i32
       %rv = ttg.memdesc_index %alloc[%c1] {ttg.partition = array<i32: 0>} : !ttg.memdesc<1x1xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem>
-      // CHECK: [[CTOK:%.*]] = nvws.semaphore.acquire [[FULL]] {ttg.partition = array<i32: 0>}
-      // CHECK-NEXT: nvws.semaphore.buffer [[FULL]], [[CTOK]] {ttg.partition = array<i32: 0>}
+      // CHECK-NOT: nvws.semaphore
+      // CHECK: [[LOAD:%.*]] = ttg.local_load {{.*}} {ttg.partition = array<i32: 0>}
       %l = ttg.local_load %rv {ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi32, #shared, #smem> -> !ty
+      // CHECK: "use"([[LOAD]]) {ttg.partition = array<i32: 0>}
       "use"(%l) {ttg.partition = array<i32: 0>} : (!ty) -> ()
     } {tt.warp_specialize, ttg.partition = array<i32: 0>, ttg.partition.stages = [0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    // CHECK-NOT: nvws.semaphore
+    // CHECK: tt.return
     tt.return
   }
 }
