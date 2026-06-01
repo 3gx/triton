@@ -1807,6 +1807,17 @@ static bool yieldedAccessTokenRequiresCarrier(Region *region,
   return false;
 }
 
+static bool syncYieldRequiresCarrier(Region *region, const SyncPlan &sp) {
+  if (!region) return false;
+  Operation *parent = region->getParentOp();
+  // A sync edge targeting a structured yield makes the semaphore token the
+  // state that crosses the CFG boundary. Loops need it for re-entry even when
+  // the source access did not already produce an async token in the input IR.
+  if (isa_and_nonnull<scf::ForOp, scf::IfOp>(parent))
+    return true;
+  return yieldedAccessTokenRequiresCarrier(region, sp);
+}
+
 static Operation *findFirstAccessInRegion(Region &region,
                                           const OptSyncDag &dag) {
   Operation *firstAccess = nullptr;
@@ -2275,7 +2286,7 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
           }
         }
         dag.releaseBeforeYield[e.dstYieldRegion].push_back(gi);
-        if (yieldedAccessTokenRequiresCarrier(e.dstYieldRegion, sp))
+        if (syncYieldRequiresCarrier(e.dstYieldRegion, sp))
           dag.acquireBeforeYield[e.dstYieldRegion].push_back(gi);
       }
       break;
@@ -2310,7 +2321,7 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
       if (probe.dstOp)
         dag.acquireBeforeOp[probe.dstOp].push_back(gi);
       else if (probe.dstYieldRegion &&
-               yieldedAccessTokenRequiresCarrier(probe.dstYieldRegion, sp))
+               syncYieldRequiresCarrier(probe.dstYieldRegion, sp))
         dag.acquireBeforeYield[probe.dstYieldRegion].push_back(gi);
       break;
     }
@@ -2399,7 +2410,7 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
               isa<TMEMLoadOp>(e.srcOp)) {
             if (!llvm::is_contained(dag.releaseAfterOp[e.srcOp], gi))
               dag.releaseAfterOp[e.srcOp].push_back(gi);
-            if (yieldedAccessTokenRequiresCarrier(e.dstYieldRegion, sp) &&
+            if (syncYieldRequiresCarrier(e.dstYieldRegion, sp) &&
                 !llvm::is_contained(dag.acquireBeforeYield[e.dstYieldRegion],
                                     gi))
               dag.acquireBeforeYield[e.dstYieldRegion].push_back(gi);
@@ -2447,8 +2458,7 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
         if (e.dstOp)
           dag.acquireBeforeOp[e.dstOp].push_back(gi);
         else if (e.dstYieldRegion &&
-                 (isIfYieldRegion(e.dstYieldRegion) ||
-                  yieldedAccessTokenRequiresCarrier(e.dstYieldRegion, sp)))
+                 syncYieldRequiresCarrier(e.dstYieldRegion, sp))
           dag.acquireBeforeYield[e.dstYieldRegion].push_back(gi);
         if (ei == g.edgeIdxs.back() &&
             edgeNeedsTerminalReadRelease(e, group, sp.resource.second) &&
@@ -2526,6 +2536,12 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
     return thenHas || elseHas;
   };
   auto propagateCarriedThreading = [&]() {
+    // Edge groups and sync anchors are fixed at this point. This pass derives
+    // only SSA carrier plumbing from that completed OPT-SYNC-DAG: when a
+    // child structured op is already known to carry the semaphore state, every
+    // enclosing loop/if that the state crosses must also return it. Re-entry
+    // into a carried loop is itself the next use, so this must not depend on
+    // finding a later access after the child in the same iteration.
     bool changed = true;
     while (changed) {
       changed = false;
@@ -2533,20 +2549,17 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
       seeds.append(dag.threadForOps.begin(), dag.threadForOps.end());
       seeds.append(dag.threadIfOps.begin(), dag.threadIfOps.end());
       for (Operation *seed : seeds) {
-        Operation *child = seed;
         for (Operation *parent = seed ? seed->getParentOp() : nullptr; parent;
              parent = parent->getParentOp()) {
           if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
-            if (carriedForRegion(forOp) && findFirstAccessAfter(child, dag))
+            if (carriedForRegion(forOp))
               changed |= dag.threadForOps.insert(parent).second;
-            child = parent;
             continue;
           }
           if (auto ifOp = dyn_cast<scf::IfOp>(parent)) {
-            if (canThreadIfRegion(ifOp) && findFirstAccessAfter(child, dag))
+            if (canThreadIfRegion(ifOp))
               changed |= dag.threadIfOps.insert(parent).second;
           }
-          child = parent;
         }
       }
     }
@@ -4905,7 +4918,12 @@ static void closeCarrierForLoop(scf::ForOp forOp, EmitState &bodyState,
         partitionOutputs.back() = carrierPartition;
       setPartitionOutputs(forOp, partitionOutputs);
     }
-      setPartition(getForYieldOp(forOp), carrierPartition);
+    scf::YieldOp yieldOp = getForYieldOp(forOp);
+    SetVector<int> yieldPartition;
+    if (hasPartition(yieldOp))
+      yieldPartition = getPartitionIds(yieldOp);
+    addPartitionIds(yieldPartition, carrierPartition);
+    setPartition(yieldOp, yieldPartition);
   }
   parentState = bodyState;
   parentState.currentToken = forOp.getResult(forOp.getNumResults() - 1);
@@ -6990,9 +7008,18 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp) {
       updateNumTmemBlocks(group, numStages, numTmemBlocks);
     }
     for (PlannedResource &planned : plannedResources) {
-      if (failed(emitResource(funcOp, group, planned.plan, planned.syncPlan,
-                              planned.optDag, backings, numStagesByGroup,
-                              eraseAfterEmission)))
+      // Earlier resources in the same backing group may have rewritten scf.for
+      // / scf.if signatures while adding carrier tokens. Rebuild the current
+      // resource plan against the live IR so commit5 emission consumes the
+      // completed OPT-SYNC-DAG with live structured-op anchors.
+      buildProgramOrderRank(funcOp, rank);
+      ResourcePlan emitPlan =
+          planResource(funcOp, static_cast<unsigned>(en.index()), group,
+                       planned.plan.resource.second, rank);
+      SyncPlan emitSyncPlan = buildSyncPlan(group, emitPlan, funcOp);
+      OptSyncDag emitOptDag = buildOptSyncDag(emitSyncPlan, emitPlan, group);
+      if (failed(emitResource(funcOp, group, emitPlan, emitSyncPlan, emitOptDag,
+                              backings, numStagesByGroup, eraseAfterEmission)))
         return failure();
     }
     if (backings.contains(static_cast<unsigned>(en.index())))
