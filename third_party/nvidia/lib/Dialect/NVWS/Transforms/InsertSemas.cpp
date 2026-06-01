@@ -2803,21 +2803,28 @@ static void updateNumTmemBlocks(BufferGroup &group, int numStages,
 }
 
 struct GroupBacking {
+  SmallVector<unsigned, 4> memberIndices;
+  DenseMap<unsigned, unsigned> memberToBackingIndex;
   SmallVector<Value, 4> buffers;
   SmallVector<Type, 4> bufferTypes;
   Value sharedEmptySemaphore;
   Value sharedFullSemaphore;
 };
 
+using BackingKey = std::pair<unsigned /*groupIdx*/, int64_t /*resourceKey*/>;
+
 static GroupBacking &
 ensureGroupBacking(BufferGroup &group, unsigned groupIdx,
-                   DenseMap<unsigned, GroupBacking> &backings,
+                   int64_t resourceKey, ArrayRef<unsigned> memberIndices,
+                   DenseMap<BackingKey, GroupBacking> &backings,
                    const DenseMap<unsigned, int> &numStagesByGroup) {
-  auto it = backings.find(groupIdx);
+  BackingKey key{groupIdx, resourceKey};
+  auto it = backings.find(key);
   if (it != backings.end())
     return it->second;
 
   GroupBacking backing;
+  backing.memberIndices.append(memberIndices.begin(), memberIndices.end());
   OpBuilder b(getSemaphoreInsertionAnchor(group));
   b.setInsertionPoint(getSemaphoreInsertionAnchor(group));
   int depth = 1;
@@ -2827,7 +2834,9 @@ ensureGroupBacking(BufferGroup &group, unsigned groupIdx,
            "TMEM semaphore numStages must be precomputed before emission");
     depth = it->second;
   }
-  for (BufferMember &member : group.members) {
+  for (auto [backingIdx, memberIdx] : llvm::enumerate(memberIndices)) {
+    BufferMember &member = group.members[memberIdx];
+    backing.memberToBackingIndex[memberIdx] = static_cast<unsigned>(backingIdx);
     MemDescType semBufType = member.type;
     if (group.isTmem()) {
       semBufType = getSemaphoreMultiBufferedType(member.type, depth);
@@ -2852,7 +2861,7 @@ ensureGroupBacking(BufferGroup &group, unsigned groupIdx,
     }
     backing.bufferTypes.push_back(semBufType);
   }
-  auto inserted = backings.insert({groupIdx, std::move(backing)});
+  auto inserted = backings.insert({key, std::move(backing)});
   return inserted.first->second;
 }
 
@@ -3296,6 +3305,7 @@ struct EmittedBufferRecord {
   Value accessBuffer;
   SmallVector<Value, 4> buffers;
   unsigned memberIdx = 0;
+  unsigned backingIdx = 0;
   StageCluster expectedStageCluster;
 };
 
@@ -3532,6 +3542,16 @@ static MemDescType getLocalSemaphoreBufferType(
       mutableMemory);
 }
 
+static FailureOr<unsigned> getBackingIndex(Operation *op,
+                                           const GroupBacking &backing,
+                                           unsigned memberIdx) {
+  auto it = backing.memberToBackingIndex.find(memberIdx);
+  if (it == backing.memberToBackingIndex.end())
+    return op->emitError("nvws-insert-semas: semaphore backing has no member "
+                         "for planned resource touch");
+  return it->second;
+}
+
 static SmallVector<Type, 4> getSemaphoreBufferViewTypes(BufferGroup &group,
                                                         const GroupBacking &backing,
                                                         ArrayRef<const AccessTouch *> touches,
@@ -3543,7 +3563,8 @@ static SmallVector<Type, 4> getSemaphoreBufferViewTypes(BufferGroup &group,
       viewTypes.push_back(getSemaphoreViewBufferType(memDescType));
     else
       viewTypes.push_back(getLocalSemaphoreBufferType(
-          static_cast<unsigned>(idx), touches, type, mutableMemory));
+          backing.memberIndices[static_cast<unsigned>(idx)], touches, type,
+          mutableMemory));
   }
   return viewTypes;
 }
@@ -3885,11 +3906,14 @@ static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
       return op->emitError("nvws-insert-semas: sourceful TMEM alloc has "
                            "multiple touches for one resource");
     const AccessTouch &touch = *touches.front();
-    if (touch.memberIdx >= buffers.size())
+    FailureOr<unsigned> backingIdx = getBackingIndex(op, backing, touch.memberIdx);
+    if (failed(backingIdx))
+      return failure();
+    if (*backingIdx >= buffers.size())
       return op->emitError("nvws-insert-semas: semaphore buffer member index out "
                            "of range");
     Value accessBuffer =
-        materializeAliasForBuffer(b, touch, buffers[touch.memberIdx]);
+        materializeAliasForBuffer(b, touch, buffers[*backingIdx]);
     if (Value src = tmemAlloc.getSrc()) {
       auto vTrue = createIntoPartition<arith::ConstantIntOp>(
           b, op->getLoc(), {event.owner, getStageCluster(op)}, true, 1);
@@ -3902,17 +3926,21 @@ static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
     }
     state.emittedBuffers.push_back(EmittedBufferRecord{
         op, retargetOp, bufferOperation, sem, token, accessBuffer,
-        state.eventBuffers[op], touch.memberIdx, bufferExpectedStageCluster});
+        state.eventBuffers[op], touch.memberIdx, *backingIdx,
+        bufferExpectedStageCluster});
   } else if (auto localAlloc = dyn_cast<LocalAllocOp>(op)) {
     if (touches.size() != 1)
       return op->emitError("nvws-insert-semas: sourceful local alloc has "
                            "multiple touches for one resource");
     const AccessTouch &touch = *touches.front();
-    if (touch.memberIdx >= buffers.size())
+    FailureOr<unsigned> backingIdx = getBackingIndex(op, backing, touch.memberIdx);
+    if (failed(backingIdx))
+      return failure();
+    if (*backingIdx >= buffers.size())
       return op->emitError("nvws-insert-semas: semaphore buffer member index out "
                            "of range");
     Value accessBuffer =
-        materializeAliasForBuffer(b, touch, buffers[touch.memberIdx]);
+        materializeAliasForBuffer(b, touch, buffers[*backingIdx]);
     if (Value src = localAlloc.getSrc()) {
       if (Operation *def = src.getDefiningOp();
           def && isa<triton::DescriptorLoadOp, triton::DescriptorGatherOp>(def)) {
@@ -3937,15 +3965,20 @@ static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
     }
     state.emittedBuffers.push_back(EmittedBufferRecord{
         op, retargetOp, bufferOperation, sem, token, accessBuffer,
-        state.eventBuffers[op], touch.memberIdx, bufferExpectedStageCluster});
+        state.eventBuffers[op], touch.memberIdx, *backingIdx,
+        bufferExpectedStageCluster});
   } else {
     SmallVector<std::pair<OpOperand *, Value>, 4> replacements;
     for (const AccessTouch *touch : touches) {
-      if (touch->memberIdx >= buffers.size())
+      FailureOr<unsigned> backingIdx =
+          getBackingIndex(op, backing, touch->memberIdx);
+      if (failed(backingIdx))
+        return failure();
+      if (*backingIdx >= buffers.size())
         return op->emitError("nvws-insert-semas: semaphore buffer member index "
                              "out of range");
       Value accessBuffer =
-          materializeAliasForBuffer(b, *touch, buffers[touch->memberIdx]);
+          materializeAliasForBuffer(b, *touch, buffers[*backingIdx]);
       Value currentAccessValue = state.rewrittenAccessValue.lookup(
           touch->accessValue);
       for (OpOperand &operand : op->getOpOperands())
@@ -3954,7 +3987,8 @@ static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
           replacements.push_back({&operand, accessBuffer});
       state.emittedBuffers.push_back(EmittedBufferRecord{
           op, retargetOp, bufferOperation, sem, token, accessBuffer,
-          state.eventBuffers[op], touch->memberIdx, bufferExpectedStageCluster});
+          state.eventBuffers[op], touch->memberIdx, *backingIdx,
+          bufferExpectedStageCluster});
     }
     for (auto [operand, accessBuffer] : replacements)
       operand->set(accessBuffer);
@@ -5608,7 +5642,7 @@ static LogicalResult verifyPostEmission(const OptSyncDag &dag, BufferGroup &grou
       unsigned recordIdx =
           static_cast<unsigned>(&*bufferIt - state.emittedBuffers.data());
       consumedRecords.push_back(recordIdx);
-      if (bufferIt->memberIdx >= bufferIt->buffers.size())
+      if (bufferIt->backingIdx >= bufferIt->buffers.size())
         return bufferIt->bufferOp->emitError(
             "nvws-insert-semas: post-emission verifier: semaphore.buffer member "
             "does not match planned touch");
@@ -5916,14 +5950,15 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
 static LogicalResult emitResource(triton::FuncOp funcOp, BufferGroup &group,
                                   const ResourcePlan &plan, const SyncPlan &sp,
                                   const OptSyncDag &dag,
-                                  DenseMap<unsigned, GroupBacking> &backings,
+                                  DenseMap<BackingKey, GroupBacking> &backings,
                                   const DenseMap<unsigned, int> &numStagesByGroup,
                                   SetVector<Operation *> &eraseAfterEmission) {
   if (dag.groups.empty()) return success();
   if (failed(verifyPlanBeforeEmission(funcOp, group, plan, sp, dag)))
     return failure();
   GroupBacking &backing =
-      ensureGroupBacking(group, dag.groupIdx, backings, numStagesByGroup);
+      ensureGroupBacking(group, dag.groupIdx, dag.resource.second,
+                         plan.memberIndices, backings, numStagesByGroup);
   EmitState state;
   state.semas = createResourceSemaphores(dag, sp, group, backing);
   if (failed(emitResourceRegion(funcOp.getBody(), dag, sp, plan, group, backing,
@@ -6991,7 +7026,7 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp) {
   DenseMap<unsigned, int> numStagesByGroup;
   SetVector<Operation *> eraseAfterEmission;
 
-  DenseMap<unsigned, GroupBacking> backings;
+  DenseMap<BackingKey, GroupBacking> backings;
   for (auto en : llvm::enumerate(groups)) {
     BufferGroup &group = en.value();
     if (dumpDag) {
@@ -7039,7 +7074,10 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp) {
                               backings, numStagesByGroup, eraseAfterEmission)))
         return failure();
     }
-    if (backings.contains(static_cast<unsigned>(en.index())))
+    bool hasBacking = llvm::any_of(backings, [&](const auto &entry) {
+      return entry.first.first == static_cast<unsigned>(en.index());
+    });
+    if (hasBacking)
       poisonOriginalTmemAllocTokens(group);
     eraseUnusedOriginals(group);
   }

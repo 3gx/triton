@@ -69,6 +69,10 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 #smem = #ttg.shared_memory
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // DAG: NVWS-SEMA-DAG buffer.id=301 memory=tmem
+  // DAG: members: m0(offset=0,extent=128,resourceKey=0) m1(offset=64,extent=1,resourceKey=0) m2(offset=0,extent=64,resourceKey=2)
+  // DAG: OWNERSHIP-DAG buffer.id=301 resourceKey=0 members: m0 m1
+  // DAG: OWNERSHIP-DAG buffer.id=301 resourceKey=2 members: m2
   // CHECK-LABEL: @tmem_qk_alpha_pacc_three_member_edges
   tt.func @tmem_qk_alpha_pacc_three_member_edges(
       %rhs: !ttg.memdesc<128x128xf16, #shared, #smem>,
@@ -81,11 +85,14 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %r = scf.for %iv = %lb to %ub step %step iter_args(%i = %c0) -> (i32) : i32 {
       // CHECK: [[QK:%.*]] = ttng.tmem_alloc {buffer.id = 301 : i32, buffer.offset = 0 : i32}
       // CHECK-NEXT: [[ALPHA:%.*]] = ttng.tmem_alloc {buffer.id = 301 : i32, buffer.offset = 64 : i32}
+      // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[QK]], [[ALPHA]] true
+      // CHECK-NEXT: [[QK_READY:%.*]] = nvws.semaphore.create [[QK]], [[ALPHA]] false
+      // CHECK-NEXT: [[ALPHA_READY:%.*]] = nvws.semaphore.create [[QK]], [[ALPHA]] false
       // CHECK-NEXT: [[PACC:%.*]] = ttng.tmem_alloc {buffer.id = 301 : i32, buffer.offset = 0 : i32}
-      // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[QK]], [[ALPHA]], [[PACC]] true
-      // CHECK-NEXT: [[QK_READY:%.*]] = nvws.semaphore.create [[QK]], [[ALPHA]], [[PACC]] false
-      // CHECK-NEXT: [[ALPHA_READY:%.*]] = nvws.semaphore.create [[QK]], [[ALPHA]], [[PACC]] false
-      // CHECK-NEXT: [[PACC_READY:%.*]] = nvws.semaphore.create [[QK]], [[ALPHA]], [[PACC]] false
+      // CHECK-NEXT: [[PACC_EMPTY:%.*]] = nvws.semaphore.create [[PACC]] true
+      // CHECK-NEXT: [[PACC_READY:%.*]] = nvws.semaphore.create [[PACC]] false
+      // CHECK-NEXT: [[PACC_ENTRY:%.*]] = nvws.semaphore.acquire [[PACC_EMPTY]] {ttg.partition = array<i32: 5>
+      // CHECK: scf.for {{.*}} iter_args({{.*}}[[PACC_CARRY:%[^ ]+]] = [[PACC_ENTRY]])
       %qk, %tq = ttng.tmem_alloc {buffer.id = 301 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 1>} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
       %alpha = ttng.tmem_alloc {buffer.id = 301 : i32, buffer.offset = 64 : i32, ttg.partition = array<i32: 5>} : () -> !ttg.memdesc<128x1xf32, #tmem1, #ttng.tensor_memory, mutable>
 
@@ -109,17 +116,18 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       %av, %at = ttng.tmem_load %alpha[] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x1xf32, #tmem1, #ttng.tensor_memory, mutable> -> tensor<128x1xf32, #alpha_blocked>
       "use_alpha"(%av) {ttg.partition = array<i32: 0>} : (tensor<128x1xf32, #alpha_blocked>) -> ()
 
+      // CHECK-NEXT: [[PACC_SRC:%.*]] = nvws.semaphore.buffer [[PACC_EMPTY]], [[PACC_CARRY]] {ttg.partition = array<i32: 5>}
       // CHECK: ttng.tmem_store {{.*}} {ttg.partition = array<i32: 5>}
-      // CHECK-NEXT: nvws.semaphore.release [[PACC_READY]], {{.*}} [#nvws.async_op<none>] {ttg.partition = array<i32: 5>}
+      // CHECK-NEXT: nvws.semaphore.release [[PACC_READY]], [[PACC_CARRY]] [#nvws.async_op<none>] {ttg.partition = array<i32: 5>}
       %pacc = ttng.tmem_alloc %cst16 {buffer.id = 301 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 5>} : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory>
 
       // CHECK-NEXT: [[T3:%.*]] = nvws.semaphore.acquire [[PACC_READY]] {ttg.partition = array<i32: 1>}
-      // CHECK-NEXT: [[PVIEW:%.*]]:3 = nvws.semaphore.buffer [[PACC_READY]], [[T3]] {ttg.partition = array<i32: 1>}
-      // CHECK-NEXT: ttng.tc_gen5_mma [[PVIEW]]#2
+      // CHECK-NEXT: [[PVIEW:%.*]] = nvws.semaphore.buffer [[PACC_READY]], [[T3]] {ttg.partition = array<i32: 1>}
+      // CHECK-NEXT: ttng.tc_gen5_mma [[PVIEW]]
       %mma = ttng.tc_gen5_mma %pacc, %rhs, %qk[%qkt], %true, %true {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory>, !ttg.memdesc<128x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
 
       // CHECK-NEXT: [[T4:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 1>}
-      // CHECK-NEXT: [[QK2:%.*]]:3 = nvws.semaphore.buffer [[EMPTY]], [[T4]] {ttg.partition = array<i32: 1>}
+      // CHECK-NEXT: [[QK2:%.*]]:2 = nvws.semaphore.buffer [[EMPTY]], [[T4]] {ttg.partition = array<i32: 1>}
       // CHECK-NEXT: ttng.tmem_store {{.*}}, [[QK2]]#0
       %qk1 = ttng.tmem_store %cst, %qk[%mma], %true {ttg.partition = array<i32: 1>} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       %j = arith.addi %i, %c0 {ttg.partition = array<i32: 0, 1, 5>} : i32
