@@ -2861,7 +2861,7 @@ static int computeTmemSemaphoreNumStages(BufferGroup &group, int numTmemBlocks) 
       }
     }
   }
-  auto numStages = 1 + 0 * isMultiStaged;
+  auto numStages = 1 + 1 * isMultiStaged;
   return numStages;
 }
 
@@ -7605,7 +7605,7 @@ static int computeTmemSemaphoreNumStagesFromPlans(
       }
     }
   }
-  auto numStages = 1 + 0 * isMultiStaged;
+  auto numStages = 1 + 1 * isMultiStaged;
   return numStages;
 }
 
