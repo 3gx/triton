@@ -66,8 +66,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %true = arith.constant true
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
-    // Single-slot: alloc, create semaphores, initial acquire+store
-    // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32,
+    // Double-buffered (2x): alloc, create semaphores, initial acquire+store
+    // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32,
     // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]] true
     // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]] false
     // CHECK-NEXT: [[ATOK:%.*]] = nvws.semaphore.acquire [[EMPTY]]
@@ -117,8 +117,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %true = arith.constant true
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
-    // Single-slot: alloc, create, initial acquire+store
-    // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32,
+    // Double-buffered (2x): alloc, create, initial acquire+store
+    // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32,
     // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]] true
     // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]] false
     // CHECK-NEXT: [[ATOK:%.*]] = nvws.semaphore.acquire [[EMPTY]]
@@ -176,8 +176,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %true = arith.constant true
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
-    // Single-slot: alloc, create, initial acquire+store
-    // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32,
+    // Double-buffered: alloc, create, initial acquire+store
+    // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32,
     // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]] true
     // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]] false
     // CHECK-NEXT: [[ATOK:%.*]] = nvws.semaphore.acquire [[EMPTY]]
@@ -226,8 +226,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %true = arith.constant true
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
-    // Single-slot: alloc, create, initial acquire+store
-    // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32,
+    // Double-buffered: alloc, create, initial acquire+store
+    // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32,
     // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]] true
     // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]] false
     // CHECK-NEXT: [[ATOK:%.*]] = nvws.semaphore.acquire [[EMPTY]]
@@ -408,8 +408,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %true = arith.constant true
     %0 = tt.descriptor_load %arg3[%c0_i32, %c0_i32] : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked1>
     %1 = ttg.local_alloc %0 : (tensor<128x64xf16, #blocked1>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
-    // Single-slot producer/consumer cycle in loop
-    // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32,
+    // Double-buffered producer/consumer cycle in loop
+    // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32,
     // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]] true
     // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]] false
     // CHECK-NEXT: [[ATOK:%.*]] = nvws.semaphore.acquire [[EMPTY]]
@@ -450,8 +450,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %true = arith.constant true
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
-    // Single-slot with use_d flag
-    // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32,
+    // Double-buffered with use_d flag
+    // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32,
     // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]] true
     // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]] false
     // CHECK-NEXT: [[ATOK:%.*]] = nvws.semaphore.acquire [[EMPTY]]
@@ -961,9 +961,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %c0_i32 = arith.constant 0 : i32
     %false = arith.constant false
     %true = arith.constant true
-    // Three TMEM allocs: S, O, and P are each single-slot.
+    // Three TMEM allocs: S is double-buffered; O and P are single-slot.
     // S semaphore pair
-    // CHECK: [[SBUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x256x64xf32,
+    // CHECK: [[SBUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<2x256x64xf32,
     // CHECK-NEXT: [[SEMPTY:%.*]] = nvws.semaphore.create [[SBUF]] true
     // CHECK-NEXT: [[SFULL:%.*]] = nvws.semaphore.create [[SBUF]] false
     // CHECK-NEXT: [[SINIT:%.*]] = nvws.semaphore.acquire [[SEMPTY]]
@@ -1207,8 +1207,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %true = arith.constant true
     %false = arith.constant false
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
-    // Single-slot: inner loop store is in partition 2 (same as MMA producer)
-    // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32,
+    // Double-buffered: inner loop store is in partition 2 (same as MMA producer)
+    // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32,
     // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]] true
     // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]] false
     %res, %tok = ttng.tmem_alloc : () ->(!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
@@ -1260,8 +1260,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %true = arith.constant true
     %false = arith.constant false
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
-    // Single-slot with scaled MMA
-    // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32,
+    // Double-buffered with scaled MMA
+    // CHECK: [[ABUF:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32,
     // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ABUF]] true
     // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ABUF]] false
     %res, %tok = ttng.tmem_alloc : () ->(!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
