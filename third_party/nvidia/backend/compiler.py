@@ -468,7 +468,7 @@ class CUDABackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         # Optimize the number of warps and registers after TMA lowering, so
         # that any local loads eliminated by TMA lowering do not inflate them.
-        if capability // 10 >= 10 and knobs.nvidia.use_meta_ws:
+        if capability // 10 >= 10 and (knobs.nvidia.use_meta_ws or use_nvws_meta):
             passes.ttgpuir.add_optimize_partition_warps(pm)
         nvidia.passes.ttnvgpuir.add_fence_insertion(pm, capability)
         nvidia.passes.ttnvgpuir.add_lower_mma(pm)
