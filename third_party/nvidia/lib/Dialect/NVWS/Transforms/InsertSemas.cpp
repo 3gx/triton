@@ -1749,6 +1749,10 @@ struct DoneFaninKey {
 static bool isIfYieldRegion(Region *region);
 static bool opReadsOnlyResource(Operation *op, BufferGroup &group,
                                 int64_t resourceKey);
+static Operation *findTerminalReadReleaseAnchor(Operation *op,
+                                                const SyncPlan &sp,
+                                                BufferGroup &group,
+                                                int64_t resourceKey);
 
 static bool collectLinearChainEdges(const SyncPlan &sp, ArrayRef<bool> claimed,
                                     SmallVectorImpl<unsigned> &chain) {
@@ -1886,6 +1890,7 @@ static Operation *getIfBranchEntryAnchor(Operation *op) {
 }
 
 static Operation *findTmemLoopExitReadForEdge(const SyncEdge &edge,
+                                              const SyncPlan &sp,
                                               const OptSyncDag &dag,
                                               BufferGroup &group,
                                               int64_t resourceKey) {
@@ -1897,9 +1902,7 @@ static Operation *findTmemLoopExitReadForEdge(const SyncEdge &edge,
       !forOp->isProperAncestor(edge.srcOp))
     return nullptr;
   Operation *afterLoop = findFirstAccessAfter(forOp.getOperation(), dag);
-  if (!opReadsOnlyResource(afterLoop, group, resourceKey))
-    return nullptr;
-  return afterLoop;
+  return findTerminalReadReleaseAnchor(afterLoop, sp, group, resourceKey);
 }
 
 static Operation *findFirstWriter(const SyncPlan &sp, BufferGroup &group,
@@ -2267,6 +2270,8 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
         }
         dag.acquireBeforeOp[acquireAnchor].push_back(gi);
         if (edgeNeedsTerminalReadRelease(e, group, sp.resource.second) &&
+            findTerminalReadReleaseAnchor(e.dstOp, sp, group,
+                                          sp.resource.second) &&
             !hasOutgoingEdgeFromOp(sp, e.dstOp) && !tokenResultIsYielded(e.dstOp))
           dag.releaseAfterOp[e.dstOp].push_back(gi);
       } else if (e.dstYieldRegion) {
@@ -2279,8 +2284,9 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
             if (Operation *afterLoop =
                     findFirstAccessAfter(forOp.getOperation(), dag)) {
               dag.acquireBeforeOp[afterLoop].push_back(gi);
-              if (opReadsOnlyResource(afterLoop, group, sp.resource.second))
-                dag.releaseAfterOp[afterLoop].push_back(gi);
+              if (Operation *terminalRead = findTerminalReadReleaseAnchor(
+                      afterLoop, sp, group, sp.resource.second))
+                dag.releaseAfterOp[terminalRead].push_back(gi);
             }
             break;
           }
@@ -2462,6 +2468,8 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
           dag.acquireBeforeYield[e.dstYieldRegion].push_back(gi);
         if (ei == g.edgeIdxs.back() &&
             edgeNeedsTerminalReadRelease(e, group, sp.resource.second) &&
+            findTerminalReadReleaseAnchor(e.dstOp, sp, group,
+                                          sp.resource.second) &&
             !hasOutgoingEdgeFromOp(sp, e.dstOp) &&
             !tokenResultIsYielded(e.dstOp))
           dag.releaseAfterOp[e.dstOp].push_back(gi);
@@ -2473,7 +2481,7 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
 
   for (auto [edgeIdx, edge] : llvm::enumerate(sp.edges))
     if (Operation *loopExitRead = findTmemLoopExitReadForEdge(
-            edge, dag, group, sp.resource.second))
+            edge, sp, dag, group, sp.resource.second))
       dag.tmemLoopExitRead[static_cast<unsigned>(edgeIdx)] = loopExitRead;
 
   auto markThreadedOp = [&](Operation *op) {
@@ -2991,6 +2999,109 @@ static bool opReadsOnlyResource(Operation *op, BufferGroup &group,
          !eventProduces(*event, resourceKey);
 }
 
+static bool operationOccursAtOrAfterInSequentialScope(Operation *anchor,
+                                                      Operation *candidate);
+
+static bool hasLaterSameOwnerResourceAccessBeforeOwnerChange(
+    Operation *op, BufferGroup &group, int64_t resourceKey) {
+  const AccessEvent *anchor = findEvent(group, op);
+  if (!anchor || !eventTouchesResource(*anchor, resourceKey))
+    return false;
+
+  for (const AccessEvent &event : group.events) {
+    if (!eventTouchesResource(event, resourceKey))
+      continue;
+    if (event.op == op) {
+      continue;
+    }
+    if (!operationOccursAtOrAfterInSequentialScope(op, event.op))
+      continue;
+    if (!sameOwner(event.owner, anchor->owner))
+      return false;
+    return true;
+  }
+  return false;
+}
+
+static bool operationOccursAtOrAfterInSequentialScope(Operation *anchor,
+                                                      Operation *candidate) {
+  if (!anchor || !candidate)
+    return false;
+  if (anchor == candidate)
+    return true;
+  for (Operation *anchorScope = anchor; anchorScope;
+       anchorScope = anchorScope->getParentOp()) {
+    Block *block = anchorScope->getBlock();
+    if (!block)
+      continue;
+    for (Operation *candidateScope = candidate; candidateScope;
+         candidateScope = candidateScope->getParentOp()) {
+      if (candidateScope->getBlock() != block)
+        continue;
+      if (anchorScope == candidateScope)
+        return false;
+      return anchorScope->isBeforeInBlock(candidateScope);
+    }
+  }
+  return false;
+}
+
+static bool regionContainsOp(Region *region, Operation *op) {
+  if (!region || !op)
+    return false;
+  for (Region *parentRegion = op->getParentRegion(); parentRegion;) {
+    if (parentRegion == region)
+      return true;
+    Operation *parentOp = parentRegion->getParentOp();
+    parentRegion = parentOp ? parentOp->getParentRegion() : nullptr;
+  }
+  return false;
+}
+
+static bool yieldOccursAtOrAfterInSequentialScope(Region *yieldRegion,
+                                                  Operation *anchor) {
+  if (!yieldRegion || !anchor)
+    return false;
+  Operation *parent = yieldRegion->getParentOp();
+  if (!parent)
+    return false;
+  if (regionContainsOp(yieldRegion, anchor))
+    return true;
+  return operationOccursAtOrAfterInSequentialScope(anchor, parent);
+}
+
+static bool ownerHasPlannedOutgoingEdgeAtOrAfterRead(
+    Operation *op, const SyncPlan &sp, BufferGroup &group,
+    int64_t resourceKey) {
+  const AccessEvent *anchor = findEvent(group, op);
+  if (!anchor || !eventTouchesResource(*anchor, resourceKey))
+    return false;
+  for (const SyncEdge &edge : sp.edges) {
+    if (!sameOwner(edge.srcOwner, anchor->owner))
+      continue;
+    if (edge.srcOp &&
+        operationOccursAtOrAfterInSequentialScope(op, edge.srcOp))
+      return true;
+    if (edge.srcYieldRegion &&
+        yieldOccursAtOrAfterInSequentialScope(edge.srcYieldRegion, op))
+      return true;
+  }
+  return false;
+}
+
+static Operation *findTerminalReadReleaseAnchor(Operation *op,
+                                                const SyncPlan &sp,
+                                                BufferGroup &group,
+                                                int64_t resourceKey) {
+  if (!opReadsOnlyResource(op, group, resourceKey))
+    return nullptr;
+  if (hasLaterSameOwnerResourceAccessBeforeOwnerChange(op, group, resourceKey))
+    return nullptr;
+  if (ownerHasPlannedOutgoingEdgeAtOrAfterRead(op, sp, group, resourceKey))
+    return nullptr;
+  return op;
+}
+
 static bool linearChainNeedsPerEdgeFulls(const SyncGroup &syncGroup,
                                          const SyncPlan &sp,
                                          BufferGroup &group,
@@ -3077,6 +3188,13 @@ static ResourceSemaphores createResourceSemaphores(const OptSyncDag &dag,
     b.setInsertionPointAfter(anchor);
   ResourceSemaphores semas;
   Location loc = group.members.front().allocOp->getLoc();
+  std::optional<PartitionId> initialEmptyOwner;
+  for (const SyncGroup &syncGroup : dag.groups) {
+    if (syncGroup.kind != SyncGroupKind::InitialEmpty)
+      continue;
+    initialEmptyOwner = syncGroup.initialOwner;
+    break;
+  }
 
   Value localSharedEmpty;
   auto createSharedEmpty = [&]() -> Value {
@@ -3137,12 +3255,17 @@ static ResourceSemaphores createResourceSemaphores(const OptSyncDag &dag,
                                  ? nullptr
                                  : &sp.edges[syncGroup.edgeIdxs.front()];
       if (edge && edgeUsesEmpty(*edge, group, dag.resource.second)) {
-        pair.empty = createSharedEmpty();
+        if (sameOwner(edge->dstOwner, initialEmptyOwner))
+          pair.empty = createSharedEmpty();
+        else
+          pair.empty = createFull();
       } else {
-        pair.full = createSharedFull();
+        pair.full = createFull();
         std::optional<unsigned> edgeIdx = findEdgeIndex(sp, edge);
         if (edge &&
-            (edgeNeedsTerminalReadRelease(*edge, group, dag.resource.second) ||
+            ((edgeNeedsTerminalReadRelease(*edge, group, dag.resource.second) &&
+              findTerminalReadReleaseAnchor(edge->dstOp, sp, group,
+                                            dag.resource.second)) ||
              (edgeIdx && dag.tmemLoopExitRead.contains(*edgeIdx))))
           pair.empty = createSharedEmpty();
       }
@@ -4691,6 +4814,20 @@ static LogicalResult emitDeferredNestedAfterOpSync(Operation *releaseAfter,
   return success();
 }
 
+static bool linearChainAnchorsLoopExit(const SyncGroup &syncGroup,
+                                       const SyncPlan &sp, Operation *forOp,
+                                       Region *region) {
+  if (!forOp || !region)
+    return false;
+  for (unsigned edgeIdx : syncGroup.edgeIdxs) {
+    const SyncEdge &edge = sp.edges[edgeIdx];
+    if (edge.srcOp == forOp || edge.dstOp == forOp ||
+        edge.srcYieldRegion == region || edge.dstYieldRegion == region)
+      return true;
+  }
+  return false;
+}
+
 static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
                                                  Region *region,
                                                  const OptSyncDag &dag,
@@ -4707,7 +4844,9 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
     groupIds.append(it->second.begin(), it->second.end());
   else
     for (auto [idx, syncGroup] : llvm::enumerate(dag.groups))
-      if (syncGroup.kind == SyncGroupKind::LinearChain)
+      if (syncGroup.kind == SyncGroupKind::LinearChain &&
+          linearChainAnchorsLoopExit(syncGroup, sp, forOp.getOperation(),
+                                     region))
         groupIds.push_back(static_cast<unsigned>(idx));
 
   for (unsigned gi : groupIds) {

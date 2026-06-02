@@ -209,9 +209,10 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       "use"(%v) {ttg.partition = array<i32: 1>} : (tensor<128x128xf32, #blocked>) -> ()
       scf.yield {ttg.partition = array<i32: 1, 2>} %load, %mma1 : !ttg.async.token, !ttg.async.token
     } {tt.warp_specialize, ttg.partition = array<i32: 1, 2>, ttg.partition.outputs = [array<i32: 1>, array<i32: 1>], ttg.warp_specialize.tag = 4 : i32}
-    // CHECK: nvws.semaphore.release [[FULL]], [[LOOP]]#0 [#nvws.async_op<none>] {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 4 : i32}
-    // CHECK-NEXT: [[EXIT:%.*]] = nvws.semaphore.acquire [[FULL]] {ttg.partition = array<i32: 2>, ttg.warp_specialize.tag = 4 : i32}
-    // CHECK-NEXT: nvws.semaphore.release [[EMPTY]], [[EXIT]] [#nvws.async_op<none>] {ttg.partition = array<i32: 2>, ttg.warp_specialize.tag = 4 : i32}
+    // CHECK-NOT: nvws.semaphore.release [[FULL]]
+    // CHECK-NOT: nvws.semaphore.acquire [[FULL]]
+    // CHECK-NOT: nvws.semaphore.release [[EMPTY]]
+    // CHECK: tt.return
     tt.return
   }
 
