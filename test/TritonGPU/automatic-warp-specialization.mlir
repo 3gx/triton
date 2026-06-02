@@ -313,7 +313,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %start_pid = tt.get_program_id x : i32
     %1 = arith.divsi %gk, %c64_i32 : i32
     %stride = arith.constant 1024 : i64
-    // CHECK: ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    // CHECK: ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     // CHECK: default
     // CHECK: ttg.global_scratch_alloc {alignment = 128 : i32, nbytes = 384 : i32}
     // CHECK: scf.for

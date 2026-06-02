@@ -1670,6 +1670,16 @@ struct SyncGroup {
   std::optional<PartitionId> initialOwner;
 };
 
+struct PlannedRelease {
+  unsigned groupIdx = 0;
+  SmallVector<unsigned, 4> edgeIdxs;
+};
+
+static bool operator==(const PlannedRelease &lhs,
+                       const PlannedRelease &rhs) {
+  return lhs.groupIdx == rhs.groupIdx && lhs.edgeIdxs == rhs.edgeIdxs;
+}
+
 struct OptSyncDag {
   ResourceId resource{0, 0};
   unsigned groupIdx = 0;
@@ -1690,10 +1700,10 @@ struct OptSyncDag {
   //                 the producer access).
   //   DoneFanin:    `releaseAfterOp[eachSrcOp]`     (one row right after
   //                 each retiring reader access).
-  DenseMap<Operation *, SmallVector<unsigned, 2>> releaseBeforeOp;
-  DenseMap<Region *, SmallVector<unsigned, 2>> releaseBeforeYield;
-  DenseMap<Operation *, SmallVector<unsigned, 2>> releaseAfterOp;
-  DenseMap<Region *, SmallVector<unsigned, 2>> releaseAfterYield;
+  DenseMap<Operation *, SmallVector<PlannedRelease, 2>> releaseBeforeOp;
+  DenseMap<Region *, SmallVector<PlannedRelease, 2>> releaseBeforeYield;
+  DenseMap<Operation *, SmallVector<PlannedRelease, 2>> releaseAfterOp;
+  DenseMap<Region *, SmallVector<PlannedRelease, 2>> releaseAfterYield;
   // Where to render the acquire row(s) — always before the consumer.
   //   Singleton:    `acquireBeforeOp[dstOp]`.
   //   ReadyFanout:  `acquireBeforeOp[eachDstOp]`.
@@ -1715,6 +1725,45 @@ struct OptSyncDag {
   DenseSet<Operation *> threadForOps;
   DenseSet<Operation *> threadIfOps;
 };
+
+static bool edgeRequiresRelease(const SyncEdge &edge) {
+  if (!edge.srcOwner)
+    return false;
+  if (edge.dstOwner && sameOwner(edge.srcOwner, edge.dstOwner))
+    return false;
+  return true;
+}
+
+template <typename AnchorT>
+static void addPlannedRelease(
+    DenseMap<AnchorT *, SmallVector<PlannedRelease, 2>> &anchors,
+    AnchorT *anchor, const SyncPlan &sp, unsigned groupIdx,
+    ArrayRef<unsigned> edgeIdxs) {
+  if (!anchor)
+    return;
+  PlannedRelease action;
+  action.groupIdx = groupIdx;
+  for (unsigned edgeIdx : edgeIdxs) {
+    if (edgeIdx >= sp.edges.size())
+      continue;
+    if (!edgeRequiresRelease(sp.edges[edgeIdx]))
+      continue;
+    action.edgeIdxs.push_back(edgeIdx);
+  }
+  if (action.edgeIdxs.empty())
+    return;
+  SmallVector<PlannedRelease, 2> &planned = anchors[anchor];
+  if (!llvm::is_contained(planned, action))
+    planned.push_back(std::move(action));
+}
+
+template <typename AnchorT>
+static void addPlannedRelease(
+    DenseMap<AnchorT *, SmallVector<PlannedRelease, 2>> &anchors,
+    AnchorT *anchor, const SyncPlan &sp, unsigned groupIdx, unsigned edgeIdx) {
+  addPlannedRelease(anchors, anchor, sp, groupIdx,
+                    ArrayRef<unsigned>(&edgeIdx, 1));
+}
 
 static std::string makeGroupName(unsigned serial) {
   std::string s;
@@ -2258,7 +2307,8 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
           dag.threadForOps.insert(e.dstOp);
           break;
         }
-        dag.releaseBeforeOp[e.dstOp].push_back(gi);
+        addPlannedRelease(dag.releaseBeforeOp, e.dstOp, sp, gi,
+                          g.edgeIdxs.front());
         Operation *acquireAnchor = e.dstOp;
         if (!group.isTmem()) {
           if (auto forOp = dyn_cast<scf::ForOp>(e.dstOp)) {
@@ -2273,25 +2323,29 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
             findTerminalReadReleaseAnchor(e.dstOp, sp, group,
                                           sp.resource.second) &&
             !hasOutgoingEdgeFromOp(sp, e.dstOp) && !tokenResultIsYielded(e.dstOp))
-          dag.releaseAfterOp[e.dstOp].push_back(gi);
+          addPlannedRelease(dag.releaseAfterOp, e.dstOp, sp, gi,
+                            g.edgeIdxs.front());
       } else if (e.dstYieldRegion) {
         if (group.isTmem()) {
           auto forOp = dyn_cast_or_null<scf::ForOp>(
               e.dstYieldRegion->getParentOp());
           if (forOp && hasWarpSpecializeTag(forOp) && !e.dstOwner &&
               e.srcOp && forOp->isProperAncestor(e.srcOp)) {
-            dag.releaseAfterOp[forOp.getOperation()].push_back(gi);
+            addPlannedRelease(dag.releaseAfterOp, forOp.getOperation(), sp, gi,
+                              g.edgeIdxs.front());
             if (Operation *afterLoop =
                     findFirstAccessAfter(forOp.getOperation(), dag)) {
               dag.acquireBeforeOp[afterLoop].push_back(gi);
               if (Operation *terminalRead = findTerminalReadReleaseAnchor(
                       afterLoop, sp, group, sp.resource.second))
-                dag.releaseAfterOp[terminalRead].push_back(gi);
+                addPlannedRelease(dag.releaseAfterOp, terminalRead, sp, gi,
+                                  g.edgeIdxs.front());
             }
             break;
           }
         }
-        dag.releaseBeforeYield[e.dstYieldRegion].push_back(gi);
+        addPlannedRelease(dag.releaseBeforeYield, e.dstYieldRegion, sp, gi,
+                          g.edgeIdxs.front());
         if (syncYieldRequiresCarrier(e.dstYieldRegion, sp))
           dag.acquireBeforeYield[e.dstYieldRegion].push_back(gi);
       }
@@ -2301,9 +2355,10 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
       // Shared release AFTER src (one row); per-consumer acquires at dst.
       const SyncEdge &probe = sp.edges[g.edgeIdxs.front()];
       if (probe.srcOp)
-        dag.releaseAfterOp[probe.srcOp].push_back(gi);
+        addPlannedRelease(dag.releaseAfterOp, probe.srcOp, sp, gi, g.edgeIdxs);
       else if (probe.srcYieldRegion)
-        dag.releaseAfterYield[probe.srcYieldRegion].push_back(gi);
+        addPlannedRelease(dag.releaseAfterYield, probe.srcYieldRegion, sp, gi,
+                          g.edgeIdxs);
       // Acquires anchor at each consumer's dst.
       for (unsigned ei : g.edgeIdxs) {
         const SyncEdge &e = sp.edges[ei];
@@ -2319,9 +2374,10 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
       for (unsigned ei : g.edgeIdxs) {
         const SyncEdge &e = sp.edges[ei];
         if (e.srcOp)
-          dag.releaseAfterOp[e.srcOp].push_back(gi);
+          addPlannedRelease(dag.releaseAfterOp, e.srcOp, sp, gi, ei);
         else if (e.srcYieldRegion)
-          dag.releaseAfterYield[e.srcYieldRegion].push_back(gi);
+          addPlannedRelease(dag.releaseAfterYield, e.srcYieldRegion, sp, gi,
+                            ei);
       }
       const SyncEdge &probe = sp.edges[g.edgeIdxs.front()];
       if (probe.dstOp)
@@ -2374,7 +2430,7 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
               if (skippedCarrierFor && forOp == skippedCarrierFor &&
                   ei == g.edgeIdxs.front() && initialOp && e.srcOp == initialOp)
                 continue;
-              dag.releaseBeforeOp[firstAccess].push_back(gi);
+              addPlannedRelease(dag.releaseBeforeOp, firstAccess, sp, gi, ei);
               dag.acquireBeforeOp[firstAccess].push_back(gi);
               continue;
             }
@@ -2386,8 +2442,14 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
             if (Operation *joinAccess =
                     findFirstAccessAfter(ifOp.getOperation(), dag)) {
               dag.threadIfOps.insert(ifOp.getOperation());
-              if (!llvm::is_contained(dag.releaseBeforeOp[joinAccess], gi))
-                dag.releaseBeforeOp[joinAccess].push_back(gi);
+              SmallVector<unsigned, 4> branchEdges;
+              for (unsigned branchEdgeIdx : g.edgeIdxs)
+                if (sp.edges[branchEdgeIdx].dstYieldRegion &&
+                    sp.edges[branchEdgeIdx].dstYieldRegion->getParentOp() ==
+                        ifOp.getOperation())
+                  branchEdges.push_back(branchEdgeIdx);
+              addPlannedRelease(dag.releaseBeforeOp, joinAccess, sp, gi,
+                                branchEdges);
               if (!llvm::is_contained(dag.acquireBeforeOp[joinAccess], gi))
                 dag.acquireBeforeOp[joinAccess].push_back(gi);
               continue;
@@ -2403,7 +2465,7 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
               if (Operation *firstAccess =
                       findFirstAccessInRegion(forOp.getRegion(), dag)) {
                 dag.loopEntryHandoffAccess[ei] = firstAccess;
-                dag.releaseBeforeOp[firstAccess].push_back(gi);
+                addPlannedRelease(dag.releaseBeforeOp, firstAccess, sp, gi, ei);
                 dag.acquireBeforeOp[firstAccess].push_back(gi);
                 dag.threadForOps.insert(forOp.getOperation());
                 continue;
@@ -2414,8 +2476,7 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
           if (e.srcOp && edgeSrcReads(e, group, sp.resource.second) &&
               !edgeSrcWrites(e, group, sp.resource.second) &&
               isa<TMEMLoadOp>(e.srcOp)) {
-            if (!llvm::is_contained(dag.releaseAfterOp[e.srcOp], gi))
-              dag.releaseAfterOp[e.srcOp].push_back(gi);
+            addPlannedRelease(dag.releaseAfterOp, e.srcOp, sp, gi, ei);
             if (syncYieldRequiresCarrier(e.dstYieldRegion, sp) &&
                 !llvm::is_contained(dag.acquireBeforeYield[e.dstYieldRegion],
                                     gi))
@@ -2431,7 +2492,7 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
               if (Operation *firstAccess =
                       findFirstAccessInRegion(forOp.getRegion(), dag)) {
                 dag.loopEntryHandoffAccess[ei] = firstAccess;
-                dag.releaseBeforeOp[firstAccess].push_back(gi);
+                addPlannedRelease(dag.releaseBeforeOp, firstAccess, sp, gi, ei);
                 dag.acquireBeforeOp[firstAccess].push_back(gi);
                 dag.threadForOps.insert(forOp.getOperation());
                 continue;
@@ -2442,24 +2503,28 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
           if (isIfYieldRegion(e.dstYieldRegion) && e.srcOp &&
               edgeSrcReads(e, group, sp.resource.second) &&
               !edgeSrcWrites(e, group, sp.resource.second))
-            dag.releaseAfterOp[e.srcOp].push_back(gi);
+            addPlannedRelease(dag.releaseAfterOp, e.srcOp, sp, gi, ei);
           else
-            dag.releaseBeforeYield[e.dstYieldRegion].push_back(gi);
+            addPlannedRelease(dag.releaseBeforeYield, e.dstYieldRegion, sp, gi,
+                              ei);
         } else if (chainHasIfYield && e.dstOp) {
           if (e.srcOp && e.srcOp->getBlock() == e.dstOp->getBlock() &&
               e.srcOp->isBeforeInBlock(e.dstOp))
-            dag.releaseAfterOp[e.srcOp].push_back(gi);
+            addPlannedRelease(dag.releaseAfterOp, e.srcOp, sp, gi, ei);
           else
-            dag.releaseBeforeOp[getIfBranchEntryAnchor(e.dstOp)].push_back(gi);
+            addPlannedRelease(dag.releaseBeforeOp, getIfBranchEntryAnchor(e.dstOp),
+                              sp, gi, ei);
         } else if (e.srcOp) {
           if (!edgeDefersToSkippedLoopExit(e, skippedCarrierFor)) {
             Operation *releaseAnchor =
                 getNonWsForAncestorExitingTo(e.srcOp, e.dstOp);
-            dag.releaseAfterOp[releaseAnchor ? releaseAnchor : e.srcOp].push_back(
-                gi);
+            addPlannedRelease(dag.releaseAfterOp,
+                              releaseAnchor ? releaseAnchor : e.srcOp, sp, gi,
+                              ei);
           }
         } else if (e.srcYieldRegion) {
-          dag.releaseAfterYield[e.srcYieldRegion].push_back(gi);
+          addPlannedRelease(dag.releaseAfterYield, e.srcYieldRegion, sp, gi,
+                            ei);
         }
         if (e.dstOp)
           dag.acquireBeforeOp[e.dstOp].push_back(gi);
@@ -2472,7 +2537,7 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
                                           sp.resource.second) &&
             !hasOutgoingEdgeFromOp(sp, e.dstOp) &&
             !tokenResultIsYielded(e.dstOp))
-          dag.releaseAfterOp[e.dstOp].push_back(gi);
+          addPlannedRelease(dag.releaseAfterOp, e.dstOp, sp, gi, ei);
       }
       break;
     }
@@ -2491,8 +2556,7 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
     else if (isa<scf::IfOp>(op))
       dag.threadIfOps.insert(op);
   };
-  auto markOpAnchors = [&](const DenseMap<Operation *, SmallVector<unsigned, 2>>
-                               &anchors) {
+  auto markOpAnchors = [&](const auto &anchors) {
     for (auto &kv : anchors)
       if (isa<scf::ForOp>(kv.first))
         markThreadedOp(kv.first);
@@ -3401,6 +3465,16 @@ static Value getSemaphoreForGroup(unsigned groupIdx, const SyncEdge *edge,
   llvm_unreachable("unhandled sync group kind");
 }
 
+static const SyncEdge *getRepresentativeReleaseEdge(const PlannedRelease &action,
+                                                    const SyncPlan &sp) {
+  if (action.edgeIdxs.empty())
+    return nullptr;
+  unsigned edgeIdx = action.edgeIdxs.front();
+  if (edgeIdx >= sp.edges.size())
+    return nullptr;
+  return &sp.edges[edgeIdx];
+}
+
 struct AcquireRecord {
   unsigned groupIdx = 0;
   Value semaphore;
@@ -3417,6 +3491,7 @@ struct EmittedSyncRecord {
   Value semaphore;
   Value token;
   StageCluster expectedStageCluster;
+  SmallVector<unsigned, 4> edgeIdxs;
 };
 
 struct EmittedBufferRecord {
@@ -4485,19 +4560,41 @@ static Operation *findLastSameBlockNonTokenResultUser(Operation *op) {
   return lastUser;
 }
 
-static LogicalResult emitReleaseForGroup(OpBuilder &b, Location loc,
-                                         SyncAnchorKind kind, Operation *anchor,
-                                         Region *yieldRegion, unsigned groupIdx,
-                                         const OptSyncDag &dag,
-                                         const SyncPlan &sp, BufferGroup &group,
-                                         EmitState &state,
-                                         StageCluster stageCluster,
-                                         Operation *liveAnchor = nullptr) {
+static LogicalResult emitReleaseAction(OpBuilder &b, Location loc,
+                                       SyncAnchorKind kind, Operation *anchor,
+                                       Region *yieldRegion,
+                                       const PlannedRelease &action,
+                                       const OptSyncDag &dag, const SyncPlan &sp,
+                                       BufferGroup &group, EmitState &state,
+                                       StageCluster stageCluster,
+                                       Operation *liveAnchor = nullptr) {
+  unsigned groupIdx = action.groupIdx;
+  if (groupIdx >= dag.groups.size())
+    return group.members.front().allocOp->emitError(
+        "nvws-insert-semas: planned release references an invalid group");
+  if (action.edgeIdxs.empty())
+    return group.members.front().allocOp->emitError(
+        "nvws-insert-semas: planned release has no transition edge");
+  for (unsigned edgeIdx : action.edgeIdxs) {
+    if (edgeIdx >= sp.edges.size())
+      return group.members.front().allocOp->emitError(
+          "nvws-insert-semas: planned release references an invalid edge");
+    if (!edgeRequiresRelease(sp.edges[edgeIdx]))
+      return group.members.front().allocOp->emitError(
+          "nvws-insert-semas: planned release is not backed by a partition "
+          "transition edge");
+    if (edgeIdx >= dag.edgeToGroup.size() || dag.edgeToGroup[edgeIdx] != groupIdx)
+      return group.members.front().allocOp->emitError(
+          "nvws-insert-semas: planned release edge does not belong to its group");
+  }
   const SyncGroup &syncGroup = dag.groups[groupIdx];
-  const SyncEdge *edge =
-      findEdgeForAnchor(syncGroup, sp, dag, kind, anchor, yieldRegion,
-                        liveAnchor);
-  std::optional<unsigned> edgeIdx = findEdgeIndex(sp, edge);
+  const SyncEdge *edge = getRepresentativeReleaseEdge(action, sp);
+  std::optional<unsigned> edgeIdx = action.edgeIdxs.front();
+  for (const EmittedSyncRecord &record : state.emittedReleases)
+    if (record.groupIdx == groupIdx && record.kind == kind &&
+        record.anchor == anchor && record.yieldRegion == yieldRegion &&
+        record.edgeIdxs == action.edgeIdxs)
+      return success();
   Value sem = getSemaphoreForGroup(groupIdx, edge, dag, sp, group, state.semas);
   bool terminalDstReadRelease =
       (syncGroup.kind == SyncGroupKind::LinearChain ||
@@ -4637,6 +4734,8 @@ static LogicalResult emitReleaseForGroup(OpBuilder &b, Location loc,
   state.emittedReleases.push_back(EmittedSyncRecord{
       groupIdx, kind, anchor, yieldRegion, release.getOperation(), sem, *token,
       expectedStampedStage(owner, stageCluster)});
+  state.emittedReleases.back().edgeIdxs.append(action.edgeIdxs.begin(),
+                                               action.edgeIdxs.end());
   return success();
 }
 
@@ -4686,10 +4785,10 @@ emitBeforeOpSync(Operation *anchor, const OptSyncDag &dag, const SyncPlan &sp,
   b.setInsertionPoint(anchor);
   auto rIt = dag.releaseBeforeOp.find(anchor);
   if (rIt != dag.releaseBeforeOp.end())
-    for (unsigned gi : rIt->second)
-      if (failed(emitReleaseForGroup(
+    for (const PlannedRelease &release : rIt->second)
+      if (failed(emitReleaseAction(
               b, anchor->getLoc(), SyncAnchorKind::ReleaseBeforeOp, anchor,
-              nullptr, gi, dag, sp, group, state, getStageCluster(anchor))))
+              nullptr, release, dag, sp, group, state, getStageCluster(anchor))))
         return failure();
   auto aIt = dag.acquireBeforeOp.find(anchor);
   if (aIt != dag.acquireBeforeOp.end())
@@ -4717,11 +4816,9 @@ static LogicalResult emitAfterOpSync(Operation *anchor, Operation *insertAfter,
   bool beforeFollowingSemaphores = false;
   bool afterLoopRelease = group.isTmem() && isa<scf::ForOp>(releaseAfter);
   if (group.isTmem()) {
-    for (unsigned gi : rIt->second) {
-      const SyncGroup &syncGroup = dag.groups[gi];
-      const SyncEdge *edge = findEdgeForAnchor(
-          syncGroup, sp, dag, SyncAnchorKind::ReleaseAfterOp, anchor, nullptr,
-          insertAfter);
+    for (const PlannedRelease &release : rIt->second) {
+      const SyncGroup &syncGroup = dag.groups[release.groupIdx];
+      const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
       if (releaseShouldPrecedeFollowingSemaphores(
               syncGroup, edge, group, dag.resource.second, insertAfter)) {
         beforeFollowingSemaphores = true;
@@ -4751,17 +4848,15 @@ static LogicalResult emitAfterOpSync(Operation *anchor, Operation *insertAfter,
       savedEventToken = it->second;
     state.eventToken[anchor] = state.currentToken;
   }
-  SmallVector<unsigned, 4> releaseGroups(rIt->second.begin(), rIt->second.end());
+  SmallVector<PlannedRelease, 4> releaseActions(rIt->second.begin(),
+                                                rIt->second.end());
   if (group.isTmem())
-    llvm::stable_sort(releaseGroups, [&](unsigned lhs, unsigned rhs) {
-      const SyncGroup &lhsGroup = dag.groups[lhs];
-      const SyncEdge *lhsEdge = findEdgeForAnchor(
-          lhsGroup, sp, dag, SyncAnchorKind::ReleaseAfterOp, anchor, nullptr,
-          insertAfter);
-      const SyncGroup &rhsGroup = dag.groups[rhs];
-      const SyncEdge *rhsEdge = findEdgeForAnchor(
-          rhsGroup, sp, dag, SyncAnchorKind::ReleaseAfterOp, anchor, nullptr,
-          insertAfter);
+    llvm::stable_sort(releaseActions, [&](const PlannedRelease &lhs,
+                                          const PlannedRelease &rhs) {
+      const SyncGroup &lhsGroup = dag.groups[lhs.groupIdx];
+      const SyncEdge *lhsEdge = getRepresentativeReleaseEdge(lhs, sp);
+      const SyncGroup &rhsGroup = dag.groups[rhs.groupIdx];
+      const SyncEdge *rhsEdge = getRepresentativeReleaseEdge(rhs, sp);
       bool lhsPrecedes = releaseShouldPrecedeFollowingSemaphores(
           lhsGroup, lhsEdge, group, dag.resource.second, insertAfter);
       bool rhsPrecedes = releaseShouldPrecedeFollowingSemaphores(
@@ -4769,10 +4864,10 @@ static LogicalResult emitAfterOpSync(Operation *anchor, Operation *insertAfter,
       return lhsPrecedes && !rhsPrecedes;
     });
   LogicalResult result = success();
-  for (unsigned gi : releaseGroups)
-    if (failed(emitReleaseForGroup(
+  for (const PlannedRelease &release : releaseActions)
+    if (failed(emitReleaseAction(
             b, insertAfter->getLoc(), SyncAnchorKind::ReleaseAfterOp, anchor,
-            nullptr, gi, dag, sp, group, state, getStageCluster(insertAfter),
+            nullptr, release, dag, sp, group, state, getStageCluster(insertAfter),
             insertAfter))) {
       result = failure();
       break;
@@ -4828,6 +4923,44 @@ static bool linearChainAnchorsLoopExit(const SyncGroup &syncGroup,
   return false;
 }
 
+static const PlannedRelease *
+findPlannedAfterOpReleaseForGroup(Operation *anchor, unsigned groupIdx,
+                                  const OptSyncDag &dag) {
+  if (!anchor)
+    return nullptr;
+  auto releaseIt = dag.releaseAfterOp.find(anchor);
+  if (releaseIt == dag.releaseAfterOp.end())
+    return nullptr;
+  for (const PlannedRelease &action : releaseIt->second)
+    if (action.groupIdx == groupIdx)
+      return &action;
+  return nullptr;
+}
+
+static bool linearChainNeedsLoopExitDrain(unsigned groupIdx,
+                                          const SyncGroup &syncGroup,
+                                          Operation *forOp, Region *region,
+                                          const OptSyncDag &dag,
+                                          const SyncPlan &sp) {
+  if (!forOp || !region)
+    return false;
+  if (findPlannedAfterOpReleaseForGroup(forOp, groupIdx, dag))
+    return true;
+  if (dag.skippedInitialLoopCarrierRegion.lookup(groupIdx) == region)
+    for (unsigned edgeIdx : syncGroup.edgeIdxs)
+      if (dag.edgesDeferringToSkippedLoopExit.contains(edgeIdx))
+        return true;
+  for (unsigned edgeIdx : syncGroup.edgeIdxs) {
+    const SyncEdge &edge = sp.edges[edgeIdx];
+    if (dag.loopEntryHandoffAccess.contains(edgeIdx))
+      return true;
+    if (edge.dstYieldRegion == region &&
+        dag.terminalLoopReadEdgesDeferringToExit.contains(edgeIdx))
+      return true;
+  }
+  return false;
+}
+
 static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
                                                  Region *region,
                                                  const OptSyncDag &dag,
@@ -4859,6 +4992,9 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
       continue;
     if (linearChainNeedsPerEdgeFulls(syncGroup, sp, group, dag.resource.second))
       continue;
+    if (!linearChainNeedsLoopExitDrain(gi, syncGroup, forOp.getOperation(),
+                                       region, dag, sp))
+      continue;
 
     const SyncEdge &firstEdge = sp.edges[syncGroup.edgeIdxs.front()];
     const SyncEdge &secondEdge = sp.edges[syncGroup.edgeIdxs[1]];
@@ -4873,6 +5009,30 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
     OpBuilder b(forOp);
     b.setInsertionPointAfter(forOp);
     Location loc = forOp.getLoc();
+    auto emitDrainRelease = [&](Value sem, Value token,
+                                std::optional<PartitionId> owner,
+                                AsyncOp payload,
+                                const SyncEdge &edge) -> LogicalResult {
+      if (!edgeRequiresRelease(edge))
+        return forOp->emitError(
+            "nvws-insert-semas: loop-exit drain release is not backed by a "
+            "partition transition edge");
+      emitRelease(b, loc, sem, token, owner, StageCluster{}, payload);
+      return success();
+    };
+    auto findPlannedAfterLoopRelease =
+        [&](const SyncEdge &edge) -> const PlannedRelease * {
+      std::optional<unsigned> edgeIdx = findEdgeIndex(sp, &edge);
+      if (!edgeIdx)
+        return nullptr;
+      auto releaseIt = dag.releaseAfterOp.find(forOp.getOperation());
+      if (releaseIt == dag.releaseAfterOp.end())
+        return nullptr;
+      for (const PlannedRelease &action : releaseIt->second)
+        if (llvm::is_contained(action.edgeIdxs, *edgeIdx))
+          return &action;
+      return nullptr;
+    };
     bool skipsInitialCarrier =
         dag.skippedInitialLoopCarrierRegion.lookup(gi) == region;
     const SyncEdge *loopEntryHandoffEdge = nullptr;
@@ -4894,8 +5054,9 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
           continue;
         Value sem = getSemaphoreForGroup(gi, &edge, dag, sp, group,
                                          state.semas);
-        emitRelease(b, loc, sem, state.currentToken, state.currentOwner,
-                    StageCluster{}, edge.asyncPayload);
+        if (failed(emitDrainRelease(sem, state.currentToken, state.currentOwner,
+                                    edge.asyncPayload, edge)))
+          return failure();
         state.currentSemaphore = sem;
         state.currentBuffers.clear();
         return success();
@@ -4925,13 +5086,26 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
                !edgeDstWrites(secondEdge, group, dag.resource.second)) {
       emptyPayload = secondEdge.asyncPayload;
     }
-    emitRelease(b, loc, pair.full, state.currentToken, releaseOwner,
-                StageCluster{}, drainPayload);
+    const SyncEdge *fullReleaseEdge =
+        loopEntryHandoffEdge ? loopEntryHandoffEdge : &firstEdge;
+    if (const PlannedRelease *releaseAction =
+            findPlannedAfterLoopRelease(*fullReleaseEdge)) {
+      if (failed(emitReleaseAction(b, loc, SyncAnchorKind::ReleaseAfterOp,
+                                   forOp.getOperation(), nullptr,
+                                   *releaseAction, dag, sp, group, state,
+                                   StageCluster{})))
+        return failure();
+    } else if (failed(emitDrainRelease(pair.full, state.currentToken,
+                                       releaseOwner, drainPayload,
+                                       *fullReleaseEdge))) {
+      return failure();
+    }
     SemaphoreAcquireOp acquire =
         emitAcquire(b, loc, pair.full, drainOwner, StageCluster{});
     state.knownCarrierTokens.insert(acquire.getToken());
-    emitRelease(b, loc, pair.empty, acquire.getToken(), drainOwner,
-                StageCluster{}, emptyPayload);
+    if (failed(emitDrainRelease(pair.empty, acquire.getToken(), drainOwner,
+                                emptyPayload, secondEdge)))
+      return failure();
     state.currentToken = acquire.getToken();
     state.currentSemaphore = pair.empty;
     state.currentOwner = drainOwner;
@@ -5024,14 +5198,11 @@ emitBeforeYieldSync(Operation *yieldOp, Region *region, const OptSyncDag &dag,
   b.setInsertionPoint(yieldOp);
   auto rIt = dag.releaseBeforeYield.find(region);
   if (rIt != dag.releaseBeforeYield.end())
-    for (unsigned gi : rIt->second) {
-      const SyncEdge *edge =
-          findEdgeForAnchor(dag.groups[gi], sp,
-                            dag,
-                            SyncAnchorKind::ReleaseBeforeYield, nullptr, region);
-      if (failed(emitReleaseForGroup(
+    for (const PlannedRelease &release : rIt->second) {
+      const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
+      if (failed(emitReleaseAction(
               b, yieldOp->getLoc(), SyncAnchorKind::ReleaseBeforeYield, nullptr,
-              region, gi, dag, sp, group, state,
+              region, release, dag, sp, group, state,
               stageForYieldOwner(edge ? edge->srcOwner : std::nullopt, state))))
         return failure();
     }
@@ -5049,14 +5220,11 @@ emitBeforeYieldSync(Operation *yieldOp, Region *region, const OptSyncDag &dag,
     }
   auto arIt = dag.releaseAfterYield.find(region);
   if (arIt != dag.releaseAfterYield.end())
-    for (unsigned gi : arIt->second) {
-      const SyncEdge *edge =
-          findEdgeForAnchor(dag.groups[gi], sp,
-                            dag,
-                            SyncAnchorKind::ReleaseAfterYield, nullptr, region);
-      if (failed(emitReleaseForGroup(
+    for (const PlannedRelease &release : arIt->second) {
+      const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
+      if (failed(emitReleaseAction(
               b, yieldOp->getLoc(), SyncAnchorKind::ReleaseAfterYield, nullptr,
-              region, gi, dag, sp, group, state,
+              region, release, dag, sp, group, state,
               stageForYieldOwner(edge ? edge->srcOwner : std::nullopt, state))))
         return failure();
     }
@@ -5437,6 +5605,22 @@ static unsigned countPlannedAnchors(const DenseMap<Region *, SmallVector<unsigne
   return count;
 }
 
+static unsigned countPlannedAnchors(
+    const DenseMap<Operation *, SmallVector<PlannedRelease, 2>> &map) {
+  unsigned count = 0;
+  for (auto &kv : map)
+    count += kv.second.size();
+  return count;
+}
+
+static unsigned countPlannedAnchors(
+    const DenseMap<Region *, SmallVector<PlannedRelease, 2>> &map) {
+  unsigned count = 0;
+  for (auto &kv : map)
+    count += kv.second.size();
+  return count;
+}
+
 static const char *syncGroupKindName(SyncGroupKind kind) {
   switch (kind) {
   case SyncGroupKind::InitialEmpty: return "initial-empty";
@@ -5658,6 +5842,63 @@ static LogicalResult verifyPlanBeforeEmission(triton::FuncOp funcOp,
     return funcOp.emitError("nvws-insert-semas: verifier: unexpected "
                             "initial-empty group");
 
+  auto emitReleasePlanError = [&](Operation *anchor, const Twine &message) {
+    if (anchor)
+      return anchor->emitError(message);
+    return funcOp.emitError(message);
+  };
+  auto verifyReleaseAction = [&](const PlannedRelease &action,
+                                 Operation *anchor) -> LogicalResult {
+    if (action.groupIdx >= dag.groups.size())
+      return emitReleasePlanError(
+          anchor, "nvws-insert-semas: verifier: planned release references an "
+                  "invalid group");
+    if (action.edgeIdxs.empty())
+      return emitReleasePlanError(
+          anchor, "nvws-insert-semas: verifier: planned release has no "
+                  "transition edge");
+    for (unsigned edgeIdx : action.edgeIdxs) {
+      if (edgeIdx >= sp.edges.size())
+        return emitReleasePlanError(
+            anchor, "nvws-insert-semas: verifier: planned release references "
+                    "an invalid edge");
+      if (edgeIdx >= dag.edgeToGroup.size() ||
+          dag.edgeToGroup[edgeIdx] != action.groupIdx)
+        return emitReleasePlanError(
+            anchor, "nvws-insert-semas: verifier: planned release edge does "
+                    "not belong to its group");
+      if (!edgeRequiresRelease(sp.edges[edgeIdx]))
+        return emitReleasePlanError(
+            anchor, "nvws-insert-semas: verifier: planned release is not "
+                    "backed by a partition transition edge");
+    }
+    return success();
+  };
+  auto verifyReleaseOpMap =
+      [&](const DenseMap<Operation *, SmallVector<PlannedRelease, 2>> &map)
+      -> LogicalResult {
+    for (auto &kv : map)
+      for (const PlannedRelease &action : kv.second)
+        if (failed(verifyReleaseAction(action, kv.first)))
+          return failure();
+    return success();
+  };
+  auto verifyReleaseYieldMap =
+      [&](const DenseMap<Region *, SmallVector<PlannedRelease, 2>> &map)
+      -> LogicalResult {
+    for (auto &kv : map)
+      for (const PlannedRelease &action : kv.second)
+        if (failed(verifyReleaseAction(
+                action, kv.first ? kv.first->getParentOp() : nullptr)))
+          return failure();
+    return success();
+  };
+  if (failed(verifyReleaseOpMap(dag.releaseBeforeOp)) ||
+      failed(verifyReleaseOpMap(dag.releaseAfterOp)) ||
+      failed(verifyReleaseYieldMap(dag.releaseBeforeYield)) ||
+      failed(verifyReleaseYieldMap(dag.releaseAfterYield)))
+    return failure();
+
   WalkResult walkResult = funcOp.walk([&](Operation *op) -> WalkResult {
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       if (!regionContainsAccess(forOp.getRegion(), dag))
@@ -5710,6 +5951,16 @@ static bool hasSyncRecord(ArrayRef<EmittedSyncRecord> records, unsigned groupIdx
   });
 }
 
+static bool hasSyncRecord(ArrayRef<EmittedSyncRecord> records,
+                          const PlannedRelease &action, SyncAnchorKind kind,
+                          Operation *anchor, Region *yieldRegion) {
+  return llvm::any_of(records, [&](const EmittedSyncRecord &record) {
+    return record.groupIdx == action.groupIdx && record.edgeIdxs == action.edgeIdxs &&
+           record.kind == kind && record.anchor == anchor &&
+           record.yieldRegion == yieldRegion && record.op;
+  });
+}
+
 static bool isRecordPlanned(const EmittedSyncRecord &record,
                             const DenseMap<Operation *, SmallVector<unsigned, 2>>
                                 &opMap,
@@ -5723,6 +5974,27 @@ static bool isRecordPlanned(const EmittedSyncRecord &record,
     auto it = yieldMap.find(record.yieldRegion);
     return it != yieldMap.end() &&
            llvm::is_contained(it->second, record.groupIdx);
+  }
+  return false;
+}
+
+static bool isRecordPlanned(
+    const EmittedSyncRecord &record,
+    const DenseMap<Operation *, SmallVector<PlannedRelease, 2>> &opMap,
+    const DenseMap<Region *, SmallVector<PlannedRelease, 2>> &yieldMap) {
+  auto matches = [&](ArrayRef<PlannedRelease> planned) {
+    return llvm::any_of(planned, [&](const PlannedRelease &action) {
+      return action.groupIdx == record.groupIdx &&
+             action.edgeIdxs == record.edgeIdxs;
+    });
+  };
+  if (record.anchor) {
+    auto it = opMap.find(record.anchor);
+    return it != opMap.end() && matches(it->second);
+  }
+  if (record.yieldRegion) {
+    auto it = yieldMap.find(record.yieldRegion);
+    return it != yieldMap.end() && matches(it->second);
   }
   return false;
 }
@@ -5742,6 +6014,24 @@ static LogicalResult verifyPlannedSyncRecords(
       if (!hasSyncRecord(records, groupIdx, yieldKind, nullptr, kv.first))
         return funcOp.emitError("nvws-insert-semas: post-emission verifier: "
                                 "planned sync op is missing at yield anchor");
+  return success();
+}
+
+static LogicalResult verifyPlannedSyncRecords(
+    triton::FuncOp funcOp, SyncAnchorKind opKind, SyncAnchorKind yieldKind,
+    const DenseMap<Operation *, SmallVector<PlannedRelease, 2>> &opMap,
+    const DenseMap<Region *, SmallVector<PlannedRelease, 2>> &yieldMap,
+    ArrayRef<EmittedSyncRecord> records) {
+  for (auto &kv : opMap)
+    for (const PlannedRelease &action : kv.second)
+      if (!hasSyncRecord(records, action, opKind, kv.first, nullptr))
+        return kv.first->emitError("nvws-insert-semas: post-emission verifier: "
+                                   "planned release is missing at op anchor");
+  for (auto &kv : yieldMap)
+    for (const PlannedRelease &action : kv.second)
+      if (!hasSyncRecord(records, action, yieldKind, nullptr, kv.first))
+        return funcOp.emitError("nvws-insert-semas: post-emission verifier: "
+                                "planned release is missing at yield anchor");
   return success();
 }
 

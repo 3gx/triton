@@ -14,7 +14,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %true = arith.constant true
     %false = arith.constant false
 
-    // CHECK: [[ACC:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32,
+    // CHECK: [[ACC:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32,
     // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ACC]] true
     // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ACC]] false
     // CHECK-NEXT: [[ATOK:%.*]] = nvws.semaphore.acquire [[EMPTY]] {{.*}}ttg.partition = array<i32: 1>
@@ -87,9 +87,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       } {tt.num_stages = 2 : i32, tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 1>], ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 1 : i32}
       scf.yield
     }
-    // CHECK: nvws.semaphore.release [[GFULL]], {{.*}}ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 1
-    // CHECK-NEXT: {{.*}} = nvws.semaphore.acquire [[GFULL]] {{.*}}ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 1
-    // CHECK-NEXT: nvws.semaphore.release [[GEMPTY]], {{.*}}ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 1{{.*}}!ttg.async.token
+    // CHECK: } {tt.num_stages = 2 : i32, tt.warp_specialize{{.*}}ttg.warp_specialize.tag = 1 : i32}
     // CHECK-NEXT: }
     // CHECK-NEXT: tt.return
     tt.return
