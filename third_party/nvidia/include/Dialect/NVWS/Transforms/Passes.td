@@ -59,6 +59,7 @@ def NVWSAssignStagePhase : Pass<"nvws-assign-stage-phase", "mlir::ModuleOp"> {
     "mlir::triton::gpu::TritonGPUDialect",
     "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
   ];
+
 }
 
 def NVWSLowerSemaphore : Pass<"nvws-lower-semaphore", "mlir::ModuleOp"> {
@@ -102,6 +103,7 @@ def NVWSInsertSemaphore: Pass<"nvws-insert-semaphore", "mlir::ModuleOp"> {
     "mlir::triton::gpu::TritonGPUDialect",
     "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
   ];
+
 }
 
 def NVWSInsertAllocas: Pass<"nvws-insert-allocas", "mlir::ModuleOp"> {
@@ -118,6 +120,7 @@ def NVWSInsertAllocas: Pass<"nvws-insert-allocas", "mlir::ModuleOp"> {
     "mlir::triton::gpu::TritonGPUDialect",
     "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
   ];
+
 }
 
 def NVWSInsertTmemSemaphore: Pass<"nvws-insert-tmem-semaphore", "mlir::ModuleOp"> {
@@ -149,6 +152,12 @@ def NVWSInsertSemas: Pass<"nvws-insert-semas", "mlir::ModuleOp"> {
     "mlir::triton::TritonDialect",
     "mlir::triton::gpu::TritonGPUDialect",
     "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+
+  let options = [
+    Option<"useMetaPartitioner", "use-meta-partitioner",
+           "bool", /*default*/"false",
+           "If true, InsertSemas is running after the NVWS meta partitioner">
   ];
 }
 

@@ -2838,7 +2838,8 @@ static bool canDoubleBufferAcc(MMAv5OpInterface mmaOp, int numTmemBlocks) {
   return true;
 }
 
-static int computeTmemSemaphoreNumStages(BufferGroup &group, int numTmemBlocks) {
+static int computeTmemSemaphoreNumStages(BufferGroup &group, int numTmemBlocks,
+                                         bool useMetaPartitioner) {
   bool isMultiStaged = true;
   for (BufferMember &member : group.members) {
     auto allocOp = cast<TMEMAllocOp>(member.allocOp);
@@ -2861,7 +2862,8 @@ static int computeTmemSemaphoreNumStages(BufferGroup &group, int numTmemBlocks) 
       }
     }
   }
-  auto numStages = 1 + 1 * isMultiStaged;
+  auto numStages =
+      useMetaPartitioner ? 1 + 0 * isMultiStaged : 1 + 1 * isMultiStaged;
   return numStages;
 }
 
@@ -7580,7 +7582,8 @@ static bool tmemPlanNeedsMultiStage(BufferGroup &group,
 }
 
 static int computeTmemSemaphoreNumStagesFromPlans(
-    BufferGroup &group, ArrayRef<PlannedResource> planned, int numTmemBlocks) {
+    BufferGroup &group, ArrayRef<PlannedResource> planned, int numTmemBlocks,
+    bool useMetaPartitioner) {
   bool isMultiStaged = tmemPlanNeedsMultiStage(group, planned);
   if (isMultiStaged) {
     for (BufferMember &member : group.members) {
@@ -7605,11 +7608,13 @@ static int computeTmemSemaphoreNumStagesFromPlans(
       }
     }
   }
-  auto numStages = 1 + 1 * isMultiStaged;
+  auto numStages =
+      useMetaPartitioner ? 1 + 0 * isMultiStaged : 1 + 1 * isMultiStaged;
   return numStages;
 }
 
-static LogicalResult runOnFunction(triton::FuncOp funcOp) {
+static LogicalResult runOnFunction(triton::FuncOp funcOp,
+                                   bool useMetaPartitioner) {
   // Only process functions that contain a warp-specialized loop, matching
   // the prior pipeline gating.
   auto walkResult = funcOp.walk([&](scf::ForOp forOp) {
@@ -7671,7 +7676,7 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp) {
     }
     if (group.isTmem()) {
       int numStages = computeTmemSemaphoreNumStagesFromPlans(
-          group, plannedResources, numTmemBlocks);
+          group, plannedResources, numTmemBlocks, useMetaPartitioner);
       numStagesByGroup[static_cast<unsigned>(en.index())] = numStages;
       updateNumTmemBlocks(group, numStages, numTmemBlocks);
     }
@@ -7719,9 +7724,12 @@ static void stripTemporarySemaphoreAttrs(triton::FuncOp funcOp) {
 class NVWSInsertSemas
     : public triton::impl::NVWSInsertSemasBase<NVWSInsertSemas> {
 public:
+  using NVWSInsertSemasBase::NVWSInsertSemasBase;
+
   void runOnOperation() override {
     auto walkResult = getOperation().walk([&](triton::FuncOp funcOp) {
-      if (failed(runOnFunction(funcOp))) return WalkResult::interrupt();
+      if (failed(runOnFunction(funcOp, useMetaPartitioner)))
+        return WalkResult::interrupt();
       stripTemporarySemaphoreAttrs(funcOp);
       return WalkResult::advance();
     });

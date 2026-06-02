@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas -cse | FileCheck %s
+// RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas="use-meta-partitioner=true" -cse | FileCheck %s --check-prefix=META
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
@@ -10,6 +11,10 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %c1_i32 = arith.constant 1 : i32
     %true = arith.constant true
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    // META: [[ALLOC:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32
+    // META-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] true
+    // META-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ALLOC]] false
+    // META-NEXT: nvws.semaphore.acquire [[EMPTY]] {{.*}}ttg.partition = array<i32: 0>
     // CHECK: [[ALLOC:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32
     // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] true
     // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ALLOC]] false
