@@ -133,6 +133,10 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       %j = arith.addi %i, %c0 {ttg.partition = array<i32: 0, 1, 5>} : i32
       scf.yield {ttg.partition = array<i32: 0, 1, 5>} %j : i32
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 5>, ttg.partition.outputs = [array<i32: 0, 1, 5>], ttg.warp_specialize.tag = 0 : i32}
+    // CHECK-NOT: nvws.semaphore.release [[QK_READY]]
+    // CHECK-NOT: nvws.semaphore.acquire [[QK_READY]]
+    // CHECK-NOT: nvws.semaphore.release [[EMPTY]]
+    // CHECK: "use_i32"
     "use_i32"(%r) : (i32) -> ()
     tt.return
   }

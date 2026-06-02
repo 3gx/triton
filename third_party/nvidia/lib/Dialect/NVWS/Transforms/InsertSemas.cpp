@@ -4718,6 +4718,8 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
     SyncGroupSemaphores pair = state.semas.byGroup.lookup(gi);
     if (!pair.full || !pair.empty)
       continue;
+    if (linearChainNeedsPerEdgeFulls(syncGroup, sp, group, dag.resource.second))
+      continue;
 
     const SyncEdge &firstEdge = sp.edges[syncGroup.edgeIdxs.front()];
     const SyncEdge &secondEdge = sp.edges[syncGroup.edgeIdxs[1]];
