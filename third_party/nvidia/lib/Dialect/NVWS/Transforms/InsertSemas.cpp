@@ -389,9 +389,13 @@ static void assignResourceKeys(BufferGroup &group) {
     for (unsigned j = i + 1; j < group.members.size(); ++j) {
       BufferMember &lhs = group.members[i];
       BufferMember &rhs = group.members[j];
-      if (group.members.size() >= 3 &&
-          lhs.type.getElementType() != rhs.type.getElementType())
-        continue;
+      // Plan §Physical Conflict Key: members whose native intervals overlap
+      // MUST share a resourceKey (overlap ⇒ same key), with no exception.
+      // A reuse handoff between overlapping members of different element
+      // types (e.g. an f32 MMA accumulator whose columns are reused to stage
+      // an f16 MMA operand) is still a physical conflict and must be
+      // synchronized through the shared resource; separating them by element
+      // type would silently drop the reuse edge and race.
       if (intervalsOverlap(lhs.offset, lhs.offset + lhs.extent, rhs.offset,
                            rhs.offset + rhs.extent))
         unite(i, j);
