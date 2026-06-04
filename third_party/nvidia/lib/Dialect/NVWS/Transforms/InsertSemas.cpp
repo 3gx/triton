@@ -2233,6 +2233,15 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
     // with no place to render the shared release, so leave as singletons.
     const SyncEdge &probe = sp.edges[rfBuckets[i].front()];
     if (!probe.srcOp && !probe.srcYieldRegion) continue;
+    // A ReadyFanout shares ONE semaphore that every consumer edge acquires, at
+    // its own consumer partition. A semaphore may be released from any
+    // partition but acquired in only one, so only collapse when all consumer
+    // edges have the same acquirer (dstOwner). Otherwise leave them as per-edge
+    // Singletons so each consumer gets its own semaphore.
+    if (llvm::any_of(rfBuckets[i], [&](unsigned e) {
+          return !sameOwner(sp.edges[e].dstOwner, probe.dstOwner);
+        }))
+      continue;
     SyncGroup g;
     g.name = makeGroupName(groupSerial++);
     g.kind = SyncGroupKind::ReadyFanout;
@@ -2275,12 +2284,38 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
   // render as one compact LinearChain group (Combine C).
   SmallVector<unsigned, 4> linearChain;
   if (collectLinearChainEdges(sp, claimed, linearChain)) {
-    SyncGroup g;
-    g.name = makeGroupName(groupSerial++);
-    g.kind = SyncGroupKind::LinearChain;
-    g.edgeIdxs.append(linearChain.begin(), linearChain.end());
-    for (unsigned e : g.edgeIdxs) claimed[e] = true;
-    dag.groups.push_back(std::move(g));
+    // A LinearChain collapses all of its writable-permit (EMPTY) handoffs onto
+    // one shared EMPTY semaphore. That is sound only if every EMPTY edge is
+    // acquired by the SAME partition: a semaphore may be released from any
+    // partition, but it must always be acquired in exactly one. If the chain's
+    // EMPTY edges span more than one acquirer (dstOwner) — e.g. a merged
+    // resource whose qk write (p1) and P write (p5) are both writer phases —
+    // collapsing would make one semaphore acquired by several partitions, which
+    // is illegal and deadlocks. Leave such edges unclaimed so they fall back to
+    // per-edge Singletons, each with a single acquirer (the RAW model).
+    //
+    // The same rule applies to the chain's data-ready edges, which may share a
+    // single semaphore at emit: only collapse when both the writable (EMPTY)
+    // edges and the data-ready (non-EMPTY) edges each have a single acquirer.
+    SmallVector<std::optional<PartitionId>, 2> emptyAcquirers, fullAcquirers;
+    for (unsigned idx : linearChain) {
+      const SyncEdge &e = sp.edges[idx];
+      auto &bucket = edgeUsesEmpty(e, group, sp.resource.second) ? emptyAcquirers
+                                                                 : fullAcquirers;
+      if (llvm::none_of(bucket,
+                        [&](const std::optional<PartitionId> &o) {
+                          return sameOwner(o, e.dstOwner);
+                        }))
+        bucket.push_back(e.dstOwner);
+    }
+    if (emptyAcquirers.size() <= 1 && fullAcquirers.size() <= 1) {
+      SyncGroup g;
+      g.name = makeGroupName(groupSerial++);
+      g.kind = SyncGroupKind::LinearChain;
+      g.edgeIdxs.append(linearChain.begin(), linearChain.end());
+      for (unsigned e : g.edgeIdxs) claimed[e] = true;
+      dag.groups.push_back(std::move(g));
+    }
   }
 
   // Remaining: Singleton groups for each unclaimed edge.
@@ -3266,16 +3301,21 @@ static ResourceSemaphores createResourceSemaphores(const OptSyncDag &dag,
     break;
   }
 
-  Value localSharedEmpty;
-  auto createSharedEmpty = [&]() -> Value {
-    Value &sharedEmpty =
-        group.isTmem() ? backing.sharedEmptySemaphore : localSharedEmpty;
-    if (sharedEmpty)
-      return sharedEmpty;
-    sharedEmpty = createSemaphore(b, loc, backing, /*released=*/true);
+  // One shared writable semaphore PER ACQUIRER PARTITION. A semaphore may be
+  // released from any partition but acquired in exactly one, so groups whose
+  // acquirers differ must get distinct semaphores. Groups that share an
+  // acquirer (e.g. the loop-entry permit and the loop-carry back edge, both
+  // acquired by the writer) correctly share one.
+  SmallVector<std::pair<std::optional<PartitionId>, Value>, 4> emptyByAcquirer;
+  auto createSharedEmpty = [&](std::optional<PartitionId> acquirer) -> Value {
+    for (auto &kv : emptyByAcquirer)
+      if (sameOwner(kv.first, acquirer))
+        return kv.second;
+    Value sem = createSemaphore(b, loc, backing, /*released=*/true);
     if (!group.isTmem())
-      setPartitionFromAnchor(sharedEmpty.getDefiningOp(), anchor);
-    return sharedEmpty;
+      setPartitionFromAnchor(sem.getDefiningOp(), anchor);
+    emptyByAcquirer.push_back({acquirer, sem});
+    return sem;
   };
   auto createFull = [&]() -> Value {
     Value full = createSemaphore(b, loc, backing, /*released=*/false);
@@ -3298,14 +3338,26 @@ static ResourceSemaphores createResourceSemaphores(const OptSyncDag &dag,
     SyncGroupSemaphores pair;
     switch (syncGroup.kind) {
     case SyncGroupKind::InitialEmpty:
+      pair.empty = createSharedEmpty(syncGroup.initialOwner);
+      break;
     case SyncGroupKind::DoneFanin:
-      pair.empty = createSharedEmpty();
+      // All fanin edges share one acquirer (the next writer).
+      pair.empty =
+          createSharedEmpty(sp.edges[syncGroup.edgeIdxs.front()].dstOwner);
       break;
     case SyncGroupKind::ReadyFanout:
       pair.full = createFull();
       break;
-    case SyncGroupKind::LinearChain:
-      pair.empty = createSharedEmpty();
+    case SyncGroupKind::LinearChain: {
+      // The chain's writable edges share one acquirer (guaranteed by the
+      // multi-acquirer guard in buildOptSyncDag); use it.
+      std::optional<PartitionId> chainEmptyAcquirer = initialEmptyOwner;
+      for (unsigned eIdx : syncGroup.edgeIdxs)
+        if (edgeUsesEmpty(sp.edges[eIdx], group, dag.resource.second)) {
+          chainEmptyAcquirer = sp.edges[eIdx].dstOwner;
+          break;
+        }
+      pair.empty = createSharedEmpty(chainEmptyAcquirer);
       if (linearChainNeedsPerEdgeFulls(syncGroup, sp, group,
                                        dag.resource.second)) {
         for (unsigned edgeIdx : syncGroup.edgeIdxs) {
@@ -3320,13 +3372,14 @@ static ResourceSemaphores createResourceSemaphores(const OptSyncDag &dag,
       }
       pair.full = createFull();
       break;
+    }
     case SyncGroupKind::Singleton: {
       const SyncEdge *edge = syncGroup.edgeIdxs.empty()
                                  ? nullptr
                                  : &sp.edges[syncGroup.edgeIdxs.front()];
       if (edge && edgeUsesEmpty(*edge, group, dag.resource.second)) {
         if (sameOwner(edge->dstOwner, initialEmptyOwner))
-          pair.empty = createSharedEmpty();
+          pair.empty = createSharedEmpty(edge->dstOwner);
         else
           pair.empty = createFull();
       } else {
@@ -3337,7 +3390,8 @@ static ResourceSemaphores createResourceSemaphores(const OptSyncDag &dag,
               findTerminalReadReleaseAnchor(edge->dstOp, sp, group,
                                             dag.resource.second)) ||
              (edgeIdx && dag.tmemLoopExitRead.contains(*edgeIdx))))
-          pair.empty = createSharedEmpty();
+          // Loop-carry writable permit acquired by the next writer.
+          pair.empty = createSharedEmpty(initialEmptyOwner);
       }
       break;
     }
@@ -6769,6 +6823,29 @@ struct OptDumpCtx {
   DenseSet<unsigned> rendered;
 };
 
+// True iff this OPT edge is realized on the resource's single shared EMPTY
+// semaphore (so the dump labels it "S_empty"). Empty-type edges that get their
+// OWN writable semaphore — a Singleton whose acquirer differs from the
+// initial-empty owner — keep their distinct per-edge name, because they are
+// distinct semaphores. This mirrors the emitter's choice in
+// createResourceSemaphores so the dump shows true semaphore identity.
+static bool edgeRendersSharedEmpty(const OptSyncDag &dag, const SyncPlan &sp,
+                                   unsigned idx) {
+  auto it = dag.edgeRendersEmpty.find(idx);
+  if (it == dag.edgeRendersEmpty.end() || !it->second)
+    return false;
+  const SyncGroup &g = dag.groups[dag.edgeToGroup[idx]];
+  if (g.kind != SyncGroupKind::Singleton)
+    return true; // LinearChain / DoneFanin empty edges share the one EMPTY.
+  std::optional<PartitionId> initialEmptyOwner;
+  for (const SyncGroup &sg : dag.groups)
+    if (sg.kind == SyncGroupKind::InitialEmpty) {
+      initialEmptyOwner = sg.initialOwner;
+      break;
+    }
+  return sameOwner(sp.edges[idx].dstOwner, initialEmptyOwner);
+}
+
 // Print the release+acquire pair for each edge anchored at `key`, in the order
 // they were recorded. Both rows render at the same depth. With `octx` set
 // (OPT-SYNC-DAG), only ReadyFanout/DoneFanin edges deviate from the per-edge
@@ -6806,8 +6883,20 @@ static void printEdgesAt(SmallVector<unsigned, 2> *edgeIdxs, SyncPlan &sp,
                    << ownerStr(anchor, edge.dstOwner) << "\n";
       if (!llvm::is_contained(faninHere, gi)) faninHere.push_back(gi);
     } else {
-      renderReleaseRow(depth, anchor, edge);
-      renderAcquireRow(depth, anchor, edge);
+      // OPT-SYNC-DAG: render each edge by its EMITTED semaphore identity so a
+      // collapse is visible in the dump. Every edge that rides the shared
+      // writable permit prints as "S_empty" (one physical semaphore); full
+      // edges keep their distinct per-edge name. A multi-handoff "linear chain"
+      // thus shows "S_empty" repeated across several R->W handoffs, exposing
+      // that they share one counter (rather than the misleading distinct
+      // per-edge S<n> names).
+      StringRef nm = edgeRendersSharedEmpty(dag, sp, idx) ? StringRef("S_empty")
+                                                          : StringRef(edge.name);
+      llvm::errs() << treePrefix(depth) << "|- r  " << nm << "  release  "
+                   << ownerStr(anchor, edge.srcOwner) << " -> "
+                   << ownerStr(anchor, edge.dstOwner) << "\n";
+      llvm::errs() << treePrefix(depth) << "|- a  " << nm << "  acquire  "
+                   << ownerStr(anchor, edge.dstOwner) << "\n";
     }
   }
   // A DoneFanin group's per-reader releases are above; its single shared
@@ -6854,12 +6943,13 @@ static void dumpRawSyncBlock(Block &block, SyncPlan &sp,
     if (&op == sp.initialPermitBeforeOp && !sp.initialPermitName.empty()) {
       StringRef entryName = sp.initialPermitName;
       if (octx && sp.initialPermitEdgeIdx >= 0) {
-        SyncGroupKind k =
-            octx->dag->groups[octx->dag->edgeToGroup[sp.initialPermitEdgeIdx]]
-                .kind;
+        unsigned ei = sp.initialPermitEdgeIdx;
+        SyncGroupKind k = octx->dag->groups[octx->dag->edgeToGroup[ei]].kind;
         if (k == SyncGroupKind::ReadyFanout)
           entryName = "S_full";
         else if (k == SyncGroupKind::DoneFanin)
+          entryName = "S_empty";
+        else if (edgeRendersSharedEmpty(*octx->dag, sp, ei))
           entryName = "S_empty";
       }
       llvm::errs() << treePrefix(depth) << "|- a  " << entryName
