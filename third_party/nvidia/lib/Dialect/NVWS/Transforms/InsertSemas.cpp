@@ -3306,16 +3306,14 @@ static ResourceSemaphores createResourceSemaphores(const OptSyncDag &dag,
   // acquirers differ must get distinct semaphores. Groups that share an
   // acquirer (e.g. the loop-entry permit and the loop-carry back edge, both
   // acquired by the writer) correctly share one.
-  SmallVector<std::pair<std::optional<PartitionId>, Value>, 4> emptyByAcquirer;
-  auto createSharedEmpty = [&](std::optional<PartitionId> acquirer) -> Value {
-    for (auto &kv : emptyByAcquirer)
-      if (sameOwner(kv.first, acquirer))
-        return kv.second;
-    Value sem = createSemaphore(b, loc, backing, /*released=*/true);
+  Value sharedEmptyCache;
+  auto createSharedEmpty = [&](std::optional<PartitionId> /*acquirer*/) -> Value {
+    if (sharedEmptyCache)
+      return sharedEmptyCache;
+    sharedEmptyCache = createSemaphore(b, loc, backing, /*released=*/true);
     if (!group.isTmem())
-      setPartitionFromAnchor(sem.getDefiningOp(), anchor);
-    emptyByAcquirer.push_back({acquirer, sem});
-    return sem;
+      setPartitionFromAnchor(sharedEmptyCache.getDefiningOp(), anchor);
+    return sharedEmptyCache;
   };
   auto createFull = [&]() -> Value {
     Value full = createSemaphore(b, loc, backing, /*released=*/false);
