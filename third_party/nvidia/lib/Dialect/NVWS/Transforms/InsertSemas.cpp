@@ -1367,9 +1367,16 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
   // Apply the "close cross-readers + optional handoff" rule. Used by W
   // (isW=true) and structural rows (isW=false). Returns true if any edge
   // was emitted at this row.
+  // `consumerGuaranteed`: the destination owner P is reached by a use that is
+  // guaranteed to exist even when no access follows this row in static program
+  // order — specifically a loop-carry back-edge (this row's YIELD flows to the
+  // loop's next-iteration ENTER, whose body has events). An owner change into
+  // such a carry is a real handoff and must emit, so it bypasses the
+  // static-downstream "release-into-void" suppression below.
   auto emitClose = [&](State &state, const Owner &P, Operation *anchorOp,
                        Region *anchorYieldRegion, bool isW,
-                       unsigned anchorRank) -> bool {
+                       unsigned anchorRank,
+                       bool consumerGuaranteed = false) -> bool {
     SmallVector<unsigned, 4> crossIdxs;
     for (unsigned i = 0; i < state.readers.size(); ++i)
       if (!sameOwner(state.readers[i], P)) crossIdxs.push_back(i);
@@ -1414,9 +1421,11 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
       fired = true;
     } else if (state.readers.empty() && state.writerSet &&
                !sameOwner(state.writer, P)) {
-      // Handoff: W always fires; structural row fires only if a real
-      // access exists downstream (release-into-void suppression).
-      if (isW || hasDownstreamAccess(anchorRank)) {
+      // Handoff: W always fires; a structural row fires if a real access
+      // exists downstream in program order (release-into-void suppression) OR
+      // the destination is reached via a guaranteed loop-carry consumer (op2
+      // is the next iteration, at a lower static rank).
+      if (isW || consumerGuaranteed || hasDownstreamAccess(anchorRank)) {
         SyncEdge edge;
         edge.name = makeEdgeName(serial++);
         edge.srcOwner = state.writer;
@@ -1522,11 +1531,14 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
                       /*isW=*/false, rank);
           }
           walkRegion(forOp.getRegion(), state);
-          // Transition at the body's YIELD row (loop-carry close).
+          // Transition at the body's YIELD row (loop-carry close). op2 is the
+          // loop's next-iteration ENTER (body has events by the precondition
+          // above), so an owner change here is a real carry handoff and must
+          // emit even with nothing after the loop in static order.
           Operation *yieldOp = forOp.getRegion().front().getTerminator();
           unsigned yieldRank = opRank.lookup(yieldOp);
           emitClose(state, pp, /*anchorOp=*/nullptr, &forOp.getRegion(),
-                    /*isW=*/false, yieldRank);
+                    /*isW=*/false, yieldRank, /*consumerGuaranteed=*/true);
           continue;
         }
         if (auto ifOp = dyn_cast<scf::IfOp>(&op)) {
