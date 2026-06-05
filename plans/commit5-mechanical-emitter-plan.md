@@ -64,8 +64,8 @@ If a valid input DAG produces output that violates a model invariant from §2 �
 **M1** (exactly one `is_released = true` semaphore per resource that has a seed;
 zero for an edge-free resource), **M2** (every
 other semaphore created unreleased and explicitly released), or **M3** (each
-semaphore acquired by exactly one owner) — treat it identically to a
-heuristic block:
+semaphore acquired by root and at most one concrete owner) — treat it identically
+to a heuristic block:
 
 1. **STOP IMMEDIATELY.** Do not "fix it up" with a special case, a merge, a
    split, a re-key, or any emit-time adjustment to make the invariant hold.
@@ -95,7 +95,9 @@ by this plan. A semaphore is created either already-released or not, is acquired
 
 The model is stated in terms of one concept only — the **owner** (partition).
 There is no reader/writer subdivision anywhere in the emitter: it keys on the
-acquiring owner and the seed marker, nothing else.
+acquiring owner and the seed marker, nothing else. `root` means the existing
+`std::nullopt` / root-external owner; a **concrete owner** means a present
+`PartitionId`.
 
 - **M1 — single released seed.** A resource with at least one synchronized
   handoff (i.e. an `InitialEmpty` seed group, F4) has **exactly one** semaphore
@@ -106,9 +108,14 @@ acquiring owner and the seed marker, nothing else.
 - **M2 — everything else is unreleased.** Every other semaphore is created
   `is_released = false` and is made acquirable only by an explicit
   `semaphore.release` from some owner.
-- **M3 — single acquirer.** A semaphore is acquired by exactly one owner. The
-  acquirer of every edge is `edge.dstOwner`, because the acquire is always
-  emitted immediately before the edge's destination.
+- **M3 — single concrete acquirer, optional root.** A semaphore's acquire-owner
+  set may contain `root` and at most one concrete owner `P`. Valid sets are
+  `{root}`, `{P}`, and `{root, P}`. Invalid sets are `{P, Q}` or
+  `{root, P, Q}` for `P != Q`. The acquirer of every edge is `edge.dstOwner`,
+  because the acquire is always emitted immediately before the edge's
+  destination; `root` is compatible with whichever single concrete owner also
+  acquires that semaphore, but it is not compatible with two different concrete
+  owners.
 
 **Why M1/M2 are correct (not assumed).** At program start the buffer is in
 exactly one well-defined state, so exactly one permit can legitimately begin
@@ -124,13 +131,14 @@ reading never-written memory is meaningless; the first owner therefore holds the
 buffer-free permit, and a free buffer is exactly the state that starts
 satisfied.)*
 
-**Why M3 prevents the known hangs.** Each `(group, owner)` class is a distinct
-semaphore acquired by exactly one owner (§6.2). The seed is claimed by the first
-owner only; any later owner (e.g. meta_fa's partitions `p1` and `p5`) acquires a
-*different*, unreleased semaphore that some earlier owner released to it — never
-the seed. Two owners can therefore never both acquire the same semaphore, which
-is the multi-acquirer condition that produced the meta_fa and
-`per_edge @three_member` hangs.
+**Why M3 prevents the known hangs.** Each `(group, concrete owner)` class is a
+distinct semaphore, with `root` allowed as an optional compatible acquirer
+(§6.2). The seed is claimed by the first concrete owner only, possibly with
+`root`; any later different concrete owner (e.g. meta_fa's partitions `p1` and
+`p5`) acquires a *different*, unreleased semaphore that some earlier owner
+released to it — never the seed. Two distinct concrete owners can therefore
+never both acquire the same semaphore, which is the multi-acquirer condition that
+produced the meta_fa and `per_edge @three_member` hangs.
 
 ---
 
@@ -155,7 +163,8 @@ These are the facts the design relies on. All confirmed by reading the source.
 - **F5.** Grouping is already mostly acquirer-homogeneous:
   - `ReadyFanout` only forms when **all** consumer edges share one `dstOwner`
     (`2241-2244`); otherwise the edges stay singletons.
-  - `DoneFanin` buckets are keyed by `dstOwner` (`2264`), so each is single-acquirer.
+  - `DoneFanin` buckets are keyed by `dstOwner` (`2264`), so each is one
+    `dstOwner` class.
   - `Singleton` has one edge → one `dstOwner`.
   - **`LinearChain` is the only kind that can contain two distinct `dstOwner`s**
     (a ping-pong alternates ownership between two owners, so its edges carry two
@@ -286,7 +295,7 @@ contain no op-kind tests, no positional parity, and no event-graph walks — onl
 ### 6.1 Data model
 
 ```
-// One semaphore per (group, acquirer partition).
+// One semaphore per (group, acquirer class): root or one concrete partition.
 struct SemaphoreId { unsigned groupIdx; std::optional<PartitionId> acquirer; };
 // Resource-level table.
 DenseMap<SemaphoreKey, Value> semaphores;     // SemaphoreKey == hashable SemaphoreId
@@ -298,7 +307,9 @@ DenseMap<SemaphoreKey, Value> semaphores;     // SemaphoreKey == hashable Semaph
 
 For each group `g` in `dag.groups` **that has edges**, partition its edges by
 `edge.dstOwner`. Each distinct `dstOwner` class is **one semaphore**, keyed
-`(g.idx, dstOwner)`.
+`(g.idx, dstOwner)`. This remains the conservative deterministic construction:
+the plan does **not** add a heuristic that merges `root` with a concrete owner
+just because such sharing would be valid.
 
 - Singleton / ReadyFanout / DoneFanin → exactly one class (single `dstOwner`,
   verified F5) → one semaphore.
@@ -308,8 +319,11 @@ For each group `g` in `dag.groups` **that has edges**, partition its edges by
   the seed *marker*; §6.3 marks exactly one edge-keyed semaphore as the released
   seed (the forward-first-acquire rule), uniformly — no loop/single-use split.
 
-This makes M3 (single acquirer) **structural**: a semaphore is, by definition,
-the set of edges in one group with one acquirer.
+This makes the concrete part of M3 **structural**: stage 2 never intentionally
+assigns one semaphore to two different concrete owners. `root` is special only
+for validation/materialized IR: if the same semaphore is observed as acquired by
+`root` and one concrete owner, that is M3-valid; if it is acquired by two
+different concrete owners, with or without `root`, that is an M3 violation.
 
 **Deterministic creation order** (external-review finding #4). Semaphore creation
 must iterate `dag.groups` in order, then each group's `edgeIdxs` in order,
@@ -547,9 +561,9 @@ schedules materialize correct IR.
 
 ### 8.3 Invariant sweeps
 
-Re-run the per-`tt.func` single-acquirer / no-dropped-release checker over the
-emitted IR of every NVWS lit test, in both OPT and RAW modes. Zero violations
-required.
+Re-run the per-`tt.func` single-concrete-acquirer-with-optional-root /
+no-dropped-release checker over the emitted IR of every NVWS lit test, in both
+OPT and RAW modes. Zero violations required.
 
 ---
 
@@ -632,7 +646,8 @@ These are **not** assumed by the design; each is a gated step.
    (§1).
 5. **Post-emit verifier.** Add to `verifyPostEmission`: M1 (exactly one
    `is_released=true` semaphore for any resource that emits semaphores; zero for
-   an edge-free resource) and M3 (each semaphore acquired by exactly one owner).
+   an edge-free resource) and M3 (each semaphore acquired by root and at most one
+   concrete owner).
    Each is a hard-fail per the §1 Hard Rule, not a repair trigger. M2 first-event
    consistency is validated by the schedule-dump / code-review audit (§9-V6a),
    not by `verifyPostEmission`. Also review the F11 cleanups (§9-V4).
@@ -668,8 +683,8 @@ step.
   logic), **except** the two changes this plan requires: (a) factoring
   `buildOptSyncDag` so the flag can skip merge formation while the common
   finalization still runs (§7.2), and (b) adding the derived `releasedSemaphores`
-  seed fact in that finalization (§6.3, §9-V6). The single-acquirer guards already
-  present in ReadyFanout (`2241-2244`) are retained.
+  seed fact in that finalization (§6.3, §9-V6). The same-`dstOwner` guards
+  already present in ReadyFanout (`2241-2244`) are retained.
 - No change to stage/phase assignment (separate pass `AssignStagePhase.cpp`).
 - No change to the older, unrelated `nvws-insert-semaphore` pass
   (`InsertSemaphore.cpp`).
@@ -682,13 +697,15 @@ step.
 - All semantic emit decisions live in the commit-4.5 schedule (§6.7); commit-5 is
   an ordered `switch` over schedule actions, deterministic canonical placement,
   and verification, with zero op-kind / parity / event-walk heuristics. Semaphore
-  identity is a pure function of `(group, dstOwner, seed-marker)`.
+  identity is a pure function of `(group, dstOwner, seed-marker)`, and M3
+  validation treats `root` as compatible with at most one concrete owner.
 - The same input emits correct IR with `disable-opt-sync-dag` false and true,
   proven by the §8.1.1 lit test.
 - `verifyPostEmission` enforces M1 (one released seed per seeded resource; zero
-  for an edge-free resource) and M3 (single acquirer per semaphore); all pass on
-  the full lit suite in both modes. M2 first-event consistency is verified by
-  schedule-dump FileChecks / code review (§9-V6a), not by `verifyPostEmission`.
+  for an edge-free resource) and M3 (single concrete acquirer per semaphore, with
+  optional `root`); all pass on the full lit suite in both modes. M2 first-event
+  consistency is verified by schedule-dump FileChecks / code review (§9-V6a), not
+  by `verifyPostEmission`.
 - matmul and meta_fa pass on GPU in both modes (or RAW-mode GPU limitation is
   documented, not hidden).
 - `test/TritonGPU/automatic-warp-specialization.mlir` passes unmodified.
