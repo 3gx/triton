@@ -3493,9 +3493,11 @@ static ResourceSemaphores createResourceSemaphores(const OptSyncDag &dag,
 
   // Mechanical identity: exactly one semaphore per canonical `semaRep` class.
   // A class is created released=true iff it is the seed's class (the single
-  // initial permit — M1); every other class is released=false (M2). Iterate
-  // ids in a deterministic order (edges in index order, then the seed) so the
-  // creation order is stable. No empty/full, no acquirer keying, no op-kind.
+  // initial permit — M1); every other class is released=false (M2). Creation
+  // order is the deterministic §6.5 order: walk dag.groups in order (the
+  // InitialEmpty seed group is group 0, so the released seed is created first),
+  // then each group's edgeIdxs in order. No empty/full, no acquirer keying, no
+  // op-kind.
   unsigned seedRep = sp.semaFind(semas.seedId);
   auto ensureClass = [&](unsigned id) {
     unsigned rep = sp.semaFind(id);
@@ -3506,8 +3508,17 @@ static ResourceSemaphores createResourceSemaphores(const OptSyncDag &dag,
       setPartitionFromAnchor(sem.getDefiningOp(), anchor);
     semas.byClass[rep] = sem;
   };
-  for (unsigned i = 0; i < sp.edges.size(); ++i)
-    ensureClass(i);
+  for (const SyncGroup &syncGroup : dag.groups) {
+    if (syncGroup.kind == SyncGroupKind::InitialEmpty) {
+      ensureClass(semas.seedId);
+      continue;
+    }
+    for (unsigned edgeIdx : syncGroup.edgeIdxs)
+      ensureClass(edgeIdx);
+  }
+  // Safety: ensure the seed class exists even if no InitialEmpty group is present
+  // (an edge-bearing resource with no separate seed marker still needs its seed
+  // class materialized for forClass()).
   ensureClass(semas.seedId);
   return semas;
 }
