@@ -7065,29 +7065,6 @@ struct OptDumpCtx {
   DenseSet<unsigned> rendered;
 };
 
-// True iff this OPT edge is realized on the resource's single shared EMPTY
-// semaphore (so the dump labels it "S_empty"). Empty-type edges that get their
-// OWN writable semaphore — a Singleton whose acquirer differs from the
-// initial-empty owner — keep their distinct per-edge name, because they are
-// distinct semaphores. This mirrors the emitter's choice in
-// createResourceSemaphores so the dump shows true semaphore identity.
-static bool edgeRendersSharedEmpty(const OptSyncDag &dag, const SyncPlan &sp,
-                                   unsigned idx) {
-  auto it = dag.edgeRendersEmpty.find(idx);
-  if (it == dag.edgeRendersEmpty.end() || !it->second)
-    return false;
-  const SyncGroup &g = dag.groups[dag.edgeToGroup[idx]];
-  if (g.kind != SyncGroupKind::Singleton)
-    return true; // LinearChain / DoneFanin empty edges share the one EMPTY.
-  std::optional<PartitionId> initialEmptyOwner;
-  for (const SyncGroup &sg : dag.groups)
-    if (sg.kind == SyncGroupKind::InitialEmpty) {
-      initialEmptyOwner = sg.initialOwner;
-      break;
-    }
-  return sameOwner(sp.edges[idx].dstOwner, initialEmptyOwner);
-}
-
 // Print the release+acquire pair for each edge anchored at `key`, in the order
 // they were recorded. Both rows render at the same depth. With `octx` set
 // (OPT-SYNC-DAG), only ReadyFanout/DoneFanin edges deviate from the per-edge
@@ -7110,31 +7087,33 @@ static void printEdgesAt(SmallVector<unsigned, 2> *edgeIdxs, SyncPlan &sp,
     const SyncEdge &edge = sp.edges[idx];
     unsigned gi = dag.edgeToGroup[idx];
     const SyncGroup &g = dag.groups[gi];
+    // OPT-SYNC-DAG identity == RAW-SYNC-DAG (canonical union-find name). A
+    // combine differs from RAW ONLY in structure: ReadyFanout renders one
+    // shared release (dst-set) + per-consumer acquires; DoneFanin renders
+    // per-reader releases + one shared pending-count acquire. The combined
+    // group is one semaphore, named by its representative edge's canonical name
+    // (NOT an invented "S_empty"/"S_full").
     if (g.kind == SyncGroupKind::ReadyFanout) {
+      StringRef nm = canonicalSemaName(sp, g.edgeIdxs.front());
       if (octx->rendered.insert(gi).second) {
         SmallVector<std::optional<PartitionId>, 4> dsts;
         for (unsigned ei : g.edgeIdxs) dsts.push_back(sp.edges[ei].dstOwner);
-        llvm::errs() << treePrefix(depth) << "|- r  S_full  release  "
+        llvm::errs() << treePrefix(depth) << "|- r  " << nm << "  release  "
                      << ownerStr(anchor, sp.edges[g.edgeIdxs.front()].srcOwner)
                      << " -> " << ownerSetStr(anchor, dsts) << "\n";
       }
-      llvm::errs() << treePrefix(depth) << "|- a  S_full  acquire  "
+      llvm::errs() << treePrefix(depth) << "|- a  " << nm << "  acquire  "
                    << ownerStr(anchor, edge.dstOwner) << "\n";
     } else if (g.kind == SyncGroupKind::DoneFanin) {
-      llvm::errs() << treePrefix(depth) << "|- r  S_empty  release  "
+      StringRef nm = canonicalSemaName(sp, idx);
+      llvm::errs() << treePrefix(depth) << "|- r  " << nm << "  release  "
                    << ownerStr(anchor, edge.srcOwner) << " -> "
                    << ownerStr(anchor, edge.dstOwner) << "\n";
       if (!llvm::is_contained(faninHere, gi)) faninHere.push_back(gi);
     } else {
-      // OPT-SYNC-DAG: render each edge by its EMITTED semaphore identity so a
-      // collapse is visible in the dump. Every edge that rides the shared
-      // writable permit prints as "S_empty" (one physical semaphore); full
-      // edges keep their distinct per-edge name. A multi-handoff "linear chain"
-      // thus shows "S_empty" repeated across several R->W handoffs, exposing
-      // that they share one counter (rather than the misleading distinct
-      // per-edge S<n> names).
-      StringRef nm = edgeRendersSharedEmpty(dag, sp, idx) ? StringRef("S_empty")
-                                                          : StringRef(edge.name);
+      // Singleton / LinearChain: identical to RAW — each edge by its own
+      // canonical name (carry-united edges share a name, the rest distinct).
+      StringRef nm = canonicalSemaName(sp, idx);
       llvm::errs() << treePrefix(depth) << "|- r  " << nm << "  release  "
                    << ownerStr(anchor, edge.srcOwner) << " -> "
                    << ownerStr(anchor, edge.dstOwner) << "\n";
@@ -7149,8 +7128,9 @@ static void printEdgesAt(SmallVector<unsigned, 2> *edgeIdxs, SyncPlan &sp,
     const SyncGroup &g = dag.groups[gi];
     SmallVector<std::optional<PartitionId>, 4> srcs;
     for (unsigned ei : g.edgeIdxs) srcs.push_back(sp.edges[ei].srcOwner);
-    llvm::errs() << treePrefix(depth) << "|- a  S_empty  acquire  pending="
-                 << ownerSetStr(anchor, srcs) << "  "
+    llvm::errs() << treePrefix(depth) << "|- a  "
+                 << canonicalSemaName(sp, g.edgeIdxs.front())
+                 << "  acquire  pending=" << ownerSetStr(anchor, srcs) << "  "
                  << ownerStr(anchor, sp.edges[g.edgeIdxs.front()].dstOwner)
                  << "\n";
   }
@@ -7185,23 +7165,15 @@ static void dumpRawSyncBlock(Block &block, SyncPlan &sp,
     // show the combined name so the entry matches the rest of the combine.
     if (&op == sp.initialPermitBeforeOp && !sp.initialPermitName.empty()) {
       StringRef entryName = sp.initialPermitName;
-      // RAW dump: render the seed under its unified (canonical) name so the
-      // entry permit and the loop-carried edge it merges with show identically.
-      if (!octx && !sp.semaRep.empty()) {
+      // Render the seed under its unified (canonical) name so the entry permit
+      // and the loop-carried edge it merges with show identically — in BOTH the
+      // RAW and OPT dumps (the union-find identity is the single source of
+      // truth; the old empty/full overlay is gone).
+      if (!sp.semaRep.empty()) {
         unsigned seedId = static_cast<unsigned>(sp.edges.size());
         unsigned rep = sp.semaFind(seedId);
         if (rep < sp.edges.size())
           entryName = sp.edges[rep].name;
-      }
-      if (octx && sp.initialPermitEdgeIdx >= 0) {
-        unsigned ei = sp.initialPermitEdgeIdx;
-        SyncGroupKind k = octx->dag->groups[octx->dag->edgeToGroup[ei]].kind;
-        if (k == SyncGroupKind::ReadyFanout)
-          entryName = "S_full";
-        else if (k == SyncGroupKind::DoneFanin)
-          entryName = "S_empty";
-        else if (edgeRendersSharedEmpty(*octx->dag, sp, ei))
-          entryName = "S_empty";
       }
       llvm::errs() << treePrefix(depth) << "|- a  " << entryName
                    << "  acquire  root\n";
