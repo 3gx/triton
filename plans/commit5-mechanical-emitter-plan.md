@@ -210,6 +210,23 @@ These are the facts the design relies on. All confirmed by reading the source.
   model does not use. They are **not** the seed mechanism for this plan. The seed
   is computed by the forward-first-acquire rule (§6.3) and promoted to a real DAG
   fact (§9-V6); this also satisfies external-review finding #1.
+- **F13.** **The only live token after emission is the `semaphore.acquire` token;
+  the original TMEM SSA tokens are discarded.** Verified in `InsertSemas.cpp`:
+  - TMEM access-op tokens (the `!ttg.async.token` results of
+    `ttng.tmem_load` / `ttng.tmem_store` / `ttng.tc_gen5_mma`) are rewired to the
+    current acquire token by `replaceTokenResults(op, token)` (`3999-4003`), called
+    from the access-event emitter. The MMA/load/store dependency is now carried by
+    the acquire token, not the TMEM dataflow token.
+  - The `TMEMAllocOp` token is dead and is replaced with `ub.poison` by
+    `poisonOriginalTmemAllocTokens` (`4020-4044`), run post-emission at `7794`.
+  - Carrier threading through `scf.for` / `scf.if` (§6.6) therefore threads
+    **acquire tokens only** (`state.currentToken = acquire.getToken()`, e.g.
+    `4826`, `5167`); it never threads a TMEM alloc/op token. This mirrors the
+    canonical pattern in the sibling pass `InsertTmemSemaphore.cpp` (acquire token
+    becomes the replacement token; alloc token → `ub.poison`;
+    `tmemLoad/Store/mma.getToken().replaceAllUsesWith(replToken)` at `922/933/940`,
+    poison at `1464/1620`). This plan does **not** change that model — it is
+    recorded so §6.6 and the §5 backend are explicit about it.
 
 ---
 
@@ -268,7 +285,11 @@ of by an inline IR walk:
 - `emitAcquire` (`3840`) / `emitRelease` (`3847`) ← `Acquire` / `Release`.
 - `SemaphoreBufferOp` view + access retarget ← `Buffer`.
 - `threadCarrierThroughFor/If` and the `scf.for`/`scf.if` rewriting (`6399-6608`)
-  ← `ThreadToken`.
+  ← `ThreadToken` (acquire tokens only, F13).
+- `replaceTokenResults` (`3999-4003`) rewires each TMEM access-op token to the live
+  acquire token, and `poisonOriginalTmemAllocTokens` (`4020-4044`, post-emission at
+  `7794`) replaces the dead `TMEMAllocOp` token with `ub.poison` (F13). These are
+  reused verbatim; they are the reason "token" means the acquire token everywhere.
 
 The carrier-threading surgery is **not** rewritten — only its *trigger* moves
 from inline decisions to explicit `ThreadToken` actions. Stage 3 may inspect IR
@@ -399,15 +420,24 @@ insertion point / partition stamping (`getSemaphoreInsertionAnchor` /
 
 ### 6.6 Token threading (forward, uniform)
 
-Each acquire yields a token consumed by its release. The token flows **forward**
-along the DAG: when its release is past a region boundary, the token is yielded as
-a region result; when that region is an `scf.for`, the result is threaded as an
-`iter_arg` to the next iteration; threading continues forward until the token
-reaches its release. This is **one uniform mechanism** for every resource — loop
-and straight-line alike. Stage 2 records it as `ThreadToken` actions (§6.7); stage
-3 materializes them with the existing carrier-threading backend
-(`threadForOps` / `threadIfOps`, `threadCarrierThroughFor/If`, F2/§5). No
-loop-specific decision is made and no back edge is introduced.
+**The only token threaded is the `semaphore.acquire` token (F13).** The original
+TMEM SSA tokens are *not* synchronization carriers in the emitted IR: each TMEM
+access op's token (`tmem_load` / `tmem_store` / `tc_gen5_mma`) is rewired to the
+live acquire token (`replaceTokenResults`, `3999-4003`), and the `TMEMAllocOp`
+token is replaced with `ub.poison` (`poisonOriginalTmemAllocTokens`, `4020-4044`,
+post-emission at `7794`). So "token" everywhere below means the acquire token; no
+`ThreadToken` action ever threads, yields, or iter-args a TMEM alloc/op token.
+
+Each acquire yields its (acquire) token, consumed by its release. The token flows
+**forward** along the DAG: when its release is past a region boundary, the token
+is yielded as a region result; when that region is an `scf.for`, the result is
+threaded as an `iter_arg` to the next iteration; threading continues forward until
+the token reaches its release. This is **one uniform mechanism** for every
+resource — loop and straight-line alike. Stage 2 records it as `ThreadToken`
+actions (§6.7); stage 3 materializes them with the existing carrier-threading
+backend (`threadForOps` / `threadIfOps`, `threadCarrierThroughFor/If`, F2/§5),
+plus the two post-emission token-replacement passes above. No loop-specific
+decision is made and no back edge is introduced.
 
 ### 6.7 The emit schedule (commit 4.5)
 
@@ -598,7 +628,13 @@ These are **not** assumed by the design; each is a gated step.
 - **V4 (Step 5).** Confirm the post-emission cleanups (F11) remain correct under
   the new single-seed scheme (they currently assume the old shared-empty); adjust
   or assert as needed. `hoistInitialEmptyAcquires` in particular is named for the
-  old model and must be reviewed.
+  old model and must be reviewed. Also confirm the TMEM token model (F13) is
+  preserved: after emission only `semaphore.acquire` tokens are live —
+  `replaceTokenResults` (`3999-4003`) has rewired every TMEM access-op token to the
+  acquire token, and `poisonOriginalTmemAllocTokens` (`4020-4044`, `7794`) has
+  replaced the `TMEMAllocOp` token with `ub.poison`. No `ThreadToken` action may
+  thread a TMEM alloc/op token; if any survives un-poisoned, that is a defect to
+  fix in the emitter, not to work around.
 - **V5 (Step 4).** Before deleting the emit-path synthesizers
   (`findTerminalReadReleaseAnchor` / `edgeNeedsTerminalReadRelease`, F9) **and**
   before rerouting the loop-exit drain (`5022-5156`, external-review finding #2),
