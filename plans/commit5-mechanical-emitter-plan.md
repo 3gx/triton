@@ -4,6 +4,14 @@ Status: proposal (awaiting approval before any code is written)
 Scope: `third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemas.cpp` only,
 plus its pass-option TableGen (`Passes.td`) and NVWS lit tests under `test/NVWS/`.
 
+> **APPROVED RUN SCOPE — read §13 before implementing.** The user has scoped the
+> first implementation round more tightly than the full plan above: **edit only
+> `InsertSemas.cpp`** (no `Passes.td`, no lit-test edits), validate via
+> `logs/per-edge-plan/commit4.5/*.txt` dumps plus two specific GPU tests under a
+> 60-second hang budget, and return for review without committing. Where §13
+> narrows or defers anything in §1–§12 (notably the §7 flag and §8.1
+> interchangeability lit test), **§13 governs this round.**
+
 This document contains only claims that were verified by reading the current
 source at HEAD `393b0f8b03`. Every code reference is a line number in
 `InsertSemas.cpp` unless stated otherwise. Items that still require empirical
@@ -714,3 +722,72 @@ step.
   produced an invariant violation, was escalated per the §1 Hard Rules
   (stopped, root-caused, exampled, reported) and resolved upstream — not at
   emit time.
+
+---
+
+## 13. Approved run scope (this implementation round)
+
+This section records the user-approved scope and acceptance procedure for the
+first implementation round. Where it narrows or defers anything in §1–§12, **§13
+governs this round** (referenced from the top of this document).
+
+### 13.1 File scope — `InsertSemas.cpp` only
+
+- **Edit only `third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemas.cpp`.**
+  Nothing else.
+- **Do not edit `Passes.td`.** Consequence: the §7 `disable-opt-sync-dag` flag is
+  **deferred** — it cannot be added without `Passes.td`. The mechanical emitter is
+  built against the OPT-SYNC-DAG produced today; RAW-interchangeability (§7) is
+  proven in a later round, only after the user authorizes touching `Passes.td`.
+  The mechanical core (stages 2+3 + verifier) is entirely inside `InsertSemas.cpp`
+  and is fully in scope.
+- **Do not edit any lit test.** Consequence: the §8.1.1 interchangeability lit
+  test is **deferred**. The existing lit suite must still **pass**; a stale CHECK
+  failure is a **STOP-and-report**, never a test edit.
+- **Do not commit.** Return for the user's review when the round is clean.
+- **BEFORE RETUNRING VERIFY that 13.2 is passing** if they are hanging ti means there is bug and verificaiotn you did failed.
+
+Generating `logs/per-edge-plan/commit4.5/*.txt` dumps is in scope — those are
+output artifacts, not source, and writing them is not a source edit.
+
+### 13.2 Correctness gates — exactly two GPU tests
+
+```
+pytest -s python/test/unit/language/test_warp_specialization.py::test_warp_specialize_tma_matmul_persistent[True-True-4-3-64-256-128-8192-8192-512]
+pytest -v python/test/unit/language/test_warp_specialization.py::test_warp_specialize_tma_matmul[False-4-2-64-128-128-8192-8192-512]
+```
+
+- **Both pass on the current commit** — that is the regression baseline.
+- **60-second budget per test. If a test does not finish within 60s, it HANGED.**
+- **A hang means semaphores were inserted incorrectly.** Investigate the
+  **post-`insert-semas` IR / DAGs / MLIR**, locate the bad placement, root-cause
+  it, and fix in `InsertSemas.cpp`. Run `third_party/tlx/killgpu.sh` after any
+  hang.
+- Both tests must pass before returning for review.
+
+### 13.3 Sequence
+
+0. **Read-only gates first (no code).** V1 dump on the *current* binary (one
+   released seed per resource? LinearChain the only multi-`dstOwner` kind?);
+   V5/V7 audit of `emitTmemLinearLoopExitDrain` (`5022-5160`) and
+   `emitResourceBlock`; capture the current-commit passing post-`insert-semas` IR
+   for both §13.2 tests as the diff baseline. Any decision that cannot reduce to a
+   DAG fact → **STOP and report before writing emitter code** (§1).
+1. Implement commit-4.5 `buildEmitSchedule` (stage 2) + the `releasedSemaphores`
+   seed fact (§6.3, §9-V6).
+2. Implement commit-5 `materializeSchedule` + `verifyPostEmission` (M1/M3
+   hard-fail); delete the empty/full machinery and emit-path heuristics (§5).
+3. Rebuild so pytest picks up the C++ change; **regenerate
+   `logs/per-edge-plan/commit4.5/*.txt` for each test case** and inspect every one
+   — no race, no hang, all semaphores correctly inserted. Fix in `InsertSemas.cpp`
+   and regenerate until clean.
+4. Run both §13.2 gates under the 60s budget. Hang → investigate
+   post-`insert-semas` IR, root-cause, fix, regenerate dumps, rerun.
+5. Both dumps clean **and** both tests pass → return for review. No commit.
+
+### 13.4 Hard rules (unchanged, restated for this round)
+
+If a case appears to need a **heuristic**, or a valid DAG produces an **M1/M2/M3
+violation** — **STOP, root-cause, build a minimal example, report, wait** (§1).
+No improvised special case, no "temporary" fallback, no op-kind sniffing in the
+emitter.
