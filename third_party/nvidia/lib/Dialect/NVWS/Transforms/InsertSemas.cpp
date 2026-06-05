@@ -42,6 +42,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -1054,6 +1055,20 @@ struct SyncPlan {
   // to render the entry acquire with the combined name (S_full/S_empty) when
   // that reused edge is itself part of a fan-in/out combine.
   int initialPermitEdgeIdx = -1;
+  // Semaphore-identity union-find (commit 3). Size = edges.size() + 1; the last
+  // slot (index == edges.size()) is the seed/initial permit. semaRep[i] is the
+  // representative of i's class; two edges (or an edge and the seed) in the same
+  // class are the SAME physical semaphore. Computed by the reaching-acquire rule
+  // (§ unifySemaphoreIdentities): every access's buffer permit comes from the
+  // nearest acquire on each control-flow path (including the loop back-edge); the
+  // semaphores of all acquires reaching one access must be one, so they are
+  // united. Rendered by the RAW-SYNC-DAG dump via canonical names.
+  SmallVector<unsigned, 8> semaRep;
+  unsigned semaFind(unsigned x) const {
+    while (semaRep[x] != x)
+      x = semaRep[x];
+    return x;
+  }
 };
 
 static bool touchReads(const AccessTouch &t) { return hasRead(t.effect); }
@@ -1639,6 +1654,94 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
       }
     }
   }
+
+  // ---- Semaphore-identity unification (commit 3) ----
+  // Reaching-acquire rule: an access's buffer permit is provided by the nearest
+  // acquire on each control-flow path. The loop back-edge means a loop's first
+  // carried access is reached by BOTH the acquire entering the loop and the
+  // carried (last) acquire of the body — so those semaphores MUST be the same.
+  // Walk forward (modelling each loop body's back-edge) and union the semaphores
+  // feeding each access. Element ids: 0..edges-1 = edges, edges.size() = seed.
+  // No op-kind / read-vs-write / parity assumption.
+  {
+    unsigned seedId = static_cast<unsigned>(sp.edges.size());
+    sp.semaRep.resize(seedId + 1);
+    for (unsigned i = 0; i <= seedId; ++i)
+      sp.semaRep[i] = i;
+    auto unite = [&](unsigned a, unsigned b) {
+      a = sp.semaFind(a);
+      b = sp.semaFind(b);
+      if (a != b)
+        sp.semaRep[std::max(a, b)] = std::min(a, b);
+    };
+    DenseMap<Operation *, SmallVector<unsigned, 2>> acqByOp;
+    DenseMap<Region *, SmallVector<unsigned, 2>> acqByYield;
+    for (auto [i, e] : llvm::enumerate(sp.edges)) {
+      if (e.dstOp)
+        acqByOp[e.dstOp].push_back(static_cast<unsigned>(i));
+      else if (e.dstYieldRegion)
+        acqByYield[e.dstYieldRegion].push_back(static_cast<unsigned>(i));
+    }
+    // Edges acquired at the same anchor (op or region-yield) are one acquire
+    // for that access — unite them and return the canonical id.
+    auto uniteAnchor = [&](ArrayRef<unsigned> es) -> unsigned {
+      for (unsigned e : es)
+        unite(es.front(), e);
+      return es.front();
+    };
+    // Forward walk threading the "current permit" (the most recent acquire). At
+    // each loop, the iter_arg carrying this resource has init = the permit
+    // entering the loop and yield = the permit live at the body's end; the
+    // loop's first carried access is therefore fed by BOTH, so they are the same
+    // semaphore — unite(enterPermit, bodyExit). Returns the permit live at the
+    // region's end.
+    std::function<unsigned(Region &, unsigned)> walk =
+        [&](Region &region, unsigned incoming) -> unsigned {
+      unsigned current = incoming;
+      for (Block &blk : region) {
+        for (Operation &op : blk) {
+          if (auto forOp = dyn_cast<scf::ForOp>(&op)) {
+            bool carriesResource = false;
+            forOp.getRegion().walk([&](Operation *o) {
+              if (sp.accessOps.contains(o))
+                carriesResource = true;
+            });
+            if (carriesResource) {
+              unsigned enter = current;
+              auto it = acqByOp.find(&op);
+              if (it != acqByOp.end())
+                enter = uniteAnchor(it->second);
+              unsigned bodyExit = walk(forOp.getRegion(), enter);
+              unite(enter, bodyExit); // carry: iter_arg init == yield
+              current = bodyExit;
+              continue;
+            }
+          }
+          // scf.if: a guarded acquire still produces the permit live after the
+          // branch. Descend into both regions with the same incoming permit and
+          // unite their exits (they feed the one scf.if result / carried slot),
+          // so a re-acquire nested in a branch is unified with the loop carry.
+          if (auto ifOp = dyn_cast<scf::IfOp>(&op)) {
+            unsigned thenExit = walk(ifOp.getThenRegion(), current);
+            unsigned elseExit = current;
+            if (!ifOp.getElseRegion().empty())
+              elseExit = walk(ifOp.getElseRegion(), current);
+            unite(thenExit, elseExit);
+            current = sp.semaFind(thenExit);
+            continue;
+          }
+          auto it = acqByOp.find(&op);
+          if (it != acqByOp.end())
+            current = uniteAnchor(it->second);
+        }
+      }
+      auto yit = acqByYield.find(&region);
+      if (yit != acqByYield.end())
+        current = uniteAnchor(yit->second);
+      return current;
+    };
+    walk(funcOp.getBody(), seedId);
+  }
   return sp;
 }
 
@@ -1697,6 +1800,14 @@ struct OptSyncDag {
   // match the emitted semaphores (and unify the cyclic back-edge with the
   // initial writable permit). Absent ⇒ not an EMPTY edge.
   DenseMap<unsigned, bool> edgeRendersEmpty;
+  // §6.3 released-bit fact: the set of semaphore classes (groupIdx, acquirer)
+  // created `is_released = true`. Computed once in buildOptSyncDag's
+  // finalization by a forward program-order scan: a class is released iff its
+  // earliest event in program order is an acquire (nothing releases it before
+  // its first acquire). M1 expects exactly one entry for a seeded resource.
+  // Stage-2 diagnostic only at this stage (not yet consumed by the emitter).
+  SmallVector<std::pair<unsigned, std::optional<PartitionId>>, 2>
+      releasedSemaphores;
   // Where to render the release row(s).
   //   Singleton:    `releaseBeforeOp[dstOp]`        (release+acquire pair
   //                 at dst — matches RAW shape).
@@ -2793,6 +2904,73 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
       dag.edgeRendersEmpty[edgeIdx] = usesEmpty;
     }
   }
+
+  // §6.3 released-bit fact (stage-2 diagnostic). Forward program-order scan over
+  // semaphore classes keyed (groupIdx, acquirer). The scan is uniform: for every
+  // edge the destination is an *acquire* and the source is a *release* (an empty
+  // edge has the reader release and the next writer acquire; a full edge has the
+  // producer release and the consumer acquire — both place the acquire at dst and
+  // the release at src). The InitialEmpty seed group contributes a single acquire
+  // at its first writer with no preceding release. A class is created
+  // `is_released = true` iff its earliest event is an acquire (§6.3): nothing
+  // releases it before its first acquire. M1 expects exactly one such class for a
+  // seeded resource; this is asserted/inspected, never repaired (§1).
+  {
+    DenseMap<Operation *, unsigned> rank;
+    if (!dag.groups.empty()) {
+      Operation *anchor = group.members.front().allocOp;
+      if (auto funcOp = anchor->getParentOfType<triton::FuncOp>())
+        buildProgramOrderRank(funcOp, rank);
+    }
+    auto rankOf = [&](Operation *op, Region *region) -> std::optional<unsigned> {
+      Operation *keyOp = op ? op : (region ? region->getParentOp() : nullptr);
+      if (!keyOp)
+        return std::nullopt;
+      auto it = rank.find(keyOp);
+      if (it == rank.end())
+        return std::nullopt;
+      return it->second;
+    };
+    struct ClassEvents {
+      unsigned groupIdx = 0;
+      std::optional<PartitionId> acquirer;
+      std::optional<unsigned> firstAcquire;
+      std::optional<unsigned> firstRelease;
+    };
+    SmallVector<ClassEvents, 4> classes;
+    auto classFor = [&](unsigned gIdx,
+                        std::optional<PartitionId> acquirer) -> ClassEvents & {
+      for (ClassEvents &c : classes)
+        if (c.groupIdx == gIdx && sameOwner(c.acquirer, acquirer))
+          return c;
+      classes.push_back(ClassEvents{gIdx, acquirer, std::nullopt, std::nullopt});
+      return classes.back();
+    };
+    auto noteEvent = [](std::optional<unsigned> &slot, std::optional<unsigned> r) {
+      if (r && (!slot || *r < *slot))
+        slot = r;
+    };
+    for (auto [idx, syncGroup] : llvm::enumerate(dag.groups)) {
+      unsigned gIdx = static_cast<unsigned>(idx);
+      if (syncGroup.kind == SyncGroupKind::InitialEmpty) {
+        ClassEvents &c = classFor(gIdx, syncGroup.initialOwner);
+        noteEvent(c.firstAcquire, rankOf(syncGroup.initialOp, nullptr));
+        continue;
+      }
+      for (unsigned edgeIdx : syncGroup.edgeIdxs) {
+        const SyncEdge &edge = sp.edges[edgeIdx];
+        ClassEvents &c = classFor(gIdx, edge.dstOwner);
+        noteEvent(c.firstAcquire, rankOf(edge.dstOp, edge.dstYieldRegion));
+        noteEvent(c.firstRelease, rankOf(edge.srcOp, edge.srcYieldRegion));
+      }
+    }
+    for (const ClassEvents &c : classes) {
+      bool released = c.firstAcquire &&
+                      (!c.firstRelease || *c.firstAcquire < *c.firstRelease);
+      if (released)
+        dag.releasedSemaphores.push_back({c.groupIdx, c.acquirer});
+    }
+  }
   return dag;
 }
 
@@ -3501,9 +3679,13 @@ static Value getSemaphoreForGroup(unsigned groupIdx, const SyncEdge *edge,
   case SyncGroupKind::ReadyFanout:
     return pair.full;
   case SyncGroupKind::LinearChain:
-    if (linearChainEdgeUsesEmpty(syncGroup, sp, dag, edge, group,
-                                 dag.resource.second))
-      return pair.empty;
+    // F7 fix: the empty/full selection is the single DAG fact
+    // `dag.edgeRendersEmpty` (computed once in buildOptSyncDag from the same
+    // classifiers), not a re-derived emit-time heuristic.
+    if (edge)
+      if (std::optional<unsigned> ei = findEdgeIndex(sp, edge))
+        if (dag.edgeRendersEmpty.lookup(*ei))
+          return pair.empty;
     if (edge) {
       for (unsigned edgeIdx : syncGroup.edgeIdxs) {
         if (&sp.edges[edgeIdx] != edge)
@@ -3516,8 +3698,11 @@ static Value getSemaphoreForGroup(unsigned groupIdx, const SyncEdge *edge,
     }
     return pair.full;
   case SyncGroupKind::Singleton:
-    if (edge && edgeUsesEmpty(*edge, group, dag.resource.second))
-      return pair.empty;
+    // F7 fix: single source of truth for empty/full (see LinearChain above).
+    if (edge)
+      if (std::optional<unsigned> ei = findEdgeIndex(sp, edge))
+        if (dag.edgeRendersEmpty.lookup(*ei))
+          return pair.empty;
     return pair.full;
   }
   llvm_unreachable("unhandled sync group kind");
@@ -6337,6 +6522,53 @@ static LogicalResult verifyPostEmission(const OptSyncDag &dag, BufferGroup &grou
   for (const ThreadRecord &record : state.threadedTokens)
     if (failed(verifyThreadRecord(record, plan, sp, dag)))
       return failure();
+
+  // M1 / M3 invariants (§2, plan step 5). These are HARD-FAIL per the §1 Hard
+  // Rule — a violation means the DAG is invalid or the model is wrong; it is
+  // never repaired here. M2 (first-event consistency) is audited via the
+  // schedule dump (§9-V6a), not asserted here.
+  SmallVector<Value, 4> resourceSemas;
+  auto addSema = [&](Value v) {
+    if (v && !llvm::is_contained(resourceSemas, v))
+      resourceSemas.push_back(v);
+  };
+  for (auto &entry : state.semas.byGroup) {
+    addSema(entry.second.empty);
+    addSema(entry.second.full);
+    for (auto &fe : entry.second.fullByEdge)
+      addSema(fe.second);
+  }
+  // M1 — exactly one released seed for a resource that emits semaphores.
+  unsigned releasedCount = 0;
+  for (Value v : resourceSemas)
+    if (auto cr = v.getDefiningOp<SemaphoreCreateOp>())
+      if (cr.getIsReleased())
+        ++releasedCount;
+  if (!resourceSemas.empty() && releasedCount != 1)
+    return group.members.front().allocOp->emitError(
+               "nvws-insert-semas: post-emission verifier: M1 violation — a "
+               "resource that emits semaphores must have exactly one released "
+               "seed, found ")
+           << releasedCount;
+  // M3 — each semaphore acquired by root and at most one concrete owner.
+  for (Value v : resourceSemas) {
+    SetVector<int> concreteOwners;
+    Operation *witness = nullptr;
+    for (const EmittedSyncRecord &rec : state.emittedAcquires) {
+      if (rec.semaphore != v || !rec.op)
+        continue;
+      if (std::optional<SetVector<int>> ids = nearestPartitionIds(rec.op))
+        for (int id : *ids) {
+          if (concreteOwners.insert(id) && !witness)
+            witness = rec.op;
+        }
+    }
+    if (concreteOwners.size() > 1)
+      return (witness ? witness : group.members.front().allocOp)
+                 ->emitError("nvws-insert-semas: post-emission verifier: M3 "
+                             "violation — semaphore acquired by ")
+             << concreteOwners.size() << " distinct concrete owners";
+  }
   return success();
 }
 
@@ -6792,16 +7024,28 @@ static void dumpOwnershipDag(ResourcePlan &plan, BufferGroup &group,
 // ---------------------------------------------------------------------------
 
 static void renderAcquireRow(unsigned depth, Operation *anchor,
-                             const SyncEdge &edge) {
-  llvm::errs() << treePrefix(depth) << "|- a  " << edge.name << "  acquire  "
+                             const SyncEdge &edge, StringRef name) {
+  llvm::errs() << treePrefix(depth) << "|- a  " << name << "  acquire  "
                << ownerStr(anchor, edge.dstOwner) << "\n";
 }
 
 static void renderReleaseRow(unsigned depth, Operation *anchor,
-                             const SyncEdge &edge) {
-  llvm::errs() << treePrefix(depth) << "|- r  " << edge.name << "  release  "
+                             const SyncEdge &edge, StringRef name) {
+  llvm::errs() << treePrefix(depth) << "|- r  " << name << "  release  "
                << ownerStr(anchor, edge.srcOwner) << " -> "
                << ownerStr(anchor, edge.dstOwner) << "\n";
+}
+
+// Canonical (unified) semaphore name for an edge: the name of the lowest-id
+// member of its union-find class (§unifySemaphoreIdentities). Two edges in the
+// same class render under the SAME name, so the RAW-SYNC-DAG visibly shows
+// which acquires/releases are the same physical semaphore.
+static StringRef canonicalSemaName(const SyncPlan &sp, unsigned idx) {
+  if (sp.semaRep.empty() || idx >= sp.edges.size())
+    return sp.edges[idx].name;
+  unsigned rep = sp.semaFind(idx);
+  return rep < sp.edges.size() ? StringRef(sp.edges[rep].name)
+                               : StringRef(sp.edges[idx].name);
 }
 
 // Defined after the RAW dag dump; forward-declared for the OPT overlay below.
@@ -6854,8 +7098,9 @@ static void printEdgesAt(SmallVector<unsigned, 2> *edgeIdxs, SyncPlan &sp,
   if (!edgeIdxs) return;
   if (!octx) {
     for (unsigned idx : *edgeIdxs) {
-      renderReleaseRow(depth, anchor, sp.edges[idx]);
-      renderAcquireRow(depth, anchor, sp.edges[idx]);
+      StringRef nm = canonicalSemaName(sp, idx);
+      renderReleaseRow(depth, anchor, sp.edges[idx], nm);
+      renderAcquireRow(depth, anchor, sp.edges[idx], nm);
     }
     return;
   }
@@ -6940,6 +7185,14 @@ static void dumpRawSyncBlock(Block &block, SyncPlan &sp,
     // show the combined name so the entry matches the rest of the combine.
     if (&op == sp.initialPermitBeforeOp && !sp.initialPermitName.empty()) {
       StringRef entryName = sp.initialPermitName;
+      // RAW dump: render the seed under its unified (canonical) name so the
+      // entry permit and the loop-carried edge it merges with show identically.
+      if (!octx && !sp.semaRep.empty()) {
+        unsigned seedId = static_cast<unsigned>(sp.edges.size());
+        unsigned rep = sp.semaFind(seedId);
+        if (rep < sp.edges.size())
+          entryName = sp.edges[rep].name;
+      }
       if (octx && sp.initialPermitEdgeIdx >= 0) {
         unsigned ei = sp.initialPermitEdgeIdx;
         SyncGroupKind k = octx->dag->groups[octx->dag->edgeToGroup[ei]].kind;
@@ -7035,6 +7288,36 @@ static void dumpRawSyncDag(SyncPlan &sp, const ResourcePlan &plan,
   llvm::errs() << "RAW-SYNC-DAG buffer.id=" << sp.resource.first
                << " resourceKey=" << sp.resource.second << " edges="
                << sp.edges.size() << "\n";
+  // Unified semaphore-identity classes (§unifySemaphoreIdentities). Members of
+  // one class are the SAME physical semaphore; the rows below render each under
+  // its canonical (lowest-id) name. SEED = the initial/entry permit.
+  if (!sp.semaRep.empty()) {
+    unsigned seedId = static_cast<unsigned>(sp.edges.size());
+    SmallVector<SmallVector<unsigned, 2>, 4> classes(sp.semaRep.size());
+    for (unsigned i = 0; i < sp.semaRep.size(); ++i)
+      classes[sp.semaFind(i)].push_back(i);
+    bool any = false;
+    for (auto &cls : classes)
+      if (cls.size() >= 2)
+        any = true;
+    if (any) {
+      llvm::errs() << "|  semaphore-classes:";
+      for (auto &cls : classes) {
+        if (cls.size() < 2)
+          continue;
+        llvm::errs() << " {";
+        bool first = true;
+        for (unsigned i : cls) {
+          llvm::errs() << (first ? "" : "=")
+                       << (i == seedId ? std::string("SEED")
+                                       : sp.edges[i].name);
+          first = false;
+        }
+        llvm::errs() << "}";
+      }
+      llvm::errs() << "\n";
+    }
+  }
   llvm::errs() << "|- func region @" << funcOp.getName() << "\n";
   for (Block &b : funcOp.getBody())
     dumpRawSyncBlock(b, sp, plan, group, /*depth=*/1);
@@ -7093,6 +7376,288 @@ static void dumpOptSyncDag(const OptSyncDag &dag, SyncPlan &sp,
   OptDumpCtx octx{&dag, {}};
   for (Block &b : funcOp.getBody())
     dumpRawSyncBlock(b, sp, plan, group, /*depth=*/1, &octx);
+}
+
+// ---------------------------------------------------------------------------
+// EMIT-SCHEDULE dump (commit 4.5, §6.7). Stage-2 diagnostic only: it enumerates
+// the mechanical emit plan (CreateSemaphore / Acquire / Release / ThreadToken)
+// directly from the completed OPT-SYNC-DAG anchors, resolving each action's
+// semaId by §6.4 — InitialEmpty resolves to the single released seed; every
+// other action is keyed (groupIdx, edge.dstOwner). No IR is mutated. The dump
+// exposes the per-semaphore acquirer set so M3 (single concrete acquirer, with
+// optional root) is inspectable in the plan, before emission is wired.
+namespace {
+// Format an optional owner the same way the RELEASED-SEMAPHORES dump does.
+static std::string ownerLabel(const std::optional<PartitionId> &o) {
+  if (!o)
+    return "{root}";
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  os << "{p" << o->first << ",ws" << o->second << "}";
+  return os.str();
+}
+
+struct SchedAction {
+  enum Kind { Create, Acquire, Release, Thread } kind;
+  unsigned rank = 0;          // program-order rank of the endpoint
+  unsigned priority = 0;      // §6.7 tie-break: Release<Acquire<Buffer<Thread
+  std::string semaKey;        // identity key for aggregation
+  std::string semaLabel;      // human label
+  std::optional<PartitionId> acquirer;
+  bool isSeed = false;
+  bool released = false;
+  std::optional<unsigned> edgeIdx;
+  std::string endpoint;
+};
+} // namespace
+
+static void dumpEmitSchedule(const OptSyncDag &dag, SyncPlan &sp,
+                             const ResourcePlan &plan, BufferGroup &group,
+                             triton::FuncOp funcOp) {
+  DenseMap<Operation *, unsigned> rank;
+  buildProgramOrderRank(funcOp, rank);
+  auto rankOf = [&](Operation *op, Region *region) -> unsigned {
+    Operation *keyOp = op ? op : (region ? region->getParentOp() : nullptr);
+    if (!keyOp)
+      return 0;
+    auto it = rank.find(keyOp);
+    return it == rank.end() ? 0 : it->second;
+  };
+  auto endpointDesc = [&](Operation *op, Region *region) -> std::string {
+    Operation *keyOp = op ? op : (region ? region->getParentOp() : nullptr);
+    if (!keyOp)
+      return "<none>";
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    os << keyOp->getName().getStringRef() << "@" << rankOf(op, region);
+    if (region)
+      os << "/yield";
+    return os.str();
+  };
+  // §6.4 semaId resolution. The seed is the single releasedSemaphores entry.
+  std::optional<std::pair<unsigned, std::optional<PartitionId>>> seed;
+  if (!dag.releasedSemaphores.empty())
+    seed = dag.releasedSemaphores.front();
+  auto semaFor = [&](unsigned groupIdx, const SyncEdge *edge,
+                     std::string &key, std::string &label,
+                     std::optional<PartitionId> &acquirer, bool &isSeed) {
+    if (dag.groups[groupIdx].kind == SyncGroupKind::InitialEmpty) {
+      isSeed = true;
+      acquirer = seed ? seed->second : dag.groups[groupIdx].initialOwner;
+      key = "SEED";
+      label = "SEED" + ownerLabel(acquirer);
+      return;
+    }
+    isSeed = false;
+    acquirer = edge ? edge->dstOwner : std::nullopt;
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    os << "g" << groupIdx << ownerLabel(acquirer);
+    key = os.str();
+    label = s;
+  };
+
+  SmallVector<SchedAction, 16> actions;
+
+  // 1) CreateSemaphore — one per (edge-bearing group, first-seen dstOwner) in
+  //    §6.5 deterministic order, plus the seed for the InitialEmpty group.
+  for (auto [idx, syncGroup] : llvm::enumerate(dag.groups)) {
+    unsigned groupIdx = static_cast<unsigned>(idx);
+    if (syncGroup.kind == SyncGroupKind::InitialEmpty) {
+      SchedAction a;
+      a.kind = SchedAction::Create;
+      a.isSeed = true;
+      a.released = true;
+      a.acquirer = seed ? seed->second : syncGroup.initialOwner;
+      a.semaKey = "SEED";
+      a.semaLabel = "SEED" + ownerLabel(a.acquirer);
+      a.endpoint = "create-scope";
+      actions.push_back(std::move(a));
+      continue;
+    }
+    SmallVector<std::optional<PartitionId>, 2> seen;
+    for (unsigned edgeIdx : syncGroup.edgeIdxs) {
+      std::optional<PartitionId> owner = sp.edges[edgeIdx].dstOwner;
+      if (llvm::any_of(seen, [&](auto &o) { return sameOwner(o, owner); }))
+        continue;
+      seen.push_back(owner);
+      SchedAction a;
+      a.kind = SchedAction::Create;
+      semaFor(groupIdx, &sp.edges[edgeIdx], a.semaKey, a.semaLabel, a.acquirer,
+              a.isSeed);
+      a.released = false; // non-seed classes are unreleased (M2)
+      a.endpoint = "create-scope";
+      actions.push_back(std::move(a));
+    }
+  }
+
+  // 2) Acquire actions from the acquire anchors.
+  auto addAcquire = [&](unsigned groupIdx, const SyncEdge *edge, unsigned rk,
+                        const std::string &ep) {
+    SchedAction a;
+    a.kind = SchedAction::Acquire;
+    a.rank = rk;
+    a.priority = 1;
+    a.edgeIdx = findEdgeIndex(sp, edge);
+    semaFor(groupIdx, edge, a.semaKey, a.semaLabel, a.acquirer, a.isSeed);
+    a.endpoint = ep;
+    actions.push_back(std::move(a));
+  };
+  for (auto &[op, groups] : dag.acquireBeforeOp)
+    for (unsigned g : groups) {
+      const SyncEdge *e = findEdgeForAnchor(dag.groups[g], sp, dag,
+                                            SyncAnchorKind::AcquireBeforeOp, op,
+                                            nullptr);
+      addAcquire(g, e, rankOf(op, nullptr), endpointDesc(op, nullptr));
+    }
+  for (auto &[region, groups] : dag.acquireBeforeYield)
+    for (unsigned g : groups) {
+      const SyncEdge *e = findEdgeForAnchor(dag.groups[g], sp, dag,
+                                            SyncAnchorKind::AcquireBeforeYield,
+                                            nullptr, region);
+      addAcquire(g, e, rankOf(nullptr, region), endpointDesc(nullptr, region));
+    }
+
+  // 3) Release actions from the release anchors.
+  auto addRelease = [&](const PlannedRelease &pr, unsigned rk,
+                        const std::string &ep) {
+    SchedAction a;
+    a.kind = SchedAction::Release;
+    a.rank = rk;
+    a.priority = 0;
+    const SyncEdge *e = getRepresentativeReleaseEdge(pr, sp);
+    a.edgeIdx = findEdgeIndex(sp, e);
+    semaFor(pr.groupIdx, e, a.semaKey, a.semaLabel, a.acquirer, a.isSeed);
+    a.endpoint = ep;
+    actions.push_back(std::move(a));
+  };
+  for (auto &[op, rels] : dag.releaseBeforeOp)
+    for (const PlannedRelease &pr : rels)
+      addRelease(pr, rankOf(op, nullptr), "before:" + endpointDesc(op, nullptr));
+  for (auto &[op, rels] : dag.releaseAfterOp)
+    for (const PlannedRelease &pr : rels)
+      addRelease(pr, rankOf(op, nullptr), "after:" + endpointDesc(op, nullptr));
+  for (auto &[region, rels] : dag.releaseBeforeYield)
+    for (const PlannedRelease &pr : rels)
+      addRelease(pr, rankOf(nullptr, region),
+                 "before:" + endpointDesc(nullptr, region));
+  for (auto &[region, rels] : dag.releaseAfterYield)
+    for (const PlannedRelease &pr : rels)
+      addRelease(pr, rankOf(nullptr, region),
+                 "after:" + endpointDesc(nullptr, region));
+
+  // 4) ThreadToken actions (forward token threading, §6.6).
+  for (Operation *op : dag.threadForOps) {
+    SchedAction a;
+    a.kind = SchedAction::Thread;
+    a.rank = rankOf(op, nullptr);
+    a.priority = 3;
+    a.semaLabel = "thread-for";
+    a.endpoint = endpointDesc(op, nullptr);
+    actions.push_back(std::move(a));
+  }
+  for (Operation *op : dag.threadIfOps) {
+    SchedAction a;
+    a.kind = SchedAction::Thread;
+    a.rank = rankOf(op, nullptr);
+    a.priority = 3;
+    a.semaLabel = "thread-if";
+    a.endpoint = endpointDesc(op, nullptr);
+    actions.push_back(std::move(a));
+  }
+
+  // §6.7 ordering: CreateSemaphore first (creation order), then by program-order
+  // rank, tie-broken by priority then stable key.
+  std::stable_sort(actions.begin(), actions.end(),
+                   [](const SchedAction &a, const SchedAction &b) {
+                     bool ac = a.kind == SchedAction::Create;
+                     bool bc = b.kind == SchedAction::Create;
+                     if (ac != bc)
+                       return ac; // creates first; keep their insertion order
+                     if (ac && bc)
+                       return false;
+                     if (a.rank != b.rank)
+                       return a.rank < b.rank;
+                     if (a.priority != b.priority)
+                       return a.priority < b.priority;
+                     return a.semaKey < b.semaKey;
+                   });
+
+  llvm::errs() << "EMIT-SCHEDULE buffer.id=" << dag.resource.first
+               << " resourceKey=" << dag.resource.second
+               << " actions=" << actions.size()
+               << " initialPermitEdgeIdx=" << sp.initialPermitEdgeIdx
+               << " initialPermitName=" << sp.initialPermitName << "\n";
+  if (!sp.semaRep.empty()) {
+    unsigned seedId = static_cast<unsigned>(sp.edges.size());
+    llvm::errs() << "  SEMA-UNION:";
+    SmallVector<SmallVector<unsigned, 2>, 4> classes(sp.semaRep.size());
+    for (unsigned i = 0; i < sp.semaRep.size(); ++i)
+      classes[sp.semaFind(i)].push_back(i);
+    for (auto &cls : classes) {
+      if (cls.size() < 2)
+        continue;
+      llvm::errs() << " {";
+      for (unsigned i : cls)
+        llvm::errs() << (i == seedId ? "SEED" : ("S" + std::to_string(i))) << " ";
+      llvm::errs() << "}";
+      // Soundness: a class must not unite two distinct concrete owners.
+      SmallVector<PartitionId, 2> concrete;
+      for (unsigned i : cls) {
+        if (i >= sp.edges.size())
+          continue; // seed acquires as root in the RAW model
+        if (std::optional<PartitionId> o = sp.edges[i].dstOwner)
+          if (!llvm::is_contained(concrete, *o))
+            concrete.push_back(*o);
+      }
+      if (concrete.size() > 1)
+        llvm::errs() << "<<UNSOUND-UNION: " << concrete.size()
+                     << " concrete owners>>";
+    }
+    llvm::errs() << "\n";
+  }
+  // Aggregate per-semaphore acquirer sets for an in-plan M3 check.
+  SmallVector<std::pair<std::string, SmallVector<std::optional<PartitionId>, 2>>,
+              4>
+      acqSet;
+  auto acqSetFor =
+      [&](const std::string &key) -> SmallVector<std::optional<PartitionId>, 2> & {
+    for (auto &kv : acqSet)
+      if (kv.first == key)
+        return kv.second;
+    acqSet.push_back({key, {}});
+    return acqSet.back().second;
+  };
+  for (const SchedAction &a : actions) {
+    const char *k = a.kind == SchedAction::Create   ? "create "
+                    : a.kind == SchedAction::Acquire ? "acquire"
+                    : a.kind == SchedAction::Release ? "release"
+                                                     : "thread ";
+    llvm::errs() << "  " << k << "  sema=" << a.semaLabel;
+    if (a.edgeIdx)
+      llvm::errs() << " edge=" << *a.edgeIdx;
+    if (a.kind == SchedAction::Create)
+      llvm::errs() << " released=" << (a.released ? "true" : "false");
+    llvm::errs() << "  @ " << a.endpoint << "\n";
+    if (a.kind == SchedAction::Acquire) {
+      auto &set = acqSetFor(a.semaKey);
+      if (!llvm::any_of(set, [&](auto &o) { return sameOwner(o, a.acquirer); }))
+        set.push_back(a.acquirer);
+    }
+  }
+  for (auto &[key, owners] : acqSet) {
+    unsigned concrete = 0;
+    for (auto &o : owners)
+      if (o)
+        ++concrete;
+    if (concrete > 1) {
+      llvm::errs() << "  <<M3-VIOLATION: sema " << key << " acquired by "
+                   << concrete << " concrete owners";
+      for (auto &o : owners)
+        llvm::errs() << " " << ownerLabel(o);
+      llvm::errs() << ">>\n";
+    }
+  }
 }
 
 static SetVector<int> unionPartitionIds(Operation *lhs, Operation *rhs) {
@@ -7762,6 +8327,30 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp,
         dumpOwnershipDag(plan, group, funcOp);
         dumpRawSyncDag(sp, plan, group, funcOp);
         dumpOptSyncDag(opt, sp, plan, group, funcOp);
+        bool seeded = llvm::any_of(opt.groups, [](const SyncGroup &g) {
+          return g.kind == SyncGroupKind::InitialEmpty;
+        });
+        llvm::errs() << "RELEASED-SEMAPHORES buffer.id=" << opt.resource.first
+                     << " resourceKey=" << opt.resource.second
+                     << " seeded=" << (seeded ? "yes" : "no")
+                     << " count=" << opt.releasedSemaphores.size();
+        if (seeded && opt.releasedSemaphores.size() != 1)
+          llvm::errs() << " <<M1-VIOLATION: seeded resource must have exactly 1>>";
+        if (!seeded && !opt.releasedSemaphores.empty())
+          llvm::errs() << " <<M1-VIOLATION: edge-free resource must have 0>>";
+        llvm::errs() << "\n";
+        for (auto &[gIdx, acquirer] : opt.releasedSemaphores) {
+          llvm::errs() << "  seed: group=" << gIdx << " (" << opt.groups[gIdx].name
+                       << ", kind=" << static_cast<int>(opt.groups[gIdx].kind)
+                       << ") acquirer=";
+          if (acquirer)
+            llvm::errs() << "{p" << acquirer->first << ",ws" << acquirer->second
+                         << "}";
+          else
+            llvm::errs() << "{root}";
+          llvm::errs() << "\n";
+        }
+        dumpEmitSchedule(opt, sp, plan, group, funcOp);
       }
       plannedResources.push_back(
           {std::move(plan), std::move(sp), std::move(opt)});
