@@ -3166,14 +3166,20 @@ static Value createSemaphore(OpBuilder &b, Location loc,
 
 static void setPartitionFromAnchor(Operation *op, Operation *anchor);
 
-struct SyncGroupSemaphores {
-  Value empty;
-  Value full;
-  DenseMap<unsigned, Value> fullByEdge;
-};
-
 struct ResourceSemaphores {
-  DenseMap<unsigned, SyncGroupSemaphores> byGroup;
+  // Mechanical identity (commit-3 `semaRep`): exactly one semaphore per
+  // canonical semaphore class. Keyed by the class representative id
+  // (`sp.semaFind(...)`). The seed/initial permit uses the class of `seedId`;
+  // every edge uses the class of its edge index. No empty/full distinction.
+  DenseMap<unsigned, Value> byClass;
+  unsigned seedId = 0;
+  // The single mechanical lookup: the semaphore an acquire/release/buffer uses
+  // is the one created for its edge's canonical class. A null edge
+  // (InitialEmpty / seed) resolves to the seed class. No heuristic, no op-kind.
+  Value forClass(const SyncPlan &sp, std::optional<unsigned> edgeIdx) const {
+    unsigned id = edgeIdx ? sp.semaFind(*edgeIdx) : sp.semaFind(seedId);
+    return byClass.lookup(id);
+  }
 };
 
 static std::optional<unsigned> findEdgeIndex(const SyncPlan &sp,
@@ -3471,109 +3477,26 @@ static ResourceSemaphores createResourceSemaphores(const OptSyncDag &dag,
     b.setInsertionPointAfter(anchor);
   ResourceSemaphores semas;
   Location loc = group.members.front().allocOp->getLoc();
-  std::optional<PartitionId> initialEmptyOwner;
-  for (const SyncGroup &syncGroup : dag.groups) {
-    if (syncGroup.kind != SyncGroupKind::InitialEmpty)
-      continue;
-    initialEmptyOwner = syncGroup.initialOwner;
-    break;
-  }
+  semas.seedId = static_cast<unsigned>(sp.edges.size());
 
-  // One shared writable semaphore PER ACQUIRER PARTITION. A semaphore may be
-  // released from any partition but acquired in exactly one, so groups whose
-  // acquirers differ must get distinct semaphores. Groups that share an
-  // acquirer (e.g. the loop-entry permit and the loop-carry back edge, both
-  // acquired by the writer) correctly share one.
-  Value sharedEmptyCache;
-  auto createSharedEmpty = [&](std::optional<PartitionId> /*acquirer*/) -> Value {
-    if (sharedEmptyCache)
-      return sharedEmptyCache;
-    sharedEmptyCache = createSemaphore(b, loc, backing, /*released=*/true);
+  // Mechanical identity: exactly one semaphore per canonical `semaRep` class.
+  // A class is created released=true iff it is the seed's class (the single
+  // initial permit — M1); every other class is released=false (M2). Iterate
+  // ids in a deterministic order (edges in index order, then the seed) so the
+  // creation order is stable. No empty/full, no acquirer keying, no op-kind.
+  unsigned seedRep = sp.semaFind(semas.seedId);
+  auto ensureClass = [&](unsigned id) {
+    unsigned rep = sp.semaFind(id);
+    if (semas.byClass.count(rep))
+      return;
+    Value sem = createSemaphore(b, loc, backing, /*released=*/rep == seedRep);
     if (!group.isTmem())
-      setPartitionFromAnchor(sharedEmptyCache.getDefiningOp(), anchor);
-    return sharedEmptyCache;
+      setPartitionFromAnchor(sem.getDefiningOp(), anchor);
+    semas.byClass[rep] = sem;
   };
-  auto createFull = [&]() -> Value {
-    Value full = createSemaphore(b, loc, backing, /*released=*/false);
-    if (!group.isTmem())
-      setPartitionFromAnchor(full.getDefiningOp(), anchor);
-    return full;
-  };
-  auto createSharedFull = [&]() -> Value {
-    if (!group.isTmem())
-      return createFull();
-    if (backing.sharedFullSemaphore)
-      return backing.sharedFullSemaphore;
-    backing.sharedFullSemaphore =
-        createSemaphore(b, loc, backing, /*released=*/false);
-    return backing.sharedFullSemaphore;
-  };
-
-  for (auto [idx, syncGroup] : llvm::enumerate(dag.groups)) {
-    unsigned groupIdx = static_cast<unsigned>(idx);
-    SyncGroupSemaphores pair;
-    switch (syncGroup.kind) {
-    case SyncGroupKind::InitialEmpty:
-      pair.empty = createSharedEmpty(syncGroup.initialOwner);
-      break;
-    case SyncGroupKind::DoneFanin:
-      // All fanin edges share one acquirer (the next writer).
-      pair.empty =
-          createSharedEmpty(sp.edges[syncGroup.edgeIdxs.front()].dstOwner);
-      break;
-    case SyncGroupKind::ReadyFanout:
-      pair.full = createFull();
-      break;
-    case SyncGroupKind::LinearChain: {
-      // The chain's writable edges share one acquirer (guaranteed by the
-      // multi-acquirer guard in buildOptSyncDag); use it.
-      std::optional<PartitionId> chainEmptyAcquirer = initialEmptyOwner;
-      for (unsigned eIdx : syncGroup.edgeIdxs)
-        if (edgeUsesEmpty(sp.edges[eIdx], group, dag.resource.second)) {
-          chainEmptyAcquirer = sp.edges[eIdx].dstOwner;
-          break;
-        }
-      pair.empty = createSharedEmpty(chainEmptyAcquirer);
-      if (linearChainNeedsPerEdgeFulls(syncGroup, sp, group,
-                                       dag.resource.second)) {
-        for (unsigned edgeIdx : syncGroup.edgeIdxs) {
-          const SyncEdge &edge = sp.edges[edgeIdx];
-          if (!linearChainEdgeUsesEmpty(syncGroup, sp, dag, &edge, group,
-                                        dag.resource.second))
-            pair.fullByEdge[edgeIdx] = createFull();
-        }
-        if (!pair.fullByEdge.empty())
-          pair.full = pair.fullByEdge.begin()->second;
-        break;
-      }
-      pair.full = createFull();
-      break;
-    }
-    case SyncGroupKind::Singleton: {
-      const SyncEdge *edge = syncGroup.edgeIdxs.empty()
-                                 ? nullptr
-                                 : &sp.edges[syncGroup.edgeIdxs.front()];
-      if (edge && edgeUsesEmpty(*edge, group, dag.resource.second)) {
-        if (sameOwner(edge->dstOwner, initialEmptyOwner))
-          pair.empty = createSharedEmpty(edge->dstOwner);
-        else
-          pair.empty = createFull();
-      } else {
-        pair.full = createFull();
-        std::optional<unsigned> edgeIdx = findEdgeIndex(sp, edge);
-        if (edge &&
-            ((edgeNeedsTerminalReadRelease(*edge, group, dag.resource.second) &&
-              findTerminalReadReleaseAnchor(edge->dstOp, sp, group,
-                                            dag.resource.second)) ||
-             (edgeIdx && dag.tmemLoopExitRead.contains(*edgeIdx))))
-          // Loop-carry writable permit acquired by the next writer.
-          pair.empty = createSharedEmpty(initialEmptyOwner);
-      }
-      break;
-    }
-    }
-    semas.byGroup[groupIdx] = pair;
-  }
+  for (unsigned i = 0; i < sp.edges.size(); ++i)
+    ensureClass(i);
+  ensureClass(semas.seedId);
   return semas;
 }
 
@@ -3669,43 +3592,12 @@ static Value getSemaphoreForGroup(unsigned groupIdx, const SyncEdge *edge,
                                   const OptSyncDag &dag, const SyncPlan &sp,
                                   BufferGroup &group,
                                   ResourceSemaphores &semas) {
-  const SyncGroup &syncGroup = dag.groups[groupIdx];
-  SyncGroupSemaphores pair = semas.byGroup.lookup(groupIdx);
-  switch (syncGroup.kind) {
-  case SyncGroupKind::InitialEmpty:
-    return pair.empty;
-  case SyncGroupKind::DoneFanin:
-    return pair.empty;
-  case SyncGroupKind::ReadyFanout:
-    return pair.full;
-  case SyncGroupKind::LinearChain:
-    // F7 fix: the empty/full selection is the single DAG fact
-    // `dag.edgeRendersEmpty` (computed once in buildOptSyncDag from the same
-    // classifiers), not a re-derived emit-time heuristic.
-    if (edge)
-      if (std::optional<unsigned> ei = findEdgeIndex(sp, edge))
-        if (dag.edgeRendersEmpty.lookup(*ei))
-          return pair.empty;
-    if (edge) {
-      for (unsigned edgeIdx : syncGroup.edgeIdxs) {
-        if (&sp.edges[edgeIdx] != edge)
-          continue;
-        auto it = pair.fullByEdge.find(edgeIdx);
-        if (it != pair.fullByEdge.end())
-          return it->second;
-        break;
-      }
-    }
-    return pair.full;
-  case SyncGroupKind::Singleton:
-    // F7 fix: single source of truth for empty/full (see LinearChain above).
-    if (edge)
-      if (std::optional<unsigned> ei = findEdgeIndex(sp, edge))
-        if (dag.edgeRendersEmpty.lookup(*ei))
-          return pair.empty;
-    return pair.full;
-  }
-  llvm_unreachable("unhandled sync group kind");
+  // Mechanical: the semaphore is the one created for this edge's canonical
+  // `semaRep` class; InitialEmpty / a null edge resolve to the seed class.
+  // No empty/full, no `edgeRendersEmpty`, no op-kind — a single fact lookup.
+  if (dag.groups[groupIdx].kind == SyncGroupKind::InitialEmpty || !edge)
+    return semas.forClass(sp, std::nullopt);
+  return semas.forClass(sp, findEdgeIndex(sp, edge));
 }
 
 static const SyncEdge *getRepresentativeReleaseEdge(const PlannedRelease &action,
@@ -4858,8 +4750,9 @@ static LogicalResult emitReleaseAction(OpBuilder &b, Location loc,
       delayReadReleaseForUsers &&
       (terminalDstReadRelease || terminalLoopExitReadRelease ||
        sourceReadRelease);
-  if (terminalDstReadRelease || terminalLoopExitReadRelease)
-    sem = state.semas.byGroup.lookup(groupIdx).empty;
+  // (No semaphore override: `sem` is the mechanical class lookup above. The
+  // terminal/loop-exit read-release flags below still drive owner/payload
+  // materialization only, not semaphore identity.)
   bool useStructuredCarrier =
       kind == SyncAnchorKind::ReleaseAfterOp && edge && edge->srcOp &&
       edge->srcOp != anchor && state.currentToken;
@@ -5230,9 +5123,6 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
     if (syncGroup.kind != SyncGroupKind::LinearChain ||
         syncGroup.edgeIdxs.size() < 2)
       continue;
-    SyncGroupSemaphores pair = state.semas.byGroup.lookup(gi);
-    if (!pair.full || !pair.empty)
-      continue;
     if (linearChainNeedsPerEdgeFulls(syncGroup, sp, group, dag.resource.second))
       continue;
     if (!linearChainNeedsLoopExitDrain(gi, syncGroup, forOp.getOperation(),
@@ -5331,6 +5221,11 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
     }
     const SyncEdge *fullReleaseEdge =
         loopEntryHandoffEdge ? loopEntryHandoffEdge : &firstEdge;
+    // Mechanical identity: the drain's "full" side is the class of the
+    // full-release edge; the "empty" side is the class of the second (carry)
+    // edge. Both are created in createResourceSemaphores.
+    Value fullSem = state.semas.forClass(sp, findEdgeIndex(sp, fullReleaseEdge));
+    Value emptySem = state.semas.forClass(sp, findEdgeIndex(sp, &secondEdge));
     if (const PlannedRelease *releaseAction =
             findPlannedAfterLoopRelease(*fullReleaseEdge)) {
       if (failed(emitReleaseAction(b, loc, SyncAnchorKind::ReleaseAfterOp,
@@ -5338,19 +5233,19 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
                                    *releaseAction, dag, sp, group, state,
                                    StageCluster{})))
         return failure();
-    } else if (failed(emitDrainRelease(pair.full, state.currentToken,
+    } else if (failed(emitDrainRelease(fullSem, state.currentToken,
                                        releaseOwner, drainPayload,
                                        *fullReleaseEdge))) {
       return failure();
     }
     SemaphoreAcquireOp acquire =
-        emitAcquire(b, loc, pair.full, drainOwner, StageCluster{});
+        emitAcquire(b, loc, fullSem, drainOwner, StageCluster{});
     state.knownCarrierTokens.insert(acquire.getToken());
-    if (failed(emitDrainRelease(pair.empty, acquire.getToken(), drainOwner,
+    if (failed(emitDrainRelease(emptySem, acquire.getToken(), drainOwner,
                                 emptyPayload, secondEdge)))
       return failure();
     state.currentToken = acquire.getToken();
-    state.currentSemaphore = pair.empty;
+    state.currentSemaphore = emptySem;
     state.currentOwner = drainOwner;
     return success();
   }
@@ -6532,12 +6427,8 @@ static LogicalResult verifyPostEmission(const OptSyncDag &dag, BufferGroup &grou
     if (v && !llvm::is_contained(resourceSemas, v))
       resourceSemas.push_back(v);
   };
-  for (auto &entry : state.semas.byGroup) {
-    addSema(entry.second.empty);
-    addSema(entry.second.full);
-    for (auto &fe : entry.second.fullByEdge)
-      addSema(fe.second);
-  }
+  for (auto &entry : state.semas.byClass)
+    addSema(entry.second);
   // M1 — exactly one released seed for a resource that emits semaphores.
   unsigned releasedCount = 0;
   for (Value v : resourceSemas)
