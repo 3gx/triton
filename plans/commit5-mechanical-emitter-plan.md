@@ -88,6 +88,24 @@ schedule-dump / code-review audit (Step 7), exist precisely to catch these and
 **hard-fail or block review**, not to trigger silent repair. No improvisation:
 the resolution is the user's to direct.
 
+### Hard rule — the agent MUST NOT overreach; when unclear, REPORT
+
+The implementing agent implements **exactly** what this plan and §2 model
+specify — no more. It MUST NOT:
+
+1. **Add scope or semantics not in the plan** — no new identity axis (e.g.
+   offset, sub-buffer, op-kind), no new concept, no new invariant, no "while I'm
+   here" change. Semaphore identity is `(group, dstOwner)` + the single seed,
+   period; the resource is `buffer.id` (resourceKey) with all members grouped.
+2. **"Improve", generalize, or harden the model/plan** on its own initiative.
+3. **Guess or extend** when the plan is silent, ambiguous, or appears incomplete.
+
+If anything is **not clear, underspecified, or seems to need more than the plan
+states — STOP and REPORT to the user, and wait.** Do not resolve it by inventing
+a rule, broadening the model, or editing the plan's semantics. Asking is correct;
+overreaching is a defect on par with adding a heuristic (above). The plan's design
+is the user's to change, not the implementer's.
+
 ---
 
 ## 2. The semaphore model (established)
@@ -827,3 +845,9 @@ If a case appears to need a **heuristic**, or a valid DAG produces an **M1/M2/M3
 violation** — **STOP, root-cause, build a minimal example, report, wait** (§1).
 No improvised special case, no "temporary" fallback, no op-kind sniffing in the
 emitter.
+
+**No overreach (§1 Hard Rule):** implement exactly what the plan and §2 model
+state — no new identity axis, concept, or invariant; no "improving" the model.
+If anything is unclear, underspecified, or seems to need more than the plan
+states, **STOP and REPORT** — do not guess, broaden, or edit the plan's
+semantics.
