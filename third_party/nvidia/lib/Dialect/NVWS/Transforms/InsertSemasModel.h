@@ -342,7 +342,6 @@ enum class SyncAnchorKind {
 };
 
 struct AcquireRecord {
-  unsigned groupIdx = 0;
   Value semaphore;
   Value token;
   std::optional<PartitionId> owner;
@@ -353,35 +352,7 @@ struct EmittedSyncRecord {
   SyncAnchorKind kind = SyncAnchorKind::AcquireBeforeOp;
   Operation *anchor = nullptr;
   Region *yieldRegion = nullptr;
-  Operation *op = nullptr;
-  Value semaphore;
-  Value token;
-  StageCluster expectedStageCluster;
   SmallVector<unsigned, 4> edgeIdxs;
-};
-
-struct EmittedBufferRecord {
-  Operation *accessOp = nullptr;
-  Operation *retargetOp = nullptr;
-  Operation *bufferOp = nullptr;
-  Value semaphore;
-  Value token;
-  Value accessBuffer;
-  SmallVector<Value, 4> buffers;
-  unsigned memberIdx = 0;
-  unsigned backingIdx = 0;
-  StageCluster expectedStageCluster;
-};
-
-enum class ThreadRecordKind { ForIterArg, ForResult, IfResult };
-
-struct ThreadRecord {
-  Operation *op = nullptr;
-  Value token;
-  std::optional<PartitionId> owner;
-  ThreadRecordKind kind = ThreadRecordKind::ForResult;
-  Region *plannedRegion = nullptr;
-  Region *plannedElseRegion = nullptr;
 };
 
 struct PoisonTokenRecord {
@@ -392,19 +363,12 @@ struct PoisonTokenRecord {
 struct EmitState {
   ResourceSemaphores semas;
   DenseMap<Operation *, Value> eventToken;
-  DenseMap<Operation *, Value> eventSemaphore;
-  DenseMap<Operation *, SmallVector<Value, 4>> eventBuffers;
   DenseMap<Value, Value> rewrittenAccessValue;
   DenseMap<Operation *, unsigned> reusedForCarrierSlots;
   DenseMap<Operation *, SmallVector<unsigned, 4>> reusedForTokenSlots;
   DenseMap<Operation *, Value> reusedForPoisonTokens;
   SmallVector<Value, 4> currentBuffers;
-  DenseSet<Operation *> protectedAccesses;
-  DenseSet<Value> knownCarrierTokens;
-  SmallVector<EmittedSyncRecord, 8> emittedAcquires;
   SmallVector<EmittedSyncRecord, 8> emittedReleases;
-  SmallVector<EmittedBufferRecord, 8> emittedBuffers;
-  SmallVector<ThreadRecord, 4> threadedTokens;
   SmallVector<PoisonTokenRecord, 8> poisonTokenResultsAfterEmission;
   SetVector<Operation *> eraseAfterEmission;
   DenseMap<PartitionId, StageCluster> stageCache;
