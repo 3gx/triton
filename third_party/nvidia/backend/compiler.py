@@ -439,7 +439,7 @@ class CUDABackend(BaseBackend):
                 generate_subtiled = opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region
                 nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, capability, opt.pingpongAutoWS,
                                                          dump_enabled, smem_budget, generate_subtiled)
-            # passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
+            passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
