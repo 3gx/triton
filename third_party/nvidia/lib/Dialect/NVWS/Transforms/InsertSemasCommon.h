@@ -1,3 +1,6 @@
+#ifndef NVIDIA_NVWS_TRANSFORMS_INSERT_SEMAS_COMMON_H_
+#define NVIDIA_NVWS_TRANSFORMS_INSERT_SEMAS_COMMON_H_
+
 #include "InsertSemasModel.h"
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -147,3 +150,5 @@ unsigned maxRankInSubtree(Operation *op,
 }
 
 } // namespace mlir::triton::nvws::insert_semas
+
+#endif // NVIDIA_NVWS_TRANSFORMS_INSERT_SEMAS_COMMON_H_

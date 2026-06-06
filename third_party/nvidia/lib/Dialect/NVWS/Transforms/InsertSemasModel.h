@@ -413,16 +413,6 @@ struct EmitState {
   std::optional<PartitionId> currentOwner;
 };
 
-void dumpBackingGroupHeader(BufferGroup &group);
-void dumpAccessDag(BufferGroup &group, mlir::triton::FuncOp funcOp);
-void dumpOwnershipDag(ResourcePlan &plan, BufferGroup &group,
-                      mlir::triton::FuncOp funcOp);
-void dumpRawSyncDag(SyncPlan &sp, const ResourcePlan &plan, BufferGroup &group,
-                    mlir::triton::FuncOp funcOp);
-void dumpOptSyncDag(const OptSyncDag &dag, SyncPlan &sp,
-                    const ResourcePlan &plan, BufferGroup &group,
-                    mlir::triton::FuncOp funcOp);
-
 } // namespace mlir::triton::nvws::insert_semas
 
 #endif // NVIDIA_NVWS_TRANSFORMS_INSERT_SEMAS_MODEL_H_
