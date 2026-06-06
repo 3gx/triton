@@ -30,10 +30,13 @@ namespace mlir::triton::nvws {
 
 // Result of analyzing the pending count for one semaphore.
 //
-// The pending count is computed from partitioned semaphore.release ops:
-// - each distinct releasing partition contributes independently
-// - multiple releases from the same partition do not add extra pending-count
-//   slots; they must agree on their async contribution
+// The pending count is computed from release waves: the partitioned
+// semaphore.release ops since the previous acquire on the same semaphore.
+// - each distinct releasing partition in one wave contributes independently
+// - releases separated by acquire ops are sequential reuse and do not add extra
+//   pending-count slots
+// - multiple releases from the same partition in one wave are counted once; all
+//   releases from the same partition must agree on their async contribution
 // - a partitioned semaphore.release must therefore carry exactly one partition
 //   id; releasing the same semaphore from multiple partitions requires
 //   multiple semaphore.release ops, one per partition
@@ -43,8 +46,8 @@ namespace mlir::triton::nvws {
 //   pendingCount is 2, so the wait completes only after both releases arrive
 // - three waiting partitions, one releasing partition: each waiting partition
 //   still observes pendingCount 1 on that semaphore stage
-// - two releases from the same partition with identical async_ops are counted
-//   once; if they imply different contributions, the analysis reports an error
+// - two release/acquire pairs reusing the same semaphore stage still have
+//   pendingCount 1 even if the two releases come from different partitions
 //
 // If no partitioned releases are present, the default pending count is 1.
 struct SemaphorePendingCountAnalysis {
@@ -62,11 +65,12 @@ struct SemaphorePendingCountAnalysis {
   }
 };
 
-// Analyze the per-partition arrival contribution for one semaphore.
+// Analyze the per-wave arrival contribution for one semaphore.
 //
 // Each supported async kind in semaphore.release contributes one arrival.  The
-// analysis sums the per-partition contribution across distinct partitions,
-// requiring repeated releases from the same partition to agree.
+// analysis sums the per-partition contribution inside each release wave and
+// takes the maximum wave size, requiring repeated releases from the same
+// partition to agree.
 SemaphorePendingCountAnalysis
 analyzeSemaphorePendingCount(SemaphoreCreateOp op);
 

@@ -23,6 +23,8 @@
 #include "nvidia/include/Dialect/NVWS/IR/SemaphorePendingCount.h"
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
+#include <algorithm>
 
 namespace mlir::triton::nvws {
 namespace {
@@ -52,19 +54,60 @@ getReleaseAsyncContribution(ArrayAttr asyncOps,
   return contribution;
 }
 
+bool directlyUsesSemaphore(Operation *operation, Value semaphore) {
+  for (Value operand : operation->getOperands())
+    if (operand == semaphore)
+      return true;
+  return false;
+}
+
+SmallVector<Operation *> getSemaphoreUsersInProgramOrder(SemaphoreCreateOp op) {
+  SmallVector<Operation *> orderedUsers;
+  Operation *scope = op->getParentOp();
+  if (!scope) {
+    for (Operation *user : op->getUsers())
+      orderedUsers.push_back(user);
+    return orderedUsers;
+  }
+
+  Value semaphore = op.getResult();
+  scope->walk<WalkOrder::PreOrder>([&](Operation *candidate) {
+    if (candidate == op.getOperation())
+      return;
+    if (directlyUsesSemaphore(candidate, semaphore))
+      orderedUsers.push_back(candidate);
+  });
+  return orderedUsers;
+}
+
 } // namespace
 
 SemaphorePendingCountAnalysis
 analyzeSemaphorePendingCount(SemaphoreCreateOp op) {
   SemaphorePendingCountAnalysis analysis;
-  // Compute pending count for this semaphore from unique releasing partitions.
-  // Different partitions contribute independently. Repeated releases from the
-  // same partition do not create extra pending-count slots and must agree on
-  // their async contribution.
-  llvm::DenseMap<int, int> partitionContrib;
+  // Compute pending count from release waves.  A wave is the set of releases on
+  // this semaphore since the previous acquire on the same semaphore.  Multiple
+  // partitions in one wave are true fan-in; releases separated by acquires are
+  // sequential reuse of the same semaphore and must not be unioned together.
+  llvm::DenseMap<int, int> globalPartitionContrib;
+  llvm::DenseMap<int, int> currentWaveContrib;
+  int currentWavePendingCount = 0;
   int pendingCount = 0;
 
-  for (Operation *user : op->getUsers()) {
+  auto recordCurrentWave = [&]() {
+    if (currentWavePendingCount == 0)
+      return;
+    pendingCount = std::max(pendingCount, currentWavePendingCount);
+    currentWaveContrib.clear();
+    currentWavePendingCount = 0;
+  };
+
+  for (Operation *user : getSemaphoreUsersInProgramOrder(op)) {
+    if (isa<SemaphoreAcquireOp>(user)) {
+      recordCurrentWave();
+      continue;
+    }
+
     auto releaseOp = dyn_cast<SemaphoreReleaseOp>(user);
     if (!releaseOp || !gpu::hasPartition(user))
       continue;
@@ -88,30 +131,27 @@ analyzeSemaphorePendingCount(SemaphoreCreateOp op) {
     }
 
     int partitionId = partitionIds.front();
-    auto [it, inserted] =
-        partitionContrib.try_emplace(partitionId, contribution.value());
-    if (inserted) {
-      // First release seen for this partition. Count its contribution once.
-      //
-      // This is what makes:
-      // - one waiting partition depend on releases from multiple other
-      //   partitions, contributing once per releasing partition
-      // - multiple waiting partitions observe the same semaphore stage with
-      //   one releasing partition, contributing once overall
-      pendingCount += contribution.value();
-      continue;
-    }
-
+    auto [globalIt, globalInserted] =
+        globalPartitionContrib.try_emplace(partitionId, contribution.value());
     // Repeated releases from the same partition are allowed only if they model
     // the same logical participant and therefore imply the same number of
     // arrivals.
-    if (it->second != contribution.value()) {
+    if (!globalInserted && globalIt->second != contribution.value()) {
       analysis.inconsistentPartitionId = partitionId;
-      analysis.expectedContribution = it->second;
+      analysis.expectedContribution = globalIt->second;
       analysis.actualContribution = contribution.value();
       return analysis;
     }
+
+    auto [waveIt, waveInserted] =
+        currentWaveContrib.try_emplace(partitionId, contribution.value());
+    (void)waveIt;
+    if (waveInserted) {
+      currentWavePendingCount += contribution.value();
+      continue;
+    }
   }
+  recordCurrentWave();
 
   // Outside partitioned warp-specialized code there may be no partitioned
   // releases at all. Keep the historical fallback of one expected arrival.

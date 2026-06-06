@@ -217,6 +217,27 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     tt.return
   }
 
+  // CHECK-LABEL: @sequential_multi_partition_not_fanin
+  tt.func @sequential_multi_partition_not_fanin() {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
+    // Same semaphore is released by two partitions, but each release is closed
+    // by an acquire before the next release. This is sequential reuse, not
+    // fan-in, so pending count is 1.
+    // CHECK: [[SEQ_MBAR:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64
+    // CHECK: [[SEQ_INIT:%.*]] = ttg.memdesc_index [[SEQ_MBAR]]
+    // CHECK: ttng.init_barrier [[SEQ_INIT]], 1
+    %sem = nvws.semaphore.create %buf true : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    %tok0 = nvws.semaphore.acquire %sem[%c0_i32, %c1_i32] {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+    nvws.semaphore.release %sem[%c0_i32], %tok0 [#nvws.async_op<none>] {ttg.partition = array<i32: 5>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
+    %tok1 = nvws.semaphore.acquire %sem[%c0_i32, %c0_i32] {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+    nvws.semaphore.release %sem[%c0_i32], %tok1 [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
+    %tok2 = nvws.semaphore.acquire %sem[%c0_i32, %c1_i32] {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+    ttg.local_dealloc %buf : !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
+    tt.return
+  }
+
   // CHECK-LABEL: @two_consumers
   // Tests 1 producer + 2 consumers with 3-buffer semaphore pair
   // Verifies barrier init counts, stage-indexed mbar, and per-slice cleanup
