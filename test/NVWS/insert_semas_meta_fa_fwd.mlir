@@ -8,19 +8,22 @@
 
 // CHECK-LABEL: @_attn_fwd_persist
 // CHECK: [[ALPHA_BUF:%.*]] = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32, buffer.offset = 0 : i32}
-// CHECK: [[ALPHA_EMPTY:%.*]] = nvws.semaphore.create {{.*}}[[ALPHA_BUF]] true
-// CHECK-NEXT: [[ALPHA_FULL:%.*]] = nvws.semaphore.create {{.*}}[[ALPHA_BUF]] false
-// CHECK-NEXT: [[ALPHA_TO_ROOT_0:%.*]] = nvws.semaphore.create {{.*}}[[ALPHA_BUF]] false
-// CHECK-NEXT: [[ALPHA_FROM_GEMM:%.*]] = nvws.semaphore.create {{.*}}[[ALPHA_BUF]] false
-// CHECK-NEXT: [[ALPHA_TO_ROOT_1:%.*]] = nvws.semaphore.create {{.*}}[[ALPHA_BUF]] false
+// CHECK: [[ALPHA_EMPTY:%.*]] = nvws.semaphore.create {{.*}}[[ALPHA_BUF]]{{.*}} true
+// CHECK-NEXT: [[ALPHA_FULL:%.*]] = nvws.semaphore.create {{.*}}[[ALPHA_BUF]]{{.*}} false
+// CHECK-NEXT: [[ALPHA_TO_ROOT_0:%.*]] = nvws.semaphore.create {{.*}}[[ALPHA_BUF]]{{.*}} false
+// CHECK-NEXT: [[ALPHA_STAGE:%.*]] = nvws.semaphore.create {{.*}}[[ALPHA_BUF]]{{.*}} false
+// CHECK-NEXT: [[ALPHA_FROM_GEMM:%.*]] = nvws.semaphore.create {{.*}}[[ALPHA_BUF]]{{.*}} false
+// CHECK-NEXT: [[ALPHA_TO_ROOT_1:%.*]] = nvws.semaphore.create {{.*}}[[ALPHA_BUF]]{{.*}} false
 // CHECK-NEXT: [[ALPHA_ENTRY:%.*]] = nvws.semaphore.acquire [[ALPHA_EMPTY]] {ttg.partition = array<i32: 1>
-// CHECK: [[INNER:%.*]]:13 = scf.for {{.*}} to %c16384_i32
+// CHECK: [[INNER:%.*]]:11 = scf.for {{.*}} to %c16384_i32
 // CHECK: nvws.semaphore.release [[ALPHA_FULL]], [[ALPHA_MMA_TOK:%arg[0-9]+]] [#nvws.async_op<tc5mma>] {{.*}}ttg.partition = array<i32: 1>
 // CHECK-NEXT: [[ALPHA_FULL_ACQ:%.*]] = nvws.semaphore.acquire [[ALPHA_FULL]] {{.*}}ttg.partition = array<i32: 5>
 // CHECK: nvws.semaphore.release [[ALPHA_TO_ROOT_0]], [[ALPHA_FULL_ACQ]] [#nvws.async_op<none>] {{.*}}ttg.partition = array<i32: 5>
 // CHECK-NEXT: [[ALPHA_TO_ROOT_0_ACQ:%.*]] = nvws.semaphore.acquire [[ALPHA_TO_ROOT_0]] {{.*}}ttg.partition = array<i32: 0>
-// CHECK: nvws.semaphore.release [[ALPHA_EMPTY]], [[ALPHA_TO_ROOT_0_ACQ]] [#nvws.async_op<none>] {{.*}}ttg.partition = array<i32: 0>
-// CHECK: nvws.semaphore.release [[ALPHA_FROM_GEMM]], [[INNER]]#3 [#nvws.async_op<none>] {ttg.partition = array<i32: 1>}
+// CHECK: nvws.semaphore.release [[ALPHA_STAGE]], [[ALPHA_TO_ROOT_0_ACQ]] [#nvws.async_op<none>] {{.*}}ttg.partition = array<i32: 0>
+// CHECK-NEXT: [[ALPHA_STAGE_ACQ:%.*]] = nvws.semaphore.acquire [[ALPHA_STAGE]] {{.*}}ttg.partition = array<i32: 5>
+// CHECK: nvws.semaphore.release [[ALPHA_EMPTY]], [[ALPHA_STAGE_ACQ]] [#nvws.async_op<none>] {{.*}}ttg.partition = array<i32: 5>
+// CHECK: nvws.semaphore.release [[ALPHA_FROM_GEMM]], [[INNER]]#3 [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>}
 // CHECK-NEXT: [[ALPHA_FROM_GEMM_ACQ:%.*]] = nvws.semaphore.acquire [[ALPHA_FROM_GEMM]] {ttg.partition = array<i32: 5>}
 // CHECK: nvws.semaphore.release [[ALPHA_TO_ROOT_1]], [[ALPHA_FROM_GEMM_ACQ]] [#nvws.async_op<none>] {ttg.partition = array<i32: 5>}
 // CHECK-NEXT: [[ALPHA_TO_ROOT_1_ACQ:%.*]] = nvws.semaphore.acquire [[ALPHA_TO_ROOT_1]] {ttg.partition = array<i32: 0>}
@@ -305,4 +308,3 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     tt.return
   }
 }
-
