@@ -1571,8 +1571,8 @@ BATCH, N_HEADS = 4, 32
 configs = []
 for HEAD_DIM in [128]:  #64, 128]:
 #    for baseVariant in ["ws", "ws_persistent"]:
-    for baseVariant in ["ws"]:
-#    for baseVariant in ["ws_persistent"]:
+#    for baseVariant in ["ws"]:
+    for baseVariant in ["ws_persistent"]:
         for mode in ["fwd"]: #, "bwd"]:
             configs.append(
                 triton.testing.Benchmark(
