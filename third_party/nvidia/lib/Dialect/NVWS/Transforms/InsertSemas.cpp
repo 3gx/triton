@@ -70,6 +70,7 @@ using namespace triton::nvws::insert_semas;
 #include "InsertSemasRawSyncDag.h"
 #include "InsertSemasOptSyncDag.h"
 #include "InsertSemasEmitter.h"
+#include "InsertSemasEmitSchedule.h"
 
 // ---------------------------------------------------------------------------
 // Top-level pipeline (commit 5 stage).
@@ -228,6 +229,7 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp,
             llvm::errs() << "{root}";
           llvm::errs() << "\n";
         }
+        dumpEmitSchedule(opt, sp, plan, group, funcOp);
       }
       plannedResources.push_back(
           {std::move(plan), std::move(sp), std::move(opt)});
