@@ -69,8 +69,8 @@ using namespace triton::nvws::insert_semas;
 #include "InsertSemasOwnerDag.h"
 #include "InsertSemasRawSyncDag.h"
 #include "InsertSemasOptSyncDag.h"
-#include "InsertSemasEmitter.h"
 #include "InsertSemasEmitSchedule.h"
+#include "InsertSemasEmitter.h"
 
 // ---------------------------------------------------------------------------
 // Top-level pipeline (commit 5 stage).
@@ -265,7 +265,6 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp,
   for (Operation *op : llvm::reverse(eraseAfterEmission))
     op->erase();
   splitSemaphoreIfForLoopScheduler(funcOp);
-  hoistInitialEmptyAcquires(funcOp);
   coalesceSemaphoreForCarriers(funcOp);
   coalesceTmemAllocsByBufferIdIntoViews(funcOp);
   eraseDeadTmemAllocs(funcOp);

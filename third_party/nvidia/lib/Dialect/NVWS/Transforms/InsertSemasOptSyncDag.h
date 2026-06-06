@@ -63,6 +63,26 @@ static std::string makeGroupName(unsigned serial) {
   return s;
 }
 
+static std::optional<unsigned> findEdgeIndex(const SyncPlan &sp,
+                                             const SyncEdge *edge) {
+  if (!edge)
+    return std::nullopt;
+  for (auto [idx, candidate] : llvm::enumerate(sp.edges))
+    if (&candidate == edge)
+      return static_cast<unsigned>(idx);
+  return std::nullopt;
+}
+
+static const SyncEdge *getRepresentativeReleaseEdge(const PlannedRelease &action,
+                                                    const SyncPlan &sp) {
+  if (action.edgeIdxs.empty())
+    return nullptr;
+  unsigned edgeIdx = action.edgeIdxs.front();
+  if (edgeIdx >= sp.edges.size())
+    return nullptr;
+  return &sp.edges[edgeIdx];
+}
+
 static bool isIfYieldRegion(Region *region);
 static bool opReadsOnlyResource(Operation *op, BufferGroup &group,
                                 int64_t resourceKey);
@@ -110,6 +130,85 @@ static bool collectLinearChainEdges(const SyncPlan &sp, ArrayRef<bool> claimed,
   }
 
   return true;
+}
+
+static const SyncEdge *findEdgeForAnchor(const SyncGroup &group,
+                                         const SyncPlan &sp,
+                                         const OptSyncDag &dag,
+                                         SyncAnchorKind kind,
+                                         Operation *anchor,
+                                         Region *yieldRegion,
+                                         Operation *liveAnchor = nullptr) {
+  if (group.kind == SyncGroupKind::InitialEmpty)
+    return nullptr;
+  if (group.kind == SyncGroupKind::ReadyFanout &&
+      (kind == SyncAnchorKind::ReleaseAfterOp ||
+       kind == SyncAnchorKind::ReleaseAfterYield))
+    return &sp.edges[group.edgeIdxs.front()];
+  if (group.kind == SyncGroupKind::DoneFanin &&
+      (kind == SyncAnchorKind::AcquireBeforeOp ||
+       kind == SyncAnchorKind::AcquireBeforeYield))
+    return &sp.edges[group.edgeIdxs.front()];
+
+  for (unsigned ei : group.edgeIdxs) {
+    const SyncEdge &edge = sp.edges[ei];
+    auto dstBranchIt = dag.dstBranchEntryAnchor.find(ei);
+    Operation *dstBranchEntry =
+        dstBranchIt == dag.dstBranchEntryAnchor.end() ? nullptr
+                                                      : dstBranchIt->second;
+    switch (kind) {
+    case SyncAnchorKind::AcquireBeforeOp:
+      if (dag.loopEntryHandoffAccess.lookup(ei) == anchor)
+        return &edge;
+      if (edge.dstOp == anchor || dstBranchEntry == anchor)
+        return &edge;
+      break;
+    case SyncAnchorKind::AcquireBeforeYield:
+      if (edge.dstYieldRegion == yieldRegion) return &edge;
+      break;
+    case SyncAnchorKind::ReleaseBeforeOp:
+      if (dag.loopEntryHandoffAccess.lookup(ei) == anchor)
+        return &edge;
+      if (edge.dstOp == anchor || dstBranchEntry == anchor)
+        return &edge;
+      break;
+    case SyncAnchorKind::ReleaseBeforeYield:
+      if (edge.dstYieldRegion == yieldRegion) return &edge;
+      break;
+    case SyncAnchorKind::ReleaseAfterOp:
+      if (edge.srcOp == anchor)
+        return &edge;
+      if (Operation *ancestorAnchor = liveAnchor ? liveAnchor : anchor)
+        if (isa<scf::ForOp>(ancestorAnchor) && edge.srcOp &&
+            ancestorAnchor->isProperAncestor(edge.srcOp) &&
+            (!edge.dstOp || !ancestorAnchor->isProperAncestor(edge.dstOp)))
+          return &edge;
+      break;
+    case SyncAnchorKind::ReleaseAfterYield:
+      if (edge.srcYieldRegion == yieldRegion) return &edge;
+      break;
+    }
+  }
+  if (group.kind == SyncGroupKind::LinearChain &&
+      (kind == SyncAnchorKind::ReleaseBeforeOp ||
+       kind == SyncAnchorKind::AcquireBeforeOp) &&
+      anchor) {
+    for (unsigned ei : group.edgeIdxs) {
+      const SyncEdge &edge = sp.edges[ei];
+      auto joinIt = dag.ifYieldJoinAccess.find(ei);
+      if (joinIt != dag.ifYieldJoinAccess.end() && joinIt->second == anchor)
+        return &edge;
+    }
+  }
+  if (group.kind == SyncGroupKind::LinearChain &&
+      kind == SyncAnchorKind::ReleaseAfterOp && anchor) {
+    for (unsigned ei : group.edgeIdxs) {
+      const SyncEdge &edge = sp.edges[ei];
+      if (edge.dstOp == anchor)
+        return &edge;
+    }
+  }
+  return group.edgeIdxs.empty() ? nullptr : &sp.edges[group.edgeIdxs.front()];
 }
 
 static bool yieldedAccessTokenRequiresCarrier(Region *region,

@@ -818,12 +818,7 @@ void dumpRawSyncBlock(Block &block, SyncPlan &sp, const ResourcePlan &plan,
     auto bIt = sp.beforeOp.find(&op);
     if (bIt != sp.beforeOp.end())
       printEdgesAt(&bIt->second, sp, &op, depth, octx);
-    AccessEvent *event = nullptr;
-    for (AccessEvent &e : group.events)
-      if (e.op == &op) {
-        event = &e;
-        break;
-      }
+    AccessEvent *event = findEvent(group, &op);
     SmallVector<const AccessTouch *, 4> touches;
     if (event)
       collectTouchesForResource(*event, sp.resource.second, touches);

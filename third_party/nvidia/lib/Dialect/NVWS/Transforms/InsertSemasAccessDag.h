@@ -18,9 +18,6 @@ static bool intervalsOverlap(int64_t aLo, int64_t aHi, int64_t bLo,
   return aLo < bHi && bLo < aHi;
 }
 
-static bool isTmemAlloc(Operation *op) { return isa<TMEMAllocOp>(op); }
-static bool isLocalAlloc(Operation *op) { return isa<LocalAllocOp>(op); }
-
 // A local alloc is a candidate semaphore-managed backing buffer if its
 // memdesc type has the multi-stage layout that insert-allocas chose.
 // Heuristic that matches the prior implementation: the alloc result type

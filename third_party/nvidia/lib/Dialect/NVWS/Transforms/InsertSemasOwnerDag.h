@@ -283,12 +283,7 @@ void dumpOwnershipBlock(Block &block, ResourcePlan &plan, BufferGroup &group,
     if (useIt == plan.useOwner.end())
       continue;
     unsigned tIdx = plan.useTouchIdx.lookup(&op);
-    AccessEvent *event = nullptr;
-    for (AccessEvent &e : group.events)
-      if (e.op == &op) {
-        event = &e;
-        break;
-      }
+    AccessEvent *event = findEvent(group, &op);
     if (!event || tIdx >= event->touches.size())
       continue;
     SmallVector<unsigned, 1> fallbackTouchIdx{tIdx};

@@ -131,6 +131,13 @@ bool isEventInScopeForRegion(Operation *tagSourceOp, Operation *eventOp,
   return false;
 }
 
+AccessEvent *findEvent(BufferGroup &group, Operation *op) {
+  for (AccessEvent &event : group.events)
+    if (event.op == op)
+      return &event;
+  return nullptr;
+}
+
 void buildProgramOrderRank(mlir::triton::FuncOp funcOp,
                            DenseMap<Operation *, unsigned> &rank) {
   rank.clear();
