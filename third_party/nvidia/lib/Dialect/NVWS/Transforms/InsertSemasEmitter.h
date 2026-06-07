@@ -14,11 +14,6 @@ static bool shouldDumpDag() {
   return s == "1" || s == "true" || s == "on";
 }
 
-// Coherent per-resource semaphore state, modeled on InsertTmemSemaphore.cpp's
-// TMEMSemaphore: holds the live carrier + bookkeeping, and the mutating
-// operations are methods (acquire/release/getBuffers); the traversal stays free
-// functions taking EmitState&. N semaphore classes (getSemaphoreForGroup), not
-// a 2-state ping/pong.
 struct EmitState {
   ResourceSemaphores semas;
   DenseMap<Operation *, Value> eventToken;
@@ -40,6 +35,16 @@ struct EmitState {
                                 unsigned groupIdx, const OptSyncDag &dag,
                                 const SyncPlan &sp, BufferGroup &group,
                                 StageCluster stageCluster);
+  std::optional<PartitionId>
+  selectReleaseOwner(const SyncGroup &syncGroup, const SyncPlan &sp,
+                     const SyncEdge *edge, Operation *anchor,
+                     SyncAnchorKind kind, bool terminalDstReadRelease,
+                     bool terminalLoopExitReadRelease) const;
+  AsyncOp selectReleasePayload(const SyncGroup &syncGroup, const SyncPlan &sp,
+                               const SyncEdge *edge, Operation *anchor,
+                               SyncAnchorKind kind, bool terminalDstReadRelease,
+                               bool terminalLoopExitReadRelease,
+                               BufferGroup &group, int64_t resourceKey) const;
   LogicalResult release(OpBuilder &b, Location loc, SyncAnchorKind kind,
                         Operation *anchor, Region *yieldRegion,
                         const PlannedRelease &action, const OptSyncDag &dag,
@@ -239,40 +244,6 @@ static bool edgeStartsAtRootTmemStoreInitializer(const SyncEdge &edge,
   return false;
 }
 
-static bool edgeUsesEmpty(const SyncEdge &edge, BufferGroup &group,
-                          int64_t resourceKey) {
-  if (edge.forceFullSemaphore)
-    return false;
-  if (edgeStartsAtRootTmemStoreInitializer(edge, group, resourceKey))
-    return true;
-  if (edge.kind == SyncEdgeKind::Done)
-    return true;
-  if (edge.kind == SyncEdgeKind::Ready)
-    return false;
-  if (group.isTmem() && isa_and_nonnull<MMAv5OpInterface>(edge.srcOp) &&
-      !edge.dstOp && edge.dstYieldRegion && edge.dstOwner)
-    return true;
-  if (edgeSrcWrites(edge, group, resourceKey) &&
-      edgeDstWrites(edge, group, resourceKey))
-    return false;
-  if (edgeDstWrites(edge, group, resourceKey))
-    return true;
-  if (edgeDstReads(edge, group, resourceKey))
-    return false;
-  if (edgeSrcReads(edge, group, resourceKey) &&
-      !edgeSrcWrites(edge, group, resourceKey))
-    return true;
-  return false;
-}
-
-static bool edgeNeedsTerminalReadRelease(const SyncEdge &edge,
-                                         BufferGroup &group,
-                                         int64_t resourceKey) {
-  return edge.dstOp && edgeDstReads(edge, group, resourceKey) &&
-         !edgeDstWrites(edge, group, resourceKey) &&
-         isa<TMEMLoadOp, LocalLoadOp>(edge.dstOp);
-}
-
 static bool opReadsOnlyResource(Operation *op, BufferGroup &group,
                                 int64_t resourceKey) {
   const AccessEvent *event = findEvent(group, op);
@@ -381,6 +352,40 @@ static Operation *findTerminalReadReleaseAnchor(Operation *op,
   if (ownerHasPlannedOutgoingEdgeAtOrAfterRead(op, sp, group, resourceKey))
     return nullptr;
   return op;
+}
+
+static bool edgeUsesEmpty(const SyncEdge &edge, BufferGroup &group,
+                          int64_t resourceKey) {
+  if (edge.forceFullSemaphore)
+    return false;
+  if (edgeStartsAtRootTmemStoreInitializer(edge, group, resourceKey))
+    return true;
+  if (edge.kind == SyncEdgeKind::Done)
+    return true;
+  if (edge.kind == SyncEdgeKind::Ready)
+    return false;
+  if (group.isTmem() && isa_and_nonnull<MMAv5OpInterface>(edge.srcOp) &&
+      !edge.dstOp && edge.dstYieldRegion && edge.dstOwner)
+    return true;
+  if (edgeSrcWrites(edge, group, resourceKey) &&
+      edgeDstWrites(edge, group, resourceKey))
+    return false;
+  if (edgeDstWrites(edge, group, resourceKey))
+    return true;
+  if (edgeDstReads(edge, group, resourceKey))
+    return false;
+  if (edgeSrcReads(edge, group, resourceKey) &&
+      !edgeSrcWrites(edge, group, resourceKey))
+    return true;
+  return false;
+}
+
+static bool edgeNeedsTerminalReadRelease(const SyncEdge &edge,
+                                         BufferGroup &group,
+                                         int64_t resourceKey) {
+  return edge.dstOp && edgeDstReads(edge, group, resourceKey) &&
+         !edgeDstWrites(edge, group, resourceKey) &&
+         isa<TMEMLoadOp, LocalLoadOp>(edge.dstOp);
 }
 
 static bool linearChainNeedsPerEdgeFulls(const SyncGroup &syncGroup,
@@ -1450,11 +1455,12 @@ static Operation *findLastSameBlockNonTokenResultUser(Operation *op) {
   return lastUser;
 }
 
-static std::optional<PartitionId>
-computeReleaseOwner(const SyncGroup &syncGroup, const SyncPlan &sp,
-                    const SyncEdge *edge, Operation *anchor, SyncAnchorKind kind,
-                    bool terminalDstReadRelease, bool terminalLoopExitReadRelease,
-                    std::optional<PartitionId> currentOwner) {
+std::optional<PartitionId>
+EmitState::selectReleaseOwner(const SyncGroup &syncGroup, const SyncPlan &sp,
+                              const SyncEdge *edge, Operation *anchor,
+                              SyncAnchorKind kind,
+                              bool terminalDstReadRelease,
+                              bool terminalLoopExitReadRelease) const {
   std::optional<PartitionId> owner = edge ? edge->srcOwner : std::nullopt;
   if (terminalDstReadRelease || terminalLoopExitReadRelease)
     owner = edge->dstOwner;
@@ -1470,12 +1476,10 @@ computeReleaseOwner(const SyncGroup &syncGroup, const SyncPlan &sp,
   return owner;
 }
 
-static AsyncOp
-computeReleasePayload(const SyncGroup &syncGroup, const SyncPlan &sp,
-                      const SyncEdge *edge, Operation *anchor,
-                      SyncAnchorKind kind, bool terminalDstReadRelease,
-                      bool terminalLoopExitReadRelease, BufferGroup &group,
-                      int64_t resourceKey) {
+AsyncOp EmitState::selectReleasePayload(
+    const SyncGroup &syncGroup, const SyncPlan &sp, const SyncEdge *edge,
+    Operation *anchor, SyncAnchorKind kind, bool terminalDstReadRelease,
+    bool terminalLoopExitReadRelease, BufferGroup &group, int64_t resourceKey) const {
   Operation *payloadOp = edge ? edge->srcOp : nullptr;
   AsyncOp payload =
       (terminalDstReadRelease || terminalLoopExitReadRelease)
@@ -1536,19 +1540,6 @@ LogicalResult EmitState::release(OpBuilder &b, Location loc, SyncAnchorKind kind
       syncGroup.kind == SyncGroupKind::Singleton &&
       kind == SyncAnchorKind::ReleaseAfterOp && edge && anchor &&
       edgeIdx && dag.tmemLoopExitRead.lookup(*edgeIdx) == anchor;
-  bool sourceReadRelease =
-      group.isTmem() && kind == SyncAnchorKind::ReleaseAfterOp && edge &&
-      anchor && edge->srcOp == anchor &&
-      edgeSrcReads(*edge, group, dag.resource.second) &&
-      !edgeSrcWrites(*edge, group, dag.resource.second);
-  bool delayReadReleaseForUsers = group.isTmem() && group.members.size() > 1;
-  bool readCompletionRelease =
-      delayReadReleaseForUsers &&
-      (terminalDstReadRelease || terminalLoopExitReadRelease ||
-       sourceReadRelease);
-  // (No semaphore override: `sem` is the mechanical class lookup above. The
-  // terminal/loop-exit read-release flags below still drive owner/payload
-  // materialization only, not semaphore identity.)
   bool useStructuredCarrier =
       kind == SyncAnchorKind::ReleaseAfterOp && edge && edge->srcOp &&
       edge->srcOp != anchor && currentToken;
@@ -1563,10 +1554,10 @@ LogicalResult EmitState::release(OpBuilder &b, Location loc, SyncAnchorKind kind
                                                 b.getInsertionBlock());
   if (failed(token))
     return failure();
-  std::optional<PartitionId> owner = computeReleaseOwner(
+  std::optional<PartitionId> owner = selectReleaseOwner(
       syncGroup, sp, edge, anchor, kind, terminalDstReadRelease,
-      terminalLoopExitReadRelease, currentOwner);
-  AsyncOp payload = computeReleasePayload(
+      terminalLoopExitReadRelease);
+  AsyncOp payload = selectReleasePayload(
       syncGroup, sp, edge, anchor, kind, terminalDstReadRelease,
       terminalLoopExitReadRelease, group, dag.resource.second);
   SemaphoreReleaseOp release =
@@ -1575,6 +1566,16 @@ LogicalResult EmitState::release(OpBuilder &b, Location loc, SyncAnchorKind kind
   // DAG placement, once automatic-warp-specialization.mlir can be regenerated).
   // Runtime-irrelevant (WS + both FA green without it); only reproduces that
   // frozen test's exact order.
+  bool sourceReadRelease =
+      group.isTmem() && kind == SyncAnchorKind::ReleaseAfterOp && edge &&
+      anchor && edge->srcOp == anchor &&
+      edgeSrcReads(*edge, group, dag.resource.second) &&
+      !edgeSrcWrites(*edge, group, dag.resource.second);
+  bool delayReadReleaseForUsers = group.isTmem() && group.members.size() > 1;
+  bool readCompletionRelease =
+      delayReadReleaseForUsers &&
+      (terminalDstReadRelease || terminalLoopExitReadRelease ||
+       sourceReadRelease);
   if (readCompletionRelease && anchor)
     if (Operation *lastUser = findLastSameBlockNonTokenResultUser(anchor))
       if (release->getBlock() == lastUser->getBlock() &&
@@ -3069,8 +3070,6 @@ static void poisonDuplicateUnbackedTokenSlots(
   }
 }
 
-// Poison duplicate/unbacked loop-carried async-token iter_args (the former
-// same-backing merge was dead code and was removed).
 static void poisonUnbackedCarrierTokenSlots(triton::FuncOp funcOp) {
   SmallVector<scf::ForOp, 8> loops;
   funcOp.walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
