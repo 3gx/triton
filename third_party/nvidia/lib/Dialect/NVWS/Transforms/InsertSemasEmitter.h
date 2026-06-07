@@ -48,6 +48,20 @@ struct ActiveSemaphoreState {
   void setSemaphore(Value sem) { semaphore = sem; clearBuffers(); }
 };
 
+struct EmitterTransitionPlan {
+  DenseMap<Operation *, SmallVector<PlannedRelease, 2>> opEntryReleases,
+      opExitReleases;
+  DenseMap<Operation *, SmallVector<unsigned, 2>> opEntryAcquires;
+  DenseMap<Region *, SmallVector<PlannedRelease, 2>> regionEntryReleases,
+      regionExitReleases;
+  DenseMap<Region *, SmallVector<unsigned, 2>> regionEntryAcquires;
+};
+
+static EmitterTransitionPlan buildEmitterTransitionPlan(const OptSyncDag &dag) {
+  return {dag.releaseBeforeOp, dag.releaseAfterOp, dag.acquireBeforeOp,
+          dag.releaseBeforeYield, dag.releaseAfterYield, dag.acquireBeforeYield};
+}
+
 struct EmitState {
   ResourceSemaphores semas;
   DenseMap<Operation *, Value> eventToken;
@@ -55,6 +69,7 @@ struct EmitState {
   DenseMap<Operation *, unsigned> reusedForCarrierSlots;
   DenseMap<Operation *, SmallVector<unsigned, 4>> reusedForTokenSlots;
   DenseMap<Operation *, Value> reusedForPoisonTokens;
+  const EmitterTransitionPlan *transitions = nullptr;
   ActiveSemaphoreState current;
   SmallVector<EmittedSyncRecord, 8> emittedReleases;
   SmallVector<PoisonTokenRecord, 8> poisonTokenResultsAfterEmission;
@@ -76,6 +91,7 @@ struct EmitState {
              std::optional<PartitionId> owner, bool freshAcquire,
              BufferGroup &group, const GroupBacking &backing,
              ArrayRef<const AccessTouch *> touches, bool writes);
+  const EmitterTransitionPlan &transitionPlan() const { return *transitions; }
 };
 
 template <typename OpT, typename... Args>
@@ -461,13 +477,6 @@ static ResourceSemaphores createResourceSemaphores(const OptSyncDag &dag,
   Location loc = group.members.front().allocOp->getLoc();
   semas.seedId = static_cast<unsigned>(sp.edges.size());
 
-  // Mechanical identity: exactly one semaphore per canonical `semaRep` class.
-  // A class is created released=true iff it is the seed's class (the single
-  // initial permit — M1); every other class is released=false (M2). Creation
-  // order is the deterministic §6.5 order: walk dag.groups in order (the
-  // InitialEmpty seed group is group 0, so the released seed is created first),
-  // then each group's edgeIdxs in order. No empty/full, no acquirer keying, no
-  // op-kind.
   unsigned seedRep = sp.semaFind(semas.seedId);
   auto ensureClass = [&](unsigned id) {
     unsigned rep = sp.semaFind(id);
@@ -486,9 +495,6 @@ static ResourceSemaphores createResourceSemaphores(const OptSyncDag &dag,
     for (unsigned edgeIdx : syncGroup.edgeIdxs)
       ensureClass(edgeIdx);
   }
-  // Safety: ensure the seed class exists even if no InitialEmpty group is present
-  // (an edge-bearing resource with no separate seed marker still needs its seed
-  // class materialized for forClass()).
   ensureClass(semas.seedId);
   return semas;
 }
@@ -497,9 +503,6 @@ static Value getSemaphoreForGroup(unsigned groupIdx, const SyncEdge *edge,
                                   const OptSyncDag &dag, const SyncPlan &sp,
                                   BufferGroup &group,
                                   ResourceSemaphores &semas) {
-  // Mechanical: the semaphore is the one created for this edge's canonical
-  // `semaRep` class; InitialEmpty / a null edge resolve to the seed class.
-  // No empty/full split and no op-kind heuristic: a single fact lookup.
   if (dag.groups[groupIdx].kind == SyncGroupKind::InitialEmpty || !edge)
     return semas.forClass(sp, std::nullopt);
   return semas.forClass(sp, findEdgeIndex(sp, edge));
@@ -1180,13 +1183,13 @@ EmitState::getBuffers(OpBuilder &b, Operation *op, Value sem, Value token,
   return buffers;
 }
 
-static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
-                                     ArrayRef<const AccessTouch *> touches,
-                                     ArrayRef<AcquireRecord> acquires,
-                                     BufferGroup &group,
-                                     const OptSyncDag &dag,
-                                     const GroupBacking &backing,
-                                     EmitState &state) {
+static LogicalResult emitAccessTransition(OpBuilder &b, AccessEvent &event,
+                                          ArrayRef<const AccessTouch *> touches,
+                                          ArrayRef<AcquireRecord> acquires,
+                                          BufferGroup &group,
+                                          const OptSyncDag &dag,
+                                          const GroupBacking &backing,
+                                          EmitState &state) {
   Operation *op = event.op;
   bool writes = llvm::any_of(touches, [](const AccessTouch *touch) {
     return touchWrites(*touch);
@@ -1583,7 +1586,6 @@ LogicalResult EmitState::release(OpBuilder &b, Location loc, SyncAnchorKind kind
       terminalLoopExitReadRelease, group, dag.resource.second, current.payload);
   SemaphoreReleaseOp release =
       emitRelease(b, loc, sem, *token, owner, stageCluster, payload);
-  // Heuristic ordering shim kept until transition-based placement matches tests.
   bool sourceReadRelease =
       group.isTmem() && kind == SyncAnchorKind::ReleaseAfterOp && edge &&
       anchor && edge->srcOp == anchor &&
@@ -1741,21 +1743,21 @@ AcquireRecord EmitState::acquireForGroup(OpBuilder &b, Location loc,
   return AcquireRecord{sem, token, owner};
 }
 
-static LogicalResult
-emitBeforeOpSync(Operation *anchor, const OptSyncDag &dag, const SyncPlan &sp,
-                 BufferGroup &group, EmitState &state,
-                 SmallVectorImpl<AcquireRecord> &acquires) {
+static LogicalResult emitOperationEntryTransitions(
+    Operation *anchor, const OptSyncDag &dag, const SyncPlan &sp,
+    BufferGroup &group, EmitState &state, SmallVectorImpl<AcquireRecord> &acquires) {
+  const EmitterTransitionPlan &transitions = state.transitionPlan();
   OpBuilder b(anchor);
   b.setInsertionPoint(anchor);
-  auto rIt = dag.releaseBeforeOp.find(anchor);
-  if (rIt != dag.releaseBeforeOp.end())
+  auto rIt = transitions.opEntryReleases.find(anchor);
+  if (rIt != transitions.opEntryReleases.end())
     for (const PlannedRelease &release : rIt->second)
       if (failed(state.release(
               b, anchor->getLoc(), SyncAnchorKind::ReleaseBeforeOp, anchor,
               nullptr, release, dag, sp, group, getStageCluster(anchor))))
         return failure();
-  auto aIt = dag.acquireBeforeOp.find(anchor);
-  if (aIt != dag.acquireBeforeOp.end())
+  auto aIt = transitions.opEntryAcquires.find(anchor);
+  if (aIt != transitions.opEntryAcquires.end())
     for (unsigned gi : aIt->second)
       acquires.push_back(state.acquireForGroup(
           b, anchor->getLoc(), SyncAnchorKind::AcquireBeforeOp, anchor, nullptr,
@@ -1763,12 +1765,12 @@ emitBeforeOpSync(Operation *anchor, const OptSyncDag &dag, const SyncPlan &sp,
   return success();
 }
 
-static LogicalResult emitAfterOpSync(Operation *anchor, Operation *insertAfter,
-                                     const OptSyncDag &dag,
-                                     const SyncPlan &sp, BufferGroup &group,
-                                     EmitState &state) {
-  auto rIt = dag.releaseAfterOp.find(anchor);
-  if (rIt == dag.releaseAfterOp.end()) return success();
+static LogicalResult emitOperationExitTransitions(
+    Operation *anchor, Operation *insertAfter, const OptSyncDag &dag,
+    const SyncPlan &sp, BufferGroup &group, EmitState &state) {
+  const EmitterTransitionPlan &transitions = state.transitionPlan();
+  auto rIt = transitions.opExitReleases.find(anchor);
+  if (rIt == transitions.opExitReleases.end()) return success();
   Operation *releaseAfter = insertAfter;
   if (!group.isTmem() && isa<LocalLoadOp>(insertAfter))
     releaseAfter = latestTransitiveConsumer(insertAfter);
@@ -1845,30 +1847,30 @@ static LogicalResult emitAfterOpSync(Operation *anchor, Operation *insertAfter,
   return result;
 }
 
-static LogicalResult emitAfterOpSync(Operation *anchor, const OptSyncDag &dag,
-                                     const SyncPlan &sp, BufferGroup &group,
-                                     EmitState &state) {
-  return emitAfterOpSync(anchor, anchor, dag, sp, group, state);
+static LogicalResult emitOperationExitTransitions(
+    Operation *anchor, const OptSyncDag &dag, const SyncPlan &sp,
+    BufferGroup &group, EmitState &state) {
+  return emitOperationExitTransitions(anchor, anchor, dag, sp, group, state);
 }
 
-static LogicalResult emitDeferredNestedAfterOpSync(Operation *releaseAfter,
-                                                   const OptSyncDag &dag,
-                                                   const SyncPlan &sp,
-                                                   BufferGroup &group,
-                                                   EmitState &state) {
+static LogicalResult emitDeferredNestedExitTransitions(
+    Operation *releaseAfter, const OptSyncDag &dag, const SyncPlan &sp,
+    BufferGroup &group, EmitState &state) {
+  const EmitterTransitionPlan &transitions = state.transitionPlan();
   SmallVector<Operation *, 4> anchors;
   releaseAfter->walk([&](Operation *op) {
     if (op == releaseAfter)
       return;
     if (!isa<LocalLoadOp>(op))
       return;
-    if (!dag.releaseAfterOp.contains(op))
+    if (!transitions.opExitReleases.contains(op))
       return;
     if (latestTransitiveConsumer(op) == releaseAfter)
       anchors.push_back(op);
   });
   for (Operation *anchor : anchors)
-    if (failed(emitAfterOpSync(anchor, releaseAfter, dag, sp, group, state)))
+    if (failed(emitOperationExitTransitions(anchor, releaseAfter, dag, sp,
+                                            group, state)))
       return failure();
   return success();
 }
@@ -1889,11 +1891,11 @@ static bool linearChainAnchorsLoopExit(const SyncGroup &syncGroup,
 
 static const PlannedRelease *
 findPlannedAfterOpReleaseForGroup(Operation *anchor, unsigned groupIdx,
-                                  const OptSyncDag &dag) {
+                                  const EmitterTransitionPlan &transitions) {
   if (!anchor)
     return nullptr;
-  auto releaseIt = dag.releaseAfterOp.find(anchor);
-  if (releaseIt == dag.releaseAfterOp.end())
+  auto releaseIt = transitions.opExitReleases.find(anchor);
+  if (releaseIt == transitions.opExitReleases.end())
     return nullptr;
   for (const PlannedRelease &action : releaseIt->second)
     if (action.groupIdx == groupIdx)
@@ -1902,13 +1904,13 @@ findPlannedAfterOpReleaseForGroup(Operation *anchor, unsigned groupIdx,
 }
 
 static bool linearChainNeedsLoopExitDrain(unsigned groupIdx,
-                                          const SyncGroup &syncGroup,
-                                          Operation *forOp, Region *region,
+                                          const SyncGroup &syncGroup, Operation *forOp, Region *region,
+                                          const EmitterTransitionPlan &transitions,
                                           const OptSyncDag &dag,
                                           const SyncPlan &sp) {
   if (!forOp || !region)
     return false;
-  if (findPlannedAfterOpReleaseForGroup(forOp, groupIdx, dag))
+  if (findPlannedAfterOpReleaseForGroup(forOp, groupIdx, transitions))
     return true;
   if (dag.skippedInitialLoopCarrierRegion.lookup(groupIdx) == region)
     for (unsigned edgeIdx : syncGroup.edgeIdxs)
@@ -1935,9 +1937,10 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
     return success();
   if (!hasWarpSpecializeTag(forOp))
     return success();
+  const EmitterTransitionPlan &transitions = state.transitionPlan();
   SmallVector<unsigned, 2> groupIds;
-  auto it = dag.acquireBeforeYield.find(region);
-  if (it != dag.acquireBeforeYield.end())
+  auto it = transitions.regionEntryAcquires.find(region);
+  if (it != transitions.regionEntryAcquires.end())
     groupIds.append(it->second.begin(), it->second.end());
   else
     for (auto [idx, syncGroup] : llvm::enumerate(dag.groups))
@@ -1954,7 +1957,7 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
     if (linearChainNeedsPerEdgeFulls(syncGroup, sp, group, dag.resource.second))
       continue;
     if (!linearChainNeedsLoopExitDrain(gi, syncGroup, forOp.getOperation(),
-                                       region, dag, sp))
+                                       region, transitions, dag, sp))
       continue;
 
     const SyncEdge &firstEdge = sp.edges[syncGroup.edgeIdxs.front()];
@@ -1986,8 +1989,8 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
       std::optional<unsigned> edgeIdx = findEdgeIndex(sp, &edge);
       if (!edgeIdx)
         return nullptr;
-      auto releaseIt = dag.releaseAfterOp.find(forOp.getOperation());
-      if (releaseIt == dag.releaseAfterOp.end())
+      auto releaseIt = transitions.opExitReleases.find(forOp.getOperation());
+      if (releaseIt == transitions.opExitReleases.end())
         return nullptr;
       for (const PlannedRelease &action : releaseIt->second)
         if (llvm::is_contained(action.edgeIdxs, *edgeIdx))
@@ -2048,9 +2051,6 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
     }
     const SyncEdge *fullReleaseEdge =
         loopEntryHandoffEdge ? loopEntryHandoffEdge : &firstEdge;
-    // Mechanical identity: the drain's "full" side is the class of the
-    // full-release edge; the "empty" side is the class of the second (carry)
-    // edge. Both are created in createResourceSemaphores.
     Value fullSem = state.semas.forClass(sp, findEdgeIndex(sp, fullReleaseEdge));
     Value emptySem = state.semas.forClass(sp, findEdgeIndex(sp, &secondEdge));
     if (const PlannedRelease *releaseAction =
@@ -2100,6 +2100,7 @@ static bool collectFirstReadOnlyRegionAccess(Region &region, const OptSyncDag &d
 
 static bool canPrebufferLocalRegionEntry(Operation *anchor, Region &region,
                                          ArrayRef<AcquireRecord> acquires,
+                                         const EmitterTransitionPlan &transitions,
                                          const OptSyncDag &dag,
                                          BufferGroup &group,
                                          SmallVectorImpl<const AccessTouch *> &touches) {
@@ -2107,22 +2108,24 @@ static bool canPrebufferLocalRegionEntry(Operation *anchor, Region &region,
     return false;
   if (!isa<scf::ForOp>(anchor))
     return false;
-  if (!dag.acquireBeforeOp.contains(anchor) || dag.releaseAfterOp.contains(anchor) ||
-      dag.acquireBeforeYield.contains(&region))
+  if (!transitions.opEntryAcquires.contains(anchor) ||
+      transitions.opExitReleases.contains(anchor) ||
+      transitions.regionEntryAcquires.contains(&region))
     return false;
   return collectFirstReadOnlyRegionAccess(region, dag, group, touches);
 }
 
 static bool canPrebufferLocalIfEntry(scf::IfOp ifOp,
                                      ArrayRef<AcquireRecord> acquires,
+                                     const EmitterTransitionPlan &transitions,
                                      const OptSyncDag &dag, BufferGroup &group,
                                      SmallVectorImpl<const AccessTouch *> &touches) {
   if (group.isTmem() || acquires.size() != 1)
     return false;
-  if (!dag.acquireBeforeOp.contains(ifOp.getOperation()) ||
-      dag.releaseAfterOp.contains(ifOp.getOperation()) ||
-      dag.acquireBeforeYield.contains(&ifOp.getThenRegion()) ||
-      dag.acquireBeforeYield.contains(&ifOp.getElseRegion()))
+  if (!transitions.opEntryAcquires.contains(ifOp.getOperation()) ||
+      transitions.opExitReleases.contains(ifOp.getOperation()) ||
+      transitions.regionEntryAcquires.contains(&ifOp.getThenRegion()) ||
+      transitions.regionEntryAcquires.contains(&ifOp.getElseRegion()))
     return false;
   if (collectFirstReadOnlyRegionAccess(ifOp.getThenRegion(), dag, group,
                                        touches))
@@ -2150,14 +2153,15 @@ static void prebufferLocalRegionEntry(OpBuilder &b, Operation *anchor,
   state.current.cacheBuffers(bufferOp.getBuffers());
 }
 
-static LogicalResult
-emitBeforeYieldSync(Operation *yieldOp, Region *region, const OptSyncDag &dag,
-                    const SyncPlan &sp, BufferGroup &group, EmitState &state,
-                    SmallVectorImpl<AcquireRecord> &acquires) {
+static LogicalResult emitRegionCloseTransitions(
+    Operation *yieldOp, Region *region, const OptSyncDag &dag,
+    const SyncPlan &sp, BufferGroup &group, EmitState &state,
+    SmallVectorImpl<AcquireRecord> &acquires) {
+  const EmitterTransitionPlan &transitions = state.transitionPlan();
   OpBuilder b(yieldOp);
   b.setInsertionPoint(yieldOp);
-  auto rIt = dag.releaseBeforeYield.find(region);
-  if (rIt != dag.releaseBeforeYield.end())
+  auto rIt = transitions.regionEntryReleases.find(region);
+  if (rIt != transitions.regionEntryReleases.end())
     for (const PlannedRelease &release : rIt->second) {
       const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
       if (failed(state.release(
@@ -2166,8 +2170,8 @@ emitBeforeYieldSync(Operation *yieldOp, Region *region, const OptSyncDag &dag,
               stageForYieldOwner(edge ? edge->srcOwner : std::nullopt, state))))
         return failure();
     }
-  auto aIt = dag.acquireBeforeYield.find(region);
-  if (aIt != dag.acquireBeforeYield.end())
+  auto aIt = transitions.regionEntryAcquires.find(region);
+  if (aIt != transitions.regionEntryAcquires.end())
     for (unsigned gi : aIt->second) {
       const SyncEdge *edge =
           findEdgeForAnchor(dag.groups[gi], sp,
@@ -2178,8 +2182,8 @@ emitBeforeYieldSync(Operation *yieldOp, Region *region, const OptSyncDag &dag,
           region, gi, dag, sp, group,
           stageForYieldOwner(edge ? edge->dstOwner : std::nullopt, state)));
     }
-  auto arIt = dag.releaseAfterYield.find(region);
-  if (arIt != dag.releaseAfterYield.end())
+  auto arIt = transitions.regionExitReleases.find(region);
+  if (arIt != transitions.regionExitReleases.end())
     for (const PlannedRelease &release : arIt->second) {
       const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
       if (failed(state.release(
@@ -2447,18 +2451,13 @@ static void mergeProtectedAccesses(EmitState &dst, const EmitState &src) {
 }
 
 static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
-                                       const SyncPlan &sp,
-                                       const ResourcePlan &plan,
-                                       BufferGroup &group,
-                                       const GroupBacking &backing,
-                                       EmitState &state,
-                                       Region *plannedRegion);
+                                       const SyncPlan &sp, const ResourcePlan &plan,
+                                       BufferGroup &group, const GroupBacking &backing,
+                                       EmitState &state, Region *plannedRegion);
 
 static LogicalResult emitResourceRegion(Region &region, const OptSyncDag &dag,
-                                        const SyncPlan &sp,
-                                        const ResourcePlan &plan,
-                                        BufferGroup &group,
-                                        const GroupBacking &backing,
+                                        const SyncPlan &sp, const ResourcePlan &plan,
+                                        BufferGroup &group, const GroupBacking &backing,
                                         EmitState &state,
                                         Region *plannedRegion = nullptr) {
   Region *regionKey = plannedRegion ? plannedRegion : &region;
@@ -2470,17 +2469,15 @@ static LogicalResult emitResourceRegion(Region &region, const OptSyncDag &dag,
 }
 
 static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
-                                       const SyncPlan &sp,
-                                       const ResourcePlan &plan,
-                                       BufferGroup &group,
-                                       const GroupBacking &backing,
-                                       EmitState &state,
-                                       Region *plannedRegion) {
+                                       const SyncPlan &sp, const ResourcePlan &plan,
+                                       BufferGroup &group, const GroupBacking &backing,
+                                       EmitState &state, Region *plannedRegion) {
   for (Operation &op : llvm::make_early_inc_range(block)) {
     if (isa<scf::YieldOp>(op)) {
       SmallVector<AcquireRecord, 2> yieldAcquires;
-      if (failed(emitBeforeYieldSync(&op, plannedRegion, dag, sp, group,
-                                     state, yieldAcquires)))
+      if (failed(emitRegionCloseTransitions(&op, plannedRegion, dag, sp,
+                                            group, state,
+                                            yieldAcquires)))
         return failure();
       continue;
     }
@@ -2496,7 +2493,8 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
     }
 
     SmallVector<AcquireRecord, 2> acquires;
-    if (failed(emitBeforeOpSync(&op, dag, sp, group, state, acquires)))
+    if (failed(emitOperationEntryTransitions(&op, dag, sp, group, state,
+                                             acquires)))
       return failure();
 
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
@@ -2508,7 +2506,7 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
       SmallVector<const AccessTouch *, 4> prebufferTouches;
       if (threaded && canPrebufferLocalRegionEntry(
                           forOp.getOperation(), forOp.getRegion(), acquires,
-                          dag, group, prebufferTouches)) {
+                          state.transitionPlan(), dag, group, prebufferTouches)) {
         OpBuilder prebufferBuilder(forOp);
         prebufferLocalRegionEntry(prebufferBuilder, forOp.getOperation(),
                                   prebufferTouches, acquires.front(), group,
@@ -2535,7 +2533,7 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
         auto regionOwnerIt = plan.regionOwners.find(plannedForRegion);
         if (regionOwnerIt != plan.regionOwners.end() &&
             (!linearChainEntersFor(oldForOp, dag, sp) ||
-             dag.acquireBeforeYield.contains(plannedForRegion))) {
+             state.transitionPlan().regionEntryAcquires.contains(plannedForRegion))) {
           ownerAtYield = regionOwnerIt->second.exit;
           overrideOwnerAtYield = true;
         }
@@ -2547,11 +2545,11 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
       } else {
         closeExistingCarrierForLoop(activeForOp, bodyState, state);
       }
-      if (failed(emitAfterOpSync(oldForOp, activeForOp.getOperation(), dag, sp,
-                                 group, state)))
+      if (failed(emitOperationExitTransitions(oldForOp, activeForOp.getOperation(),
+                                              dag, sp, group, state)))
         return failure();
-      if (failed(emitDeferredNestedAfterOpSync(activeForOp.getOperation(), dag,
-                                               sp, group, state)))
+      if (failed(emitDeferredNestedExitTransitions(activeForOp.getOperation(),
+                                                   dag, sp, group, state)))
         return failure();
       continue;
     }
@@ -2560,8 +2558,8 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
       Region *plannedThenRegion = &ifOp.getThenRegion();
       Region *plannedElseRegion = &ifOp.getElseRegion();
       SmallVector<const AccessTouch *, 4> prebufferTouches;
-      if (canPrebufferLocalIfEntry(ifOp, acquires, dag, group,
-                                   prebufferTouches)) {
+      if (canPrebufferLocalIfEntry(ifOp, acquires, state.transitionPlan(), dag,
+                                   group, prebufferTouches)) {
         OpBuilder prebufferBuilder(ifOp);
         prebufferLocalRegionEntry(prebufferBuilder, ifOp.getOperation(),
                                   prebufferTouches, acquires.front(), group,
@@ -2688,11 +2686,11 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
         mergeProtectedAccesses(state, thenState);
         mergeProtectedAccesses(state, elseState);
       }
-      if (failed(emitAfterOpSync(oldIfOp, activeIfOp.getOperation(), dag, sp,
-                                 group, state)))
+      if (failed(emitOperationExitTransitions(oldIfOp, activeIfOp.getOperation(),
+                                              dag, sp, group, state)))
         return failure();
-      if (failed(emitDeferredNestedAfterOpSync(activeIfOp.getOperation(), dag,
-                                               sp, group, state)))
+      if (failed(emitDeferredNestedExitTransitions(activeIfOp.getOperation(),
+                                                   dag, sp, group, state)))
         return failure();
       if (threaded && !reuseExistingTokenResult)
         state.eraseAfterEmission.insert(oldIfOp);
@@ -2702,11 +2700,11 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
     if (event && !touches.empty()) {
       OpBuilder b(&op);
       b.setInsertionPoint(&op);
-      if (failed(emitAccessEvent(b, *event, touches, acquires, group, dag,
-                                 backing, state)))
+      if (failed(emitAccessTransition(b, *event, touches, acquires, group, dag,
+                                      backing, state)))
         return failure();
     }
-    if (failed(emitAfterOpSync(&op, dag, sp, group, state)))
+    if (failed(emitOperationExitTransitions(&op, dag, sp, group, state)))
       return failure();
   }
   return success();
@@ -2724,6 +2722,8 @@ static LogicalResult emitResource(triton::FuncOp funcOp, BufferGroup &group,
                          plan.memberIndices, backings, numStagesByGroup);
   EmitState state;
   state.semas = createResourceSemaphores(dag, sp, group, backing);
+  EmitterTransitionPlan transitions = buildEmitterTransitionPlan(dag);
+  state.transitions = &transitions;
   if (failed(emitResourceRegion(funcOp.getBody(), dag, sp, plan, group, backing,
                                 state)))
     return failure();
