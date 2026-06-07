@@ -82,6 +82,7 @@ static void dumpEmitSchedule(const OptSyncDag &dag, SyncPlan &sp,
   };
 
   SmallVector<SchedAction, 16> actions;
+  EmitterTransitionPlan transitions = buildEmitterTransitionPlan(dag, sp, group);
 
   // 1) CreateSemaphore: one per (edge-bearing group, first-seen dstOwner) in
   // deterministic order, plus the released seed group.
@@ -127,14 +128,14 @@ static void dumpEmitSchedule(const OptSyncDag &dag, SyncPlan &sp,
     a.endpoint = ep;
     actions.push_back(std::move(a));
   };
-  for (auto &[op, groups] : dag.acquireBeforeOp)
+  for (auto &[op, groups] : transitions.opEntryAcquires)
     for (unsigned g : groups) {
       const SyncEdge *e = findEdgeForAnchor(dag.groups[g], sp, dag,
                                             SyncAnchorKind::AcquireBeforeOp, op,
                                             nullptr);
       addAcquire(g, e, rankOf(op, nullptr), endpointDesc(op, nullptr));
     }
-  for (auto &[region, groups] : dag.acquireBeforeYield)
+  for (auto &[region, groups] : transitions.regionEntryAcquires)
     for (unsigned g : groups) {
       const SyncEdge *e = findEdgeForAnchor(dag.groups[g], sp, dag,
                                             SyncAnchorKind::AcquireBeforeYield,
@@ -155,17 +156,17 @@ static void dumpEmitSchedule(const OptSyncDag &dag, SyncPlan &sp,
     a.endpoint = ep;
     actions.push_back(std::move(a));
   };
-  for (auto &[op, rels] : dag.releaseBeforeOp)
+  for (auto &[op, rels] : transitions.opEntryReleases)
     for (const PlannedRelease &pr : rels)
       addRelease(pr, rankOf(op, nullptr), "before:" + endpointDesc(op, nullptr));
-  for (auto &[op, rels] : dag.releaseAfterOp)
+  for (auto &[op, rels] : transitions.opExitReleases)
     for (const PlannedRelease &pr : rels)
       addRelease(pr, rankOf(op, nullptr), "after:" + endpointDesc(op, nullptr));
-  for (auto &[region, rels] : dag.releaseBeforeYield)
+  for (auto &[region, rels] : transitions.regionEntryReleases)
     for (const PlannedRelease &pr : rels)
       addRelease(pr, rankOf(nullptr, region),
                  "before:" + endpointDesc(nullptr, region));
-  for (auto &[region, rels] : dag.releaseAfterYield)
+  for (auto &[region, rels] : transitions.regionExitReleases)
     for (const PlannedRelease &pr : rels)
       addRelease(pr, rankOf(nullptr, region),
                  "after:" + endpointDesc(nullptr, region));

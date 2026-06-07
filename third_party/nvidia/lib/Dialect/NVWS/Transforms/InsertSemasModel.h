@@ -287,6 +287,21 @@ inline bool operator==(const PlannedRelease &lhs,
   return lhs.groupIdx == rhs.groupIdx && lhs.edgeIdxs == rhs.edgeIdxs;
 }
 
+struct EmitterTransitionPlan {
+  DenseMap<Operation *, SmallVector<PlannedRelease, 2>> opEntryReleases,
+      opExitReleases;
+  DenseMap<Operation *, SmallVector<unsigned, 2>> opEntryAcquires;
+  DenseMap<Region *, SmallVector<PlannedRelease, 2>> regionEntryReleases,
+      regionExitReleases;
+  DenseMap<Region *, SmallVector<unsigned, 2>> regionEntryAcquires;
+  DenseMap<Operation *, Operation *> opEntryReleaseInsertAfter,
+      opEntryReleaseInsertBefore, opExitReleaseInsertAfter,
+      opExitReleaseInsertBefore;
+  DenseMap<Region *, Operation *> regionEntryReleaseInsertAfter,
+      regionEntryReleaseInsertBefore;
+  DenseMap<Operation *, SmallVector<Operation *, 2>> deferredOpExitAnchors;
+};
+
 struct OptSyncDag {
   ResourceId resource{0, 0};
   unsigned groupIdx = 0;
@@ -295,12 +310,6 @@ struct OptSyncDag {
   SmallVector<unsigned> edgeToGroup;
   SmallVector<std::pair<unsigned, std::optional<PartitionId>>, 2>
       releasedSemaphores;
-  DenseMap<Operation *, SmallVector<PlannedRelease, 2>> releaseBeforeOp;
-  DenseMap<Region *, SmallVector<PlannedRelease, 2>> releaseBeforeYield;
-  DenseMap<Operation *, SmallVector<PlannedRelease, 2>> releaseAfterOp;
-  DenseMap<Region *, SmallVector<PlannedRelease, 2>> releaseAfterYield;
-  DenseMap<Operation *, SmallVector<unsigned, 2>> acquireBeforeOp;
-  DenseMap<Region *, SmallVector<unsigned, 2>> acquireBeforeYield;
   DenseMap<unsigned, Operation *> ifYieldJoinAccess;
   DenseMap<unsigned, Operation *> dstBranchEntryAnchor;
   DenseMap<unsigned, Operation *> tmemLoopExitRead;
