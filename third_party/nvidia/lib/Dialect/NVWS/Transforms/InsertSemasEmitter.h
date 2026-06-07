@@ -14,6 +14,44 @@ static bool shouldDumpDag() {
   return s == "1" || s == "true" || s == "on";
 }
 
+// Coherent per-resource semaphore state, modeled on InsertTmemSemaphore.cpp's
+// TMEMSemaphore: holds the live carrier + bookkeeping, and the mutating
+// operations are methods (acquire/release/getBuffers); the traversal stays free
+// functions taking EmitState&. N semaphore classes (getSemaphoreForGroup), not
+// a 2-state ping/pong.
+struct EmitState {
+  ResourceSemaphores semas;
+  DenseMap<Operation *, Value> eventToken;
+  DenseMap<Value, Value> rewrittenAccessValue;
+  DenseMap<Operation *, unsigned> reusedForCarrierSlots;
+  DenseMap<Operation *, SmallVector<unsigned, 4>> reusedForTokenSlots;
+  DenseMap<Operation *, Value> reusedForPoisonTokens;
+  SmallVector<Value, 4> currentBuffers;
+  SmallVector<EmittedSyncRecord, 8> emittedReleases;
+  SmallVector<PoisonTokenRecord, 8> poisonTokenResultsAfterEmission;
+  SetVector<Operation *> eraseAfterEmission;
+  DenseMap<PartitionId, StageCluster> stageCache;
+  Value currentToken;
+  Value currentSemaphore;
+  std::optional<PartitionId> currentOwner;
+
+  AcquireRecord acquireForGroup(OpBuilder &b, Location loc, SyncAnchorKind kind,
+                                Operation *anchor, Region *yieldRegion,
+                                unsigned groupIdx, const OptSyncDag &dag,
+                                const SyncPlan &sp, BufferGroup &group,
+                                StageCluster stageCluster);
+  LogicalResult release(OpBuilder &b, Location loc, SyncAnchorKind kind,
+                        Operation *anchor, Region *yieldRegion,
+                        const PlannedRelease &action, const OptSyncDag &dag,
+                        const SyncPlan &sp, BufferGroup &group,
+                        StageCluster stageCluster, Operation *liveAnchor = nullptr);
+  SmallVector<Value, 4>
+  getBuffers(OpBuilder &b, Operation *op, Value sem, Value token,
+             std::optional<PartitionId> owner, bool freshAcquire,
+             BufferGroup &group, const GroupBacking &backing,
+             ArrayRef<const AccessTouch *> touches, bool writes);
+};
+
 template <typename OpT, typename... Args>
 static OpT createIntoPartition(
     OpBuilder &b, Location loc,
@@ -1093,6 +1131,30 @@ static void eraseDeadTmemAllocs(triton::FuncOp funcOp) {
       allocOp.erase();
 }
 
+SmallVector<Value, 4>
+EmitState::getBuffers(OpBuilder &b, Operation *op, Value sem, Value token,
+                      std::optional<PartitionId> owner, bool freshAcquire,
+                      BufferGroup &group, const GroupBacking &backing,
+                      ArrayRef<const AccessTouch *> touches, bool writes) {
+  StageCluster stageCluster = getStageCluster(op);
+  bool canReuse = !freshAcquire && currentToken == token &&
+                  currentSemaphore == sem &&
+                  currentBuffers.size() == backing.bufferTypes.size();
+  if (canReuse)
+    return SmallVector<Value, 4>(currentBuffers.begin(), currentBuffers.end());
+  SemaphoreBufferOp bufferOp =
+      emitSemaphoreBuffer(b, op->getLoc(), sem, token, owner, stageCluster, group,
+                          backing, touches, writes);
+  if (!owner)
+    setPartitionFromAnchor(bufferOp.getOperation(), op);
+  if (!owner)
+    setPartitionFromTokenIfParentPartitioned(bufferOp.getOperation(), token);
+  SmallVector<Value, 4> buffers(bufferOp.getBuffers().begin(),
+                                bufferOp.getBuffers().end());
+  currentBuffers = buffers;
+  return buffers;
+}
+
 static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
                                      ArrayRef<const AccessTouch *> touches,
                                      ArrayRef<AcquireRecord> acquires,
@@ -1120,28 +1182,10 @@ static LogicalResult emitAccessEvent(OpBuilder &b, AccessEvent &event,
     return success();
   }
 
-  StageCluster stageCluster = getStageCluster(op);
-  Operation *bufferOperation = nullptr;
-  SmallVector<Value, 4> buffers;
-  bool canReuseCurrentBuffers =
-      acquires.empty() && state.currentToken == token &&
-      state.currentSemaphore == sem &&
-      state.currentBuffers.size() == backing.bufferTypes.size();
-  if (canReuseCurrentBuffers) {
-    buffers.assign(state.currentBuffers.begin(), state.currentBuffers.end());
-    bufferOperation = getBufferDefiningOp(buffers);
-  } else {
-    SemaphoreBufferOp bufferOp =
-        emitSemaphoreBuffer(b, op->getLoc(), sem, token, event.owner,
-                            stageCluster, group, backing, touches, writes);
-    if (!event.owner)
-      setPartitionFromAnchor(bufferOp.getOperation(), op);
-    if (!event.owner)
-      setPartitionFromTokenIfParentPartitioned(bufferOp.getOperation(), token);
-    bufferOperation = bufferOp.getOperation();
-    buffers.assign(bufferOp.getBuffers().begin(), bufferOp.getBuffers().end());
-    state.currentBuffers = buffers;
-  }
+  SmallVector<Value, 4> buffers =
+      state.getBuffers(b, op, sem, token, event.owner, !acquires.empty(), group,
+                       backing, touches, writes);
+  Operation *bufferOperation = getBufferDefiningOp(buffers);
   Operation *retargetOp = op;
   bool ownsAsyncToken = accessOwnsAsyncToken(op, touches, group);
 
@@ -1406,14 +1450,55 @@ static Operation *findLastSameBlockNonTokenResultUser(Operation *op) {
   return lastUser;
 }
 
-static LogicalResult emitReleaseAction(OpBuilder &b, Location loc,
-                                       SyncAnchorKind kind, Operation *anchor,
-                                       Region *yieldRegion,
-                                       const PlannedRelease &action,
-                                       const OptSyncDag &dag, const SyncPlan &sp,
-                                       BufferGroup &group, EmitState &state,
-                                       StageCluster stageCluster,
-                                       Operation *liveAnchor = nullptr) {
+static std::optional<PartitionId>
+computeReleaseOwner(const SyncGroup &syncGroup, const SyncPlan &sp,
+                    const SyncEdge *edge, Operation *anchor, SyncAnchorKind kind,
+                    bool terminalDstReadRelease, bool terminalLoopExitReadRelease,
+                    std::optional<PartitionId> currentOwner) {
+  std::optional<PartitionId> owner = edge ? edge->srcOwner : std::nullopt;
+  if (terminalDstReadRelease || terminalLoopExitReadRelease)
+    owner = edge->dstOwner;
+  if (terminalLoopExitReadRelease)
+    owner = getPartitionId(anchor);
+  if (!owner && kind == SyncAnchorKind::ReleaseBeforeOp && currentOwner)
+    owner = currentOwner;
+  if (edge && !edge->srcOwner && kind == SyncAnchorKind::ReleaseBeforeOp &&
+      syncGroup.kind == SyncGroupKind::LinearChain &&
+      syncGroup.edgeIdxs.size() > 1 &&
+      &sp.edges[syncGroup.edgeIdxs.front()] == edge)
+    owner = sp.edges[syncGroup.edgeIdxs[1]].dstOwner;
+  return owner;
+}
+
+static AsyncOp
+computeReleasePayload(const SyncGroup &syncGroup, const SyncPlan &sp,
+                      const SyncEdge *edge, Operation *anchor,
+                      SyncAnchorKind kind, bool terminalDstReadRelease,
+                      bool terminalLoopExitReadRelease, BufferGroup &group,
+                      int64_t resourceKey) {
+  Operation *payloadOp = edge ? edge->srcOp : nullptr;
+  AsyncOp payload =
+      (terminalDstReadRelease || terminalLoopExitReadRelease)
+          ? getAsyncPayload(anchor)
+          : (edge ? edge->asyncPayload : getAsyncPayload(payloadOp));
+  if (group.isTmem() && edge && edge->srcYieldRegion &&
+      !terminalDstReadRelease && !terminalLoopExitReadRelease &&
+      payload == AsyncOp::NONE)
+    if (const AccessEvent *producer =
+            findLastProducerInRegion(edge->srcYieldRegion, group, resourceKey))
+      if (sameOwner(producer->owner, edge->srcOwner))
+        payload = getAsyncPayload(producer->op);
+  if (shouldForceNonePayload(syncGroup, sp, edge, kind))
+    payload = AsyncOp::NONE;
+  return payload;
+}
+
+LogicalResult EmitState::release(OpBuilder &b, Location loc, SyncAnchorKind kind,
+                                 Operation *anchor, Region *yieldRegion,
+                                 const PlannedRelease &action,
+                                 const OptSyncDag &dag, const SyncPlan &sp,
+                                 BufferGroup &group, StageCluster stageCluster,
+                                 Operation *liveAnchor) {
   unsigned groupIdx = action.groupIdx;
   if (groupIdx >= dag.groups.size())
     return group.members.front().allocOp->emitError(
@@ -1436,12 +1521,12 @@ static LogicalResult emitReleaseAction(OpBuilder &b, Location loc,
   const SyncGroup &syncGroup = dag.groups[groupIdx];
   const SyncEdge *edge = getRepresentativeReleaseEdge(action, sp);
   std::optional<unsigned> edgeIdx = action.edgeIdxs.front();
-  for (const EmittedSyncRecord &record : state.emittedReleases)
+  for (const EmittedSyncRecord &record : emittedReleases)
     if (record.groupIdx == groupIdx && record.kind == kind &&
         record.anchor == anchor && record.yieldRegion == yieldRegion &&
         record.edgeIdxs == action.edgeIdxs)
       return success();
-  Value sem = getSemaphoreForGroup(groupIdx, edge, dag, sp, group, state.semas);
+  Value sem = getSemaphoreForGroup(groupIdx, edge, dag, sp, group, semas);
   bool terminalDstReadRelease =
       (syncGroup.kind == SyncGroupKind::LinearChain ||
        syncGroup.kind == SyncGroupKind::Singleton) &&
@@ -1466,36 +1551,30 @@ static LogicalResult emitReleaseAction(OpBuilder &b, Location loc,
   // materialization only, not semaphore identity.)
   bool useStructuredCarrier =
       kind == SyncAnchorKind::ReleaseAfterOp && edge && edge->srcOp &&
-      edge->srcOp != anchor && state.currentToken;
+      edge->srcOp != anchor && currentToken;
   useStructuredCarrier |= kind == SyncAnchorKind::ReleaseBeforeOp && edge &&
-                          edge->srcOp && edge->srcOp != anchor &&
-                          state.currentToken;
+                          edge->srcOp && edge->srcOp != anchor && currentToken;
   SetVector<int> structuredCarrierPartition;
   if (useStructuredCarrier)
-    structuredCarrierPartition = partitionSetForValue(state.currentToken);
+    structuredCarrierPartition = partitionSetForValue(currentToken);
   FailureOr<Value> token =
-      useStructuredCarrier ? FailureOr<Value>(state.currentToken)
-                           : lookupReleaseToken(loc, edge, state,
+      useStructuredCarrier ? FailureOr<Value>(currentToken)
+                           : lookupReleaseToken(loc, edge, *this,
                                                 b.getInsertionBlock());
   if (failed(token))
     return failure();
-  std::optional<PartitionId> owner = edge ? edge->srcOwner : std::nullopt;
-  if (terminalDstReadRelease || terminalLoopExitReadRelease)
-    owner = edge->dstOwner;
-  if (terminalLoopExitReadRelease)
-    owner = getPartitionId(anchor);
-  if (!owner && kind == SyncAnchorKind::ReleaseBeforeOp && state.currentOwner)
-    owner = state.currentOwner;
-  if (edge && !edge->srcOwner && kind == SyncAnchorKind::ReleaseBeforeOp &&
-      syncGroup.kind == SyncGroupKind::LinearChain &&
-      syncGroup.edgeIdxs.size() > 1 && &sp.edges[syncGroup.edgeIdxs.front()] == edge)
-    owner = sp.edges[syncGroup.edgeIdxs[1]].dstOwner;
-  // Payload decision is centralized in computeReleasePayload (the same fact the
-  // schedule records); called here with the live edge/anchor.
-  AsyncOp payload = computeReleasePayload(syncGroup, sp, edge, anchor, kind,
-                                          edgeIdx, dag, group);
+  std::optional<PartitionId> owner = computeReleaseOwner(
+      syncGroup, sp, edge, anchor, kind, terminalDstReadRelease,
+      terminalLoopExitReadRelease, currentOwner);
+  AsyncOp payload = computeReleasePayload(
+      syncGroup, sp, edge, anchor, kind, terminalDstReadRelease,
+      terminalLoopExitReadRelease, group, dag.resource.second);
   SemaphoreReleaseOp release =
       emitRelease(b, loc, sem, *token, owner, stageCluster, payload);
+  // RELEASE-PLACEMENT NUDGE (heuristic; delete to matching marker for the clean
+  // DAG placement, once automatic-warp-specialization.mlir can be regenerated).
+  // Runtime-irrelevant (WS + both FA green without it); only reproduces that
+  // frozen test's exact order.
   if (readCompletionRelease && anchor)
     if (Operation *lastUser = findLastSameBlockNonTokenResultUser(anchor))
       if (release->getBlock() == lastUser->getBlock() &&
@@ -1522,11 +1601,11 @@ static LogicalResult emitReleaseAction(OpBuilder &b, Location loc,
       (moveReadOnlyTmemLoadSource || readOnlyMmaSource || writeMmaSource) &&
       operationIsAttached(edge->srcOp) &&
       release->getBlock() == edge->srcOp->getBlock()) {
-    if (writeMmaSource)
+    if (writeMmaSource) {
       moveAfterExistingReleasesBeforeAcquire(release.getOperation(), edge->srcOp);
-    else if (moveReadOnlyTmemLoadSource)
+    } else if (moveReadOnlyTmemLoadSource) {
       release->moveAfter(edge->srcOp);
-    else {
+    } else {
       Operation *insertAfter = edge->srcOp;
       if (Operation *lastUser =
               findLastSameBlockNonTokenResultUser(edge->srcOp))
@@ -1536,8 +1615,8 @@ static LogicalResult emitReleaseAction(OpBuilder &b, Location loc,
     }
   }
   if (group.isTmem() && kind == SyncAnchorKind::ReleaseBeforeOp && edge &&
-      edge->srcYieldRegion && anchor && opReadsOnlyResource(anchor, group,
-                                                            dag.resource.second)) {
+      edge->srcYieldRegion && anchor &&
+      opReadsOnlyResource(anchor, group, dag.resource.second)) {
     if (edgeIdx && dag.srcYieldParentWarpFor.contains(*edgeIdx)) {
       for (Operation *candidate = release->getPrevNode(); candidate;
            candidate = candidate->getPrevNode()) {
@@ -1553,9 +1632,10 @@ static LogicalResult emitReleaseAction(OpBuilder &b, Location loc,
       }
     }
   }
+  // === end RELEASE-PLACEMENT NUDGE (see marker above) ===
   if (useStructuredCarrier && structuredCarrierPartition.size() == 1 && !owner) {
     setPartition(release.getOperation(), structuredCarrierPartition);
-    if (auto tag = wsTagForValue(state.currentToken))
+    if (auto tag = wsTagForValue(currentToken))
       setWarpTagOutsideWsLoop(release.getOperation(), *tag);
   }
   if (!owner) {
@@ -1568,10 +1648,10 @@ static LogicalResult emitReleaseAction(OpBuilder &b, Location loc,
                                     : (yieldRegion ? yieldRegion->getParentOp()
                                                    : nullptr));
   }
-  state.emittedReleases.push_back(
+  emittedReleases.push_back(
       EmittedSyncRecord{groupIdx, kind, anchor, yieldRegion});
-  state.emittedReleases.back().edgeIdxs.append(action.edgeIdxs.begin(),
-                                               action.edgeIdxs.end());
+  emittedReleases.back().edgeIdxs.append(action.edgeIdxs.begin(),
+                                         action.edgeIdxs.end());
   return success();
 }
 
@@ -1596,18 +1676,16 @@ static bool hasInterveningLiveTmemAllocCarrier(Operation *first,
   return false;
 }
 
-static AcquireRecord emitAcquireForGroup(OpBuilder &b, Location loc,
+AcquireRecord EmitState::acquireForGroup(OpBuilder &b, Location loc,
                                          SyncAnchorKind kind, Operation *anchor,
-                                         Region *yieldRegion,
-                                         unsigned groupIdx,
+                                         Region *yieldRegion, unsigned groupIdx,
                                          const OptSyncDag &dag,
                                          const SyncPlan &sp, BufferGroup &group,
-                                         EmitState &state,
                                          StageCluster stageCluster) {
   const SyncGroup &syncGroup = dag.groups[groupIdx];
   const SyncEdge *edge =
       findEdgeForAnchor(syncGroup, sp, dag, kind, anchor, yieldRegion);
-  Value sem = getSemaphoreForGroup(groupIdx, edge, dag, sp, group, state.semas);
+  Value sem = getSemaphoreForGroup(groupIdx, edge, dag, sp, group, semas);
   std::optional<PartitionId> owner =
       edge ? edge->dstOwner : syncGroup.initialOwner;
   if (syncGroup.kind == SyncGroupKind::InitialEmpty && anchor) {
@@ -1641,10 +1719,10 @@ static AcquireRecord emitAcquireForGroup(OpBuilder &b, Location loc,
                                                  : nullptr));
   }
   Value token = acquire.getToken();
-  state.currentToken = token;
-  state.currentSemaphore = sem;
-  state.currentOwner = owner;
-  state.currentBuffers.clear();
+  currentToken = token;
+  currentSemaphore = sem;
+  currentOwner = owner;
+  currentBuffers.clear();
   return AcquireRecord{sem, token, owner};
 }
 
@@ -1657,16 +1735,16 @@ emitBeforeOpSync(Operation *anchor, const OptSyncDag &dag, const SyncPlan &sp,
   auto rIt = dag.releaseBeforeOp.find(anchor);
   if (rIt != dag.releaseBeforeOp.end())
     for (const PlannedRelease &release : rIt->second)
-      if (failed(emitReleaseAction(
+      if (failed(state.release(
               b, anchor->getLoc(), SyncAnchorKind::ReleaseBeforeOp, anchor,
-              nullptr, release, dag, sp, group, state, getStageCluster(anchor))))
+              nullptr, release, dag, sp, group, getStageCluster(anchor))))
         return failure();
   auto aIt = dag.acquireBeforeOp.find(anchor);
   if (aIt != dag.acquireBeforeOp.end())
     for (unsigned gi : aIt->second)
-      acquires.push_back(emitAcquireForGroup(
+      acquires.push_back(state.acquireForGroup(
           b, anchor->getLoc(), SyncAnchorKind::AcquireBeforeOp, anchor, nullptr,
-          gi, dag, sp, group, state, getStageCluster(anchor)));
+          gi, dag, sp, group, getStageCluster(anchor)));
   return success();
 }
 
@@ -1736,9 +1814,9 @@ static LogicalResult emitAfterOpSync(Operation *anchor, Operation *insertAfter,
     });
   LogicalResult result = success();
   for (const PlannedRelease &release : releaseActions)
-    if (failed(emitReleaseAction(
+    if (failed(state.release(
             b, insertAfter->getLoc(), SyncAnchorKind::ReleaseAfterOp, anchor,
-            nullptr, release, dag, sp, group, state, getStageCluster(insertAfter),
+            nullptr, release, dag, sp, group, getStageCluster(insertAfter),
             insertAfter))) {
       result = failure();
       break;
@@ -1963,10 +2041,9 @@ static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
     Value emptySem = state.semas.forClass(sp, findEdgeIndex(sp, &secondEdge));
     if (const PlannedRelease *releaseAction =
             findPlannedAfterLoopRelease(*fullReleaseEdge)) {
-      if (failed(emitReleaseAction(b, loc, SyncAnchorKind::ReleaseAfterOp,
-                                   forOp.getOperation(), nullptr,
-                                   *releaseAction, dag, sp, group, state,
-                                   StageCluster{})))
+      if (failed(state.release(b, loc, SyncAnchorKind::ReleaseAfterOp,
+                               forOp.getOperation(), nullptr, *releaseAction, dag,
+                               sp, group, StageCluster{})))
         return failure();
     } else if (failed(emitDrainRelease(fullSem, state.currentToken,
                                        releaseOwner, drainPayload,
@@ -2072,9 +2149,9 @@ emitBeforeYieldSync(Operation *yieldOp, Region *region, const OptSyncDag &dag,
   if (rIt != dag.releaseBeforeYield.end())
     for (const PlannedRelease &release : rIt->second) {
       const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
-      if (failed(emitReleaseAction(
+      if (failed(state.release(
               b, yieldOp->getLoc(), SyncAnchorKind::ReleaseBeforeYield, nullptr,
-              region, release, dag, sp, group, state,
+              region, release, dag, sp, group,
               stageForYieldOwner(edge ? edge->srcOwner : std::nullopt, state))))
         return failure();
     }
@@ -2085,18 +2162,18 @@ emitBeforeYieldSync(Operation *yieldOp, Region *region, const OptSyncDag &dag,
           findEdgeForAnchor(dag.groups[gi], sp,
                             dag,
                             SyncAnchorKind::AcquireBeforeYield, nullptr, region);
-      acquires.push_back(emitAcquireForGroup(
+      acquires.push_back(state.acquireForGroup(
           b, yieldOp->getLoc(), SyncAnchorKind::AcquireBeforeYield, nullptr,
-          region, gi, dag, sp, group, state,
+          region, gi, dag, sp, group,
           stageForYieldOwner(edge ? edge->dstOwner : std::nullopt, state)));
     }
   auto arIt = dag.releaseAfterYield.find(region);
   if (arIt != dag.releaseAfterYield.end())
     for (const PlannedRelease &release : arIt->second) {
       const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
-      if (failed(emitReleaseAction(
+      if (failed(state.release(
               b, yieldOp->getLoc(), SyncAnchorKind::ReleaseAfterYield, nullptr,
-              region, release, dag, sp, group, state,
+              region, release, dag, sp, group,
               stageForYieldOwner(edge ? edge->srcOwner : std::nullopt, state))))
         return failure();
     }
@@ -2644,7 +2721,6 @@ static LogicalResult emitResource(triton::FuncOp funcOp, BufferGroup &group,
                          plan.memberIndices, backings, numStagesByGroup);
   EmitState state;
   state.semas = createResourceSemaphores(dag, sp, group, backing);
-  state.schedule = buildEmitSchedule(dag, sp, group, funcOp);
   if (failed(emitResourceRegion(funcOp.getBody(), dag, sp, plan, group, backing,
                                 state)))
     return failure();
@@ -2906,26 +2982,6 @@ static void splitSemaphoreIfForLoopScheduler(triton::FuncOp funcOp) {
   }
 }
 
-static Value findLatestSemaphoreCarrierInit(scf::ForOp forOp,
-                                            ArrayRef<unsigned> slots) {
-  if (slots.empty())
-    return {};
-
-  Value latestInit = forOp.getInitArgs()[slots.front()];
-  Operation *latestAcquire = nullptr;
-  for (unsigned slot : slots) {
-    auto acquireOp = forOp.getInitArgs()[slot].getDefiningOp<SemaphoreAcquireOp>();
-    if (!acquireOp || acquireOp->getBlock() != forOp->getBlock() ||
-        !acquireOp->isBeforeInBlock(forOp))
-      continue;
-    if (!latestAcquire || latestAcquire->isBeforeInBlock(acquireOp)) {
-      latestAcquire = acquireOp;
-      latestInit = forOp.getInitArgs()[slot];
-    }
-  }
-  return latestInit;
-}
-
 static void collectSemaphoreBackingsForToken(Value token,
                                              SetVector<Value> &backings,
                                              DenseSet<Value> &visited) {
@@ -3013,12 +3069,13 @@ static void poisonDuplicateUnbackedTokenSlots(
   }
 }
 
-static void coalesceSemaphoreForCarriers(triton::FuncOp funcOp) {
+// Poison duplicate/unbacked loop-carried async-token iter_args (the former
+// same-backing merge was dead code and was removed).
+static void poisonUnbackedCarrierTokenSlots(triton::FuncOp funcOp) {
   SmallVector<scf::ForOp, 8> loops;
   funcOp.walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
 
   for (scf::ForOp forOp : loops) {
-    llvm::MapVector<Value, SmallVector<unsigned, 4>> slotsByBacking;
     DenseMap<unsigned, Value> backingBySlot;
     SmallVector<unsigned, 4> asyncTokenSlots;
     for (auto [idx, init] : llvm::enumerate(forOp.getInitArgs())) {
@@ -3031,47 +3088,15 @@ static void coalesceSemaphoreForCarriers(triton::FuncOp funcOp) {
         auto createOp =
             acquireOp.getSemaphore().getDefiningOp<SemaphoreCreateOp>();
         if (createOp && !createOp.getBuffers().empty()) {
-          Value backing = createOp.getBuffers().front();
-          backingBySlot[slot] = backing;
-          slotsByBacking[backing].push_back(slot);
+          backingBySlot[slot] = createOp.getBuffers().front();
           continue;
         }
       }
-      if (std::optional<Value> backing = inferSemaphoreBackingForCarrierSlot(
-              forOp, slot)) {
+      if (std::optional<Value> backing =
+              inferSemaphoreBackingForCarrierSlot(forOp, slot))
         backingBySlot[slot] = *backing;
-        slotsByBacking[*backing].push_back(slot);
-      }
     }
-
     poisonDuplicateUnbackedTokenSlots(forOp, asyncTokenSlots, backingBySlot);
-
-    for (auto &it : slotsByBacking) {
-      ArrayRef<unsigned> semaphoreTokenSlots = it.second;
-      if (semaphoreTokenSlots.size() < 2)
-        continue;
-
-      Value carrierInit =
-          findLatestSemaphoreCarrierInit(forOp, semaphoreTokenSlots);
-      if (!carrierInit)
-        continue;
-
-      unsigned canonicalSlot = semaphoreTokenSlots.front();
-      Value canonicalIterArg = forOp.getRegionIterArg(canonicalSlot);
-      Value canonicalResult = forOp.getResult(canonicalSlot);
-      scf::YieldOp yieldOp = getForYieldOp(forOp);
-      Value canonicalYield = yieldOp.getOperand(canonicalSlot);
-      unsigned controlOperands = forOp.getNumControlOperands();
-      forOp->setOperand(controlOperands + canonicalSlot, carrierInit);
-      for (unsigned slot : semaphoreTokenSlots) {
-        if (slot == canonicalSlot)
-          continue;
-        forOp.getRegionIterArg(slot).replaceAllUsesWith(canonicalIterArg);
-        forOp.getResult(slot).replaceAllUsesWith(canonicalResult);
-        yieldOp.setOperand(slot, canonicalYield);
-        forOp->setOperand(controlOperands + slot, carrierInit);
-      }
-    }
   }
 }
 

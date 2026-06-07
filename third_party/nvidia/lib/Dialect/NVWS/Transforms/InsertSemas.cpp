@@ -265,7 +265,7 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp,
   for (Operation *op : llvm::reverse(eraseAfterEmission))
     op->erase();
   splitSemaphoreIfForLoopScheduler(funcOp);
-  coalesceSemaphoreForCarriers(funcOp);
+  poisonUnbackedCarrierTokenSlots(funcOp);
   coalesceTmemAllocsByBufferIdIntoViews(funcOp);
   eraseDeadTmemAllocs(funcOp);
   if (dumpDag)
