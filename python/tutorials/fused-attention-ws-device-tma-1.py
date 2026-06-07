@@ -198,9 +198,9 @@ def _host_descriptor_pre_hook(nargs):
 if is_hip():
     NUM_STAGES_OPTIONS = [1]
 elif supports_host_descriptor():
-    NUM_STAGES_OPTIONS = [1]
+    NUM_STAGES_OPTIONS = [2]
 else:
-    NUM_STAGES_OPTIONS = [1]
+    NUM_STAGES_OPTIONS = [2]
 
 configs = [
     triton.Config(
@@ -1571,8 +1571,8 @@ BATCH, N_HEADS = 4, 32
 configs = []
 for HEAD_DIM in [128]:  #64, 128]:
 #    for baseVariant in ["ws", "ws_persistent"]:
-#    for baseVariant in ["ws"]:
-    for baseVariant in ["ws_persistent"]:
+    for baseVariant in ["ws"]:
+#    for baseVariant in ["ws_persistent"]:
         for mode in ["fwd"]: #, "bwd"]:
             configs.append(
                 triton.testing.Benchmark(
@@ -1637,7 +1637,7 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider
 if __name__ == "__main__":
     if is_blackwell():
         print("Test op...")
-        test_op(Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="fwd", baseVariant="ws_persistent", provider="triton-fp16", SUBTILING=True, VECT_MUL=1, FADD2_REDUCE=False, bwd_config_idx=0)
+        test_op(Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="fwd", baseVariant="ws", provider="triton-fp16", SUBTILING=True, VECT_MUL=1, FADD2_REDUCE=False, bwd_config_idx=0)
         print("Running benchmarks...")
         bench_flash_attention.run(print_data=True)
     else:
