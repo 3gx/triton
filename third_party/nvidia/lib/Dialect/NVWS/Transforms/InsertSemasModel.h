@@ -10,6 +10,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/PartitionBuilder.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -307,12 +308,12 @@ struct PlannedLoopExitDrain {
 };
 
 struct EmitterTransitionPlan {
-  DenseMap<Operation *, SmallVector<PlannedRelease, 2>> opEntryReleases,
+  llvm::MapVector<Operation *, SmallVector<PlannedRelease, 2>> opEntryReleases,
       opExitReleases;
-  DenseMap<Operation *, SmallVector<unsigned, 2>> opEntryAcquires;
-  DenseMap<Region *, SmallVector<PlannedRelease, 2>> regionEntryReleases,
+  llvm::MapVector<Operation *, SmallVector<unsigned, 2>> opEntryAcquires;
+  llvm::MapVector<Region *, SmallVector<PlannedRelease, 2>> regionEntryReleases,
       regionExitReleases;
-  DenseMap<Region *, SmallVector<unsigned, 2>> regionEntryAcquires;
+  llvm::MapVector<Region *, SmallVector<unsigned, 2>> regionEntryAcquires;
   DenseMap<Operation *, Operation *> opEntryReleaseInsertAfter,
       opEntryReleaseInsertBefore, opExitReleaseInsertAfter,
       opExitReleaseInsertBefore;
@@ -339,8 +340,8 @@ struct OptSyncDag {
   DenseSet<unsigned> terminalLoopReadEdgesDeferringToExit;
   DenseSet<unsigned> srcYieldParentWarpFor;
   DenseSet<Operation *> accessOps;
-  DenseSet<Operation *> threadForOps;
-  DenseSet<Operation *> threadIfOps;
+  SetVector<Operation *> threadForOps;
+  SetVector<Operation *> threadIfOps;
 };
 
 struct GroupBacking {

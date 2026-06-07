@@ -153,7 +153,10 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
   // Max rank of any access op — used to answer "any access after this row?".
   unsigned maxAccessRank = 0;
   bool anyAccess = false;
-  for (Operation *op : sp.accessOps) {
+  for (const AccessEvent &event : group.events) {
+    if (!eventTouchesResource(event, rp.resource.second))
+      continue;
+    Operation *op = event.op;
     auto it = opRank.find(op);
     if (it == opRank.end()) continue;
     if (!anyAccess || it->second > maxAccessRank) {
@@ -499,9 +502,11 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
     SmallVector<Owner, 4> distinctOwners;
     Operation *firstAccess = nullptr, *lastAccess = nullptr;
     unsigned firstRank = 0, lastRank = 0;
-    for (auto &kv : opToEvent) {
-      Operation *op = kv.first;
-      const Owner &o = kv.second->owner;
+    for (const AccessEvent &event : group.events) {
+      if (!eventTouchesResource(event, rp.resource.second))
+        continue;
+      Operation *op = event.op;
+      const Owner &o = event.owner;
       if (!llvm::any_of(distinctOwners,
                         [&](const Owner &q) { return sameOwner(o, q); }))
         distinctOwners.push_back(o);
@@ -517,7 +522,10 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
       Operation *anchorOp = wsLoop ? wsLoop.getOperation() : firstAccess;
       scf::ForOp cycleLoop = wsLoop;
       if (!cycleLoop)
-        for (Operation *op : sp.accessOps) {
+        for (const AccessEvent &event : group.events) {
+          if (!eventTouchesResource(event, rp.resource.second))
+            continue;
+          Operation *op = event.op;
           scf::ForOp outer;
           for (Operation *p = op->getParentOp(); p; p = p->getParentOp())
             if (auto f = dyn_cast<scf::ForOp>(p))

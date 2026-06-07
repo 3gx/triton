@@ -27,7 +27,7 @@ static bool edgeRequiresRelease(const SyncEdge &edge) {
 
 template <typename AnchorT>
 static void addPlannedRelease(
-    DenseMap<AnchorT *, SmallVector<PlannedRelease, 2>> &anchors,
+    llvm::MapVector<AnchorT *, SmallVector<PlannedRelease, 2>> &anchors,
     AnchorT *anchor, const SyncPlan &sp, unsigned groupIdx,
     ArrayRef<unsigned> edgeIdxs) {
   if (!anchor)
@@ -50,7 +50,7 @@ static void addPlannedRelease(
 
 template <typename AnchorT>
 static void addPlannedRelease(
-    DenseMap<AnchorT *, SmallVector<PlannedRelease, 2>> &anchors,
+    llvm::MapVector<AnchorT *, SmallVector<PlannedRelease, 2>> &anchors,
     AnchorT *anchor, const SyncPlan &sp, unsigned groupIdx, unsigned edgeIdx) {
   addPlannedRelease(anchors, anchor, sp, groupIdx,
                     ArrayRef<unsigned>(&edgeIdx, 1));
@@ -646,7 +646,7 @@ static void resolvePlannedReleaseState(PlannedRelease &action,
 
 template <typename AnchorT>
 static void addTransitionAcquire(
-    DenseMap<AnchorT *, SmallVector<unsigned, 2>> &anchors, AnchorT *anchor,
+    llvm::MapVector<AnchorT *, SmallVector<unsigned, 2>> &anchors, AnchorT *anchor,
     unsigned groupIdx, bool unique = false) {
   if (!anchor)
     return;
@@ -926,7 +926,9 @@ static void resolveEmitterTransitionPlacement(EmitterTransitionPlan &transitions
             lhsGroup, lhsEdge, group, dag.resource.second, anchor);
         bool rhsPrecedes = transitionReleaseBeforeAcquire(
             rhsGroup, rhsEdge, group, dag.resource.second, anchor);
-        return lhsPrecedes && !rhsPrecedes;
+        if (lhsPrecedes != rhsPrecedes)
+          return lhsPrecedes;
+        return false;
       });
     }
     if (releaseAfter != anchor)
@@ -1859,12 +1861,12 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
              parent = parent->getParentOp()) {
           if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
             if (carriedForRegion(forOp))
-              changed |= dag.threadForOps.insert(parent).second;
+              changed |= dag.threadForOps.insert(parent);
             continue;
           }
           if (auto ifOp = dyn_cast<scf::IfOp>(parent)) {
             if (canThreadIfRegion(ifOp) && carrierCrossesIfBoundary(ifOp))
-              changed |= dag.threadIfOps.insert(parent).second;
+              changed |= dag.threadIfOps.insert(parent);
           }
         }
       }

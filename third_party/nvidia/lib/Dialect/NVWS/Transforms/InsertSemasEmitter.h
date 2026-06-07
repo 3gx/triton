@@ -64,6 +64,7 @@ struct EmitState {
   SmallVector<PoisonTokenRecord, 8> poisonTokenResultsAfterEmission;
   SetVector<Operation *> eraseAfterEmission;
   DenseMap<PartitionId, StageCluster> stageCache;
+  SetVector<Operation *> completedTransitionAnchors;
 
   AcquireRecord acquireForGroup(OpBuilder &b, Location loc, SyncAnchorKind kind,
                                 Operation *anchor, Region *yieldRegion,
@@ -1397,11 +1398,13 @@ static LogicalResult emitOperationEntryTransitions(
   if (rIt != transitions.opEntryReleases.end())
     for (const PlannedRelease &release : rIt->second) {
       OpBuilder releaseBuilder(anchor);
+      bool anchorHasEntryAcquire = transitions.opEntryAcquires.contains(anchor);
       if (Operation *insertBefore =
               transitions.opEntryReleaseInsertBefore.lookup(anchor))
         releaseBuilder.setInsertionPoint(insertBefore);
       else if (Operation *insertAfter =
-                   transitions.opEntryReleaseInsertAfter.lookup(anchor))
+                   transitions.opEntryReleaseInsertAfter.lookup(anchor);
+               insertAfter && !anchorHasEntryAcquire)
         releaseBuilder.setInsertionPointAfter(insertAfter);
       else
         releaseBuilder.setInsertionPoint(anchor);
@@ -1483,10 +1486,12 @@ static LogicalResult emitDeferredNestedExitTransitions(
   auto deferredIt = transitions.deferredOpExitAnchors.find(releaseAfter);
   if (deferredIt == transitions.deferredOpExitAnchors.end())
     return success();
-  for (Operation *anchor : deferredIt->second)
+  for (Operation *anchor : deferredIt->second) {
     if (failed(emitOperationExitTransitions(anchor, releaseAfter, dag, sp,
                                             group, state)))
       return failure();
+    state.completedTransitionAnchors.insert(anchor);
+  }
   return success();
 }
 
@@ -2038,6 +2043,8 @@ static void mergeProtectedAccesses(EmitState &dst, const EmitState &src) {
     dst.loopCarrierSlots[kv.first] = kv.second;
   for (auto &kv : src.stageCache)
     dst.stageCache[kv.first] = kv.second;
+  for (Operation *anchor : src.completedTransitionAnchors)
+    dst.completedTransitionAnchors.insert(anchor);
 }
 
 static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
@@ -2045,8 +2052,10 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
                                        BufferGroup &group, const GroupBacking &backing,
                                        EmitState &state, Region *plannedRegion);
 
-static bool isOperationTransitionAnchor(
-    Operation *op, const EmitterTransitionPlan &transitions) {
+static bool isOperationTransitionAnchor(Operation *op, const EmitState &state,
+                                        const EmitterTransitionPlan &transitions) {
+  if (state.completedTransitionAnchors.contains(op))
+    return false;
   return transitions.opEntryReleases.contains(op) ||
          transitions.opEntryAcquires.contains(op) ||
          transitions.opExitReleases.contains(op);
@@ -2092,15 +2101,17 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
     }
 
     bool isStructural = isa<scf::ForOp, scf::IfOp>(op);
-    bool isTransitionAnchor = isOperationTransitionAnchor(&op, transitions);
+    bool isTransitionAnchor = isOperationTransitionAnchor(&op, state, transitions);
     if (!isStructural && !isAccessEvent && !isTransitionAnchor)
       continue;
 
     SmallVector<AcquireRecord, 2> acquires;
-    if (isTransitionAnchor)
+    if (isTransitionAnchor) {
       if (failed(emitOperationEntryTransitions(&op, dag, sp, group, state,
                                                acquires)))
         return failure();
+      state.completedTransitionAnchors.insert(&op);
+    }
 
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       Operation *oldForOp = forOp.getOperation();
@@ -2157,6 +2168,8 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
                                                    dag, sp, group, state)))
         return failure();
       normalizeLoopCarrierTokenSlots(activeForOp);
+      if (isTransitionAnchor)
+        state.completedTransitionAnchors.insert(oldForOp);
       continue;
     }
     if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
@@ -2300,6 +2313,8 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
         return failure();
       if (threaded && !reuseExistingTokenResult)
         state.eraseAfterEmission.insert(oldIfOp);
+      if (isTransitionAnchor)
+        state.completedTransitionAnchors.insert(oldIfOp);
       continue;
     }
 
@@ -2313,6 +2328,8 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
     if (isTransitionAnchor)
       if (failed(emitOperationExitTransitions(&op, dag, sp, group, state)))
         return failure();
+    if (isTransitionAnchor)
+      state.completedTransitionAnchors.insert(&op);
   }
   return success();
 }

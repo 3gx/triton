@@ -186,8 +186,9 @@ planResource(triton::FuncOp funcOp, unsigned groupIdx, BufferGroup &group,
   }
 
   Planner planner(funcOp, plan, rank);
-  for (auto &kv : plan.useOwner)
-    planner.orderedEventOps.push_back(kv.first);
+  for (AccessEvent &event : group.events)
+    if (eventTouchesResource(event, resourceKey))
+      planner.orderedEventOps.push_back(event.op);
   llvm::sort(planner.orderedEventOps, [&](Operation *a, Operation *b) {
     return rank.lookup(a) < rank.lookup(b);
   });
