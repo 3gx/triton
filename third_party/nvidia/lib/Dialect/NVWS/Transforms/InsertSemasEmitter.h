@@ -1490,20 +1490,10 @@ static LogicalResult emitReleaseAction(OpBuilder &b, Location loc,
       syncGroup.kind == SyncGroupKind::LinearChain &&
       syncGroup.edgeIdxs.size() > 1 && &sp.edges[syncGroup.edgeIdxs.front()] == edge)
     owner = sp.edges[syncGroup.edgeIdxs[1]].dstOwner;
-  Operation *payloadOp = edge ? edge->srcOp : nullptr;
-  AsyncOp payload =
-      (terminalDstReadRelease || terminalLoopExitReadRelease)
-          ? getAsyncPayload(anchor)
-          : (edge ? edge->asyncPayload : getAsyncPayload(payloadOp));
-  if (group.isTmem() && edge && edge->srcYieldRegion &&
-      !terminalDstReadRelease && !terminalLoopExitReadRelease &&
-      payload == AsyncOp::NONE)
-    if (const AccessEvent *producer = findLastProducerInRegion(
-            edge->srcYieldRegion, group, dag.resource.second))
-      if (sameOwner(producer->owner, edge->srcOwner))
-        payload = getAsyncPayload(producer->op);
-  if (shouldForceNonePayload(syncGroup, sp, edge, kind))
-    payload = AsyncOp::NONE;
+  // Payload decision is centralized in computeReleasePayload (the same fact the
+  // schedule records); called here with the live edge/anchor.
+  AsyncOp payload = computeReleasePayload(syncGroup, sp, edge, anchor, kind,
+                                          edgeIdx, dag, group);
   SemaphoreReleaseOp release =
       emitRelease(b, loc, sem, *token, owner, stageCluster, payload);
   if (readCompletionRelease && anchor)
@@ -2654,6 +2644,7 @@ static LogicalResult emitResource(triton::FuncOp funcOp, BufferGroup &group,
                          plan.memberIndices, backings, numStagesByGroup);
   EmitState state;
   state.semas = createResourceSemaphores(dag, sp, group, backing);
+  state.schedule = buildEmitSchedule(dag, sp, group, funcOp);
   if (failed(emitResourceRegion(funcOp.getBody(), dag, sp, plan, group, backing,
                                 state)))
     return failure();

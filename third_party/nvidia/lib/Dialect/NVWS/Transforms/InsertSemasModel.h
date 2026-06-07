@@ -360,6 +360,34 @@ struct PoisonTokenRecord {
   Operation *insertBefore = nullptr;
 };
 
+// Mechanical emit schedule (commit 4.5 / section 6.7). One typed action per
+// semaphore op the emitter will materialize. All emit-time *decisions* (which
+// semaphore, the released bit, the release owner/payload) are settled here from
+// DAG facts; the emitter (commit 5) only looks them up and places the op. There
+// is no "empty"/"full": a semaphore is created released or unreleased (section 2).
+enum class EmitActionKind { CreateSemaphore, Acquire, Release, Buffer, ThreadToken };
+
+struct EmitAction {
+  EmitActionKind kind;
+  unsigned groupIdx = 0;
+  bool isSeed = false;                  // resolves to ResourceSemaphores::seedId
+  std::optional<unsigned> edgeIdx;      // representative edge for forClass()
+  std::optional<PartitionId> acquirer;  // edge.dstOwner of the class (M3 / dump)
+  bool released = false;                // CreateSemaphore: the is_released bit
+  SyncAnchorKind anchorKind = SyncAnchorKind::AcquireBeforeOp;
+  Operation *anchorOp = nullptr;
+  Region *anchorRegion = nullptr;
+  Operation *threadOp = nullptr;
+  PlannedRelease release;
+  std::optional<PartitionId> owner;     // release owner (edge fact)
+  AsyncOp payload = AsyncOp::NONE;      // release async payload (edge fact)
+  unsigned rank = 0;                    // program-order rank of endpoint
+  unsigned priority = 0;                // tie-break: Release<Acquire<Buffer<Thread
+  std::string semaKey;                  // stable key for aggregation / dump
+};
+
+using EmitSchedule = SmallVector<EmitAction, 16>;
+
 struct EmitState {
   ResourceSemaphores semas;
   DenseMap<Operation *, Value> eventToken;
@@ -375,6 +403,7 @@ struct EmitState {
   Value currentToken;
   Value currentSemaphore;
   std::optional<PartitionId> currentOwner;
+  EmitSchedule schedule; // mechanical emit plan, built once per resource
 };
 
 } // namespace mlir::triton::nvws::insert_semas
