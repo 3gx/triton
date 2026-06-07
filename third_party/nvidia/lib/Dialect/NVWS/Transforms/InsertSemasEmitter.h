@@ -48,13 +48,16 @@ struct ActiveSemaphoreState {
   void setSemaphore(Value sem) { semaphore = sem; clearBuffers(); }
 };
 
+struct LoopCarrierSlotState {
+  SmallVector<unsigned, 4> tokenSlots;
+  Value poisonToken;
+};
+
 struct EmitState {
   ResourceSemaphores semas;
   DenseMap<Operation *, Value> eventToken;
   DenseMap<Value, Value> rewrittenAccessValue;
-  DenseMap<Operation *, unsigned> reusedForCarrierSlots;
-  DenseMap<Operation *, SmallVector<unsigned, 4>> reusedForTokenSlots;
-  DenseMap<Operation *, Value> reusedForPoisonTokens;
+  DenseMap<Operation *, LoopCarrierSlotState> loopCarrierSlots;
   const EmitterTransitionPlan *transitions = nullptr;
   ActiveSemaphoreState current;
   SmallVector<EmittedSyncRecord, 8> emittedReleases;
@@ -409,30 +412,6 @@ static bool edgeNeedsTerminalReadRelease(const SyncEdge &edge,
   return edge.dstOp && edgeDstReads(edge, group, resourceKey) &&
          !edgeDstWrites(edge, group, resourceKey) &&
          isa<TMEMLoadOp, LocalLoadOp>(edge.dstOp);
-}
-
-static bool linearChainNeedsPerEdgeFulls(const SyncGroup &syncGroup,
-                                         const SyncPlan &sp,
-                                         BufferGroup &group,
-                                         int64_t resourceKey) {
-  if (!group.isTmem())
-    return false;
-  std::optional<int64_t> firstOffset;
-  for (unsigned edgeIdx : syncGroup.edgeIdxs) {
-    for (const AccessTouch &touch : sp.edges[edgeIdx].touches) {
-      if (touch.resourceKey != resourceKey ||
-          touch.memberIdx >= group.members.size())
-        continue;
-      int64_t offset = group.members[touch.memberIdx].offset;
-      if (!firstOffset) {
-        firstOffset = offset;
-        continue;
-      }
-      if (*firstOffset != offset)
-        return true;
-    }
-  }
-  return false;
 }
 
 static ResourceSemaphores createResourceSemaphores(const OptSyncDag &dag,
@@ -1267,101 +1246,6 @@ static FailureOr<Value> lookupReleaseToken(Location loc, const SyncEdge *edge,
   return failure();
 }
 
-static bool isConstantTrue(Value value) {
-  auto constant = value.getDefiningOp<arith::ConstantIntOp>();
-  return constant && constant.value() != 0;
-}
-
-static bool isConditionalTmemStore(Operation *op) {
-  auto store = dyn_cast_or_null<TMEMStoreOp>(op);
-  return store && !isConstantTrue(store.getPred());
-}
-
-static bool nextLinearEdgeDstIsConditionalStore(const SyncGroup &syncGroup,
-                                                const SyncPlan &sp,
-                                                const SyncEdge *edge) {
-  if (!edge)
-    return false;
-  for (auto [pos, edgeIdx] : llvm::enumerate(syncGroup.edgeIdxs)) {
-    if (&sp.edges[edgeIdx] != edge)
-      continue;
-    if (pos + 1 >= syncGroup.edgeIdxs.size())
-      return false;
-    const SyncEdge &nextEdge = sp.edges[syncGroup.edgeIdxs[pos + 1]];
-    return isConditionalTmemStore(nextEdge.dstOp);
-  }
-  return false;
-}
-
-static bool shouldForceNonePayload(const SyncGroup &syncGroup,
-                                   const SyncPlan &sp, const SyncEdge *edge,
-                                   SyncAnchorKind kind) {
-  return syncGroup.kind == SyncGroupKind::LinearChain &&
-         kind == SyncAnchorKind::ReleaseAfterOp && edge && edge->srcOp &&
-         isa<MMAv5OpInterface>(edge->srcOp) && edge->dstOp &&
-         isa<TMEMLoadOp>(edge->dstOp) &&
-         nextLinearEdgeDstIsConditionalStore(syncGroup, sp, edge);
-}
-
-static const AccessEvent *findLastProducerInRegion(Region *region,
-                                                   BufferGroup &group,
-                                                   int64_t resourceKey) {
-  const AccessEvent *lastProducer = nullptr;
-  Operation *parent = region ? region->getParentOp() : nullptr;
-  if (!parent)
-    return nullptr;
-  for (const AccessEvent &event : group.events)
-    if (event.op && parent->isProperAncestor(event.op) &&
-        eventProduces(event, resourceKey))
-      lastProducer = &event;
-  return lastProducer;
-}
-
-static std::optional<PartitionId>
-computeReleaseOwner(const SyncGroup &syncGroup, const SyncPlan &sp,
-                    const SyncEdge *edge, Operation *anchor, SyncAnchorKind kind,
-                    bool terminalDstReadRelease,
-                    bool terminalLoopExitReadRelease,
-                    std::optional<PartitionId> carriedOwner) {
-  std::optional<PartitionId> owner = edge ? edge->srcOwner : std::nullopt;
-  if (terminalDstReadRelease || terminalLoopExitReadRelease)
-    owner = edge->dstOwner;
-  if (terminalLoopExitReadRelease)
-    owner = getPartitionId(anchor);
-  if (!owner && kind == SyncAnchorKind::ReleaseBeforeOp && carriedOwner)
-    owner = carriedOwner;
-  if (edge && !edge->srcOwner && kind == SyncAnchorKind::ReleaseBeforeOp &&
-      syncGroup.kind == SyncGroupKind::LinearChain &&
-      syncGroup.edgeIdxs.size() > 1 &&
-      &sp.edges[syncGroup.edgeIdxs.front()] == edge)
-    owner = sp.edges[syncGroup.edgeIdxs[1]].dstOwner;
-  return owner;
-}
-
-static AsyncOp computeReleasePayload(
-    const SyncGroup &syncGroup, const SyncPlan &sp, const SyncEdge *edge,
-    Operation *anchor, SyncAnchorKind kind, bool terminalDstReadRelease,
-    bool terminalLoopExitReadRelease, BufferGroup &group, int64_t resourceKey,
-    std::optional<AsyncOp> carriedPayload) {
-  Operation *payloadOp = edge ? edge->srcOp : nullptr;
-  AsyncOp payload =
-      (terminalDstReadRelease || terminalLoopExitReadRelease)
-          ? getAsyncPayload(anchor)
-          : (edge ? edge->asyncPayload : getAsyncPayload(payloadOp));
-  if ((terminalDstReadRelease || terminalLoopExitReadRelease) && carriedPayload)
-    payload = *carriedPayload;
-  if (group.isTmem() && edge && edge->srcYieldRegion &&
-      !terminalDstReadRelease && !terminalLoopExitReadRelease &&
-      payload == AsyncOp::NONE)
-    if (const AccessEvent *producer =
-            findLastProducerInRegion(edge->srcYieldRegion, group, resourceKey))
-      if (sameOwner(producer->owner, edge->srcOwner))
-        payload = getAsyncPayload(producer->op);
-  if (shouldForceNonePayload(syncGroup, sp, edge, kind))
-    payload = AsyncOp::NONE;
-  return payload;
-}
-
 LogicalResult EmitState::release(OpBuilder &b, Location loc, SyncAnchorKind kind,
                                  Operation *anchor, Region *yieldRegion,
                                  const PlannedRelease &action,
@@ -1387,24 +1271,13 @@ LogicalResult EmitState::release(OpBuilder &b, Location loc, SyncAnchorKind kind
       return group.members.front().allocOp->emitError(
           "nvws-insert-semas: planned release edge does not belong to its group");
   }
-  const SyncGroup &syncGroup = dag.groups[groupIdx];
   const SyncEdge *edge = getRepresentativeReleaseEdge(action, sp);
-  std::optional<unsigned> edgeIdx = action.edgeIdxs.front();
   for (const EmittedSyncRecord &record : emittedReleases)
     if (record.groupIdx == groupIdx && record.kind == kind &&
         record.anchor == anchor && record.yieldRegion == yieldRegion &&
         record.edgeIdxs == action.edgeIdxs)
       return success();
   Value sem = getSemaphoreForGroup(groupIdx, edge, dag, sp, group, semas);
-  bool terminalDstReadRelease =
-      (syncGroup.kind == SyncGroupKind::LinearChain ||
-       syncGroup.kind == SyncGroupKind::Singleton) &&
-      kind == SyncAnchorKind::ReleaseAfterOp && edge && edge->dstOp == anchor &&
-      edge->srcOp != anchor;
-  bool terminalLoopExitReadRelease =
-      syncGroup.kind == SyncGroupKind::Singleton &&
-      kind == SyncAnchorKind::ReleaseAfterOp && edge && anchor &&
-      edgeIdx && dag.tmemLoopExitRead.lookup(*edgeIdx) == anchor;
   bool useStructuredCarrier =
       kind == SyncAnchorKind::ReleaseAfterOp && edge && edge->srcOp &&
       edge->srcOp != anchor && current.token;
@@ -1419,12 +1292,11 @@ LogicalResult EmitState::release(OpBuilder &b, Location loc, SyncAnchorKind kind
                                                 b.getInsertionBlock());
   if (failed(token))
     return failure();
-  std::optional<PartitionId> owner = computeReleaseOwner(
-      syncGroup, sp, edge, anchor, kind, terminalDstReadRelease,
-      terminalLoopExitReadRelease, current.owner);
-  AsyncOp payload = computeReleasePayload(
-      syncGroup, sp, edge, anchor, kind, terminalDstReadRelease,
-      terminalLoopExitReadRelease, group, dag.resource.second, current.payload);
+  std::optional<PartitionId> owner =
+      action.useCarriedOwner && current.owner ? current.owner : action.owner;
+  AsyncOp payload = action.useCarriedPayload && current.payload
+                        ? *current.payload
+                        : action.payload;
   SemaphoreReleaseOp release =
       emitRelease(b, loc, sem, *token, owner, stageCluster, payload);
   if (useStructuredCarrier && structuredCarrierPartition.size() == 1 && !owner) {
@@ -1618,201 +1490,71 @@ static LogicalResult emitDeferredNestedExitTransitions(
   return success();
 }
 
-static bool linearChainAnchorsLoopExit(const SyncGroup &syncGroup,
-                                       const SyncPlan &sp, Operation *forOp,
-                                       Region *region) {
-  if (!forOp || !region)
-    return false;
-  for (unsigned edgeIdx : syncGroup.edgeIdxs) {
-    const SyncEdge &edge = sp.edges[edgeIdx];
-    if (edge.srcOp == forOp || edge.dstOp == forOp ||
-        edge.srcYieldRegion == region || edge.dstYieldRegion == region)
-      return true;
-  }
-  return false;
+static FailureOr<Value>
+emitPlannedDrainRelease(OpBuilder &b, Location loc, scf::ForOp forOp,
+                        const PlannedDrainRelease &release, Value token,
+                        const SyncPlan &sp, EmitState &state) {
+  if (release.edgeIdx >= sp.edges.size())
+    return forOp->emitError(
+        "nvws-insert-semas: loop-exit drain release references an invalid edge");
+  const SyncEdge &edge = sp.edges[release.edgeIdx];
+  if (!edgeRequiresRelease(edge))
+    return forOp->emitError(
+        "nvws-insert-semas: loop-exit drain release is not backed by a "
+        "partition transition edge");
+  Value sem = state.semas.forClass(sp, release.edgeIdx);
+  std::optional<PartitionId> owner =
+      release.useCurrentOwner ? state.current.owner : release.owner;
+  emitRelease(b, loc, sem, token, owner, StageCluster{}, release.payload);
+  return sem;
 }
 
-static const PlannedRelease *
-findPlannedAfterOpReleaseForGroup(Operation *anchor, unsigned groupIdx,
-                                  const EmitterTransitionPlan &transitions) {
-  if (!anchor)
-    return nullptr;
-  auto releaseIt = transitions.opExitReleases.find(anchor);
-  if (releaseIt == transitions.opExitReleases.end())
-    return nullptr;
-  for (const PlannedRelease &action : releaseIt->second)
-    if (action.groupIdx == groupIdx)
-      return &action;
-  return nullptr;
-}
-
-static bool linearChainNeedsLoopExitDrain(unsigned groupIdx,
-                                          const SyncGroup &syncGroup, Operation *forOp, Region *region,
-                                          const EmitterTransitionPlan &transitions,
-                                          const OptSyncDag &dag,
-                                          const SyncPlan &sp) {
-  if (!forOp || !region)
-    return false;
-  if (findPlannedAfterOpReleaseForGroup(forOp, groupIdx, transitions))
-    return true;
-  if (dag.skippedInitialLoopCarrierRegion.lookup(groupIdx) == region)
-    for (unsigned edgeIdx : syncGroup.edgeIdxs)
-      if (dag.edgesDeferringToSkippedLoopExit.contains(edgeIdx))
-        return true;
-  for (unsigned edgeIdx : syncGroup.edgeIdxs) {
-    const SyncEdge &edge = sp.edges[edgeIdx];
-    if (dag.loopEntryHandoffAccess.contains(edgeIdx))
-      return true;
-    if (edge.dstYieldRegion == region &&
-        dag.terminalLoopReadEdgesDeferringToExit.contains(edgeIdx))
-      return true;
-  }
-  return false;
-}
-
-static LogicalResult emitTmemLinearLoopExitDrain(scf::ForOp forOp,
-                                                 Region *region,
-                                                 const OptSyncDag &dag,
-                                                 const SyncPlan &sp,
-                                                 BufferGroup &group,
-                                                 EmitState &state) {
-  if (!group.isTmem() || !state.current.token)
-    return success();
-  if (!hasWarpSpecializeTag(forOp))
+static LogicalResult emitPlannedLoopExitDrains(scf::ForOp forOp,
+                                               const OptSyncDag &dag,
+                                               const SyncPlan &sp,
+                                               BufferGroup &group,
+                                               EmitState &state) {
+  if (!state.current.token)
     return success();
   const EmitterTransitionPlan &transitions = state.transitionPlan();
-  SmallVector<unsigned, 2> groupIds;
-  auto it = transitions.regionEntryAcquires.find(region);
-  if (it != transitions.regionEntryAcquires.end())
-    groupIds.append(it->second.begin(), it->second.end());
-  else
-    for (auto [idx, syncGroup] : llvm::enumerate(dag.groups))
-      if (syncGroup.kind == SyncGroupKind::LinearChain &&
-          linearChainAnchorsLoopExit(syncGroup, sp, forOp.getOperation(),
-                                     region))
-        groupIds.push_back(static_cast<unsigned>(idx));
+  auto it = transitions.loopExitDrains.find(forOp.getOperation());
+  if (it == transitions.loopExitDrains.end())
+    return success();
 
-  for (unsigned gi : groupIds) {
-    const SyncGroup &syncGroup = dag.groups[gi];
-    if (syncGroup.kind != SyncGroupKind::LinearChain ||
-        syncGroup.edgeIdxs.size() < 2)
-      continue;
-    if (linearChainNeedsPerEdgeFulls(syncGroup, sp, group, dag.resource.second))
-      continue;
-    if (!linearChainNeedsLoopExitDrain(gi, syncGroup, forOp.getOperation(),
-                                       region, transitions, dag, sp))
-      continue;
-
-    const SyncEdge &firstEdge = sp.edges[syncGroup.edgeIdxs.front()];
-    const SyncEdge &secondEdge = sp.edges[syncGroup.edgeIdxs[1]];
-    auto loopExitPayload = [&]() {
-      Operation *lastWriter = nullptr;
-      for (const AccessEvent &event : group.events)
-        if (event.op && forOp->isProperAncestor(event.op) &&
-            eventProduces(event, dag.resource.second))
-          lastWriter = event.op;
-      return getAsyncPayload(lastWriter);
-    };
-    OpBuilder b(forOp);
-    b.setInsertionPointAfter(forOp);
-    Location loc = forOp.getLoc();
-    auto emitDrainRelease = [&](Value sem, Value token,
-                                std::optional<PartitionId> owner,
-                                AsyncOp payload,
-                                const SyncEdge &edge) -> LogicalResult {
-      if (!edgeRequiresRelease(edge))
-        return forOp->emitError(
-            "nvws-insert-semas: loop-exit drain release is not backed by a "
-            "partition transition edge");
-      emitRelease(b, loc, sem, token, owner, StageCluster{}, payload);
-      return success();
-    };
-    auto findPlannedAfterLoopRelease =
-        [&](const SyncEdge &edge) -> const PlannedRelease * {
-      std::optional<unsigned> edgeIdx = findEdgeIndex(sp, &edge);
-      if (!edgeIdx)
-        return nullptr;
-      auto releaseIt = transitions.opExitReleases.find(forOp.getOperation());
-      if (releaseIt == transitions.opExitReleases.end())
-        return nullptr;
-      for (const PlannedRelease &action : releaseIt->second)
-        if (llvm::is_contained(action.edgeIdxs, *edgeIdx))
-          return &action;
-      return nullptr;
-    };
-    bool skipsInitialCarrier =
-        dag.skippedInitialLoopCarrierRegion.lookup(gi) == region;
-    const SyncEdge *loopEntryHandoffEdge = nullptr;
-    for (unsigned edgeIdx : syncGroup.edgeIdxs)
-      if (dag.loopEntryHandoffAccess.contains(edgeIdx)) {
-        loopEntryHandoffEdge = &sp.edges[edgeIdx];
-        break;
-      }
-    bool deferredTerminalLoopRead = llvm::any_of(
-        syncGroup.edgeIdxs, [&](unsigned edgeIdx) {
-          const SyncEdge &edge = sp.edges[edgeIdx];
-          return edge.dstYieldRegion == region &&
-                 dag.terminalLoopReadEdgesDeferringToExit.contains(edgeIdx);
-        });
-    if (skipsInitialCarrier) {
-      for (unsigned edgeIdx : syncGroup.edgeIdxs) {
-        const SyncEdge &edge = sp.edges[edgeIdx];
-        if (!dag.edgesDeferringToSkippedLoopExit.contains(edgeIdx))
-          continue;
-        Value sem = getSemaphoreForGroup(gi, &edge, dag, sp, group,
-                                         state.semas);
-        if (failed(emitDrainRelease(sem, state.current.token, state.current.owner,
-                                    edge.asyncPayload, edge)))
-          return failure();
-        state.current.setSemaphore(sem);
-        return success();
-      }
-    }
-    std::optional<PartitionId> drainOwner = firstEdge.dstOwner;
-    std::optional<PartitionId> releaseOwner = state.current.owner;
-    AsyncOp drainPayload = AsyncOp::NONE;
-    AsyncOp emptyPayload = AsyncOp::NONE;
-    if (loopEntryHandoffEdge) {
-      releaseOwner = loopEntryHandoffEdge->srcOwner;
-      drainOwner = loopEntryHandoffEdge->dstOwner;
-      emptyPayload = loopExitPayload();
-    } else if (skipsInitialCarrier) {
-      drainOwner = secondEdge.dstOwner;
-      drainPayload = loopExitPayload();
-    } else if (deferredTerminalLoopRead) {
-      emptyPayload = loopExitPayload();
-    } else if (firstEdge.dstOp == forOp.getOperation()) {
-      drainPayload = secondEdge.asyncPayload;
-    } else if (isa_and_nonnull<MMAv5OpInterface>(firstEdge.srcOp) &&
-               edgeDstReads(firstEdge, group, dag.resource.second) &&
-               !edgeDstWrites(firstEdge, group, dag.resource.second)) {
-      drainPayload = loopExitPayload();
-    } else if (isa_and_nonnull<MMAv5OpInterface>(secondEdge.srcOp) &&
-               edgeDstReads(secondEdge, group, dag.resource.second) &&
-               !edgeDstWrites(secondEdge, group, dag.resource.second)) {
-      emptyPayload = secondEdge.asyncPayload;
-    }
-    const SyncEdge *fullReleaseEdge =
-        loopEntryHandoffEdge ? loopEntryHandoffEdge : &firstEdge;
-    Value fullSem = state.semas.forClass(sp, findEdgeIndex(sp, fullReleaseEdge));
-    Value emptySem = state.semas.forClass(sp, findEdgeIndex(sp, &secondEdge));
-    if (const PlannedRelease *releaseAction =
-            findPlannedAfterLoopRelease(*fullReleaseEdge)) {
-      if (failed(state.release(b, loc, SyncAnchorKind::ReleaseAfterOp,
-                               forOp.getOperation(), nullptr, *releaseAction, dag,
-                               sp, group, StageCluster{})))
+  OpBuilder b(forOp);
+  b.setInsertionPointAfter(forOp);
+  Location loc = forOp.getLoc();
+  for (const PlannedLoopExitDrain &drain : it->second) {
+    if (drain.singleReleaseOnly) {
+      FailureOr<Value> sem = emitPlannedDrainRelease(
+          b, loc, forOp, drain.fullRelease, state.current.token, sp, state);
+      if (failed(sem))
         return failure();
-    } else if (failed(emitDrainRelease(fullSem, state.current.token,
-                                       releaseOwner, drainPayload,
-                                       *fullReleaseEdge))) {
-      return failure();
+      state.current.setSemaphore(*sem);
+      return success();
+    }
+
+    Value fullSem = state.semas.forClass(sp, drain.fullRelease.edgeIdx);
+    if (drain.plannedFullRelease) {
+      if (failed(state.release(b, loc, SyncAnchorKind::ReleaseAfterOp,
+                               forOp.getOperation(), nullptr,
+                               *drain.plannedFullRelease, dag, sp, group,
+                               StageCluster{})))
+        return failure();
+    } else {
+      FailureOr<Value> sem = emitPlannedDrainRelease(
+          b, loc, forOp, drain.fullRelease, state.current.token, sp, state);
+      if (failed(sem))
+        return failure();
+      fullSem = *sem;
     }
     SemaphoreAcquireOp acquire =
-        emitAcquire(b, loc, fullSem, drainOwner, StageCluster{});
-    if (failed(emitDrainRelease(emptySem, acquire.getToken(), drainOwner,
-                                emptyPayload, secondEdge)))
+        emitAcquire(b, loc, fullSem, drain.acquireOwner, StageCluster{});
+    FailureOr<Value> emptySem = emitPlannedDrainRelease(
+        b, loc, forOp, drain.emptyRelease, acquire.getToken(), sp, state);
+    if (failed(emptySem))
       return failure();
-    state.current.setCarrier(emptySem, acquire.getToken(), drainOwner);
+    state.current.setCarrier(*emptySem, acquire.getToken(), drain.acquireOwner);
     return success();
   }
   return success();
@@ -1979,6 +1721,110 @@ static bool linearChainEntersFor(Operation *forOp, const OptSyncDag &dag,
 
 static void mergeProtectedAccesses(EmitState &dst, const EmitState &src);
 
+static void collectLoopCarrierBackings(Value token,
+                                       SetVector<Value> &backings,
+                                       DenseSet<Value> &visited) {
+  if (!token || !visited.insert(token).second)
+    return;
+
+  auto addSemaphoreBacking = [&](Value semaphore) {
+    auto createOp = semaphore.getDefiningOp<SemaphoreCreateOp>();
+    if (createOp && !createOp.getBuffers().empty())
+      backings.insert(createOp.getBuffers().front());
+  };
+
+  for (Operation *user : token.getUsers()) {
+    if (auto bufferOp = dyn_cast<SemaphoreBufferOp>(user)) {
+      addSemaphoreBacking(bufferOp.getSemaphore());
+      continue;
+    }
+    if (auto releaseOp = dyn_cast<SemaphoreReleaseOp>(user)) {
+      addSemaphoreBacking(releaseOp.getSemaphore());
+      continue;
+    }
+    if (auto forOp = dyn_cast<scf::ForOp>(user)) {
+      unsigned controlOperands = forOp.getNumControlOperands();
+      for (OpOperand &operand : forOp->getOpOperands()) {
+        if (operand.get() != token ||
+            operand.getOperandNumber() < controlOperands)
+          continue;
+        unsigned slot = operand.getOperandNumber() - controlOperands;
+        collectLoopCarrierBackings(forOp.getRegionIterArg(slot), backings,
+                                   visited);
+      }
+    }
+  }
+}
+
+static std::optional<Value> inferLoopCarrierSlotBacking(scf::ForOp forOp,
+                                                        unsigned slot) {
+  SetVector<Value> backings;
+  DenseSet<Value> visited;
+  collectLoopCarrierBackings(forOp.getRegionIterArg(slot), backings, visited);
+  if (backings.size() != 1)
+    return std::nullopt;
+  return backings.front();
+}
+
+static bool isPoisonCarrierToken(Value value) {
+  return value && isa<AsyncTokenType>(value.getType()) &&
+         value.getDefiningOp<ub::PoisonOp>();
+}
+
+static void normalizeLoopCarrierTokenSlots(scf::ForOp forOp) {
+  DenseMap<unsigned, Value> backingBySlot;
+  SmallVector<unsigned, 4> asyncTokenSlots;
+  for (auto [idx, init] : llvm::enumerate(forOp.getInitArgs())) {
+    if (!isa<AsyncTokenType>(init.getType()))
+      continue;
+    unsigned slot = static_cast<unsigned>(idx);
+    asyncTokenSlots.push_back(slot);
+    auto acquireOp = init.getDefiningOp<SemaphoreAcquireOp>();
+    if (acquireOp) {
+      auto createOp =
+          acquireOp.getSemaphore().getDefiningOp<SemaphoreCreateOp>();
+      if (createOp && !createOp.getBuffers().empty()) {
+        backingBySlot[slot] = createOp.getBuffers().front();
+        continue;
+      }
+    }
+    if (std::optional<Value> backing = inferLoopCarrierSlotBacking(forOp, slot))
+      backingBySlot[slot] = *backing;
+  }
+
+  llvm::MapVector<Value, SmallVector<unsigned, 4>> slotsByInit;
+  for (unsigned slot : asyncTokenSlots)
+    slotsByInit[forOp.getInitArgs()[slot]].push_back(slot);
+
+  scf::YieldOp yieldOp = getForYieldOp(forOp);
+  unsigned controlOperands = forOp.getNumControlOperands();
+  Value poison;
+  for (auto &it : slotsByInit) {
+    ArrayRef<unsigned> slots = it.second;
+    if (slots.size() < 2)
+      continue;
+    bool hasSemaphoreBackedSlot = false;
+    for (unsigned slot : slots)
+      hasSemaphoreBackedSlot |= backingBySlot.contains(slot);
+    if (!hasSemaphoreBackedSlot)
+      continue;
+
+    for (unsigned slot : slots) {
+      if (backingBySlot.contains(slot) ||
+          !isPoisonCarrierToken(yieldOp.getOperand(slot)))
+        continue;
+      if (!poison) {
+        OpBuilder b(forOp);
+        b.setInsertionPoint(forOp);
+        poison =
+            ub::PoisonOp::create(b, forOp.getLoc(), b.getType<AsyncTokenType>());
+      }
+      forOp->setOperand(controlOperands + slot, poison);
+      yieldOp.setOperand(slot, poison);
+    }
+  }
+}
+
 static FailureOr<scf::ForOp> threadCarrierThroughFor(OpBuilder &b,
                                                      scf::ForOp forOp,
                                                      EmitState &state,
@@ -2021,10 +1867,10 @@ static FailureOr<scf::ForOp> threadCarrierThroughFor(OpBuilder &b,
       forOp->setOperand(3 + slot, slot == carrierSlot ? init : poison);
 
     state.current.setToken(forOp.getRegionIterArg(carrierSlot));
-    state.reusedForCarrierSlots[forOp.getOperation()] = carrierSlot;
-    state.reusedForTokenSlots[forOp.getOperation()] = reusableSlots;
-    if (poison)
-      state.reusedForPoisonTokens[forOp.getOperation()] = poison;
+    LoopCarrierSlotState slotState;
+    slotState.tokenSlots.append(reusableSlots.begin(), reusableSlots.end());
+    slotState.poisonToken = poison;
+    state.loopCarrierSlots[forOp.getOperation()] = std::move(slotState);
     if (hasPartition(forOp)) {
       addPartitionIds(oldPartitionIds, carrierPartition);
       if (carrierSlot < oldPartitionOutputs.size())
@@ -2051,9 +1897,10 @@ static void closeCarrierForLoop(scf::ForOp forOp, EmitState &bodyState,
                                 EmitState &parentState,
                                 std::optional<PartitionId> ownerAtYield,
                                 bool overrideOwnerAtYield) {
-  auto reusedIt = bodyState.reusedForCarrierSlots.find(forOp.getOperation());
-  if (reusedIt != bodyState.reusedForCarrierSlots.end()) {
-    unsigned slot = reusedIt->second;
+  auto slotIt = bodyState.loopCarrierSlots.find(forOp.getOperation());
+  if (slotIt != bodyState.loopCarrierSlots.end()) {
+    const LoopCarrierSlotState &slotState = slotIt->second;
+    unsigned slot = slotState.tokenSlots.front();
     Value yieldedToken = bodyState.current.token
                              ? bodyState.current.token
                              : forOp.getRegionIterArg(slot);
@@ -2062,15 +1909,9 @@ static void closeCarrierForLoop(scf::ForOp forOp, EmitState &bodyState,
                              : (ownerAtYield ? ownerAtYield
                                              : bodyState.current.owner);
     auto yieldOp = getForYieldOp(forOp);
-    auto slotsIt = bodyState.reusedForTokenSlots.find(forOp.getOperation());
-    ArrayRef<unsigned> tokenSlots =
-        slotsIt == bodyState.reusedForTokenSlots.end()
-            ? ArrayRef<unsigned>(slot)
-            : ArrayRef<unsigned>(slotsIt->second);
-    Value poison = bodyState.reusedForPoisonTokens.lookup(forOp.getOperation());
-    for (unsigned tokenSlot : tokenSlots)
+    for (unsigned tokenSlot : slotState.tokenSlots)
       yieldOp.setOperand(tokenSlot,
-                         tokenSlot == slot ? yieldedToken : poison);
+                         tokenSlot == slot ? yieldedToken : slotState.poisonToken);
     SetVector<int> carrierPartition = partitionSetForTokenOrOwner(
         yieldedToken, resultOwner, forOp.getOperation());
     SetVector<int> yieldPartition;
@@ -2193,12 +2034,8 @@ static void mergeProtectedAccesses(EmitState &dst, const EmitState &src) {
   }
   for (Operation *op : src.eraseAfterEmission)
     dst.eraseAfterEmission.insert(op);
-  for (auto &kv : src.reusedForCarrierSlots)
-    dst.reusedForCarrierSlots[kv.first] = kv.second;
-  for (auto &kv : src.reusedForTokenSlots)
-    dst.reusedForTokenSlots[kv.first] = kv.second;
-  for (auto &kv : src.reusedForPoisonTokens)
-    dst.reusedForPoisonTokens[kv.first] = kv.second;
+  for (auto &kv : src.loopCarrierSlots)
+    dst.loopCarrierSlots[kv.first] = kv.second;
   for (auto &kv : src.stageCache)
     dst.stageCache[kv.first] = kv.second;
 }
@@ -2207,6 +2044,13 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
                                        const SyncPlan &sp, const ResourcePlan &plan,
                                        BufferGroup &group, const GroupBacking &backing,
                                        EmitState &state, Region *plannedRegion);
+
+static bool isOperationTransitionAnchor(
+    Operation *op, const EmitterTransitionPlan &transitions) {
+  return transitions.opEntryReleases.contains(op) ||
+         transitions.opEntryAcquires.contains(op) ||
+         transitions.opExitReleases.contains(op);
+}
 
 static LogicalResult emitResourceRegion(Region &region, const OptSyncDag &dag,
                                         const SyncPlan &sp, const ResourcePlan &plan,
@@ -2226,6 +2070,7 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
                                        BufferGroup &group, const GroupBacking &backing,
                                        EmitState &state, Region *plannedRegion) {
   for (Operation &op : llvm::make_early_inc_range(block)) {
+    const EmitterTransitionPlan &transitions = state.transitionPlan();
     if (isa<scf::YieldOp>(op)) {
       SmallVector<AcquireRecord, 2> yieldAcquires;
       if (failed(emitRegionCloseTransitions(&op, plannedRegion, dag, sp,
@@ -2237,7 +2082,8 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
 
     AccessEvent *event = nullptr;
     SmallVector<const AccessTouch *, 4> touches;
-    if (dag.accessOps.contains(&op)) {
+    bool isAccessEvent = dag.accessOps.contains(&op);
+    if (isAccessEvent) {
       event = findEvent(group, &op);
       if (event)
         collectTouchesForResource(*event, dag.resource.second, touches);
@@ -2245,10 +2091,16 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
         state.stageCache[*event->owner] = getStageCluster(&op);
     }
 
+    bool isStructural = isa<scf::ForOp, scf::IfOp>(op);
+    bool isTransitionAnchor = isOperationTransitionAnchor(&op, transitions);
+    if (!isStructural && !isAccessEvent && !isTransitionAnchor)
+      continue;
+
     SmallVector<AcquireRecord, 2> acquires;
-    if (failed(emitOperationEntryTransitions(&op, dag, sp, group, state,
-                                             acquires)))
-      return failure();
+    if (isTransitionAnchor)
+      if (failed(emitOperationEntryTransitions(&op, dag, sp, group, state,
+                                               acquires)))
+        return failure();
 
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       Operation *oldForOp = forOp.getOperation();
@@ -2292,8 +2144,8 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
         }
         closeCarrierForLoop(activeForOp, bodyState, state, ownerAtYield,
                             overrideOwnerAtYield);
-        if (failed(emitTmemLinearLoopExitDrain(activeForOp, plannedForRegion,
-                                               dag, sp, group, state)))
+        if (failed(emitPlannedLoopExitDrains(activeForOp, dag, sp, group,
+                                             state)))
           return failure();
       } else {
         closeExistingCarrierForLoop(activeForOp, bodyState, state);
@@ -2304,6 +2156,7 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
       if (failed(emitDeferredNestedExitTransitions(activeForOp.getOperation(),
                                                    dag, sp, group, state)))
         return failure();
+      normalizeLoopCarrierTokenSlots(activeForOp);
       continue;
     }
     if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
@@ -2457,8 +2310,9 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
                                       backing, state)))
         return failure();
     }
-    if (failed(emitOperationExitTransitions(&op, dag, sp, group, state)))
-      return failure();
+    if (isTransitionAnchor)
+      if (failed(emitOperationExitTransitions(&op, dag, sp, group, state)))
+        return failure();
   }
   return success();
 }
@@ -2735,122 +2589,6 @@ static void splitSemaphoreIfForLoopScheduler(triton::FuncOp funcOp) {
       setPartition(ifOp, ifIds);
       setPartitionOutputs(ifOp, outputs);
     }
-  }
-}
-
-static void collectSemaphoreBackingsForToken(Value token,
-                                             SetVector<Value> &backings,
-                                             DenseSet<Value> &visited) {
-  if (!token || !visited.insert(token).second)
-    return;
-
-  auto addSemaphoreBacking = [&](Value semaphore) {
-    auto createOp = semaphore.getDefiningOp<SemaphoreCreateOp>();
-    if (createOp && !createOp.getBuffers().empty())
-      backings.insert(createOp.getBuffers().front());
-  };
-
-  for (Operation *user : token.getUsers()) {
-    if (auto bufferOp = dyn_cast<SemaphoreBufferOp>(user)) {
-      addSemaphoreBacking(bufferOp.getSemaphore());
-      continue;
-    }
-    if (auto releaseOp = dyn_cast<SemaphoreReleaseOp>(user)) {
-      addSemaphoreBacking(releaseOp.getSemaphore());
-      continue;
-    }
-    if (auto forOp = dyn_cast<scf::ForOp>(user)) {
-      unsigned controlOperands = forOp.getNumControlOperands();
-      for (OpOperand &operand : forOp->getOpOperands()) {
-        if (operand.get() != token ||
-            operand.getOperandNumber() < controlOperands)
-          continue;
-        unsigned slot = operand.getOperandNumber() - controlOperands;
-        collectSemaphoreBackingsForToken(forOp.getRegionIterArg(slot),
-                                         backings, visited);
-      }
-    }
-  }
-}
-
-static std::optional<Value> inferSemaphoreBackingForCarrierSlot(scf::ForOp forOp,
-                                                                unsigned slot) {
-  SetVector<Value> backings;
-  DenseSet<Value> visited;
-  collectSemaphoreBackingsForToken(forOp.getRegionIterArg(slot), backings,
-                                   visited);
-  if (backings.size() != 1)
-    return std::nullopt;
-  return backings.front();
-}
-
-static bool isPoisonAsyncToken(Value value) {
-  return value && isa<AsyncTokenType>(value.getType()) &&
-         value.getDefiningOp<ub::PoisonOp>();
-}
-
-static void poisonDuplicateUnbackedTokenSlots(
-    scf::ForOp forOp, ArrayRef<unsigned> asyncTokenSlots,
-    const DenseMap<unsigned, Value> &backingBySlot) {
-  llvm::MapVector<Value, SmallVector<unsigned, 4>> slotsByInit;
-  for (unsigned slot : asyncTokenSlots)
-    slotsByInit[forOp.getInitArgs()[slot]].push_back(slot);
-
-  scf::YieldOp yieldOp = getForYieldOp(forOp);
-  unsigned controlOperands = forOp.getNumControlOperands();
-  Value poison;
-  for (auto &it : slotsByInit) {
-    ArrayRef<unsigned> slots = it.second;
-    if (slots.size() < 2)
-      continue;
-    bool hasSemaphoreBackedSlot = false;
-    for (unsigned slot : slots)
-      hasSemaphoreBackedSlot |= backingBySlot.contains(slot);
-    if (!hasSemaphoreBackedSlot)
-      continue;
-
-    for (unsigned slot : slots) {
-      if (backingBySlot.contains(slot) ||
-          !isPoisonAsyncToken(yieldOp.getOperand(slot)))
-        continue;
-      if (!poison) {
-        OpBuilder b(forOp);
-        b.setInsertionPoint(forOp);
-        poison =
-            ub::PoisonOp::create(b, forOp.getLoc(), b.getType<AsyncTokenType>());
-      }
-      forOp->setOperand(controlOperands + slot, poison);
-      yieldOp.setOperand(slot, poison);
-    }
-  }
-}
-
-static void poisonUnbackedCarrierTokenSlots(triton::FuncOp funcOp) {
-  SmallVector<scf::ForOp, 8> loops;
-  funcOp.walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
-
-  for (scf::ForOp forOp : loops) {
-    DenseMap<unsigned, Value> backingBySlot;
-    SmallVector<unsigned, 4> asyncTokenSlots;
-    for (auto [idx, init] : llvm::enumerate(forOp.getInitArgs())) {
-      if (!isa<AsyncTokenType>(init.getType()))
-        continue;
-      unsigned slot = static_cast<unsigned>(idx);
-      asyncTokenSlots.push_back(slot);
-      auto acquireOp = init.getDefiningOp<SemaphoreAcquireOp>();
-      if (acquireOp) {
-        auto createOp =
-            acquireOp.getSemaphore().getDefiningOp<SemaphoreCreateOp>();
-        if (createOp && !createOp.getBuffers().empty()) {
-          backingBySlot[slot] = createOp.getBuffers().front();
-          continue;
-        }
-      }
-      if (std::optional<Value> backing =
-              inferSemaphoreBackingForCarrierSlot(forOp, slot))
-        backingBySlot[slot] = *backing;
-    }
-    poisonDuplicateUnbackedTokenSlots(forOp, asyncTokenSlots, backingBySlot);
   }
 }
 

@@ -1,19 +1,3 @@
-// v4 commit 5: discovery + ACCESS DAG + OWNERSHIP DAG + RAW-SYNC DAG +
-// OPT-SYNC DAG + semaphore IR emission.
-//
-// Per meta2nvws-plan/per-edge-sema-plan.v4.md Implementation Plan, this
-// commit adds the final stage of the v4 pipeline:
-//
-//   discover backing buffers
-//     -> build ACCESS DAG per buffer
-//     -> build OWNERSHIP DAG per (logicalGroupId, resourceKey)
-//     -> derive RAW-SYNC DAG per (logicalGroupId, resourceKey)
-//     -> derive OPT-SYNC DAG via fanout/fanin combines
-//     -> render nvws.semaphore.* IR from the OPT-SYNC DAG
-//
-// When NVWS_INSERT_SEMA_DUMP_DAG=1, the pass prints each planned stage to
-// stderr before emitting IR.
-
 #include "Utilities.h"
 #include "InsertSemasModel.h"
 #include "InsertSemasCommon.h"
@@ -69,7 +53,6 @@ using namespace triton::nvws::insert_semas;
 #include "InsertSemasOwnerDag.h"
 #include "InsertSemasRawSyncDag.h"
 #include "InsertSemasOptSyncDag.h"
-#include "InsertSemasEmitSchedule.h"
 #include "InsertSemasEmitter.h"
 
 // ---------------------------------------------------------------------------
@@ -187,8 +170,8 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp,
   for (auto en : llvm::enumerate(groups)) {
     BufferGroup &group = en.value();
     if (dumpDag) {
-      dumpBackingGroupHeader(group);
-      dumpAccessDag(group, funcOp);
+        dumpBackingGroupHeader(group);
+        dumpAccessDag(group, funcOp);
     }
     std::set<int64_t> keys;
     for (auto &m : group.members) keys.insert(m.resourceKey);
@@ -212,24 +195,19 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp,
         llvm::errs() << "RELEASED-SEMAPHORES buffer.id=" << opt.resource.first
                      << " resourceKey=" << opt.resource.second
                      << " seeded=" << (seeded ? "yes" : "no")
-                     << " count=" << opt.releasedSemaphores.size();
-        if (seeded && opt.releasedSemaphores.size() != 1)
-          llvm::errs() << " <<M1-VIOLATION: seeded resource must have exactly 1>>";
-        if (!seeded && !opt.releasedSemaphores.empty())
-          llvm::errs() << " <<M1-VIOLATION: edge-free resource must have 0>>";
-        llvm::errs() << "\n";
+                     << " count=" << opt.releasedSemaphores.size() << "\n";
         for (auto &[gIdx, acquirer] : opt.releasedSemaphores) {
-          llvm::errs() << "  seed: group=" << gIdx << " (" << opt.groups[gIdx].name
-                       << ", kind=" << static_cast<int>(opt.groups[gIdx].kind)
+          llvm::errs() << "  seed: group=" << gIdx << " ("
+                       << opt.groups[gIdx].name << ", kind="
+                       << static_cast<int>(opt.groups[gIdx].kind)
                        << ") acquirer=";
           if (acquirer)
-            llvm::errs() << "{p" << acquirer->first << ",ws" << acquirer->second
-                         << "}";
+            llvm::errs() << "{p" << acquirer->first << ",ws"
+                         << acquirer->second << "}";
           else
             llvm::errs() << "{root}";
           llvm::errs() << "\n";
         }
-        dumpEmitSchedule(opt, sp, plan, group, funcOp);
       }
       plannedResources.push_back(
           {std::move(plan), std::move(sp), std::move(opt)});
@@ -265,7 +243,6 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp,
   for (Operation *op : llvm::reverse(eraseAfterEmission))
     op->erase();
   splitSemaphoreIfForLoopScheduler(funcOp);
-  poisonUnbackedCarrierTokenSlots(funcOp);
   coalesceTmemAllocsByBufferIdIntoViews(funcOp);
   eraseDeadTmemAllocs(funcOp);
   if (dumpDag)
