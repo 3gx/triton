@@ -768,71 +768,6 @@ static Operation *createNVWSDescriptorLoadOp(
   llvm_unreachable("unknown descriptor op");
 }
 
-static Operation *latestSameBlockConsumer(Operation *anchor) {
-  Operation *latest = anchor;
-  Block *block = anchor->getBlock();
-  SmallVector<Operation *, 8> worklist;
-  DenseSet<Operation *> seen;
-  for (Value result : anchor->getResults())
-    for (Operation *user : result.getUsers())
-      worklist.push_back(user);
-
-  while (!worklist.empty()) {
-    Operation *user = worklist.pop_back_val();
-    if (!seen.insert(user).second)
-      continue;
-    Operation *ancestor = block->findAncestorOpInBlock(*user);
-    if (!ancestor)
-      continue;
-    if (latest->isBeforeInBlock(ancestor))
-      latest = ancestor;
-    for (Value result : user->getResults())
-      for (Operation *next : result.getUsers())
-        worklist.push_back(next);
-  }
-  return latest;
-}
-
-static bool hasMemDescResult(Operation *op) {
-  return llvm::any_of(op->getResults(),
-                      [](Value result) { return isa<MemDescType>(result.getType()); });
-}
-
-static void collectTransitiveConsumers(Operation *producer, Block *anchorBlock,
-                                       DenseSet<Operation *> &seen,
-                                       SetVector<Operation *> &consumers) {
-  if (!seen.insert(producer).second)
-    return;
-  for (Value result : producer->getResults()) {
-    for (Operation *user : result.getUsers()) {
-      if (hasMemDescResult(user)) {
-        collectTransitiveConsumers(user, anchorBlock, seen, consumers);
-        continue;
-      }
-      Operation *ancestor = anchorBlock->findAncestorOpInBlock(*user);
-      consumers.insert(ancestor ? ancestor : user);
-    }
-  }
-}
-
-static Operation *latestTransitiveConsumer(Operation *anchor) {
-  SetVector<Operation *> consumers;
-  DenseSet<Operation *> seen;
-  collectTransitiveConsumers(anchor, anchor->getBlock(), seen, consumers);
-  if (consumers.empty())
-    return latestSameBlockConsumer(anchor);
-  SmallVector<Operation *, 8> consumerOps(consumers.begin(), consumers.end());
-  Operation *scope = nullptr;
-  if (auto funcOp = anchor->getParentOfType<triton::FuncOp>())
-    scope = funcOp.getOperation();
-  PostDominanceInfo dom(scope ? scope : anchor->getParentOp());
-  Operation *postDom = findNearestCommonPostDominator(consumerOps, dom);
-  if (!postDom)
-    return latestSameBlockConsumer(anchor);
-  Operation *ancestor = anchor->getBlock()->findAncestorOpInBlock(*postDom);
-  return ancestor ? ancestor : postDom;
-}
-
 static bool sameMemDescViewType(Type a, Type b) {
   if (a == b)
     return true;
@@ -1382,29 +1317,6 @@ static bool shouldForceNonePayload(const SyncGroup &syncGroup,
          nextLinearEdgeDstIsConditionalStore(syncGroup, sp, edge);
 }
 
-static bool releaseShouldPrecedeFollowingSemaphores(const SyncGroup &syncGroup,
-                                                    const SyncEdge *edge,
-                                                    BufferGroup &group,
-                                                    int64_t resourceKey,
-                                                    Operation *anchor) {
-  if (!group.isTmem() || !edge || !isa<MMAv5OpInterface>(anchor))
-    return false;
-  bool linearReadRelease =
-      syncGroup.kind == SyncGroupKind::LinearChain && edge->srcOp == anchor &&
-      edgeSrcReads(*edge, group, resourceKey) &&
-      !edgeSrcWrites(*edge, group, resourceKey);
-  bool terminalReadRelease =
-      (syncGroup.kind == SyncGroupKind::LinearChain ||
-       syncGroup.kind == SyncGroupKind::Singleton) &&
-      edge->dstOp == anchor && edgeDstReads(*edge, group, resourceKey) &&
-      !edgeDstWrites(*edge, group, resourceKey);
-  bool mmaSourceRelease =
-      (syncGroup.kind == SyncGroupKind::LinearChain ||
-       syncGroup.kind == SyncGroupKind::Singleton) &&
-      edge->srcOp == anchor;
-  return linearReadRelease || terminalReadRelease || mmaSourceRelease;
-}
-
 static const AccessEvent *findLastProducerInRegion(Region *region,
                                                    BufferGroup &group,
                                                    int64_t resourceKey) {
@@ -1419,46 +1331,7 @@ static const AccessEvent *findLastProducerInRegion(Region *region,
   return lastProducer;
 }
 
-static bool hasLaterBackingGroupAccessInSameBlock(Operation *op,
-                                                  BufferGroup &group) {
-  if (!op || !op->getBlock())
-    return false;
-  bool seen = false;
-  for (const AccessEvent &event : group.events) {
-    if (event.op == op) {
-      seen = true;
-      continue;
-    }
-    if (!seen || !event.op || event.op->getBlock() != op->getBlock())
-      continue;
-    if (op->isBeforeInBlock(event.op))
-      return true;
-  }
-  return false;
-}
-
-static void moveAfterExistingReleasesBeforeAcquire(Operation *op,
-                                                   Operation *source) {
-  Operation *insertBefore = source->getNextNode();
-  while (insertBefore && isa<SemaphoreReleaseOp>(insertBefore))
-    insertBefore = insertBefore->getNextNode();
-  if (insertBefore && isa<SemaphoreAcquireOp>(insertBefore))
-    op->moveBefore(insertBefore);
-  else
-    op->moveAfter(source);
-}
-
-static void moveAfterLoopBeforeFollowingSemaphores(Operation *op,
-                                                   scf::ForOp forOp) {
-  Operation *insertBefore = forOp->getNextNode();
-  if (insertBefore &&
-      isa<SemaphoreReleaseOp, SemaphoreAcquireOp>(insertBefore))
-    op->moveBefore(insertBefore);
-  else
-    op->moveAfter(forOp);
-}
-
-static Operation *findLastSameBlockNonTokenResultUser(Operation *op) {
+static Operation *lastNonTokenResultUserInBlock(Operation *op) {
   if (!op || !op->getBlock())
     return nullptr;
   Operation *lastUser = nullptr;
@@ -1474,6 +1347,131 @@ static Operation *findLastSameBlockNonTokenResultUser(Operation *op) {
     }
   }
   return lastUser;
+}
+static bool hasLaterResourceAccessInBlock(Operation *op, BufferGroup &group) {
+  if (!op || !op->getBlock())
+    return false;
+  bool seen = false;
+  for (const AccessEvent &event : group.events) {
+    if (event.op == op) {
+      seen = true;
+      continue;
+    }
+    if (!seen || !event.op || event.op->getBlock() != op->getBlock())
+      continue;
+    if (op->isBeforeInBlock(event.op))
+      return true;
+  }
+  return false;
+}
+static void collectAccessCompletionConsumers(Operation *producer,
+                                             Block *anchorBlock,
+                                             DenseSet<Operation *> &seen,
+                                             SetVector<Operation *> &consumers) {
+  if (!seen.insert(producer).second) return;
+  for (Value result : producer->getResults())
+    for (Operation *user : result.getUsers()) {
+      bool hasMemDesc = llvm::any_of(user->getResults(), [](Value result) {
+        return isa<MemDescType>(result.getType());
+      });
+      if (hasMemDesc) {
+        collectAccessCompletionConsumers(user, anchorBlock, seen, consumers);
+        continue;
+      }
+      Operation *ancestor = anchorBlock->findAncestorOpInBlock(*user);
+      consumers.insert(ancestor ? ancestor : user);
+    }
+}
+static Operation *sameBlockAccessCompletion(Operation *anchor) {
+  Operation *latest = anchor;
+  Block *block = anchor->getBlock();
+  SmallVector<Operation *, 8> worklist;
+  DenseSet<Operation *> seen;
+  for (Value result : anchor->getResults())
+    for (Operation *user : result.getUsers())
+      worklist.push_back(user);
+
+  while (!worklist.empty()) {
+    Operation *user = worklist.pop_back_val();
+    if (!seen.insert(user).second)
+      continue;
+    Operation *ancestor = block->findAncestorOpInBlock(*user);
+    if (!ancestor)
+      continue;
+    if (latest->isBeforeInBlock(ancestor))
+      latest = ancestor;
+    for (Value result : user->getResults())
+      for (Operation *next : result.getUsers())
+        worklist.push_back(next);
+  }
+  return latest;
+}
+static Operation *transitiveAccessCompletion(Operation *anchor) {
+  SetVector<Operation *> consumers;
+  DenseSet<Operation *> seen;
+  collectAccessCompletionConsumers(anchor, anchor->getBlock(), seen, consumers);
+  if (consumers.empty())
+    return sameBlockAccessCompletion(anchor);
+  SmallVector<Operation *, 8> consumerOps(consumers.begin(), consumers.end());
+  Operation *scope = nullptr;
+  if (auto funcOp = anchor->getParentOfType<triton::FuncOp>())
+    scope = funcOp.getOperation();
+  PostDominanceInfo dom(scope ? scope : anchor->getParentOp());
+  Operation *postDom = findNearestCommonPostDominator(consumerOps, dom);
+  if (!postDom)
+    return sameBlockAccessCompletion(anchor);
+  Operation *ancestor = anchor->getBlock()->findAncestorOpInBlock(*postDom);
+  return ancestor ? ancestor : postDom;
+}
+static bool opExitReleaseClosesBeforeFollowingAcquire(
+    const SyncGroup &syncGroup, const SyncEdge *edge, BufferGroup &group,
+    int64_t resourceKey, Operation *anchor) {
+  if (!group.isTmem() || !edge || !isa<MMAv5OpInterface>(anchor))
+    return false;
+  bool chainOrSingleton = syncGroup.kind == SyncGroupKind::LinearChain ||
+                          syncGroup.kind == SyncGroupKind::Singleton;
+  return (syncGroup.kind == SyncGroupKind::LinearChain &&
+          edge->srcOp == anchor && edgeSrcReads(*edge, group, resourceKey) &&
+          !edgeSrcWrites(*edge, group, resourceKey)) ||
+         (chainOrSingleton && edge->dstOp == anchor &&
+          edgeDstReads(*edge, group, resourceKey) &&
+          !edgeDstWrites(*edge, group, resourceKey)) ||
+         (chainOrSingleton && edge->srcOp == anchor);
+}
+static bool opExitReleaseClosesReadCompletion(const SyncGroup &syncGroup,
+                                              const SyncEdge *edge,
+                                              BufferGroup &group,
+                                              int64_t resourceKey,
+                                              Operation *anchor,
+                                              const OptSyncDag &dag,
+                                              std::optional<unsigned> edgeIdx) {
+  bool chainOrSingleton = syncGroup.kind == SyncGroupKind::LinearChain ||
+                          syncGroup.kind == SyncGroupKind::Singleton;
+  return group.isTmem() && group.members.size() > 1 &&
+         ((chainOrSingleton && edge && edge->dstOp == anchor &&
+           edge->srcOp != anchor) ||
+          (syncGroup.kind == SyncGroupKind::Singleton && edge && anchor &&
+           edgeIdx && dag.tmemLoopExitRead.lookup(*edgeIdx) == anchor) ||
+          (edge && anchor && edge->srcOp == anchor &&
+           edgeSrcReads(*edge, group, resourceKey) &&
+           !edgeSrcWrites(*edge, group, resourceKey)));
+}
+static void setAfterAccessBeforeAcquire(OpBuilder &b, Operation *source) {
+  Operation *insertBefore = source->getNextNode();
+  while (insertBefore && isa<SemaphoreReleaseOp>(insertBefore))
+    insertBefore = insertBefore->getNextNode();
+  if (insertBefore && isa<SemaphoreAcquireOp>(insertBefore))
+    b.setInsertionPoint(insertBefore);
+  else
+    b.setInsertionPointAfter(source);
+}
+static void setAfterLoopBeforeSemaphoreHandoff(OpBuilder &b, scf::ForOp forOp) {
+  Operation *insertBefore = forOp->getNextNode();
+  if (insertBefore &&
+      isa<SemaphoreReleaseOp, SemaphoreAcquireOp>(insertBefore))
+    b.setInsertionPoint(insertBefore);
+  else
+    b.setInsertionPointAfter(forOp);
 }
 
 static std::optional<PartitionId>
@@ -1586,73 +1584,6 @@ LogicalResult EmitState::release(OpBuilder &b, Location loc, SyncAnchorKind kind
       terminalLoopExitReadRelease, group, dag.resource.second, current.payload);
   SemaphoreReleaseOp release =
       emitRelease(b, loc, sem, *token, owner, stageCluster, payload);
-  bool sourceReadRelease =
-      group.isTmem() && kind == SyncAnchorKind::ReleaseAfterOp && edge &&
-      anchor && edge->srcOp == anchor &&
-      edgeSrcReads(*edge, group, dag.resource.second) &&
-      !edgeSrcWrites(*edge, group, dag.resource.second);
-  bool delayReadReleaseForUsers = group.isTmem() && group.members.size() > 1;
-  bool readCompletionRelease =
-      delayReadReleaseForUsers &&
-      (terminalDstReadRelease || terminalLoopExitReadRelease ||
-       sourceReadRelease);
-  if (readCompletionRelease && anchor)
-    if (Operation *lastUser = findLastSameBlockNonTokenResultUser(anchor))
-      if (release->getBlock() == lastUser->getBlock() &&
-          release->isBeforeInBlock(lastUser))
-        release->moveAfter(lastUser);
-  bool readOnlyMmaSource =
-      edge && isa_and_nonnull<MMAv5OpInterface>(edge->srcOp) &&
-      edge->dstYieldRegion && edge->dstOwner &&
-      edgeSrcReads(*edge, group, dag.resource.second) &&
-      !edgeSrcWrites(*edge, group, dag.resource.second) &&
-      !hasLaterBackingGroupAccessInSameBlock(edge->srcOp, group);
-  bool writeMmaSource =
-      edge && isa_and_nonnull<MMAv5OpInterface>(edge->srcOp) &&
-      edge->dstYieldRegion && edge->dstOwner &&
-      edgeSrcWrites(*edge, group, dag.resource.second) &&
-      !hasLaterBackingGroupAccessInSameBlock(edge->srcOp, group);
-  bool readOnlyTmemLoadSource =
-      edge && isa_and_nonnull<TMEMLoadOp>(edge->srcOp) &&
-      edgeSrcReads(*edge, group, dag.resource.second) &&
-      !edgeSrcWrites(*edge, group, dag.resource.second);
-  bool moveReadOnlyTmemLoadSource =
-      readOnlyTmemLoadSource && group.members.size() == 1;
-  if (group.isTmem() && kind == SyncAnchorKind::ReleaseBeforeYield && edge &&
-      (moveReadOnlyTmemLoadSource || readOnlyMmaSource || writeMmaSource) &&
-      operationIsAttached(edge->srcOp) &&
-      release->getBlock() == edge->srcOp->getBlock()) {
-    if (writeMmaSource) {
-      moveAfterExistingReleasesBeforeAcquire(release.getOperation(), edge->srcOp);
-    } else if (moveReadOnlyTmemLoadSource) {
-      release->moveAfter(edge->srcOp);
-    } else {
-      Operation *insertAfter = edge->srcOp;
-      if (Operation *lastUser =
-              findLastSameBlockNonTokenResultUser(edge->srcOp))
-        if (insertAfter->isBeforeInBlock(lastUser))
-          insertAfter = lastUser;
-      release->moveAfter(insertAfter);
-    }
-  }
-  if (group.isTmem() && kind == SyncAnchorKind::ReleaseBeforeOp && edge &&
-      edge->srcYieldRegion && anchor &&
-      opReadsOnlyResource(anchor, group, dag.resource.second)) {
-    if (edgeIdx && dag.srcYieldParentWarpFor.contains(*edgeIdx)) {
-      for (Operation *candidate = release->getPrevNode(); candidate;
-           candidate = candidate->getPrevNode()) {
-        if (isa<SemaphoreAcquireOp, SemaphoreReleaseOp>(candidate))
-          continue;
-        auto forOp = dyn_cast<scf::ForOp>(candidate);
-        if (!forOp)
-          break;
-        if (hasWarpSpecializeTag(forOp) &&
-            release->getBlock() == forOp->getBlock())
-          moveAfterLoopBeforeFollowingSemaphores(release.getOperation(), forOp);
-        break;
-      }
-    }
-  }
   if (useStructuredCarrier && structuredCarrierPartition.size() == 1 && !owner) {
     setPartition(release.getOperation(), structuredCarrierPartition);
     if (auto tag = wsTagForValue(current.token))
@@ -1747,15 +1678,38 @@ static LogicalResult emitOperationEntryTransitions(
     Operation *anchor, const OptSyncDag &dag, const SyncPlan &sp,
     BufferGroup &group, EmitState &state, SmallVectorImpl<AcquireRecord> &acquires) {
   const EmitterTransitionPlan &transitions = state.transitionPlan();
-  OpBuilder b(anchor);
-  b.setInsertionPoint(anchor);
   auto rIt = transitions.opEntryReleases.find(anchor);
   if (rIt != transitions.opEntryReleases.end())
-    for (const PlannedRelease &release : rIt->second)
+    for (const PlannedRelease &release : rIt->second) {
+      OpBuilder releaseBuilder(anchor);
+      releaseBuilder.setInsertionPoint(anchor);
+      const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
+      std::optional<unsigned> edgeIdx =
+          release.edgeIdxs.empty() ? std::nullopt
+                                   : std::optional<unsigned>(release.edgeIdxs.front());
+      if (group.isTmem() && edge && edge->srcYieldRegion &&
+          opReadsOnlyResource(anchor, group, dag.resource.second) && edgeIdx &&
+          dag.srcYieldParentWarpFor.contains(*edgeIdx)) {
+        for (Operation *candidate = anchor->getPrevNode(); candidate;
+             candidate = candidate->getPrevNode()) {
+          if (isa<SemaphoreAcquireOp, SemaphoreReleaseOp>(candidate))
+            continue;
+          auto forOp = dyn_cast<scf::ForOp>(candidate);
+          if (!forOp)
+            break;
+          if (hasWarpSpecializeTag(forOp) &&
+              anchor->getBlock() == forOp->getBlock())
+            setAfterLoopBeforeSemaphoreHandoff(releaseBuilder, forOp);
+          break;
+        }
+      }
       if (failed(state.release(
-              b, anchor->getLoc(), SyncAnchorKind::ReleaseBeforeOp, anchor,
-              nullptr, release, dag, sp, group, getStageCluster(anchor))))
+              releaseBuilder, anchor->getLoc(), SyncAnchorKind::ReleaseBeforeOp,
+              anchor, nullptr, release, dag, sp, group, getStageCluster(anchor))))
         return failure();
+    }
+  OpBuilder b(anchor);
+  b.setInsertionPoint(anchor);
   auto aIt = transitions.opEntryAcquires.find(anchor);
   if (aIt != transitions.opEntryAcquires.end())
     for (unsigned gi : aIt->second)
@@ -1773,36 +1727,45 @@ static LogicalResult emitOperationExitTransitions(
   if (rIt == transitions.opExitReleases.end()) return success();
   Operation *releaseAfter = insertAfter;
   if (!group.isTmem() && isa<LocalLoadOp>(insertAfter))
-    releaseAfter = latestTransitiveConsumer(insertAfter);
+    releaseAfter = transitiveAccessCompletion(insertAfter);
+  for (const PlannedRelease &release : rIt->second) {
+    const SyncGroup &syncGroup = dag.groups[release.groupIdx];
+    const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
+    std::optional<unsigned> edgeIdx =
+        release.edgeIdxs.empty() ? std::nullopt
+                                 : std::optional<unsigned>(release.edgeIdxs.front());
+    if (!opExitReleaseClosesReadCompletion(syncGroup, edge, group,
+                                           dag.resource.second, anchor, dag,
+                                           edgeIdx))
+      continue;
+    Operation *lastUser = lastNonTokenResultUserInBlock(anchor);
+    if (lastUser && releaseAfter->getBlock() == lastUser->getBlock() &&
+        releaseAfter->isBeforeInBlock(lastUser))
+      releaseAfter = lastUser;
+  }
   if (anchor == insertAfter && operationIsAttached(releaseAfter) &&
       operationIsAttached(anchor) &&
       releaseAfter->isProperAncestor(anchor))
     return success();
   OpBuilder b(releaseAfter);
-  bool beforeFollowingSemaphores = false;
+  bool beforeFollowingAcquire = false;
   bool afterLoopRelease = group.isTmem() && isa<scf::ForOp>(releaseAfter);
   if (group.isTmem()) {
     for (const PlannedRelease &release : rIt->second) {
       const SyncGroup &syncGroup = dag.groups[release.groupIdx];
       const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
-      if (releaseShouldPrecedeFollowingSemaphores(
+      if (opExitReleaseClosesBeforeFollowingAcquire(
               syncGroup, edge, group, dag.resource.second, insertAfter)) {
-        beforeFollowingSemaphores = true;
+        beforeFollowingAcquire = true;
         break;
       }
     }
-    beforeFollowingSemaphores |= afterLoopRelease;
+    beforeFollowingAcquire |= afterLoopRelease;
   }
   if (isa<scf::YieldOp>(releaseAfter)) {
     b.setInsertionPoint(releaseAfter);
-  } else if (beforeFollowingSemaphores) {
-    Operation *insertBefore = releaseAfter->getNextNode();
-    while (insertBefore && isa<SemaphoreReleaseOp>(insertBefore))
-      insertBefore = insertBefore->getNextNode();
-    if (insertBefore && isa<SemaphoreAcquireOp>(insertBefore))
-      b.setInsertionPoint(insertBefore);
-    else
-      b.setInsertionPointAfter(releaseAfter);
+  } else if (beforeFollowingAcquire) {
+    setAfterAccessBeforeAcquire(b, releaseAfter);
   } else {
     b.setInsertionPointAfter(releaseAfter);
   }
@@ -1814,6 +1777,7 @@ static LogicalResult emitOperationExitTransitions(
       savedEventToken = it->second;
     state.eventToken[anchor] = state.current.token;
   }
+  LogicalResult result = success();
   SmallVector<PlannedRelease, 4> releaseActions(rIt->second.begin(),
                                                 rIt->second.end());
   if (group.isTmem())
@@ -1823,13 +1787,12 @@ static LogicalResult emitOperationExitTransitions(
       const SyncEdge *lhsEdge = getRepresentativeReleaseEdge(lhs, sp);
       const SyncGroup &rhsGroup = dag.groups[rhs.groupIdx];
       const SyncEdge *rhsEdge = getRepresentativeReleaseEdge(rhs, sp);
-      bool lhsPrecedes = releaseShouldPrecedeFollowingSemaphores(
+      bool lhsPrecedes = opExitReleaseClosesBeforeFollowingAcquire(
           lhsGroup, lhsEdge, group, dag.resource.second, insertAfter);
-      bool rhsPrecedes = releaseShouldPrecedeFollowingSemaphores(
+      bool rhsPrecedes = opExitReleaseClosesBeforeFollowingAcquire(
           rhsGroup, rhsEdge, group, dag.resource.second, insertAfter);
       return lhsPrecedes && !rhsPrecedes;
     });
-  LogicalResult result = success();
   for (const PlannedRelease &release : releaseActions)
     if (failed(state.release(
             b, insertAfter->getLoc(), SyncAnchorKind::ReleaseAfterOp, anchor,
@@ -1865,7 +1828,7 @@ static LogicalResult emitDeferredNestedExitTransitions(
       return;
     if (!transitions.opExitReleases.contains(op))
       return;
-    if (latestTransitiveConsumer(op) == releaseAfter)
+    if (transitiveAccessCompletion(op) == releaseAfter)
       anchors.push_back(op);
   });
   for (Operation *anchor : anchors)
@@ -2164,9 +2127,45 @@ static LogicalResult emitRegionCloseTransitions(
   if (rIt != transitions.regionEntryReleases.end())
     for (const PlannedRelease &release : rIt->second) {
       const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
+      OpBuilder releaseBuilder(yieldOp);
+      releaseBuilder.setInsertionPoint(yieldOp);
+      bool readOnlyMmaSource =
+          edge && isa_and_nonnull<MMAv5OpInterface>(edge->srcOp) &&
+          edge->dstYieldRegion && edge->dstOwner &&
+          edgeSrcReads(*edge, group, dag.resource.second) &&
+          !edgeSrcWrites(*edge, group, dag.resource.second) &&
+          !hasLaterResourceAccessInBlock(edge->srcOp, group);
+      bool writeMmaSource =
+          edge && isa_and_nonnull<MMAv5OpInterface>(edge->srcOp) &&
+          edge->dstYieldRegion && edge->dstOwner &&
+          edgeSrcWrites(*edge, group, dag.resource.second) &&
+          !hasLaterResourceAccessInBlock(edge->srcOp, group);
+      bool readOnlyTmemLoadSource =
+          edge && isa_and_nonnull<TMEMLoadOp>(edge->srcOp) &&
+          edgeSrcReads(*edge, group, dag.resource.second) &&
+          !edgeSrcWrites(*edge, group, dag.resource.second);
+      bool moveToReadOnlyTmemLoad =
+          readOnlyTmemLoadSource && group.members.size() == 1;
+      if (group.isTmem() && edge &&
+          (moveToReadOnlyTmemLoad || readOnlyMmaSource || writeMmaSource) &&
+          operationIsAttached(edge->srcOp) &&
+          yieldOp->getBlock() == edge->srcOp->getBlock()) {
+        if (writeMmaSource) {
+          setAfterAccessBeforeAcquire(releaseBuilder, edge->srcOp);
+        } else if (moveToReadOnlyTmemLoad) {
+          releaseBuilder.setInsertionPointAfter(edge->srcOp);
+        } else {
+          Operation *insertAfter = edge->srcOp;
+          if (Operation *lastUser = lastNonTokenResultUserInBlock(edge->srcOp))
+            if (insertAfter->isBeforeInBlock(lastUser))
+              insertAfter = lastUser;
+          releaseBuilder.setInsertionPointAfter(insertAfter);
+        }
+      }
       if (failed(state.release(
-              b, yieldOp->getLoc(), SyncAnchorKind::ReleaseBeforeYield, nullptr,
-              region, release, dag, sp, group,
+              releaseBuilder, yieldOp->getLoc(),
+              SyncAnchorKind::ReleaseBeforeYield, nullptr, region, release, dag, sp,
+              group,
               stageForYieldOwner(edge ? edge->srcOwner : std::nullopt, state))))
         return failure();
     }
