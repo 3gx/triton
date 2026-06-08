@@ -643,555 +643,100 @@ static Operation *findInitialAcquireAnchor(const SyncGroup &syncGroup,
   return threadedRegionOp ? threadedRegionOp : syncGroup.initialOp;
 }
 
-static Operation *transitionLastValueUserInBlock(Operation *op) {
-  if (!op || !op->getBlock())
-    return nullptr;
-  Operation *lastUser = nullptr;
-  for (Value result : op->getResults()) {
-    if (isa<AsyncTokenType>(result.getType()))
-      continue;
-    for (Operation *user : result.getUsers()) {
-      if (user->getBlock() != op->getBlock() || user == op ||
-          !op->isBeforeInBlock(user))
-        continue;
-      if (!lastUser || lastUser->isBeforeInBlock(user))
-        lastUser = user;
-    }
-  }
-  return lastUser;
-}
-
-static bool transitionHasLaterResourceAccess(Operation *op, BufferGroup &group) {
-  if (!op || !op->getBlock())
-    return false;
-  bool seen = false;
-  for (const AccessEvent &event : group.events) {
-    if (event.op == op) {
-      seen = true;
-      continue;
-    }
-    if (!seen || !event.op || event.op->getBlock() != op->getBlock())
-      continue;
-    if (op->isBeforeInBlock(event.op))
-      return true;
-  }
-  return false;
-}
-
-static void collectTransitionCompletionConsumers(
-    Operation *producer, Block *anchorBlock, DenseSet<Operation *> &seen,
-    SetVector<Operation *> &consumers) {
-  if (!seen.insert(producer).second)
-    return;
-  for (Value result : producer->getResults())
-    for (Operation *user : result.getUsers()) {
-      bool hasMemDesc = llvm::any_of(user->getResults(), [](Value result) {
-        return isa<MemDescType>(result.getType());
-      });
-      if (hasMemDesc) {
-        collectTransitionCompletionConsumers(user, anchorBlock, seen, consumers);
-        continue;
-      }
-      Operation *ancestor = anchorBlock->findAncestorOpInBlock(*user);
-      consumers.insert(ancestor ? ancestor : user);
-    }
-}
-
-static Operation *sameBlockTransitionCompletion(Operation *anchor) {
-  Operation *latest = anchor;
-  Block *block = anchor->getBlock();
-  SmallVector<Operation *, 8> worklist;
-  DenseSet<Operation *> seen;
-  for (Value result : anchor->getResults())
-    for (Operation *user : result.getUsers())
-      worklist.push_back(user);
-
-  while (!worklist.empty()) {
-    Operation *user = worklist.pop_back_val();
-    if (!seen.insert(user).second)
-      continue;
-    Operation *ancestor = block->findAncestorOpInBlock(*user);
-    if (!ancestor)
-      continue;
-    if (latest->isBeforeInBlock(ancestor))
-      latest = ancestor;
-    for (Value result : user->getResults())
-      for (Operation *next : result.getUsers())
-        worklist.push_back(next);
-  }
-  return latest;
-}
-
-static Operation *transitionAccessCompletion(Operation *anchor) {
-  SetVector<Operation *> consumers;
-  DenseSet<Operation *> seen;
-  collectTransitionCompletionConsumers(anchor, anchor->getBlock(), seen,
-                                       consumers);
-  if (consumers.empty())
-    return sameBlockTransitionCompletion(anchor);
-  SmallVector<Operation *, 8> consumerOps(consumers.begin(), consumers.end());
-  Operation *scope = nullptr;
-  if (auto funcOp = anchor->getParentOfType<triton::FuncOp>())
-    scope = funcOp.getOperation();
-  PostDominanceInfo dom(scope ? scope : anchor->getParentOp());
-  Operation *postDom = findNearestCommonPostDominator(consumerOps, dom);
-  if (!postDom)
-    return sameBlockTransitionCompletion(anchor);
-  Operation *ancestor = anchor->getBlock()->findAncestorOpInBlock(*postDom);
-  return ancestor ? ancestor : postDom;
-}
-
-static bool transitionReleaseBeforeAcquire(const SyncGroup &syncGroup,
-                                           const SyncEdge *edge,
-                                           BufferGroup &group,
-                                           int64_t resourceKey,
-                                           Operation *anchor) {
-  if (!group.isTmem() || !edge || !isa<MMAv5OpInterface>(anchor))
-    return false;
-  bool chainOrSingleton = syncGroup.kind == SyncGroupKind::LinearChain ||
-                          syncGroup.kind == SyncGroupKind::Singleton;
-  return (syncGroup.kind == SyncGroupKind::LinearChain &&
-          edge->srcOp == anchor && edgeSrcReads(*edge, group, resourceKey) &&
-          !edgeSrcWrites(*edge, group, resourceKey)) ||
-         (chainOrSingleton && edge->dstOp == anchor &&
-          edgeDstReads(*edge, group, resourceKey) &&
-          !edgeDstWrites(*edge, group, resourceKey)) ||
-         (chainOrSingleton && edge->srcOp == anchor);
-}
-
-static bool transitionReleaseWaitsForReadCompletion(
-    const SyncGroup &syncGroup, const SyncEdge *edge, BufferGroup &group,
-    int64_t resourceKey, Operation *anchor, const OptSyncDag &dag,
-    std::optional<unsigned> edgeIdx) {
-  bool chainOrSingleton = syncGroup.kind == SyncGroupKind::LinearChain ||
-                          syncGroup.kind == SyncGroupKind::Singleton;
-  return group.isTmem() && group.members.size() > 1 &&
-         ((chainOrSingleton && edge && edge->dstOp == anchor &&
-           edge->srcOp != anchor) ||
-          (syncGroup.kind == SyncGroupKind::Singleton && edge && anchor &&
-           edgeIdx && dag.tmemLoopExitRead.lookup(*edgeIdx) == anchor) ||
-          (edge && anchor && edge->srcOp == anchor &&
-           edgeSrcReads(*edge, group, resourceKey) &&
-           !edgeSrcWrites(*edge, group, resourceKey)));
-}
-
-static Operation *firstAcquireAfterExistingReleases(Operation *source) {
-  Operation *insertBefore = source ? source->getNextNode() : nullptr;
-  while (insertBefore && isa<SemaphoreReleaseOp>(insertBefore))
-    insertBefore = insertBefore->getNextNode();
-  if (insertBefore && isa<SemaphoreAcquireOp>(insertBefore))
-    return insertBefore;
-  return nullptr;
-}
-
-static void setTransitionInsertionAfter(EmitterTransitionPlan &transitions,
-                                        Operation *anchor, Operation *after,
-                                        bool beforeFollowingAcquire = false) {
-  if (!anchor || !after)
-    return;
-  transitions.opExitReleaseInsertAfter[anchor] = after;
-  if (beforeFollowingAcquire) {
-    if (Operation *insertBefore = firstAcquireAfterExistingReleases(after)) {
-      transitions.opExitReleaseInsertBefore[anchor] = insertBefore;
-      return;
-    }
-  }
-}
-
-static void setTransitionInsertionAfter(EmitterTransitionPlan &transitions,
-                                        Region *region, Operation *after,
-                                        bool beforeFollowingAcquire = false) {
-  if (!region || !after)
-    return;
-  transitions.regionEntryReleaseInsertAfter[region] = after;
-  if (beforeFollowingAcquire) {
-    if (Operation *insertBefore = firstAcquireAfterExistingReleases(after)) {
-      transitions.regionEntryReleaseInsertBefore[region] = insertBefore;
-      return;
-    }
-  }
-}
-
-static void resolveEmitterTransitionPlacement(EmitterTransitionPlan &transitions,
-                                              const OptSyncDag &dag,
-                                              const SyncPlan &sp,
-                                              BufferGroup &group) {
-  for (auto &[anchor, releases] : transitions.opEntryReleases) {
-    for (const PlannedRelease &release : releases) {
-      const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
-      std::optional<unsigned> edgeIdx =
-          release.edgeIdxs.empty() ? std::nullopt
-                                   : std::optional<unsigned>(release.edgeIdxs.front());
-      if (!group.isTmem() || !edge || !edge->srcYieldRegion ||
-          !opReadsOnlyResource(anchor, group, dag.resource.second) || !edgeIdx ||
-          !dag.srcYieldParentWarpFor.contains(*edgeIdx))
-        continue;
-      for (Operation *candidate = anchor->getPrevNode(); candidate;
-           candidate = candidate->getPrevNode()) {
-        if (isa<SemaphoreAcquireOp, SemaphoreReleaseOp>(candidate))
-          continue;
-        auto forOp = dyn_cast<scf::ForOp>(candidate);
-        if (!forOp)
-          break;
-        if (hasWarpSpecializeTag(forOp) &&
-            anchor->getBlock() == forOp->getBlock()) {
-          Operation *insertAfter = forOp.getOperation();
-          Operation *insertBefore = insertAfter->getNextNode();
-          if (insertBefore &&
-              isa<SemaphoreReleaseOp, SemaphoreAcquireOp>(insertBefore))
-            transitions.opEntryReleaseInsertBefore[anchor] = insertBefore;
-          else
-            transitions.opEntryReleaseInsertAfter[anchor] = insertAfter;
-        }
-        break;
-      }
-    }
-  }
-
-  for (auto &[anchor, releases] : transitions.opExitReleases) {
-    Operation *releaseAfter = anchor;
-    if (!group.isTmem() && isa<LocalLoadOp>(anchor))
-      releaseAfter = transitionAccessCompletion(anchor);
-    for (const PlannedRelease &release : releases) {
-      const SyncGroup &syncGroup = dag.groups[release.groupIdx];
-      const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
-      std::optional<unsigned> edgeIdx =
-          release.edgeIdxs.empty() ? std::nullopt
-                                   : std::optional<unsigned>(release.edgeIdxs.front());
-      if (!transitionReleaseWaitsForReadCompletion(
-              syncGroup, edge, group, dag.resource.second, anchor, dag, edgeIdx))
-        continue;
-      Operation *lastUser = transitionLastValueUserInBlock(anchor);
-      if (lastUser && releaseAfter->getBlock() == lastUser->getBlock() &&
-          releaseAfter->isBeforeInBlock(lastUser))
-        releaseAfter = lastUser;
-    }
-    bool beforeFollowingAcquire = false;
-    bool afterLoopRelease = group.isTmem() && isa<scf::ForOp>(releaseAfter);
-    if (group.isTmem()) {
-      for (const PlannedRelease &release : releases) {
-        const SyncGroup &syncGroup = dag.groups[release.groupIdx];
-        const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
-        if (transitionReleaseBeforeAcquire(syncGroup, edge, group,
-                                           dag.resource.second, anchor)) {
-          beforeFollowingAcquire = true;
-          break;
-        }
-      }
-      beforeFollowingAcquire |= afterLoopRelease;
-      llvm::stable_sort(releases, [&](const PlannedRelease &lhs,
-                                      const PlannedRelease &rhs) {
-        const SyncGroup &lhsGroup = dag.groups[lhs.groupIdx];
-        const SyncEdge *lhsEdge = getRepresentativeReleaseEdge(lhs, sp);
-        const SyncGroup &rhsGroup = dag.groups[rhs.groupIdx];
-        const SyncEdge *rhsEdge = getRepresentativeReleaseEdge(rhs, sp);
-        bool lhsPrecedes = transitionReleaseBeforeAcquire(
-            lhsGroup, lhsEdge, group, dag.resource.second, anchor);
-        bool rhsPrecedes = transitionReleaseBeforeAcquire(
-            rhsGroup, rhsEdge, group, dag.resource.second, anchor);
-        if (lhsPrecedes != rhsPrecedes)
-          return lhsPrecedes;
-        return false;
-      });
-    }
-    if (releaseAfter != anchor)
-      setTransitionInsertionAfter(transitions, anchor, releaseAfter,
-                                  beforeFollowingAcquire);
-    else if (beforeFollowingAcquire)
-      setTransitionInsertionAfter(transitions, anchor, releaseAfter,
-                                  /*beforeFollowingAcquire=*/true);
-    if (releaseAfter != anchor && operationIsAttached(releaseAfter) &&
-        operationIsAttached(anchor) && releaseAfter->isProperAncestor(anchor))
-      transitions.deferredOpExitAnchors[releaseAfter].push_back(anchor);
-  }
-
-  for (auto &[region, releases] : transitions.regionEntryReleases) {
-    Operation *yieldOp = region && !region->empty()
-                             ? region->front().getTerminator()
-                             : nullptr;
-    if (!yieldOp)
-      continue;
-    for (const PlannedRelease &release : releases) {
-      const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
-      bool readOnlyMmaSource =
-          edge && isa_and_nonnull<MMAv5OpInterface>(edge->srcOp) &&
-          edge->dstYieldRegion && edge->dstOwner &&
-          edgeSrcReads(*edge, group, dag.resource.second) &&
-          !edgeSrcWrites(*edge, group, dag.resource.second) &&
-          !transitionHasLaterResourceAccess(edge->srcOp, group);
-      bool writeMmaSource =
-          edge && isa_and_nonnull<MMAv5OpInterface>(edge->srcOp) &&
-          edge->dstYieldRegion && edge->dstOwner &&
-          edgeSrcWrites(*edge, group, dag.resource.second) &&
-          !transitionHasLaterResourceAccess(edge->srcOp, group);
-      bool readOnlyTmemLoadSource =
-          edge && isa_and_nonnull<TMEMLoadOp>(edge->srcOp) &&
-          edgeSrcReads(*edge, group, dag.resource.second) &&
-          !edgeSrcWrites(*edge, group, dag.resource.second);
-      bool moveToReadOnlyTmemLoad =
-          readOnlyTmemLoadSource && group.members.size() == 1;
-      if (!group.isTmem() || !edge ||
-          !(moveToReadOnlyTmemLoad || readOnlyMmaSource || writeMmaSource) ||
-          !operationIsAttached(edge->srcOp) ||
-          yieldOp->getBlock() != edge->srcOp->getBlock())
-        continue;
-      if (writeMmaSource) {
-        setTransitionInsertionAfter(transitions, region, edge->srcOp,
-                                    /*beforeFollowingAcquire=*/true);
-      } else if (moveToReadOnlyTmemLoad) {
-        setTransitionInsertionAfter(transitions, region, edge->srcOp);
-      } else {
-        Operation *insertAfter = edge->srcOp;
-        if (Operation *lastUser = transitionLastValueUserInBlock(edge->srcOp))
-          if (insertAfter->isBeforeInBlock(lastUser))
-            insertAfter = lastUser;
-        setTransitionInsertionAfter(transitions, region, insertAfter);
-      }
-    }
-  }
-}
-
 static EmitterTransitionPlan
 buildEmitterTransitionPlan(const OptSyncDag &dag, const SyncPlan &sp,
-                           BufferGroup &group,
+                           BufferGroup &group, triton::FuncOp funcOp,
                            bool reanchorInitialAcquire = true) {
   EmitterTransitionPlan transitions;
-  for (unsigned gi = 0; gi < dag.groups.size(); ++gi) {
-    const SyncGroup &g = dag.groups[gi];
-    switch (g.kind) {
+  SmallVector<char, 8> readyFanoutReleaseSeen(dag.groups.size(), 0);
+  SmallVector<char, 8> doneFaninAcquireSeen(dag.groups.size(), 0);
+
+  auto siteIsYield = [](SyncRenderSite site) {
+    return site.anchor && isa<scf::YieldOp>(site.anchor);
+  };
+  auto addSiteReleases = [&](SyncRenderSite site, unsigned groupIdx,
+                             ArrayRef<unsigned> edgeIdxs) {
+    if (siteIsYield(site)) {
+      addPlannedRelease(transitions.regionEntryReleases, site.region, sp,
+                        groupIdx, edgeIdxs);
+      return;
+    }
+    addPlannedRelease(transitions.opEntryReleases, site.anchor, sp, groupIdx,
+                      edgeIdxs);
+  };
+  auto addSiteRelease = [&](SyncRenderSite site, unsigned groupIdx,
+                            unsigned edgeIdx) {
+    addSiteReleases(site, groupIdx, ArrayRef<unsigned>(&edgeIdx, 1));
+  };
+  auto addSiteAcquire = [&](SyncRenderSite site, unsigned groupIdx,
+                            bool unique = false) {
+    if (siteIsYield(site)) {
+      addTransitionAcquire(transitions.regionEntryAcquires, site.region,
+                           groupIdx, unique);
+      return;
+    }
+    addTransitionAcquire(transitions.opEntryAcquires, site.anchor, groupIdx,
+                         unique);
+  };
+
+  for (unsigned groupIdx = 0; groupIdx < dag.groups.size(); ++groupIdx) {
+    const SyncGroup &syncGroup = dag.groups[groupIdx];
+    if (syncGroup.kind != SyncGroupKind::InitialEmpty)
+      continue;
+    addTransitionAcquire(
+        transitions.opEntryAcquires,
+        findInitialAcquireAnchor(syncGroup, dag, group, reanchorInitialAcquire),
+        groupIdx);
+  }
+
+  (void)walkRenderedSyncSites(
+      sp, funcOp, [&](ArrayRef<unsigned> edges, SyncRenderSite site)
+                      -> LogicalResult {
+        SmallVector<unsigned, 2> faninHere;
+        for (unsigned edgeIdx : edges) {
+          if (edgeIdx >= dag.edgeToGroup.size())
+            continue;
+          unsigned groupIdx = dag.edgeToGroup[edgeIdx];
+          if (groupIdx >= dag.groups.size())
+            continue;
+          const SyncGroup &syncGroup = dag.groups[groupIdx];
+          switch (syncGroup.kind) {
     case SyncGroupKind::InitialEmpty:
-      addTransitionAcquire(
-          transitions.opEntryAcquires,
-          findInitialAcquireAnchor(g, dag, group, reanchorInitialAcquire), gi);
       break;
-    case SyncGroupKind::Singleton: {
-      const SyncEdge &e = sp.edges[g.edgeIdxs.front()];
-      if (e.dstOp) {
-        if (isRootToWsLoopEntryEdge(e, group))
-          break;
-        addPlannedRelease(transitions.opEntryReleases, e.dstOp, sp, gi,
-                          g.edgeIdxs.front());
-        Operation *acquireAnchor = e.dstOp;
-        if (!group.isTmem()) {
-          if (auto forOp = dyn_cast<scf::ForOp>(e.dstOp)) {
-            if (hasWarpSpecializeTag(forOp.getOperation()))
-              if (Operation *firstAccess =
-                      findFirstAccessInRegion(forOp.getRegion(), dag))
-                acquireAnchor = firstAccess;
-          }
-        }
-        addTransitionAcquire(transitions.opEntryAcquires, acquireAnchor, gi);
-        if (edgeNeedsTerminalReadRelease(e, group, sp.resource.second) &&
-            findTerminalReadReleaseAnchor(e.dstOp, sp, group,
-                                          sp.resource.second) &&
-            !hasOutgoingEdgeFromOp(sp, e.dstOp) && !tokenResultIsYielded(e.dstOp))
-          addPlannedRelease(transitions.opExitReleases, e.dstOp, sp, gi,
-                            g.edgeIdxs.front());
-      } else if (e.dstYieldRegion) {
-        if (group.isTmem()) {
-          auto forOp = dyn_cast_or_null<scf::ForOp>(
-              e.dstYieldRegion->getParentOp());
-          if (forOp && hasWarpSpecializeTag(forOp) && !e.dstOwner &&
-              e.srcOp && forOp->isProperAncestor(e.srcOp)) {
-            addPlannedRelease(transitions.opExitReleases, forOp.getOperation(), sp,
-                              gi, g.edgeIdxs.front());
-            if (Operation *afterLoop =
-                    findFirstAccessAfter(forOp.getOperation(), dag)) {
-              addTransitionAcquire(transitions.opEntryAcquires, afterLoop, gi);
-              if (Operation *terminalRead = findTerminalReadReleaseAnchor(
-                      afterLoop, sp, group, sp.resource.second))
-                addPlannedRelease(transitions.opExitReleases, terminalRead, sp,
-                                  gi, g.edgeIdxs.front());
-            }
-            break;
-          }
-        }
-        addPlannedRelease(transitions.regionEntryReleases, e.dstYieldRegion, sp,
-                          gi, g.edgeIdxs.front());
-        if (syncYieldRequiresCarrier(e.dstYieldRegion, sp))
-          addTransitionAcquire(transitions.regionEntryAcquires, e.dstYieldRegion,
-                               gi);
+    case SyncGroupKind::ReadyFanout:
+      if (!readyFanoutReleaseSeen[groupIdx]) {
+        addSiteReleases(site, groupIdx, syncGroup.edgeIdxs);
+        readyFanoutReleaseSeen[groupIdx] = 1;
       }
+      addSiteAcquire(site, groupIdx);
       break;
-    }
-    case SyncGroupKind::ReadyFanout: {
-      const SyncEdge &probe = sp.edges[g.edgeIdxs.front()];
-      if (probe.srcOp)
-        addPlannedRelease(transitions.opExitReleases, probe.srcOp, sp, gi,
-                          g.edgeIdxs);
-      else if (probe.srcYieldRegion)
-        addPlannedRelease(transitions.regionExitReleases, probe.srcYieldRegion,
-                          sp, gi, g.edgeIdxs);
-      for (unsigned ei : g.edgeIdxs) {
-        const SyncEdge &e = sp.edges[ei];
-        if (e.dstOp)
-          addTransitionAcquire(transitions.opEntryAcquires, e.dstOp, gi);
-        else if (e.dstYieldRegion)
-          addTransitionAcquire(transitions.regionEntryAcquires, e.dstYieldRegion,
-                               gi);
-      }
+    case SyncGroupKind::DoneFanin:
+      addSiteRelease(site, groupIdx, edgeIdx);
+      if (!llvm::is_contained(faninHere, groupIdx))
+        faninHere.push_back(groupIdx);
       break;
-    }
-    case SyncGroupKind::DoneFanin: {
-      for (unsigned ei : g.edgeIdxs) {
-        const SyncEdge &e = sp.edges[ei];
-        if (e.srcOp)
-          addPlannedRelease(transitions.opExitReleases, e.srcOp, sp, gi, ei);
-        else if (e.srcYieldRegion)
-          addPlannedRelease(transitions.regionExitReleases, e.srcYieldRegion, sp,
-                            gi, ei);
-      }
-      const SyncEdge &probe = sp.edges[g.edgeIdxs.front()];
-      if (probe.dstOp)
-        addTransitionAcquire(transitions.opEntryAcquires, probe.dstOp, gi);
-      else if (probe.dstYieldRegion &&
-               syncYieldRequiresCarrier(probe.dstYieldRegion, sp))
-        addTransitionAcquire(transitions.regionEntryAcquires,
-                             probe.dstYieldRegion, gi);
+    case SyncGroupKind::Singleton:
+    case SyncGroupKind::LinearChain:
+      addSiteRelease(site, groupIdx, edgeIdx);
+      addSiteAcquire(site, groupIdx);
       break;
-    }
-    case SyncGroupKind::LinearChain: {
-      Operation *initialOp = nullptr;
-      for (const SyncGroup &candidate : dag.groups)
-        if (candidate.kind == SyncGroupKind::InitialEmpty) {
-          initialOp = candidate.initialOp;
-          break;
-        }
-      scf::ForOp skippedCarrierFor =
-          getSkippedInitialLoopCarrierFor(g, sp, group);
-      bool chainEntersLoop =
-          group.isTmem() && !g.edgeIdxs.empty() &&
-          isa_and_nonnull<scf::ForOp>(sp.edges[g.edgeIdxs.front()].dstOp);
-      bool chainHasIfYield =
-          llvm::any_of(g.edgeIdxs, [&](unsigned edgeIdx) {
-            return isIfYieldRegion(sp.edges[edgeIdx].dstYieldRegion);
-          });
-      DenseMap<Operation *, unsigned> ifYieldCounts;
-      for (unsigned edgeIdx : g.edgeIdxs) {
-        Region *yieldRegion = sp.edges[edgeIdx].dstYieldRegion;
-        if (!isIfYieldRegion(yieldRegion))
-          continue;
-        ++ifYieldCounts[yieldRegion->getParentOp()];
       }
-      for (unsigned ei : g.edgeIdxs) {
-        const SyncEdge &e = sp.edges[ei];
-        if (group.isTmem()) {
-          if (auto forOp = dyn_cast_or_null<scf::ForOp>(e.dstOp)) {
-            if (Operation *firstAccess =
-                    findFirstAccessInRegion(forOp.getRegion(), dag)) {
-              if (skippedCarrierFor && forOp == skippedCarrierFor &&
-                  ei == g.edgeIdxs.front() && initialOp && e.srcOp == initialOp)
-                continue;
-              addPlannedRelease(transitions.opEntryReleases, firstAccess, sp, gi,
-                                ei);
-              addTransitionAcquire(transitions.opEntryAcquires, firstAccess, gi);
-              continue;
-            }
-          }
-        }
-        if (isIfYieldRegion(e.dstYieldRegion)) {
-          auto ifOp = cast<scf::IfOp>(e.dstYieldRegion->getParentOp());
-          if (ifYieldCounts.lookup(ifOp.getOperation()) > 1) {
-            if (Operation *joinAccess =
-                    findFirstAccessAfter(ifOp.getOperation(), dag)) {
-              SmallVector<unsigned, 4> branchEdges;
-              for (unsigned branchEdgeIdx : g.edgeIdxs)
-                if (sp.edges[branchEdgeIdx].dstYieldRegion &&
-                    sp.edges[branchEdgeIdx].dstYieldRegion->getParentOp() ==
-                        ifOp.getOperation())
-                  branchEdges.push_back(branchEdgeIdx);
-              addPlannedRelease(transitions.opEntryReleases, joinAccess, sp, gi,
-                                branchEdges);
-              addTransitionAcquire(transitions.opEntryAcquires, joinAccess, gi,
-                                   /*unique=*/true);
-              continue;
-            }
-          }
-        }
-        if (chainEntersLoop && e.dstYieldRegion &&
-            !isIfYieldRegion(e.dstYieldRegion)) {
-          if (shouldDeferTerminalLoopReadToExit(e, group, sp.resource.second)) {
-            auto forOp = dyn_cast_or_null<scf::ForOp>(
-                e.dstYieldRegion->getParentOp());
-            if (forOp)
-              if (Operation *firstAccess =
-                      findFirstAccessInRegion(forOp.getRegion(), dag)) {
-                addPlannedRelease(transitions.opEntryReleases, firstAccess, sp,
-                                  gi, ei);
-                addTransitionAcquire(transitions.opEntryAcquires, firstAccess,
-                                     gi);
-                continue;
-              }
-            continue;
-          }
-          if (e.srcOp && edgeSrcReads(e, group, sp.resource.second) &&
-              !edgeSrcWrites(e, group, sp.resource.second) &&
-              isa<TMEMLoadOp>(e.srcOp)) {
-            addPlannedRelease(transitions.opExitReleases, e.srcOp, sp, gi, ei);
-            if (syncYieldRequiresCarrier(e.dstYieldRegion, sp))
-              addTransitionAcquire(transitions.regionEntryAcquires,
-                                   e.dstYieldRegion, gi, /*unique=*/true);
-          }
-          continue;
-        }
-        if (e.dstYieldRegion) {
-          if (shouldDeferTerminalLoopReadToExit(e, group, sp.resource.second)) {
-            auto forOp = dyn_cast_or_null<scf::ForOp>(
-                e.dstYieldRegion->getParentOp());
-            if (forOp)
-              if (Operation *firstAccess =
-                      findFirstAccessInRegion(forOp.getRegion(), dag)) {
-                addPlannedRelease(transitions.opEntryReleases, firstAccess, sp,
-                                  gi, ei);
-                addTransitionAcquire(transitions.opEntryAcquires, firstAccess,
-                                     gi);
-                continue;
-              }
-            continue;
-          }
-          if (isIfYieldRegion(e.dstYieldRegion) && e.srcOp &&
-              edgeSrcReads(e, group, sp.resource.second) &&
-              !edgeSrcWrites(e, group, sp.resource.second))
-            addPlannedRelease(transitions.opExitReleases, e.srcOp, sp, gi, ei);
-          else
-            addPlannedRelease(transitions.regionEntryReleases, e.dstYieldRegion,
-                              sp, gi, ei);
-        } else if (chainHasIfYield && e.dstOp) {
-          if (e.srcOp && e.srcOp->getBlock() == e.dstOp->getBlock() &&
-              e.srcOp->isBeforeInBlock(e.dstOp))
-            addPlannedRelease(transitions.opExitReleases, e.srcOp, sp, gi, ei);
-          else
-            addPlannedRelease(transitions.opEntryReleases,
-                              getIfBranchEntryAnchor(e.dstOp), sp, gi, ei);
-        } else if (e.srcOp) {
-          if (!edgeDefersToSkippedLoopExit(e, skippedCarrierFor)) {
-            Operation *releaseAnchor =
-                getNonWsForAncestorExitingTo(e.srcOp, e.dstOp);
-            addPlannedRelease(transitions.opExitReleases,
-                              releaseAnchor ? releaseAnchor : e.srcOp, sp, gi,
-                              ei);
-          }
-        } else if (e.srcYieldRegion) {
-          addPlannedRelease(transitions.regionExitReleases, e.srcYieldRegion, sp,
-                            gi, ei);
-        }
-        if (e.dstOp)
-          addTransitionAcquire(transitions.opEntryAcquires, e.dstOp, gi);
-        else if (e.dstYieldRegion &&
-                 syncYieldRequiresCarrier(e.dstYieldRegion, sp))
-          addTransitionAcquire(transitions.regionEntryAcquires, e.dstYieldRegion,
-                               gi);
-        if (ei == g.edgeIdxs.back() &&
-            edgeNeedsTerminalReadRelease(e, group, sp.resource.second) &&
-            findTerminalReadReleaseAnchor(e.dstOp, sp, group,
-                                          sp.resource.second) &&
-            !hasOutgoingEdgeFromOp(sp, e.dstOp) &&
-            !tokenResultIsYielded(e.dstOp))
-          addPlannedRelease(transitions.opExitReleases, e.dstOp, sp, gi, ei);
-      }
-      break;
     }
+    for (unsigned groupIdx : faninHere) {
+      if (doneFaninAcquireSeen[groupIdx])
+        continue;
+      addSiteAcquire(site, groupIdx);
+      doneFaninAcquireSeen[groupIdx] = 1;
     }
+    return success();
+  });
+
+  if (sp.initialPermitReleaseAfterOp && sp.initialPermitEdgeIdx >= 0) {
+    unsigned edgeIdx = static_cast<unsigned>(sp.initialPermitEdgeIdx);
+    if (edgeIdx < sp.edges.size() && edgeIdx < dag.edgeToGroup.size())
+      addPlannedRelease(transitions.opExitReleases,
+                        sp.initialPermitReleaseAfterOp, sp,
+                        dag.edgeToGroup[edgeIdx], edgeIdx);
   }
 
   auto resolveOpReleases = [&](auto &releasesByAnchor, SyncAnchorKind kind) {
@@ -1211,14 +756,11 @@ buildEmitterTransitionPlan(const OptSyncDag &dag, const SyncPlan &sp,
                     SyncAnchorKind::ReleaseAfterOp);
   resolveRegionReleases(transitions.regionEntryReleases,
                         SyncAnchorKind::ReleaseBeforeYield);
-  resolveRegionReleases(transitions.regionExitReleases,
-                        SyncAnchorKind::ReleaseAfterYield);
-  resolveEmitterTransitionPlacement(transitions, dag, sp, group);
   return transitions;
 }
 
 static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
-                                  BufferGroup &group) {
+                                  BufferGroup &group, triton::FuncOp funcOp) {
   OptSyncDag dag;
   dag.resource = sp.resource;
   dag.groupIdx = sp.groupIdx;
@@ -1229,12 +771,6 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
     unsigned idx = static_cast<unsigned>(edgeIdx);
     if (edge.dstOp)
       dag.dstBranchEntryAnchor[idx] = getIfBranchEntryAnchor(edge.dstOp);
-    if (edge.srcYieldRegion) {
-      auto forOp = dyn_cast_or_null<scf::ForOp>(
-          edge.srcYieldRegion->getParentOp());
-      if (forOp && hasWarpSpecializeTag(forOp))
-        dag.srcYieldParentWarpFor.insert(idx);
-    }
     if (!isIfYieldRegion(edge.dstYieldRegion))
       continue;
     Operation *ifOp = edge.dstYieldRegion->getParentOp();
@@ -1544,7 +1080,8 @@ static OptSyncDag buildOptSyncDag(const SyncPlan &sp, const ResourcePlan &plan,
       dag.tmemLoopExitRead[static_cast<unsigned>(edgeIdx)] = loopExitRead;
 
   EmitterTransitionPlan preliminaryTransitions =
-      buildEmitterTransitionPlan(dag, sp, group, /*reanchorInitialAcquire=*/false);
+      buildEmitterTransitionPlan(dag, sp, group, funcOp,
+                                 /*reanchorInitialAcquire=*/false);
   auto markOpAnchors = [&](const auto &anchors) {
     for (auto &kv : anchors)
       if (isa<scf::ForOp>(kv.first))

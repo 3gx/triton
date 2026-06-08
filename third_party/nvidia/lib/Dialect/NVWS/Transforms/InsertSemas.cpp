@@ -186,7 +186,7 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp,
       SyncPlan sp = buildSyncPlan(group, plan, funcOp);
       if (failed(verifyRawSyncDagStructuralInvariant(sp, funcOp)))
         return failure();
-      OptSyncDag opt = buildOptSyncDag(sp, plan, group);
+      OptSyncDag opt = buildOptSyncDag(sp, plan, group, funcOp);
       if (failed(verifyOptSyncDagStructuralInvariant(opt, sp, funcOp)))
         return failure();
       if (dumpDag) {
@@ -234,7 +234,8 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp,
       SyncPlan emitSyncPlan = buildSyncPlan(group, emitPlan, funcOp);
       if (failed(verifyRawSyncDagStructuralInvariant(emitSyncPlan, funcOp)))
         return failure();
-      OptSyncDag emitOptDag = buildOptSyncDag(emitSyncPlan, emitPlan, group);
+      OptSyncDag emitOptDag =
+          buildOptSyncDag(emitSyncPlan, emitPlan, group, funcOp);
       if (failed(
               verifyOptSyncDagStructuralInvariant(emitOptDag, emitSyncPlan,
                                                   funcOp)))

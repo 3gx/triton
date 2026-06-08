@@ -296,15 +296,8 @@ struct EmitterTransitionPlan {
   llvm::MapVector<Operation *, SmallVector<PlannedRelease, 2>> opEntryReleases,
       opExitReleases;
   llvm::MapVector<Operation *, SmallVector<unsigned, 2>> opEntryAcquires;
-  llvm::MapVector<Region *, SmallVector<PlannedRelease, 2>> regionEntryReleases,
-      regionExitReleases;
+  llvm::MapVector<Region *, SmallVector<PlannedRelease, 2>> regionEntryReleases;
   llvm::MapVector<Region *, SmallVector<unsigned, 2>> regionEntryAcquires;
-  DenseMap<Operation *, Operation *> opEntryReleaseInsertAfter,
-      opEntryReleaseInsertBefore, opExitReleaseInsertAfter,
-      opExitReleaseInsertBefore;
-  DenseMap<Region *, Operation *> regionEntryReleaseInsertAfter,
-      regionEntryReleaseInsertBefore;
-  DenseMap<Operation *, SmallVector<Operation *, 2>> deferredOpExitAnchors;
 };
 
 struct OptSyncDag {
@@ -322,7 +315,6 @@ struct OptSyncDag {
   DenseMap<unsigned, Region *> skippedInitialLoopCarrierRegion;
   DenseSet<unsigned> edgesDeferringToSkippedLoopExit;
   DenseSet<unsigned> terminalLoopReadEdgesDeferringToExit;
-  DenseSet<unsigned> srcYieldParentWarpFor;
   DenseSet<Operation *> accessOps;
   SetVector<Operation *> threadForOps;
   SetVector<Operation *> threadIfOps;

@@ -491,6 +491,15 @@ static StageCluster stageForYieldOwner(std::optional<PartitionId> owner,
   return it == state.stageCache.end() ? StageCluster{} : it->second;
 }
 
+static StageCluster stageForReleaseAction(const PlannedRelease &release,
+                                          const SyncPlan &sp, EmitState &state,
+                                          StageCluster fallback) {
+  const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
+  StageCluster stage = stageForYieldOwner(edge ? edge->srcOwner : std::nullopt,
+                                          state);
+  return stage ? stage : fallback;
+}
+
 static SetVector<int> partitionSetForOwner(std::optional<PartitionId> owner) {
   SetVector<int> ids;
   if (owner)
@@ -1444,27 +1453,17 @@ static LogicalResult emitOperationEntryTransitions(
     Operation *anchor, const OptSyncDag &dag, const SyncPlan &sp,
     BufferGroup &group, EmitState &state, SmallVectorImpl<AcquireRecord> &acquires) {
   const EmitterTransitionPlan &transitions = state.transitionPlan();
+  OpBuilder b(anchor);
+  b.setInsertionPoint(anchor);
   auto rIt = transitions.opEntryReleases.find(anchor);
   if (rIt != transitions.opEntryReleases.end())
     for (const PlannedRelease &release : rIt->second) {
-      OpBuilder releaseBuilder(anchor);
-      bool anchorHasEntryAcquire = transitions.opEntryAcquires.contains(anchor);
-      if (Operation *insertBefore =
-              transitions.opEntryReleaseInsertBefore.lookup(anchor))
-        releaseBuilder.setInsertionPoint(insertBefore);
-      else if (Operation *insertAfter =
-                   transitions.opEntryReleaseInsertAfter.lookup(anchor);
-               insertAfter && !anchorHasEntryAcquire)
-        releaseBuilder.setInsertionPointAfter(insertAfter);
-      else
-        releaseBuilder.setInsertionPoint(anchor);
       if (failed(state.release(
-              releaseBuilder, anchor->getLoc(), SyncAnchorKind::ReleaseBeforeOp,
-              anchor, nullptr, release, dag, sp, group, getStageCluster(anchor))))
+              b, anchor->getLoc(), SyncAnchorKind::ReleaseBeforeOp,
+              anchor, nullptr, release, dag, sp, group,
+              stageForReleaseAction(release, sp, state, getStageCluster(anchor)))))
         return failure();
     }
-  OpBuilder b(anchor);
-  b.setInsertionPoint(anchor);
   auto aIt = transitions.opEntryAcquires.find(anchor);
   if (aIt != transitions.opEntryAcquires.end())
     for (unsigned gi : aIt->second)
@@ -1481,18 +1480,8 @@ static LogicalResult emitOperationExitTransitions(
   auto rIt = transitions.opExitReleases.find(anchor);
   if (rIt == transitions.opExitReleases.end()) return success();
   Operation *releaseAfter = insertAfter;
-  if (Operation *plannedAfter =
-          transitions.opExitReleaseInsertAfter.lookup(anchor))
-    releaseAfter = plannedAfter == anchor ? insertAfter : plannedAfter;
-  if (anchor == insertAfter && operationIsAttached(releaseAfter) &&
-      operationIsAttached(anchor) &&
-      releaseAfter->isProperAncestor(anchor))
-    return success();
   OpBuilder b(releaseAfter);
-  if (Operation *insertBefore =
-          transitions.opExitReleaseInsertBefore.lookup(anchor)) {
-    b.setInsertionPoint(insertBefore);
-  } else if (isa<scf::YieldOp>(releaseAfter)) {
+  if (isa<scf::YieldOp>(releaseAfter)) {
     b.setInsertionPoint(releaseAfter);
   } else {
     b.setInsertionPointAfter(releaseAfter);
@@ -1527,22 +1516,6 @@ static LogicalResult emitOperationExitTransitions(
     Operation *anchor, const OptSyncDag &dag, const SyncPlan &sp,
     BufferGroup &group, EmitState &state) {
   return emitOperationExitTransitions(anchor, anchor, dag, sp, group, state);
-}
-
-static LogicalResult emitDeferredNestedExitTransitions(
-    Operation *releaseAfter, const OptSyncDag &dag, const SyncPlan &sp,
-    BufferGroup &group, EmitState &state) {
-  const EmitterTransitionPlan &transitions = state.transitionPlan();
-  auto deferredIt = transitions.deferredOpExitAnchors.find(releaseAfter);
-  if (deferredIt == transitions.deferredOpExitAnchors.end())
-    return success();
-  for (Operation *anchor : deferredIt->second) {
-    if (failed(emitOperationExitTransitions(anchor, releaseAfter, dag, sp,
-                                            group, state)))
-      return failure();
-    state.completedTransitionAnchors.insert(anchor);
-  }
-  return success();
 }
 
 static bool linearChainRequiresPerEdgeSemaphores(const SyncGroup &syncGroup,
@@ -1929,17 +1902,8 @@ static LogicalResult emitRegionCloseTransitions(
   if (rIt != transitions.regionEntryReleases.end())
     for (const PlannedRelease &release : rIt->second) {
       const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
-      OpBuilder releaseBuilder(yieldOp);
-      if (Operation *insertBefore =
-              transitions.regionEntryReleaseInsertBefore.lookup(region))
-        releaseBuilder.setInsertionPoint(insertBefore);
-      else if (Operation *insertAfter =
-                   transitions.regionEntryReleaseInsertAfter.lookup(region))
-        releaseBuilder.setInsertionPointAfter(insertAfter);
-      else
-        releaseBuilder.setInsertionPoint(yieldOp);
       if (failed(state.release(
-              releaseBuilder, yieldOp->getLoc(),
+              b, yieldOp->getLoc(),
               SyncAnchorKind::ReleaseBeforeYield, nullptr, region, release, dag, sp,
               group,
               stageForYieldOwner(edge ? edge->srcOwner : std::nullopt, state))))
@@ -1956,16 +1920,6 @@ static LogicalResult emitRegionCloseTransitions(
           b, yieldOp->getLoc(), SyncAnchorKind::AcquireBeforeYield, nullptr,
           region, gi, dag, sp, group,
           stageForYieldOwner(edge ? edge->dstOwner : std::nullopt, state)));
-    }
-  auto arIt = transitions.regionExitReleases.find(region);
-  if (arIt != transitions.regionExitReleases.end())
-    for (const PlannedRelease &release : arIt->second) {
-      const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
-      if (failed(state.release(
-              b, yieldOp->getLoc(), SyncAnchorKind::ReleaseAfterYield, nullptr,
-              region, release, dag, sp, group,
-              stageForYieldOwner(edge ? edge->srcOwner : std::nullopt, state))))
-        return failure();
     }
   return success();
 }
@@ -2458,9 +2412,6 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
                                               activeForOp.getOperation(), dag,
                                               sp, group, state)))
         return failure();
-      if (failed(emitDeferredNestedExitTransitions(activeForOp.getOperation(),
-                                                   dag, sp, group, state)))
-        return failure();
       normalizeLoopCarrierTokenSlots(activeForOp);
       if (isTransitionAnchor)
         state.completedTransitionAnchors.insert(oldForOp);
@@ -2624,9 +2575,6 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
       if (failed(emitOperationExitTransitions(oldIfOp, activeIfOp.getOperation(),
                                               dag, sp, group, state)))
         return failure();
-      if (failed(emitDeferredNestedExitTransitions(activeIfOp.getOperation(),
-                                                   dag, sp, group, state)))
-        return failure();
       if (threaded && !reuseExistingTokenResult)
         state.eraseAfterEmission.insert(oldIfOp);
       if (isTransitionAnchor)
@@ -2662,7 +2610,8 @@ static LogicalResult emitResource(triton::FuncOp funcOp, BufferGroup &group,
                          plan.memberIndices, backings, numStagesByGroup);
   EmitState state;
   state.semas = createResourceSemaphores(dag, sp, group, backing);
-  EmitterTransitionPlan transitions = buildEmitterTransitionPlan(dag, sp, group);
+  EmitterTransitionPlan transitions =
+      buildEmitterTransitionPlan(dag, sp, group, funcOp);
   state.transitions = &transitions;
   if (failed(emitResourceRegion(funcOp.getBody(), dag, sp, plan, group, backing,
                                 state)))
