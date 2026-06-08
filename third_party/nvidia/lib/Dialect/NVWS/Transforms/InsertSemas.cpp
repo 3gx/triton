@@ -184,7 +184,11 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp,
                                        static_cast<unsigned>(en.index()),
                                        group, key, rank);
       SyncPlan sp = buildSyncPlan(group, plan, funcOp);
+      if (failed(verifyRawSyncDagStructuralInvariant(sp, funcOp)))
+        return failure();
       OptSyncDag opt = buildOptSyncDag(sp, plan, group);
+      if (failed(verifyOptSyncDagStructuralInvariant(opt, sp, funcOp)))
+        return failure();
       if (dumpDag) {
         dumpOwnershipDag(plan, group, funcOp);
         dumpRawSyncDag(sp, plan, group, funcOp);
@@ -228,7 +232,13 @@ static LogicalResult runOnFunction(triton::FuncOp funcOp,
           planResource(funcOp, static_cast<unsigned>(en.index()), group,
                        planned.plan.resource.second, rank);
       SyncPlan emitSyncPlan = buildSyncPlan(group, emitPlan, funcOp);
+      if (failed(verifyRawSyncDagStructuralInvariant(emitSyncPlan, funcOp)))
+        return failure();
       OptSyncDag emitOptDag = buildOptSyncDag(emitSyncPlan, emitPlan, group);
+      if (failed(
+              verifyOptSyncDagStructuralInvariant(emitOptDag, emitSyncPlan,
+                                                  funcOp)))
+        return failure();
       if (failed(emitResource(funcOp, group, emitPlan, emitSyncPlan, emitOptDag,
                               backings, numStagesByGroup, eraseAfterEmission)))
         return failure();

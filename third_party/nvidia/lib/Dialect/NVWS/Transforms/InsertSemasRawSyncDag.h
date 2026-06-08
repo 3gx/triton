@@ -677,6 +677,235 @@ struct OptDumpCtx {
   DenseSet<unsigned> rendered;
 };
 
+struct SyncRenderSite {
+  Region *region = nullptr;
+  Block *block = nullptr;
+  Operation *anchor = nullptr;
+  unsigned ordinal = 0;
+};
+
+static bool sameSyncRenderRegion(const SyncRenderSite &lhs,
+                                 const SyncRenderSite &rhs) {
+  return lhs.region == rhs.region && lhs.block == rhs.block;
+}
+
+static bool hasRenderedAccessInSubtree(Operation *op, const SyncPlan &sp) {
+  bool hasAccess = false;
+  op->walk([&](Operation *nested) -> WalkResult {
+    if (sp.accessOps.contains(nested)) {
+      hasAccess = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return hasAccess;
+}
+
+static LogicalResult emitStructuralSyncInvariantError(triton::FuncOp funcOp,
+                                                      StringRef dagName,
+                                                      StringRef reason) {
+  InFlightDiagnostic diag = funcOp.emitError("nvws-insert-semas: ");
+  diag << dagName << " violates structural release/acquire invariant: "
+       << reason;
+  return failure();
+}
+
+struct SyncInvariantSubject {
+  unsigned expectedReleases = 0;
+  unsigned expectedAcquires = 0;
+  unsigned releases = 0;
+  unsigned acquires = 0;
+  std::optional<SyncRenderSite> firstSite;
+  std::optional<unsigned> maxReleaseOrdinal;
+  std::optional<unsigned> minAcquireOrdinal;
+};
+
+struct SyncDagStructuralVerifier {
+  triton::FuncOp funcOp;
+  StringRef dagName;
+  SmallVector<unsigned, 8> edgeRenderCount;
+  SmallVector<SyncInvariantSubject, 8> subjects;
+
+  SyncDagStructuralVerifier(triton::FuncOp funcOp, StringRef dagName,
+                            unsigned edgeCount, unsigned subjectCount)
+      : funcOp(funcOp), dagName(dagName), edgeRenderCount(edgeCount, 0),
+        subjects(subjectCount) {}
+
+  LogicalResult verifySite(ArrayRef<unsigned> edges, SyncRenderSite site,
+                           unsigned edgeCount) {
+    if (!site.region || !site.block || !site.anchor)
+      return emitStructuralSyncInvariantError(funcOp, dagName,
+                                              "invalid rendered sync site");
+    for (unsigned edgeIdx : edges) {
+      if (edgeIdx >= edgeCount)
+        return emitStructuralSyncInvariantError(
+            funcOp, dagName, "rendered edge index is out of range");
+      ++edgeRenderCount[edgeIdx];
+    }
+    return success();
+  }
+
+  LogicalResult noteSubjectSite(unsigned subjectIdx, SyncRenderSite site) {
+    if (subjectIdx >= subjects.size())
+      return emitStructuralSyncInvariantError(funcOp, dagName,
+                                              "sync subject is out of range");
+    SyncInvariantSubject &subject = subjects[subjectIdx];
+    if (!subject.firstSite) {
+      subject.firstSite = site;
+      return success();
+    }
+    if (!sameSyncRenderRegion(*subject.firstSite, site))
+      return emitStructuralSyncInvariantError(
+          funcOp, dagName, "release/acquire rows are not in the same region");
+    return success();
+  }
+
+  LogicalResult noteRelease(unsigned subjectIdx, SyncRenderSite site) {
+    if (failed(noteSubjectSite(subjectIdx, site)))
+      return failure();
+    SyncInvariantSubject &subject = subjects[subjectIdx];
+    ++subject.releases;
+    if (!subject.maxReleaseOrdinal ||
+        site.ordinal > *subject.maxReleaseOrdinal)
+      subject.maxReleaseOrdinal = site.ordinal;
+    return success();
+  }
+
+  LogicalResult noteAcquire(unsigned subjectIdx, SyncRenderSite site) {
+    if (failed(noteSubjectSite(subjectIdx, site)))
+      return failure();
+    SyncInvariantSubject &subject = subjects[subjectIdx];
+    ++subject.acquires;
+    if (!subject.minAcquireOrdinal ||
+        site.ordinal < *subject.minAcquireOrdinal)
+      subject.minAcquireOrdinal = site.ordinal;
+    return success();
+  }
+
+  LogicalResult finish() {
+    for (unsigned count : edgeRenderCount)
+      if (count != 1)
+        return emitStructuralSyncInvariantError(
+            funcOp, dagName,
+            count == 0 ? "edge is not rendered"
+                       : "edge is rendered more than once");
+    for (const SyncInvariantSubject &subject : subjects) {
+      if (subject.releases != subject.expectedReleases)
+        return emitStructuralSyncInvariantError(
+            funcOp, dagName, "release row count does not match the DAG");
+      if (subject.acquires != subject.expectedAcquires)
+        return emitStructuralSyncInvariantError(
+            funcOp, dagName, "acquire row count does not match the DAG");
+      if (!subject.expectedReleases || !subject.expectedAcquires)
+        continue;
+      if (!subject.maxReleaseOrdinal || !subject.minAcquireOrdinal)
+        return emitStructuralSyncInvariantError(
+            funcOp, dagName, "release/acquire rows are incomplete");
+      if (*subject.maxReleaseOrdinal > *subject.minAcquireOrdinal)
+        return emitStructuralSyncInvariantError(
+            funcOp, dagName, "release row is rendered after acquire row");
+    }
+    return success();
+  }
+};
+
+static LogicalResult walkRenderedSyncSites(
+    const SyncPlan &sp, triton::FuncOp funcOp,
+    const std::function<LogicalResult(ArrayRef<unsigned>, SyncRenderSite)> &fn) {
+  unsigned ordinal = 0;
+  std::function<LogicalResult(Region &)> walkRegion;
+  std::function<LogicalResult(Block &)> walkBlock;
+
+  auto visitOpSite = [&](Operation *op, ArrayRef<unsigned> edges) {
+    SyncRenderSite site{op->getParentRegion(), op->getBlock(), op, ordinal++};
+    return fn(edges, site);
+  };
+  auto visitYieldSite = [&](Region &region, ArrayRef<unsigned> edges) {
+    Operation *yieldOp = region.empty() ? nullptr : region.front().getTerminator();
+    SyncRenderSite site{&region, region.empty() ? nullptr : &region.front(),
+                        yieldOp, ordinal++};
+    return fn(edges, site);
+  };
+
+  walkRegion = [&](Region &region) -> LogicalResult {
+    for (Block &block : region)
+      if (failed(walkBlock(block)))
+        return failure();
+    auto yIt = sp.beforeYield.find(&region);
+    if (yIt != sp.beforeYield.end())
+      if (failed(visitYieldSite(region, yIt->second)))
+        return failure();
+    return success();
+  };
+
+  walkBlock = [&](Block &block) -> LogicalResult {
+    for (Operation &op : block) {
+      if (auto forOp = dyn_cast<scf::ForOp>(&op)) {
+        bool show = hasRenderedAccessInSubtree(forOp.getOperation(), sp);
+        if (!show && !sp.beforeYield.count(&forOp.getRegion()))
+          continue;
+        auto bIt = sp.beforeOp.find(&op);
+        if (bIt != sp.beforeOp.end())
+          if (failed(visitOpSite(&op, bIt->second)))
+            return failure();
+        if (failed(walkRegion(forOp.getRegion())))
+          return failure();
+        continue;
+      }
+      if (auto ifOp = dyn_cast<scf::IfOp>(&op)) {
+        if (!hasRenderedAccessInSubtree(ifOp.getOperation(), sp))
+          continue;
+        auto bIt = sp.beforeOp.find(&op);
+        if (bIt != sp.beforeOp.end())
+          if (failed(visitOpSite(&op, bIt->second)))
+            return failure();
+        if (failed(walkRegion(ifOp.getThenRegion())))
+          return failure();
+        if (!ifOp.getElseRegion().empty())
+          if (failed(walkRegion(ifOp.getElseRegion())))
+            return failure();
+        continue;
+      }
+      if (isa<scf::YieldOp>(op))
+        continue;
+      if (!sp.accessOps.contains(&op))
+        continue;
+      auto bIt = sp.beforeOp.find(&op);
+      if (bIt != sp.beforeOp.end())
+        if (failed(visitOpSite(&op, bIt->second)))
+          return failure();
+    }
+    return success();
+  };
+
+  return walkRegion(funcOp.getBody());
+}
+
+static LogicalResult verifyRawSyncDagStructuralInvariant(const SyncPlan &sp,
+                                                         triton::FuncOp funcOp) {
+  SyncDagStructuralVerifier verifier(funcOp, "RAW-SYNC-DAG", sp.edges.size(),
+                                     sp.edges.size());
+  for (SyncInvariantSubject &subject : verifier.subjects) {
+    subject.expectedReleases = 1;
+    subject.expectedAcquires = 1;
+  }
+  if (failed(walkRenderedSyncSites(
+          sp, funcOp, [&](ArrayRef<unsigned> edges, SyncRenderSite site)
+                          -> LogicalResult {
+            if (failed(verifier.verifySite(edges, site, sp.edges.size())))
+              return failure();
+            for (unsigned edgeIdx : edges) {
+              if (failed(verifier.noteRelease(edgeIdx, site)))
+                return failure();
+              if (failed(verifier.noteAcquire(edgeIdx, site)))
+                return failure();
+            }
+            return success();
+          })))
+    return failure();
+  return verifier.finish();
+}
+
 void printEdgesAt(SmallVector<unsigned, 2> *edgeIdxs, SyncPlan &sp,
                   Operation *anchor, unsigned depth,
                   OptDumpCtx *octx = nullptr) {

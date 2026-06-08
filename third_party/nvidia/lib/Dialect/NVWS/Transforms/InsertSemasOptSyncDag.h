@@ -1776,6 +1776,164 @@ std::string ownerSetStr(Operation *anchor,
   return s;
 }
 
+static LogicalResult
+verifyOptSyncDagStructuralInvariant(const OptSyncDag &dag, const SyncPlan &sp,
+                                    triton::FuncOp funcOp) {
+  if (dag.edgeToGroup.size() != sp.edges.size())
+    return emitStructuralSyncInvariantError(
+        funcOp, "OPT-SYNC-DAG", "edge-to-group map has the wrong size");
+
+  SmallVector<SyncInvariantSubject, 8> expectedSubjects;
+  SmallVector<int, 8> groupSubject(dag.groups.size(), -1);
+  SmallVector<int, 8> edgeSubject(sp.edges.size(), -1);
+
+  auto addSubject = [&](unsigned releases, unsigned acquires) {
+    expectedSubjects.emplace_back();
+    SyncInvariantSubject &subject = expectedSubjects.back();
+    subject.expectedReleases = releases;
+    subject.expectedAcquires = acquires;
+    return static_cast<unsigned>(expectedSubjects.size() - 1);
+  };
+
+  for (auto [groupIdxIt, group] : llvm::enumerate(dag.groups)) {
+    unsigned groupIdx = static_cast<unsigned>(groupIdxIt);
+    if (group.kind == SyncGroupKind::InitialEmpty) {
+      if (!group.edgeIdxs.empty())
+        return emitStructuralSyncInvariantError(
+            funcOp, "OPT-SYNC-DAG", "initial-empty group owns sync edges");
+      if (!group.initialOp)
+        return emitStructuralSyncInvariantError(
+            funcOp, "OPT-SYNC-DAG", "initial-empty group has no anchor");
+      continue;
+    }
+    if (group.edgeIdxs.empty())
+      return emitStructuralSyncInvariantError(
+          funcOp, "OPT-SYNC-DAG", "non-initial group has no sync edges");
+    for (unsigned edgeIdx : group.edgeIdxs) {
+      if (edgeIdx >= sp.edges.size())
+        return emitStructuralSyncInvariantError(
+            funcOp, "OPT-SYNC-DAG", "group edge index is out of range");
+      if (dag.edgeToGroup[edgeIdx] != groupIdx)
+        return emitStructuralSyncInvariantError(
+            funcOp, "OPT-SYNC-DAG", "edge-to-group map is inconsistent");
+    }
+
+    switch (group.kind) {
+    case SyncGroupKind::InitialEmpty:
+      llvm_unreachable("handled above");
+    case SyncGroupKind::ReadyFanout:
+      groupSubject[groupIdx] =
+          static_cast<int>(addSubject(/*releases=*/1,
+                                      /*acquires=*/group.edgeIdxs.size()));
+      break;
+    case SyncGroupKind::DoneFanin:
+      groupSubject[groupIdx] =
+          static_cast<int>(addSubject(/*releases=*/group.edgeIdxs.size(),
+                                      /*acquires=*/1));
+      break;
+    case SyncGroupKind::Singleton:
+    case SyncGroupKind::LinearChain:
+      for (unsigned edgeIdx : group.edgeIdxs) {
+        if (edgeSubject[edgeIdx] >= 0)
+          return emitStructuralSyncInvariantError(
+              funcOp, "OPT-SYNC-DAG", "sync edge is assigned twice");
+        edgeSubject[edgeIdx] =
+            static_cast<int>(addSubject(/*releases=*/1, /*acquires=*/1));
+      }
+      break;
+    }
+  }
+
+  SyncDagStructuralVerifier verifier(funcOp, "OPT-SYNC-DAG", sp.edges.size(),
+                                     expectedSubjects.size());
+  for (auto [idx, subject] : llvm::enumerate(expectedSubjects))
+    verifier.subjects[static_cast<unsigned>(idx)] = subject;
+
+  SmallVector<char, 8> groupRendered(dag.groups.size(), 0);
+  if (failed(walkRenderedSyncSites(
+          sp, funcOp, [&](ArrayRef<unsigned> edges, SyncRenderSite site)
+                          -> LogicalResult {
+            if (failed(verifier.verifySite(edges, site, sp.edges.size())))
+              return failure();
+            SmallVector<unsigned, 2> faninHere;
+            for (unsigned edgeIdx : edges) {
+              unsigned groupIdx = dag.edgeToGroup[edgeIdx];
+              if (groupIdx >= dag.groups.size())
+                return emitStructuralSyncInvariantError(
+                    funcOp, "OPT-SYNC-DAG", "group index is out of range");
+              const SyncGroup &group = dag.groups[groupIdx];
+              switch (group.kind) {
+              case SyncGroupKind::InitialEmpty:
+                return emitStructuralSyncInvariantError(
+                    funcOp, "OPT-SYNC-DAG",
+                    "sync edge maps to initial-empty group");
+              case SyncGroupKind::ReadyFanout: {
+                int subjectIdx = groupSubject[groupIdx];
+                if (subjectIdx < 0)
+                  return emitStructuralSyncInvariantError(
+                      funcOp, "OPT-SYNC-DAG",
+                      "ready-fanout group has no sync subject");
+                if (!groupRendered[groupIdx]) {
+                  if (failed(verifier.noteRelease(
+                          static_cast<unsigned>(subjectIdx), site)))
+                    return failure();
+                  groupRendered[groupIdx] = 1;
+                }
+                if (failed(verifier.noteAcquire(
+                        static_cast<unsigned>(subjectIdx), site)))
+                  return failure();
+                break;
+              }
+              case SyncGroupKind::DoneFanin: {
+                int subjectIdx = groupSubject[groupIdx];
+                if (subjectIdx < 0)
+                  return emitStructuralSyncInvariantError(
+                      funcOp, "OPT-SYNC-DAG",
+                      "done-fanin group has no sync subject");
+                if (failed(verifier.noteRelease(
+                        static_cast<unsigned>(subjectIdx), site)))
+                  return failure();
+                if (!llvm::is_contained(faninHere, groupIdx))
+                  faninHere.push_back(groupIdx);
+                break;
+              }
+              case SyncGroupKind::Singleton:
+              case SyncGroupKind::LinearChain: {
+                int subjectIdx = edgeSubject[edgeIdx];
+                if (subjectIdx < 0)
+                  return emitStructuralSyncInvariantError(
+                      funcOp, "OPT-SYNC-DAG",
+                      "sync edge has no sync subject");
+                if (failed(verifier.noteRelease(
+                        static_cast<unsigned>(subjectIdx), site)))
+                  return failure();
+                if (failed(verifier.noteAcquire(
+                        static_cast<unsigned>(subjectIdx), site)))
+                  return failure();
+                break;
+              }
+              }
+            }
+            for (unsigned groupIdx : faninHere) {
+              if (groupRendered[groupIdx])
+                continue;
+              int subjectIdx = groupSubject[groupIdx];
+              if (subjectIdx < 0)
+                return emitStructuralSyncInvariantError(
+                    funcOp, "OPT-SYNC-DAG",
+                    "done-fanin group has no acquire subject");
+              if (failed(verifier.noteAcquire(static_cast<unsigned>(subjectIdx),
+                                              site)))
+                return failure();
+              groupRendered[groupIdx] = 1;
+            }
+            return success();
+          })))
+    return failure();
+
+  return verifier.finish();
+}
+
 
 void dumpOptSyncDag(const OptSyncDag &dag, SyncPlan &sp,
                     const ResourcePlan &plan, BufferGroup &group,
