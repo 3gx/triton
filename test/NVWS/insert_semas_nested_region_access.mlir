@@ -16,14 +16,12 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // both annotated in OWNERSHIP-DAG via transitive-event propagation;
   // the "something" arith op contributes no row.
   tt.func @for_outer_if_inner_access(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
-    %alloc = ttg.local_alloc {buffer.id = 800 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
+    %alloc = ttg.local_alloc {buffer.id = 800 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {
       %something = arith.addi %iv, %iv {ttg.partition = array<i32: 0>} : i32
       scf.if %cond {
         %v = "producer"() {ttg.partition = array<i32: 1>} : () -> !ty
-        %c0 = arith.constant {ttg.partition = array<i32: 1>} 0 : i32
-        %pv = ttg.memdesc_index %alloc[%c0] {ttg.partition = array<i32: 1>} : !ttg.memdesc<1x1xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-        ttg.local_store %v, %pv {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+        ttg.local_store %v, %alloc {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
       } {ttg.partition = array<i32: 0, 1>}
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32}
     tt.return
@@ -44,14 +42,12 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // uses tagged display `{@0.X}` because it is anchored outside the WS
   // loop.
   tt.func @if_outer_for_inner_access(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
-    %alloc = ttg.local_alloc {buffer.id = 801 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
+    %alloc = ttg.local_alloc {buffer.id = 801 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.if %cond {
       %something = arith.constant 42 : i32
       scf.for %iv = %lb to %ub step %step : i32 {
         %v = "producer"() {ttg.partition = array<i32: 1>} : () -> !ty
-        %c0 = arith.constant {ttg.partition = array<i32: 1>} 0 : i32
-        %pv = ttg.memdesc_index %alloc[%c0] {ttg.partition = array<i32: 1>} : !ttg.memdesc<1x1xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-        ttg.local_store %v, %pv {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+        ttg.local_store %v, %alloc {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
       } {tt.warp_specialize, ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32}
     }
     tt.return
@@ -71,15 +67,13 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // must be annotated via transitive access; the outer if has no direct
   // event.
   tt.func @if_outer_if_inner_access(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
-    %alloc = ttg.local_alloc {buffer.id = 802 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
+    %alloc = ttg.local_alloc {buffer.id = 802 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {
       scf.if %cond {
         %something = arith.constant {ttg.partition = array<i32: 0>} 0 : i32
         scf.if %cond {
           %v = "producer"() {ttg.partition = array<i32: 1>} : () -> !ty
-          %c0 = arith.constant {ttg.partition = array<i32: 1>} 0 : i32
-          %pv = ttg.memdesc_index %alloc[%c0] {ttg.partition = array<i32: 1>} : !ttg.memdesc<1x1xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-          ttg.local_store %v, %pv {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+          ttg.local_store %v, %alloc {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
         } {ttg.partition = array<i32: 0, 1>}
       } {ttg.partition = array<i32: 0, 1>}
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32}
@@ -99,14 +93,12 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // inner scf.for is plain. Access is in the inner body. Verify outer
   // for is annotated transitively via the inner for's annotation.
   tt.func @for_outer_for_inner_access(%lb: i32, %ub: i32, %step: i32) {
-    %alloc = ttg.local_alloc {buffer.id = 803 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
+    %alloc = ttg.local_alloc {buffer.id = 803 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {
       %something = arith.addi %iv, %iv {ttg.partition = array<i32: 0>} : i32
       scf.for %jv = %lb to %ub step %step : i32 {
         %v = "producer"() {ttg.partition = array<i32: 1>} : () -> !ty
-        %c0 = arith.constant {ttg.partition = array<i32: 1>} 0 : i32
-        %pv = ttg.memdesc_index %alloc[%c0] {ttg.partition = array<i32: 1>} : !ttg.memdesc<1x1xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-        ttg.local_store %v, %pv {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+        ttg.local_store %v, %alloc {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
       } {ttg.partition = array<i32: 0, 1>}
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32}
     tt.return
@@ -125,14 +117,12 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // for body. Outer scf.for is WS-tagged. Every ancestor on the path
   // (outer for, if, inner for) must be annotated transitively.
   tt.func @triple_for_if_for_access(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
-    %alloc = ttg.local_alloc {buffer.id = 804 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
+    %alloc = ttg.local_alloc {buffer.id = 804 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {
       scf.if %cond {
         scf.for %jv = %lb to %ub step %step : i32 {
           %v = "producer"() {ttg.partition = array<i32: 1>} : () -> !ty
-          %c0 = arith.constant {ttg.partition = array<i32: 1>} 0 : i32
-          %pv = ttg.memdesc_index %alloc[%c0] {ttg.partition = array<i32: 1>} : !ttg.memdesc<1x1xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-          ttg.local_store %v, %pv {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+          ttg.local_store %v, %alloc {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
         } {ttg.partition = array<i32: 0, 1>}
       } {ttg.partition = array<i32: 0, 1>}
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32}
@@ -154,14 +144,12 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // show tagged display `{@0.X}` on its branches. All three regioned
   // ops on the path must be annotated.
   tt.func @triple_if_for_if_access(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
-    %alloc = ttg.local_alloc {buffer.id = 805 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
+    %alloc = ttg.local_alloc {buffer.id = 805 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.if %cond {
       scf.for %iv = %lb to %ub step %step : i32 {
         scf.if %cond {
           %v = "producer"() {ttg.partition = array<i32: 1>} : () -> !ty
-          %c0 = arith.constant {ttg.partition = array<i32: 1>} 0 : i32
-          %pv = ttg.memdesc_index %alloc[%c0] {ttg.partition = array<i32: 1>} : !ttg.memdesc<1x1xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-          ttg.local_store %v, %pv {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+          ttg.local_store %v, %alloc {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
         } {ttg.partition = array<i32: 1>}
       } {tt.warp_specialize, ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32}
     }
@@ -182,15 +170,13 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // depth: every ancestor on the path is annotated, every sibling
   // empty region (else of each if) is reconciled.
   tt.func @quad_for_if_for_if_access(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
-    %alloc = ttg.local_alloc {buffer.id = 806 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
+    %alloc = ttg.local_alloc {buffer.id = 806 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {
       scf.if %cond {
         scf.for %jv = %lb to %ub step %step : i32 {
           scf.if %cond {
             %v = "producer"() {ttg.partition = array<i32: 1>} : () -> !ty
-            %c0 = arith.constant {ttg.partition = array<i32: 1>} 0 : i32
-            %pv = ttg.memdesc_index %alloc[%c0] {ttg.partition = array<i32: 1>} : !ttg.memdesc<1x1xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-            ttg.local_store %v, %pv {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+            ttg.local_store %v, %alloc {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
           } {ttg.partition = array<i32: 0, 1>}
         } {ttg.partition = array<i32: 0, 1>}
       } {ttg.partition = array<i32: 0, 1>}
@@ -212,13 +198,11 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // must be absent from the OWNERSHIP-DAG and ACCESS-DAG entirely;
   // the one with access must appear with proper annotation.
   tt.func @sibling_if_only_one_with_access(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
-    %alloc = ttg.local_alloc {buffer.id = 807 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
+    %alloc = ttg.local_alloc {buffer.id = 807 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {
       scf.if %cond {
         %v = "producer"() {ttg.partition = array<i32: 1>} : () -> !ty
-        %c0 = arith.constant {ttg.partition = array<i32: 1>} 0 : i32
-        %pv = ttg.memdesc_index %alloc[%c0] {ttg.partition = array<i32: 1>} : !ttg.memdesc<1x1xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-        ttg.local_store %v, %pv {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+        ttg.local_store %v, %alloc {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
       } {ttg.partition = array<i32: 0, 1>}
       scf.if %cond {
         %side = "side_effect"() {ttg.partition = array<i32: 0>} : () -> i32
@@ -240,13 +224,11 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // WS-tagged outer scf.for. Only the first inner for has access. The
   // second inner for must be absent from both DAGs.
   tt.func @sibling_for_only_one_with_access(%lb: i32, %ub: i32, %step: i32) {
-    %alloc = ttg.local_alloc {buffer.id = 808 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
+    %alloc = ttg.local_alloc {buffer.id = 808 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {
       scf.for %jv = %lb to %ub step %step : i32 {
         %v = "producer"() {ttg.partition = array<i32: 1>} : () -> !ty
-        %c0 = arith.constant {ttg.partition = array<i32: 1>} 0 : i32
-        %pv = ttg.memdesc_index %alloc[%c0] {ttg.partition = array<i32: 1>} : !ttg.memdesc<1x1xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-        ttg.local_store %v, %pv {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+        ttg.local_store %v, %alloc {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
       } {ttg.partition = array<i32: 0, 1>}
       scf.for %kv = %lb to %ub step %step : i32 {
         %side = "side_effect"() {ttg.partition = array<i32: 0>} : () -> i32

@@ -13,7 +13,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
     %true = arith.constant true
     // CHECK: [[V1:%.*]] = ttg.local_alloc {buffer.id = 910 : i32} : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
-    %scratch = ttg.local_alloc {buffer.id = 910 : i32} : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
+    %scratch = ttg.local_alloc {buffer.id = 910 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     // CHECK: [[V2:%.*]] = nvws.semaphore.create [[V1]] true : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK: [[V3:%.*]] = nvws.semaphore.create [[V1]] false : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK: [[V4:%.*]] = ttng.tmem_alloc {buffer.id = 900 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
@@ -57,21 +57,17 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       %out, %out_tok = ttng.tmem_load %acc[%inner_tmem] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
       "use_tmem_post"(%out) {ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> ()
 
-      %c0_p2 = arith.constant {ttg.partition = array<i32: 2>} 0 : i32
-      %write = ttg.memdesc_index %scratch[%c0_p2] {ttg.partition = array<i32: 2>} : !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       %payload = "local_payload"() {ttg.partition = array<i32: 2>} : () -> tensor<128x128xf16, #blocked>
       // CHECK: [[V26:%.*]] = nvws.semaphore.buffer [[V2]], [[V12]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       // CHECK: ttg.local_store %{{[-A-Za-z0-9_.$#]+}}, [[V26]] {ttg.partition = array<i32: 2>} : tensor<128x128xf16, #blocked> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-      ttg.local_store %payload, %write {ttg.partition = array<i32: 2>} : tensor<128x128xf16, #blocked> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      ttg.local_store %payload, %scratch {ttg.partition = array<i32: 2>} : tensor<128x128xf16, #blocked> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     // CHECK: nvws.semaphore.release [[V3]], [[V12]] [#nvws.async_op<none>] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
     // CHECK: [[V27:%.*]] = nvws.semaphore.acquire [[V3]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
     // CHECK: [[V28:%.*]] = nvws.semaphore.buffer [[V3]], [[V27]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem>
     // CHECK: %{{[-A-Za-z0-9_.$#]+}} = ttg.local_load [[V28]] {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem> -> tensor<128x128xf16, #blocked>
 
-      %c0_p1 = arith.constant {ttg.partition = array<i32: 1>} 0 : i32
-      %read = ttg.memdesc_index %scratch[%c0_p1] {ttg.partition = array<i32: 1>} : !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem>
       scf.for %iv2 = %lb to %ub step %step : i32 {
-        %loaded = ttg.local_load %read {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem> -> tensor<128x128xf16, #blocked>
+        %loaded = ttg.local_load %scratch {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #blocked>
         "use_local"(%loaded) {ttg.partition = array<i32: 1>} : (tensor<128x128xf16, #blocked>) -> ()
       } {ttg.partition = array<i32: 1>}
 
