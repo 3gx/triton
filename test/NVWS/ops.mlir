@@ -29,8 +29,8 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
     %0 = nvws.semaphore.create %d true : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>]>
     %1 = nvws.semaphore.acquire %0 : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>]> -> !ttg.async.token
     %2 = nvws.semaphore.acquire %0[%c1_i32, %c0_i32] : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>]> -> !ttg.async.token
-    %3 = nvws.semaphore.buffer %0, %1 : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>]>, !ttg.async.token -> !ttg.memdesc<64x16xf16, #shared0, #smem>
-    %4 = nvws.semaphore.buffer %0[%c1_i32], %2 : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>]>, !ttg.async.token -> !ttg.memdesc<64x16xf16, #shared0, #smem>
+    %3 = nvws.semaphore.buffer %0, %1 : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>]>, !ttg.async.token -> !ttg.memdesc<64x16xf16, #shared0, #smem, mutable>
+    %4 = nvws.semaphore.buffer %0[%c1_i32], %2 : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>]>, !ttg.async.token -> !ttg.memdesc<64x16xf16, #shared0, #smem, mutable>
     tt.return
   }
 }

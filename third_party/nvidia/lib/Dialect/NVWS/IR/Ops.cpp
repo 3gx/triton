@@ -211,6 +211,8 @@ verifySemaphoreBuffer(SemaphoreType semaphore,
       auto resultT = dyn_cast<triton::gpu::MemDescType>(resultTy);
       if (auto verifyResult = verifySlice(origT, resultT))
         return verifyResult;
+      if (!resultT.getMutableMemory())
+        return "Semaphore buffer result memdesc must be mutable";
     } else {
       return "Slicing not implemented for this type";
     }

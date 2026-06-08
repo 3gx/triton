@@ -118,6 +118,22 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @semaphore_buffer_result_must_be_mutable() {
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>
+    %sem = nvws.semaphore.create %buf true : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>
+    %tok = nvws.semaphore.acquire %sem : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]> -> !ttg.async.token
+    // expected-error @below {{Semaphore buffer result memdesc must be mutable}}
+    %view = nvws.semaphore.buffer %sem, %tok : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared0, #smem>
+    ttg.local_dealloc %buf : !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func @semaphore_create_inconsistent_pending_count() {
     %c0_i32 = arith.constant 0 : i32
     %buf = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>

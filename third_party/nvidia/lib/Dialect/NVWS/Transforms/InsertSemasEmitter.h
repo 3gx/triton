@@ -90,7 +90,7 @@ struct EmitState {
   getBuffers(OpBuilder &b, Operation *op, Value sem, Value token,
              std::optional<PartitionId> owner, bool freshAcquire,
              BufferGroup &group, const GroupBacking &backing,
-             ArrayRef<const AccessTouch *> touches, bool writes);
+             ArrayRef<const AccessTouch *> touches);
   const EmitterTransitionPlan &transitionPlan() const { return *transitions; }
 };
 
@@ -634,8 +634,8 @@ static MemDescType withMutableMemory(MemDescType type, bool mutableMemory) {
 }
 
 static MemDescType getLocalSemaphoreBufferType(
-    unsigned memberIdx, ArrayRef<const AccessTouch *> touches, Type backingType,
-    bool mutableMemory) {
+    unsigned memberIdx, ArrayRef<const AccessTouch *> touches,
+    Type backingType) {
   for (const AccessTouch *touch : touches) {
     if (touch->memberIdx != memberIdx) continue;
     Value viewValue = touch->accessValue;
@@ -649,11 +649,11 @@ static MemDescType getLocalSemaphoreBufferType(
       viewValue = step.op->getResult(0);
     }
     if (auto accessTy = dyn_cast<MemDescType>(viewValue.getType()))
-      return withMutableMemory(accessTy, mutableMemory);
+      return withMutableMemory(accessTy, /*mutableMemory=*/true);
   }
   return withMutableMemory(
       getSemaphoreViewBufferType(cast<MemDescType>(backingType)),
-      mutableMemory);
+      /*mutableMemory=*/true);
 }
 
 static FailureOr<unsigned> getBackingIndex(Operation *op,
@@ -666,10 +666,9 @@ static FailureOr<unsigned> getBackingIndex(Operation *op,
   return it->second;
 }
 
-static SmallVector<Type, 4> getSemaphoreBufferViewTypes(BufferGroup &group,
-                                                        const GroupBacking &backing,
-                                                        ArrayRef<const AccessTouch *> touches,
-                                                        bool mutableMemory) {
+static SmallVector<Type, 4>
+getSemaphoreBufferViewTypes(BufferGroup &group, const GroupBacking &backing,
+                            ArrayRef<const AccessTouch *> touches) {
   SmallVector<Type, 4> viewTypes;
   for (auto [idx, type] : llvm::enumerate(backing.bufferTypes)) {
     auto memDescType = cast<MemDescType>(type);
@@ -677,8 +676,7 @@ static SmallVector<Type, 4> getSemaphoreBufferViewTypes(BufferGroup &group,
       viewTypes.push_back(getSemaphoreViewBufferType(memDescType));
     else
       viewTypes.push_back(getLocalSemaphoreBufferType(
-          backing.memberIndices[static_cast<unsigned>(idx)], touches, type,
-          mutableMemory));
+          backing.memberIndices[static_cast<unsigned>(idx)], touches, type));
   }
   return viewTypes;
 }
@@ -687,10 +685,9 @@ static SemaphoreBufferOp
 emitSemaphoreBuffer(OpBuilder &b, Location loc, Value sem, Value token,
                     std::optional<PartitionId> owner, StageCluster stageCluster,
                     BufferGroup &group, const GroupBacking &backing,
-                    ArrayRef<const AccessTouch *> touches,
-                    bool mutableMemory) {
+                    ArrayRef<const AccessTouch *> touches) {
   SmallVector<Type, 4> viewTypes =
-      getSemaphoreBufferViewTypes(group, backing, touches, mutableMemory);
+      getSemaphoreBufferViewTypes(group, backing, touches);
   return createIntoPartition<SemaphoreBufferOp>(
       b, loc, {owner, stageCluster}, sem, TypeRange(viewTypes), token);
 }
@@ -777,11 +774,13 @@ static Value materializeAliasForBuffer(OpBuilder &b, const AccessTouch &touch,
       mapping.map(operand, idx == step.sourceOperand ? cur : operand);
     Value source = cur;
     Operation *cloned = b.clone(*old, mapping);
-    if (auto trans = dyn_cast<MemDescTransOp>(cloned)) {
-      auto resultTy = cast<MemDescType>(trans.getResult().getType());
+    if (cloned->hasTrait<OpTrait::MemDescViewTrait>() &&
+        cloned->getNumResults() == 1) {
+      auto resultTy = dyn_cast<MemDescType>(cloned->getResult(0).getType());
       auto sourceTy = cast<MemDescType>(source.getType());
-      trans.getResult().setType(
-          withMutableMemory(resultTy, sourceTy.getMutableMemory()));
+      if (resultTy)
+        cloned->getResult(0).setType(
+            withMutableMemory(resultTy, sourceTy.getMutableMemory()));
     }
     cur = cloned->getResult(0);
   }
@@ -1087,7 +1086,7 @@ SmallVector<Value, 4>
 EmitState::getBuffers(OpBuilder &b, Operation *op, Value sem, Value token,
                       std::optional<PartitionId> owner, bool freshAcquire,
                       BufferGroup &group, const GroupBacking &backing,
-                      ArrayRef<const AccessTouch *> touches, bool writes) {
+                      ArrayRef<const AccessTouch *> touches) {
   StageCluster stageCluster = getStageCluster(op);
   bool canReuse =
       !freshAcquire && current.canReuseBuffer(sem, token, backing.bufferTypes.size());
@@ -1095,7 +1094,7 @@ EmitState::getBuffers(OpBuilder &b, Operation *op, Value sem, Value token,
     return SmallVector<Value, 4>(current.buffers.begin(), current.buffers.end());
   SemaphoreBufferOp bufferOp =
       emitSemaphoreBuffer(b, op->getLoc(), sem, token, owner, stageCluster, group,
-                          backing, touches, writes);
+                          backing, touches);
   if (!owner)
     setPartitionFromAnchor(bufferOp.getOperation(), op);
   if (!owner)
@@ -1135,7 +1134,7 @@ static LogicalResult emitAccessTransition(OpBuilder &b, AccessEvent &event,
 
   SmallVector<Value, 4> buffers =
       state.getBuffers(b, op, sem, token, event.owner, !acquires.empty(), group,
-                       backing, touches, writes);
+                       backing, touches);
   Operation *bufferOperation = getBufferDefiningOp(buffers);
   Operation *retargetOp = op;
   bool ownsAsyncToken = accessOwnsAsyncToken(op, touches, group);
@@ -1889,7 +1888,7 @@ static void prebufferLocalRegionEntry(OpBuilder &b, Operation *anchor,
   SemaphoreBufferOp bufferOp =
       emitSemaphoreBuffer(b, anchor->getLoc(), acquire.semaphore, acquire.token,
                           acquire.owner, getStageCluster(anchor), group, backing,
-                          touches, /*mutableMemory=*/false);
+                          touches);
   if (!acquire.owner)
     setPartitionFromAnchor(bufferOp.getOperation(), anchor);
   if (!acquire.owner)
