@@ -1545,10 +1545,10 @@ static LogicalResult emitDeferredNestedExitTransitions(
   return success();
 }
 
-static bool linearChainNeedsPerEdgeFulls(const SyncGroup &syncGroup,
-                                         const SyncPlan &sp,
-                                         BufferGroup &group,
-                                         int64_t resourceKey) {
+static bool linearChainRequiresPerEdgeSemaphores(const SyncGroup &syncGroup,
+                                                 const SyncPlan &sp,
+                                                 BufferGroup &group,
+                                                 int64_t resourceKey) {
   if (!group.isTmem())
     return false;
   std::optional<int64_t> firstOffset;
@@ -1569,9 +1569,9 @@ static bool linearChainNeedsPerEdgeFulls(const SyncGroup &syncGroup,
   return false;
 }
 
-static bool linearChainAnchorsLoopExit(const SyncGroup &syncGroup,
-                                       const SyncPlan &sp, Operation *forOp,
-                                       Region *region) {
+static bool groupTouchesLoopBoundary(const SyncGroup &syncGroup,
+                                     const SyncPlan &sp, Operation *forOp,
+                                     Region *region) {
   if (!forOp || !region)
     return false;
   for (unsigned edgeIdx : syncGroup.edgeIdxs) {
@@ -1583,7 +1583,7 @@ static bool linearChainAnchorsLoopExit(const SyncGroup &syncGroup,
   return false;
 }
 
-static bool linearChainNeedsLoopExitClosure(
+static bool loopCloseStateTransitionApplies(
     unsigned groupIdx, const SyncGroup &syncGroup, Operation *forOp,
     Region *region, const EmitterTransitionPlan &transitions,
     const OptSyncDag &dag, const SyncPlan &sp) {
@@ -1609,17 +1609,28 @@ static bool linearChainNeedsLoopExitClosure(
   return false;
 }
 
-static FailureOr<Value> emitLoopExitStateRelease(
+struct LoopCloseTransition {
+  std::optional<unsigned> releaseEdgeIdx;
+  std::optional<unsigned> acquireEdgeIdx;
+  std::optional<unsigned> postAcquireReleaseEdgeIdx;
+  std::optional<PartitionId> releaseOwner;
+  std::optional<PartitionId> acquireOwner;
+  AsyncOp releasePayload = AsyncOp::NONE;
+  AsyncOp postAcquireReleasePayload = AsyncOp::NONE;
+  bool preferPlannedRelease = false;
+};
+
+static FailureOr<Value> releaseCurrentStateForEdge(
     OpBuilder &b, Location loc, scf::ForOp forOp, unsigned edgeIdx, Value token,
     std::optional<PartitionId> owner, AsyncOp payload, const SyncPlan &sp,
     EmitState &state) {
   if (edgeIdx >= sp.edges.size())
     return forOp->emitError(
-        "nvws-insert-semas: loop-exit drain release references an invalid edge");
+        "nvws-insert-semas: loop close release references an invalid edge");
   const SyncEdge &edge = sp.edges[edgeIdx];
   if (!edgeRequiresRelease(edge))
     return forOp->emitError(
-        "nvws-insert-semas: loop-exit drain release is not backed by a "
+        "nvws-insert-semas: loop close release is not backed by a "
         "partition transition edge");
   Value sem = state.semas.forClass(sp, edgeIdx);
   emitRelease(b, loc, sem, token, owner, StageCluster{}, payload);
@@ -1634,23 +1645,22 @@ static AsyncOp carriedProducerPayloadForOwner(
   return AsyncOp::NONE;
 }
 
-static FailureOr<bool> closeLinearChainLoopStateAfter(
+static std::optional<LoopCloseTransition> buildLoopCloseTransition(
     scf::ForOp forOp, Region *region, unsigned groupIdx, const OptSyncDag &dag,
-    const SyncPlan &sp, BufferGroup &group, EmitState &state) {
+    const SyncPlan &sp, BufferGroup &group, const EmitState &state) {
   const EmitterTransitionPlan &transitions = state.transitionPlan();
   const SyncGroup &syncGroup = dag.groups[groupIdx];
   if (syncGroup.kind != SyncGroupKind::LinearChain ||
       syncGroup.edgeIdxs.size() < 2)
-    return false;
-  if (linearChainNeedsPerEdgeFulls(syncGroup, sp, group, dag.resource.second))
-    return false;
-  if (!linearChainNeedsLoopExitClosure(groupIdx, syncGroup, forOp.getOperation(),
+    return std::nullopt;
+  if (linearChainRequiresPerEdgeSemaphores(syncGroup, sp, group,
+                                           dag.resource.second))
+    return std::nullopt;
+  if (!loopCloseStateTransitionApplies(groupIdx, syncGroup, forOp.getOperation(),
                                        region, transitions, dag, sp))
-    return false;
+    return std::nullopt;
 
-  OpBuilder b(forOp);
-  b.setInsertionPointAfter(forOp);
-  Location loc = forOp.getLoc();
+  LoopCloseTransition transition;
 
   bool skipsInitialCarrier =
       dag.skippedInitialLoopCarrierRegion.lookup(groupIdx) == region;
@@ -1659,13 +1669,10 @@ static FailureOr<bool> closeLinearChainLoopStateAfter(
       const SyncEdge &edge = sp.edges[edgeIdx];
       if (!dag.edgesDeferringToSkippedLoopExit.contains(edgeIdx))
         continue;
-      FailureOr<Value> sem = emitLoopExitStateRelease(
-          b, loc, forOp, edgeIdx, state.current.token, state.current.owner,
-          edge.asyncPayload, sp, state);
-      if (failed(sem))
-        return failure();
-      state.current.setSemaphore(*sem);
-      return true;
+      transition.releaseEdgeIdx = edgeIdx;
+      transition.releaseOwner = state.current.owner;
+      transition.releasePayload = edge.asyncPayload;
+      return transition;
     }
   }
 
@@ -1715,39 +1722,89 @@ static FailureOr<bool> closeLinearChainLoopStateAfter(
     emptyPayload = secondEdge.asyncPayload;
   }
 
-  Value fullSem = state.semas.forClass(sp, fullEdgeIdx);
-  bool emittedPlannedFullRelease = false;
-  if (auto it = transitions.opExitReleases.find(forOp.getOperation());
-      it != transitions.opExitReleases.end())
-    for (const PlannedRelease &action : it->second) {
-      if (!llvm::is_contained(action.edgeIdxs, fullEdgeIdx))
-        continue;
-      if (failed(state.release(b, loc, SyncAnchorKind::ReleaseAfterOp,
-                               forOp.getOperation(), nullptr, action, dag, sp, group,
-                               StageCluster{})))
-        return failure();
-      emittedPlannedFullRelease = true;
-      break;
-    }
+  transition.releaseEdgeIdx = fullEdgeIdx;
+  transition.acquireEdgeIdx = fullEdgeIdx;
+  transition.postAcquireReleaseEdgeIdx = secondEdgeIdx;
+  transition.releaseOwner = fullOwner;
+  transition.acquireOwner = drainOwner;
+  transition.releasePayload = fullPayload;
+  transition.postAcquireReleasePayload = emptyPayload;
+  transition.preferPlannedRelease = true;
+  return transition;
+}
 
-  if (!emittedPlannedFullRelease) {
-    FailureOr<Value> sem = emitLoopExitStateRelease(
-        b, loc, forOp, fullEdgeIdx, state.current.token, fullOwner, fullPayload,
-        sp, state);
-    if (failed(sem))
-      return failure();
-    fullSem = *sem;
+static FailureOr<bool> applyLoopCloseTransitionAfter(
+    scf::ForOp forOp, const LoopCloseTransition &transition,
+    const OptSyncDag &dag, const SyncPlan &sp, BufferGroup &group,
+    EmitState &state) {
+  OpBuilder b(forOp);
+  b.setInsertionPointAfter(forOp);
+  Location loc = forOp.getLoc();
+
+  Value acquireSem;
+  bool emittedPlannedFullRelease = false;
+  if (transition.releaseEdgeIdx)
+    acquireSem = state.semas.forClass(sp, *transition.releaseEdgeIdx);
+  if (transition.preferPlannedRelease) {
+    if (auto it = state.transitionPlan().opExitReleases.find(forOp.getOperation());
+        it != state.transitionPlan().opExitReleases.end()) {
+      for (const PlannedRelease &action : it->second) {
+        if (!transition.releaseEdgeIdx ||
+            !llvm::is_contained(action.edgeIdxs, *transition.releaseEdgeIdx))
+          continue;
+        if (failed(state.release(b, loc, SyncAnchorKind::ReleaseAfterOp,
+                                 forOp.getOperation(), nullptr, action, dag, sp,
+                                 group, StageCluster{})))
+          return failure();
+        emittedPlannedFullRelease = true;
+        break;
+      }
+    }
   }
 
-  SemaphoreAcquireOp acquire =
-      emitAcquire(b, loc, fullSem, drainOwner, StageCluster{});
-  FailureOr<Value> emptySem =
-      emitLoopExitStateRelease(b, loc, forOp, secondEdgeIdx, acquire.getToken(),
-                               drainOwner, emptyPayload, sp, state);
-  if (failed(emptySem))
+  if (transition.releaseEdgeIdx && !emittedPlannedFullRelease) {
+    FailureOr<Value> sem = releaseCurrentStateForEdge(
+        b, loc, forOp, *transition.releaseEdgeIdx, state.current.token,
+        transition.releaseOwner, transition.releasePayload, sp, state);
+    if (failed(sem))
+      return failure();
+    acquireSem = *sem;
+  }
+
+  if (!transition.acquireEdgeIdx) {
+    if (acquireSem)
+      state.current.setSemaphore(acquireSem);
+    return true;
+  }
+  if (!acquireSem)
+    acquireSem = state.semas.forClass(sp, *transition.acquireEdgeIdx);
+  SemaphoreAcquireOp acquire = emitAcquire(b, loc, acquireSem,
+                                           transition.acquireOwner,
+                                           StageCluster{});
+  if (!transition.postAcquireReleaseEdgeIdx) {
+    state.current.setCarrier(acquireSem, acquire.getToken(),
+                             transition.acquireOwner);
+    return true;
+  }
+  FailureOr<Value> nextSem = releaseCurrentStateForEdge(
+      b, loc, forOp, *transition.postAcquireReleaseEdgeIdx, acquire.getToken(),
+      transition.acquireOwner, transition.postAcquireReleasePayload, sp, state);
+  if (failed(nextSem))
     return failure();
-  state.current.setCarrier(*emptySem, acquire.getToken(), drainOwner);
+  state.current.setCarrier(*nextSem, acquire.getToken(),
+                           transition.acquireOwner);
   return true;
+}
+
+static FailureOr<bool> closeStateMachineLoopTransitionAfter(
+    scf::ForOp forOp, Region *region, unsigned groupIdx, const OptSyncDag &dag,
+    const SyncPlan &sp, BufferGroup &group, EmitState &state) {
+  std::optional<LoopCloseTransition> transition =
+      buildLoopCloseTransition(forOp, region, groupIdx, dag, sp, group, state);
+  if (!transition)
+    return false;
+  return applyLoopCloseTransitionAfter(forOp, *transition, dag, sp, group,
+                                       state);
 }
 
 static LogicalResult closeLoopSemaphoreStateAfter(scf::ForOp forOp,
@@ -1767,14 +1824,14 @@ static LogicalResult closeLoopSemaphoreStateAfter(scf::ForOp forOp,
   } else {
     for (auto [idx, syncGroup] : llvm::enumerate(dag.groups))
       if (syncGroup.kind == SyncGroupKind::LinearChain &&
-          linearChainAnchorsLoopExit(syncGroup, sp, forOp.getOperation(), region))
+          groupTouchesLoopBoundary(syncGroup, sp, forOp.getOperation(), region))
         groupIds.push_back(static_cast<unsigned>(idx));
   }
 
   for (unsigned groupIdx : groupIds) {
     FailureOr<bool> closed =
-        closeLinearChainLoopStateAfter(forOp, region, groupIdx, dag, sp, group,
-                                       state);
+        closeStateMachineLoopTransitionAfter(forOp, region, groupIdx, dag, sp,
+                                             group, state);
     if (failed(closed))
       return failure();
     if (*closed)

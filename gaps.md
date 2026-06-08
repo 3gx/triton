@@ -49,26 +49,25 @@ Plan checked: `plans/emiiter-tmem-semaphore-state-machine-plan.md`.
      `test/NVWS/insert_semas.mlir` plus
      `test/NVWS/insert_semas_nested_carrier.mlir`, and full lit baseline.
 
-6. TMEM linear loop-exit drain is no longer semantic emitter logic.
+6. TMEM loop close is emitted as a state-machine close transition.
    - Evidence to re-check: no `emitTmemLinearLoopExitDrain`,
      `PlannedLoopExitDrain`, `PlannedDrainRelease`, `loopExitDrains`,
      `buildLoopExitDrain*`, `emitPlannedLoopExitDrains`, or
-     `emitPlannedDrainRelease` in `InsertSemas*.{h,cpp}`.
-     `closeLoopSemaphoreStateAfter` / `closeLinearChainLoopStateAfter` close
-     the loop from `EmitState::current` after the loop body has been walked.
-   - Current status: closed. Verified with build, the 20-test
-     `insert_semas` lit filter, `test/NVWS/tmem-buffer-reuse-semas.mlir`, and
-     full NVWS lit.
+     `emitPlannedDrainRelease` in `InsertSemas*.{h,cpp}`. Also no
+     `closeLinearChainLoopStateAfter`, `emitLoopExitStateRelease`, or
+     `linearChainNeedsLoopExitClosure` in `InsertSemas*.{h,cpp}`.
+     `buildLoopCloseTransition` materializes a `LoopCloseTransition` from the
+     carried `EmitState::current`, and `applyLoopCloseTransitionAfter` applies
+     the state step as release-current / optional acquire / optional release-next
+     before updating the carried state.
+   - Current status: closed with caveat. The emitter now applies an explicit
+     state-machine loop close instead of an ad hoc drain helper. Caveat: the
+     transition selector still has LinearChain compatibility predicates and
+     consults loop-exit metadata from `OptSyncDag` because the byte-identical
+     collapsed-class output still needs to distinguish skipped initial carriers,
+     loop-entry handoffs, and deferred terminal loop reads.
 
-7. LoC target is met.
-   - Evidence to re-check:
-     `wc -l third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemas*.{h,cpp}`
-     reports 7086 total, below the plan target of 7090.
-   - Current status: closed. The obsolete `InsertSemasEmitSchedule.h`
-     action-list diagnostic is deleted; the `RELEASED-SEMAPHORES` dump is
-     retained without the old M1 violation text.
-
-8. Source-yield producer payload promotion is no longer a transition-plan
+7. Source-yield producer payload promotion is no longer a transition-plan
    payload derivation rule.
    - Evidence to re-check: no `useCarriedProducerPayload`,
      `findLastProducerInRegion`, `canPromoteYieldProducerPayload`, or
@@ -77,24 +76,36 @@ Plan checked: `plans/emiiter-tmem-semaphore-state-machine-plan.md`.
      `EmitState::release` uses `releaseShouldUseCarriedProducerState` to
      decide whether the current carried producer state is valid for the release.
    - Current status: closed. Verified with build, the 20-test
-     `insert_semas` lit filter, and full NVWS lit.
+     `insert_semas` lit filter, and full NVWS lit in the earlier iteration.
 
 ## Caveats To Revisit Later
 
-1. Placement predicates still exist in transition-plan derivation.
-   - Current status: accepted caveat, not an open blocker for this iteration.
-   - Evidence: `transitionLastValueUserInBlock`,
-     `transitionHasLaterResourceAccess`, `transitionAccessCompletion`,
-     `transitionReleaseBeforeAcquire`, and
-     `transitionReleaseWaitsForReadCompletion` in
-     `InsertSemasOptSyncDag.h`.
-
-2. Carrier slot selection still uses existing loop token slots when they are
+1. Carrier slot selection still uses existing loop token slots when they are
    already the byte-identical live carrier.
    - Current status: accepted caveat. Blindly appending new carriers changed
      golden loop arity and broke the plan's byte-identical constraint, so the
      implementation keeps local slot selection plus local normalization.
 
+2. Loop-close transition selection is still LinearChain-aware.
+   - Current status: accepted caveat for this iteration. The close operation is
+     now a carried-state transition, but selecting that transition still uses
+     LinearChain compatibility facts from `OptSyncDag` to preserve frozen output.
+
 ## Remaining Gaps
 
-None for this iteration.
+1. High: release placement still has transition-plan predicates.
+   - Evidence: `transitionLastValueUserInBlock`,
+     `transitionHasLaterResourceAccess`, `transitionAccessCompletion`,
+     `transitionReleaseBeforeAcquire`, and
+     `transitionReleaseWaitsForReadCompletion` in
+     `InsertSemasOptSyncDag.h`.
+   - Why still open: this iteration only closed loop-close emission. Placement
+     still uses compatibility predicates during transition-plan derivation rather
+     than falling entirely out of the carried state walk.
+
+2. Low: LoC target is not met.
+   - Evidence to re-check:
+     `wc -l third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemas*.{h,cpp}`
+     currently reports 7182 total, above the plan target of 7090.
+   - Why still open: the user explicitly asked not to focus on line count in the
+     current loop-close iteration.
