@@ -421,9 +421,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK: [[TOK_A:%.*]] = nvws.semaphore.acquire [[FULL_A]]
     %tok = nvws.semaphore.acquire %full : !nvws.semaphore<[!ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>]> -> !ttg.async.token
     // CHECK: [[BUF_A:%.*]] = nvws.semaphore.buffer [[FULL_A]][
-    %buf = nvws.semaphore.buffer %full, %tok : !nvws.semaphore<[!ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>]>, !ttg.async.token -> !ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>
+    %buf = nvws.semaphore.buffer %full, %tok : !nvws.semaphore<[!ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>]>, !ttg.async.token -> !ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory, mutable>
     // CHECK: ttng.tc_gen5_mma_scaled {{.*}}, [[BUF_A]], {{.*}}, %true, %true lhs = e4m3 rhs = e4m3
-    ttng.tc_gen5_mma_scaled %arg0, %arg1, %acc, %buf, %arg2, %true, %true lhs = e4m3 rhs = e4m3 : !ttg.memdesc<128x64xf16, #shared9, #smem9>, !ttg.memdesc<64x128xf16, #shared9, #smem9>, !ttg.memdesc<128x128xf32, #tmem9, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>, !ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>
+    ttng.tc_gen5_mma_scaled %arg0, %arg1, %acc, %buf, %arg2, %true, %true lhs = e4m3 rhs = e4m3 : !ttg.memdesc<128x64xf16, #shared9, #smem9>, !ttg.memdesc<64x128xf16, #shared9, #smem9>, !ttg.memdesc<128x128xf32, #tmem9, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>
     // CHECK: nvws.semaphore.release [[EMPTY_A]][
     nvws.semaphore.release %empty, %tok [#nvws.async_op<tc5mma>] : !nvws.semaphore<[!ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>]>, !ttg.async.token
     tt.return
@@ -440,9 +440,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK: [[TOK_B:%.*]] = nvws.semaphore.acquire [[FULL_B]]
     %tok = nvws.semaphore.acquire %full : !nvws.semaphore<[!ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>]> -> !ttg.async.token
     // CHECK: [[BUF_B:%.*]] = nvws.semaphore.buffer [[FULL_B]][
-    %buf = nvws.semaphore.buffer %full, %tok : !nvws.semaphore<[!ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>]>, !ttg.async.token -> !ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>
+    %buf = nvws.semaphore.buffer %full, %tok : !nvws.semaphore<[!ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>]>, !ttg.async.token -> !ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory, mutable>
     // CHECK: ttng.tc_gen5_mma_scaled {{.*}}, {{.*}}, [[BUF_B]], %true, %true lhs = e4m3 rhs = e4m3
-    ttng.tc_gen5_mma_scaled %arg0, %arg1, %acc, %arg2, %buf, %true, %true lhs = e4m3 rhs = e4m3 : !ttg.memdesc<128x64xf16, #shared9, #smem9>, !ttg.memdesc<64x128xf16, #shared9, #smem9>, !ttg.memdesc<128x128xf32, #tmem9, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>, !ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>
+    ttng.tc_gen5_mma_scaled %arg0, %arg1, %acc, %arg2, %buf, %true, %true lhs = e4m3 rhs = e4m3 : !ttg.memdesc<128x64xf16, #shared9, #smem9>, !ttg.memdesc<64x128xf16, #shared9, #smem9>, !ttg.memdesc<128x128xf32, #tmem9, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>, !ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory, mutable>
     // CHECK: nvws.semaphore.release [[EMPTY_B]][
     nvws.semaphore.release %empty, %tok [#nvws.async_op<tc5mma>] : !nvws.semaphore<[!ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>]>, !ttg.async.token
     tt.return

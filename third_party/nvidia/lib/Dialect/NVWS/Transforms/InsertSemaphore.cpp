@@ -710,7 +710,7 @@ void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
   SetVector<int> consumerPartitions;
   consumerPartitions.insert(consumerPartition);
   auto allocBufType = cast<MemDescType>(sema.alloc.getType());
-  Type bufferType = getBufferViewType(allocBufType, /*mutable*/ false);
+  Type bufferType = getBufferViewType(allocBufType, /*mutable*/ true);
 
   // Acquire full semaphore
   auto acquire = createInto<SemaphoreAcquireOp>(

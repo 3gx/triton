@@ -19,8 +19,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // SMEM: [[LHS:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
   // SMEM: [[RHS:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
   // SMEM: nvws.descriptor_load {{.*}} [[LHS]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>}
-  // SMEM: [[RHS_CONSUMER:%.*]] = ttg.memdesc_reinterpret [[RHS]] {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>}
-  // SMEM: ttg.memdesc_trans [[RHS_CONSUMER]]
+  // SMEM: [[RHS_CONSUMER:%.*]] = ttg.memdesc_trans [[RHS]] {loop.cluster = 0 : i32, loop.stage = 1 : i32, order = array<i32: 1, 0>, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x128xf16, #shared1, #smem, mutable>
   tt.func @warp_specialize_tma_matmul(%arg0: i32, %arg1: i32, %arg2: i32, %arg3: !tt.tensordesc<tensor<128x64xf16, #shared>>, %arg4: !tt.tensordesc<tensor<128x64xf16, #shared>>) {
     %true = arith.constant true
     %c0_i32 = arith.constant 0 : i32
@@ -78,8 +77,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // SMEM-LABEL: tt.func @value_semaphore_multiple_producers
   // SMEM: [[SSA_BUF:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared{{[0-9]*}}, #smem, mutable>
   // SMEM: ttg.local_store {{.*}}, [[SSA_BUF]]
-  // SMEM: [[SSA_CONSUMER:%.*]] = ttg.memdesc_reinterpret [[SSA_BUF]] {{.*}}ttg.partition = array<i32: 2>} : {{.*}} -> !ttg.memdesc<128x64xf16, #shared{{[0-9]*}}, #smem>
-  // SMEM: [[SSA_LOAD:%.*]] = ttg.local_load [[SSA_CONSUMER]]
+  // SMEM: [[SSA_LOAD:%.*]] = ttg.local_load [[SSA_BUF]] {{.*}}ttg.partition = array<i32: 2>} : !ttg.memdesc<128x64xf16, #shared{{[0-9]*}}, #smem, mutable> -> tensor<128x64xf16, #blocked1>
   // SMEM: "use2"([[SSA_LOAD]])
   tt.func @value_semaphore_multiple_producers(%arg0: tensor<128x64xf16, #blocked1>, %arg1: i32) {
     %c0_i32 = arith.constant 0 : i32
@@ -99,8 +97,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // SMEM: nvws.descriptor_load {{.*}} [[REG_SMEM_PRODUCER:%.*]] {{.*}}ttg.partition = array<i32: 2>}
   // SMEM: [[REG_LOAD:%.*]] = ttg.local_load {{.*}} {{.*}}ttg.partition = array<i32: 0>}
   // SMEM: "use1"([[REG_LOAD]]) {{.*}}ttg.partition = array<i32: 0>}
-  // SMEM: [[SMEM_VIEW:%.*]] = ttg.memdesc_reinterpret [[REG_SMEM_BUF]] {{.*}}ttg.partition = array<i32: 1>} : {{.*}} -> !ttg.memdesc<128x64xf16, #shared, #smem>
-  // SMEM: "use2"([[SMEM_VIEW]]) {{.*}}ttg.partition = array<i32: 1>}
+  // SMEM: "use2"([[REG_SMEM_BUF]]) {{.*}}ttg.partition = array<i32: 1>} : (!ttg.memdesc<128x64xf16, #shared, #smem, mutable>) -> ()
   tt.func @load_used_as_reg_and_smem(%arg0: !tt.tensordesc<tensor<128x64xf16, #shared>>, %arg1: i32) {
     %c0_i32 = arith.constant 0 : i32
     %c1_i32 = arith.constant 1 : i32
@@ -198,7 +195,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // SMEM-LABEL: tt.func @descriptor_store_via_convert_uses_descriptor_encoding
   // SMEM: [[DESC_CONV_BUF:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
   // SMEM: ttg.local_store {{.*}}, {{.*}} : tensor<128x128xf16, #linear> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-  // SMEM: [[DESC_CONV_LOAD:%.*]] = ttg.local_load {{.*}} : !ttg.memdesc<128x128xf16, #shared, #smem> -> tensor<128x128xf16, #linear>
+  // SMEM: [[DESC_CONV_LOAD:%.*]] = ttg.local_load {{.*}} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #linear>
   // SMEM: [[DESC_CONV:%.*]] = ttg.convert_layout [[DESC_CONV_LOAD]]
   // SMEM: tt.descriptor_store {{.*}}, [[DESC_CONV]]
   tt.func @descriptor_store_via_convert_uses_descriptor_encoding(%desc: !tt.tensordesc<tensor<128x128xf16, #shared>>, %lb: i32, %ub: i32, %step: i32) {
@@ -214,7 +211,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // SMEM-LABEL: tt.func @descriptor_store_direct_uses_descriptor_encoding
   // SMEM: [[DESC_DIRECT_BUF:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
   // SMEM: ttg.local_store {{.*}}, {{.*}} : tensor<128x128xf16, #blocked> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-  // SMEM: [[DESC_DIRECT_LOAD:%.*]] = ttg.local_load {{.*}} : !ttg.memdesc<128x128xf16, #shared, #smem> -> tensor<128x128xf16, #blocked>
+  // SMEM: [[DESC_DIRECT_LOAD:%.*]] = ttg.local_load {{.*}} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #blocked>
   // SMEM: tt.descriptor_store {{.*}}, [[DESC_DIRECT_LOAD]]
   tt.func @descriptor_store_direct_uses_descriptor_encoding(%desc: !tt.tensordesc<tensor<128x128xf16, #shared>>, %lb: i32, %ub: i32, %step: i32) {
     %c0_i32 = arith.constant 0 : i32
@@ -607,8 +604,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // SMEM-LABEL: tt.func @descriptor_gather_alloca
   // SMEM: [[GATHER_BUF:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
   // SMEM: nvws.descriptor_gather {{.*}} [[GATHER_BUF]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>}
-  // SMEM: [[GATHER_CONSUMER:%.*]] = ttg.memdesc_reinterpret [[GATHER_BUF]] {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0>}
-  // SMEM: [[GATHER_LOAD:%.*]] = ttg.local_load [[GATHER_CONSUMER]]
+  // SMEM: [[GATHER_LOAD:%.*]] = ttg.local_load [[GATHER_BUF]] {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked1>
   // SMEM: "use"([[GATHER_LOAD]]) {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0>}
   tt.func @descriptor_gather_alloca(%desc: !tt.tensordesc<tensor<1x64xf16, #shared>>, %idx: tensor<128xi32, #offs>, %lb: i32, %ub: i32, %step: i32) {
     scf.for %i = %lb to %ub step %step : i32 {

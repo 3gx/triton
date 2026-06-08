@@ -209,10 +209,10 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %c1_i32 = arith.constant 1 : i32
     %sem = nvws.semaphore.create %arg0 true : !nvws.semaphore<[!ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>]>
     %tok = nvws.semaphore.acquire %sem[%c0_i32, %c1_i32] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>]> -> !ttg.async.token
-    %view = nvws.semaphore.buffer %sem[%c0_i32], %tok {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>]>, !ttg.async.token -> !ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>
+    %view = nvws.semaphore.buffer %sem[%c0_i32], %tok {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>]>, !ttg.async.token -> !ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory, mutable>
     // CHECK: "use_scale_load"(%arg0) : (!ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>) -> ()
     // CHECK-NOT: ttg.memdesc_index {{.*}}#ttng.tensor_memory_scales_encoding
-    "use_scale_load"(%view) : (!ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>) -> ()
+    "use_scale_load"(%view) : (!ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory, mutable>) -> ()
     nvws.semaphore.release %sem[%c0_i32], %tok [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>]>, !ttg.async.token
     tt.return
   }
