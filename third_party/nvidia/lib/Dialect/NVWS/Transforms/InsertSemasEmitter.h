@@ -1795,16 +1795,15 @@ static LogicalResult closeLoopSemaphoreStateAfter(scf::ForOp forOp,
     return success();
 
   const EmitterTransitionPlan &transitions = state.transitionPlan();
+  if (transitions.regionEntryReleases.contains(region) ||
+      transitions.regionEntryAcquires.contains(region))
+    return success();
+
   SmallVector<unsigned, 2> groupIds;
-  if (auto it = transitions.regionEntryAcquires.find(region);
-      it != transitions.regionEntryAcquires.end()) {
-    groupIds.append(it->second.begin(), it->second.end());
-  } else {
-    for (auto [idx, syncGroup] : llvm::enumerate(dag.groups))
-      if (syncGroup.kind == SyncGroupKind::LinearChain &&
-          groupTouchesLoopBoundary(syncGroup, sp, forOp.getOperation(), region))
-        groupIds.push_back(static_cast<unsigned>(idx));
-  }
+  for (auto [idx, syncGroup] : llvm::enumerate(dag.groups))
+    if (syncGroup.kind == SyncGroupKind::LinearChain &&
+        groupTouchesLoopBoundary(syncGroup, sp, forOp.getOperation(), region))
+      groupIds.push_back(static_cast<unsigned>(idx));
 
   for (unsigned groupIdx : groupIds) {
     FailureOr<bool> closed =
@@ -2603,6 +2602,112 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
   return success();
 }
 
+struct EmittedSyncCounts {
+  unsigned releases = 0;
+  unsigned acquires = 0;
+};
+
+static FailureOr<EmittedSyncCounts>
+countExpectedOptSyncRows(const OptSyncDag &dag, const SyncPlan &sp,
+                         triton::FuncOp funcOp) {
+  EmittedSyncCounts counts;
+  if (sp.initialPermitBeforeOp && !sp.initialPermitName.empty())
+    ++counts.acquires;
+
+  SmallVector<char, 8> groupRendered(dag.groups.size(), 0);
+  if (failed(walkRenderedSyncSites(
+          sp, funcOp, [&](ArrayRef<unsigned> edges, SyncRenderSite site)
+                          -> LogicalResult {
+            (void)site;
+            SmallVector<unsigned, 2> faninHere;
+            for (unsigned edgeIdx : edges) {
+              if (edgeIdx >= dag.edgeToGroup.size())
+                return funcOp.emitError(
+                    "nvws-insert-semas: OPT-SYNC-DAG row references an edge "
+                    "outside the group map");
+              unsigned groupIdx = dag.edgeToGroup[edgeIdx];
+              if (groupIdx >= dag.groups.size())
+                return funcOp.emitError(
+                    "nvws-insert-semas: OPT-SYNC-DAG row references an "
+                    "invalid group");
+              const SyncGroup &syncGroup = dag.groups[groupIdx];
+              switch (syncGroup.kind) {
+              case SyncGroupKind::InitialEmpty:
+                return funcOp.emitError(
+                    "nvws-insert-semas: OPT-SYNC-DAG sync edge maps to an "
+                    "initial-empty group");
+              case SyncGroupKind::ReadyFanout:
+                if (!groupRendered[groupIdx]) {
+                  ++counts.releases;
+                  groupRendered[groupIdx] = 1;
+                }
+                ++counts.acquires;
+                break;
+              case SyncGroupKind::DoneFanin:
+                ++counts.releases;
+                if (!llvm::is_contained(faninHere, groupIdx))
+                  faninHere.push_back(groupIdx);
+                break;
+              case SyncGroupKind::Singleton:
+              case SyncGroupKind::LinearChain:
+                ++counts.releases;
+                ++counts.acquires;
+                break;
+              }
+            }
+            for (unsigned groupIdx : faninHere) {
+              if (groupRendered[groupIdx])
+                continue;
+              ++counts.acquires;
+              groupRendered[groupIdx] = 1;
+            }
+            return success();
+          })))
+    return failure();
+
+  if (sp.initialPermitReleaseAfterOp && !sp.initialPermitName.empty())
+    ++counts.releases;
+  return counts;
+}
+
+static EmittedSyncCounts
+countEmittedSemaphoreOps(triton::FuncOp funcOp,
+                         const ResourceSemaphores &semas) {
+  DenseSet<Value> resourceSemaphores;
+  for (const auto &entry : semas.byClass)
+    if (entry.second)
+      resourceSemaphores.insert(entry.second);
+
+  EmittedSyncCounts counts;
+  funcOp.walk([&](Operation *op) {
+    if (auto releaseOp = dyn_cast<SemaphoreReleaseOp>(op)) {
+      if (resourceSemaphores.contains(releaseOp.getSemaphore()))
+        ++counts.releases;
+      return;
+    }
+    if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(op))
+      if (resourceSemaphores.contains(acquireOp.getSemaphore()))
+        ++counts.acquires;
+  });
+  return counts;
+}
+
+static LogicalResult verifyEmittedSyncCounts(triton::FuncOp funcOp,
+                                             EmittedSyncCounts expected,
+                                             const ResourceSemaphores &semas) {
+  EmittedSyncCounts actual = countEmittedSemaphoreOps(funcOp, semas);
+  if (expected.releases == actual.releases &&
+      expected.acquires == actual.acquires)
+    return success();
+  InFlightDiagnostic diag = funcOp.emitError(
+      "nvws-insert-semas: emitted semaphore counts do not match OPT-SYNC-DAG");
+  diag << " expected releases=" << expected.releases
+       << " actual releases=" << actual.releases
+       << " expected acquires=" << expected.acquires
+       << " actual acquires=" << actual.acquires;
+  return failure();
+}
+
 static LogicalResult emitResource(triton::FuncOp funcOp, BufferGroup &group,
                                   const ResourcePlan &plan, const SyncPlan &sp,
                                   const OptSyncDag &dag,
@@ -2610,6 +2715,10 @@ static LogicalResult emitResource(triton::FuncOp funcOp, BufferGroup &group,
                                   const DenseMap<unsigned, int> &numStagesByGroup,
                                   SetVector<Operation *> &eraseAfterEmission) {
   if (dag.groups.empty()) return success();
+  FailureOr<EmittedSyncCounts> expectedCounts =
+      countExpectedOptSyncRows(dag, sp, funcOp);
+  if (failed(expectedCounts))
+    return failure();
   GroupBacking &backing =
       ensureGroupBacking(group, dag.groupIdx, dag.resource.second,
                          plan.memberIndices, backings, numStagesByGroup);
@@ -2630,6 +2739,8 @@ static LogicalResult emitResource(triton::FuncOp funcOp, BufferGroup &group,
                                                 : record.op);
     poisonTokenResults(poisonBuilder, record.op, record.insertBefore);
   }
+  if (failed(verifyEmittedSyncCounts(funcOp, *expectedCounts, state.semas)))
+    return failure();
   for (Operation *op : llvm::reverse(state.eraseAfterEmission))
     eraseAfterEmission.insert(op);
   return success();
