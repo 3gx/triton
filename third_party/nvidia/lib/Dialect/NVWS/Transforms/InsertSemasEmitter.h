@@ -1311,7 +1311,12 @@ LogicalResult EmitState::release(OpBuilder &b, Location loc, SyncAnchorKind kind
     return group.members.front().allocOp->emitError(
         "nvws-insert-semas: planned release references an invalid group");
   const SyncGroup &syncGroup = dag.groups[groupIdx];
-  if (action.edgeIdxs.empty())
+  bool initialPermitTerminalRelease =
+      action.initialPermitTerminalRelease &&
+      syncGroup.kind == SyncGroupKind::InitialEmpty &&
+      kind == SyncAnchorKind::ReleaseAfterOp && anchor &&
+      anchor == sp.initialPermitReleaseAfterOp;
+  if (action.edgeIdxs.empty() && !initialPermitTerminalRelease)
     return group.members.front().allocOp->emitError(
         "nvws-insert-semas: planned release has no transition edge");
   for (unsigned edgeIdx : action.edgeIdxs) {

@@ -285,11 +285,14 @@ struct PlannedRelease {
   AsyncOp payload = AsyncOp::NONE;
   bool useCarriedOwner = false;
   bool useCarriedPayload = false;
+  bool initialPermitTerminalRelease = false;
 };
 
 inline bool operator==(const PlannedRelease &lhs,
                        const PlannedRelease &rhs) {
-  return lhs.groupIdx == rhs.groupIdx && lhs.edgeIdxs == rhs.edgeIdxs;
+  return lhs.groupIdx == rhs.groupIdx && lhs.edgeIdxs == rhs.edgeIdxs &&
+         lhs.initialPermitTerminalRelease ==
+             rhs.initialPermitTerminalRelease;
 }
 
 struct EmitterTransitionPlan {

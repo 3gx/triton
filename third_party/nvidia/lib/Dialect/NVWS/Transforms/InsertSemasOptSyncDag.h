@@ -731,12 +731,27 @@ buildEmitterTransitionPlan(const OptSyncDag &dag, const SyncPlan &sp,
     return success();
   });
 
-  if (sp.initialPermitReleaseAfterOp && sp.initialPermitEdgeIdx >= 0) {
-    unsigned edgeIdx = static_cast<unsigned>(sp.initialPermitEdgeIdx);
-    if (edgeIdx < sp.edges.size() && edgeIdx < dag.edgeToGroup.size())
-      addPlannedRelease(transitions.opExitReleases,
-                        sp.initialPermitReleaseAfterOp, sp,
-                        dag.edgeToGroup[edgeIdx], edgeIdx);
+  if (sp.initialPermitReleaseAfterOp) {
+    if (sp.initialPermitEdgeIdx >= 0) {
+      unsigned edgeIdx = static_cast<unsigned>(sp.initialPermitEdgeIdx);
+      if (edgeIdx < sp.edges.size() && edgeIdx < dag.edgeToGroup.size())
+        addPlannedRelease(transitions.opExitReleases,
+                          sp.initialPermitReleaseAfterOp, sp,
+                          dag.edgeToGroup[edgeIdx], edgeIdx);
+    } else {
+      for (auto [groupIdxIt, syncGroup] : llvm::enumerate(dag.groups)) {
+        if (syncGroup.kind != SyncGroupKind::InitialEmpty)
+          continue;
+        PlannedRelease release;
+        release.groupIdx = static_cast<unsigned>(groupIdxIt);
+        release.initialPermitTerminalRelease = true;
+        SmallVector<PlannedRelease, 2> &planned =
+            transitions.opExitReleases[sp.initialPermitReleaseAfterOp];
+        if (!llvm::is_contained(planned, release))
+          planned.push_back(std::move(release));
+        break;
+      }
+    }
   }
 
   auto resolveOpReleases = [&](auto &releasesByAnchor, SyncAnchorKind kind) {
