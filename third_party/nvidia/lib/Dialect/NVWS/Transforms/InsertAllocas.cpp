@@ -217,9 +217,18 @@ struct CommunicationBuffer {
   Value empty; // semaphore initially released (producer acquires)
   Value full;  // semaphore initially not released (consumer acquires)
   Value alloc; // underlying buffer allocation
+  bool hasStageDimension = false;
 
   bool hasSemaphores() const { return empty && full; }
 };
+
+MemDescType withMutableMemory(MemDescType type, bool mutableMemory) {
+  if (type.getMutableMemory() == mutableMemory)
+    return type;
+  return MemDescType::get(type.getShape(), type.getElementType(),
+                          type.getEncoding(), type.getMemorySpace(),
+                          mutableMemory, type.getAllocShape());
+}
 
 struct InsertCommunicationOptions {
   bool createSemaphores = true;
@@ -390,18 +399,26 @@ CommunicationBuffer createCommunicationBuffer(
   }
 
   MemDescType allocBufType;
+  bool hasStageDimension = false;
   if (isa<TensorMemorySpaceAttr>(memDescType.getMemorySpace())) {
-    allocBufType = options.createSemaphores
-                       ? getSemaphoreMultiBufferedType(memDescType, 1)
-                       : memDescType;
-  } else {
+    if (options.createSemaphores) {
+      allocBufType = getSemaphoreMultiBufferedType(memDescType, 1);
+      hasStageDimension = true;
+    } else {
+      allocBufType = memDescType;
+    }
+  } else if (options.createSemaphores) {
     allocBufType = getMultiBufferedType(memDescType, 1);
+    hasStageDimension = true;
+  } else {
+    allocBufType = withMutableMemory(memDescType, true);
   }
   auto loc = result.getLoc();
   auto alloc = triton::nvws::createAlloc(builder, loc, allocBufType, Value());
 
   if (!options.createSemaphores)
-    return CommunicationBuffer{Value(), Value(), alloc->getResult(0)};
+    return CommunicationBuffer{Value(), Value(), alloc->getResult(0),
+                               hasStageDimension};
 
   auto baseTypes = TypeArrayAttr::get(builder.getContext(), {allocBufType});
   auto semaTy = SemaphoreType::get(builder.getContext(), baseTypes);
@@ -409,7 +426,8 @@ CommunicationBuffer createCommunicationBuffer(
                                          alloc->getResults(), true);
   auto full = SemaphoreCreateOp::create(builder, loc, semaTy,
                                         alloc->getResults(), false);
-  return CommunicationBuffer{empty, full, alloc->getResult(0)};
+  return CommunicationBuffer{empty, full, alloc->getResult(0),
+                             hasStageDimension};
 }
 
 int getTxCount(Operation *descOp) {
@@ -480,12 +498,23 @@ StageCluster getStageClusterForProducer(Value producedValue) {
 
 Value createStage0BufferView(OpBuilder &builder, Location loc, Value alloc,
                              bool mutableMemory,
+                             bool hasStageDimension,
                              const SetVector<int> &partitions,
                              StageCluster stageCluster,
                              std::optional<int> wsTag) {
   auto allocBufType = cast<MemDescType>(alloc.getType());
   if (isa<TensorMemorySpaceAttr>(allocBufType.getMemorySpace()))
     return alloc;
+
+  if (!hasStageDimension && allocBufType.getMutableMemory() == mutableMemory)
+    return alloc;
+
+  if (!hasStageDimension) {
+    auto viewType = withMutableMemory(allocBufType, mutableMemory);
+    return createInto<MemDescReinterpretOp>(builder, loc, partitions,
+                                            stageCluster, wsTag, viewType, alloc)
+        .getResult();
+  }
 
   auto viewType = MemDescType::get(
       allocBufType.getShape().drop_front(), allocBufType.getElementType(),
@@ -529,6 +558,7 @@ createSemaphoreProducer(OpBuilder &builder, CommunicationBuffer &sema,
   } else {
     dataBuf = createStage0BufferView(builder, loc, sema.alloc,
                                      /*mutableMemory=*/true,
+                                     sema.hasStageDimension,
                                      producerPartitions, stageCluster, wsTag);
   }
 
@@ -786,6 +816,7 @@ void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
   } else {
     dataBuf = createStage0BufferView(builder, loc, sema.alloc,
                                      /*mutableMemory=*/false,
+                                     sema.hasStageDimension,
                                      consumerPartitions, stageClusterEnter,
                                      wsTag);
   }

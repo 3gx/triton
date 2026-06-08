@@ -204,10 +204,6 @@ ensureGroupBacking(BufferGroup &group, unsigned groupIdx,
       copyBufferAttrs(member.allocOp, semAlloc);
       backing.buffers.append(semAlloc->getResults().begin(),
                              semAlloc->getResults().end());
-    } else if (auto localAlloc = dyn_cast<LocalAllocOp>(member.allocOp);
-               localAlloc && !localAlloc.getSrc()) {
-      member.allocOp->setAttr("nvws.semaphore.backing", b.getUnitAttr());
-      backing.buffers.push_back(member.value);
     } else {
       semBufType = getMultiBufferedType(member.type, depth);
       Operation *semAlloc = createAlloc(b, member.allocOp->getLoc(), semBufType,
