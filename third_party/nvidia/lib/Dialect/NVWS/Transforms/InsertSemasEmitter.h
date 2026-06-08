@@ -775,7 +775,14 @@ static Value materializeAliasForBuffer(OpBuilder &b, const AccessTouch &touch,
     IRMapping mapping;
     for (auto [idx, operand] : llvm::enumerate(old->getOperands()))
       mapping.map(operand, idx == step.sourceOperand ? cur : operand);
+    Value source = cur;
     Operation *cloned = b.clone(*old, mapping);
+    if (auto trans = dyn_cast<MemDescTransOp>(cloned)) {
+      auto resultTy = cast<MemDescType>(trans.getResult().getType());
+      auto sourceTy = cast<MemDescType>(source.getType());
+      trans.getResult().setType(
+          withMutableMemory(resultTy, sourceTy.getMutableMemory()));
+    }
     cur = cloned->getResult(0);
   }
   return cur;

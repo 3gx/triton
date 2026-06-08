@@ -506,15 +506,8 @@ Value createStage0BufferView(OpBuilder &builder, Location loc, Value alloc,
   if (isa<TensorMemorySpaceAttr>(allocBufType.getMemorySpace()))
     return alloc;
 
-  if (!hasStageDimension && allocBufType.getMutableMemory() == mutableMemory)
+  if (!hasStageDimension)
     return alloc;
-
-  if (!hasStageDimension) {
-    auto viewType = withMutableMemory(allocBufType, mutableMemory);
-    return createInto<MemDescReinterpretOp>(builder, loc, partitions,
-                                            stageCluster, wsTag, viewType, alloc)
-        .getResult();
-  }
 
   auto viewType = MemDescType::get(
       allocBufType.getShape().drop_front(), allocBufType.getElementType(),
