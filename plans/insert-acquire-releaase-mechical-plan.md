@@ -61,7 +61,11 @@ the DAG rule into a different source-op/destination-op rule.
 3. Build `EmitterTransitionPlan` from those collected DAG row sites.
 4. Remove the endpoint-based mechanical verifier.
 5. Remove placement repair heuristics from transition emission.
-6. Keep semaphore class selection, token threading, backing allocation, and
+6. Delete dead placement-repair code instead of leaving it bypassed. This
+   includes old source/destination endpoint placement, SSA-user completion,
+   post-dominance placement, insertion repair maps, and dead helper functions
+   made unused by mechanical DAG-row placement.
+7. Keep semaphore class selection, token threading, backing allocation, and
    `EmitState` materialization unchanged unless a real verifier failure proves
    they must change.
 
@@ -85,6 +89,11 @@ Focused lit signal:
 /home/egaburov/work/oai-triton/triton-src/llvm-project.git/build//bin/llvm-lit -v test/NVWS/insert_semas*.mlir test/NVWS/tmem-buffer-reuse-semas.mlir
 ```
 
+Lit may fail because mechanical placement can intentionally move release/acquire
+ops relative to current golden checks. Do not fix lit checks in this step unless
+the failure is a build/verifier/runtime correctness failure. Golden lit updates
+are the next step after the mechanical emitter passes runtime gates.
+
 Runtime gates:
 
 ```bash
@@ -92,3 +101,5 @@ PYTHONPATH=/home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/p
 PYTHONPATH=/home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/python timeout 60s sh run_nvws_1.sh
 PYTHONPATH=/home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/python timeout 60s pytest -n16 python/test/unit/language/test_warp_specialization.py
 ```
+
+All three runtime gates must pass for this implementation step.
