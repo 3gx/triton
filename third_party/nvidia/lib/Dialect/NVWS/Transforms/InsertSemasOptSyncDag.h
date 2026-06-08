@@ -557,35 +557,6 @@ static bool plannedReleaseForcesNonePayload(const SyncGroup &syncGroup,
          nextLinearEdgeDstIsConditionalStore(syncGroup, sp, edge);
 }
 
-static const AccessEvent *findLastProducerInRegion(Region *region,
-                                                   BufferGroup &group,
-                                                   int64_t resourceKey) {
-  const AccessEvent *lastProducer = nullptr;
-  Operation *parent = region ? region->getParentOp() : nullptr;
-  if (!parent)
-    return nullptr;
-  for (const AccessEvent &event : group.events)
-    if (event.op && parent->isProperAncestor(event.op) &&
-        eventProduces(event, resourceKey))
-      lastProducer = &event;
-  return lastProducer;
-}
-
-static bool destinationAccessIsInWarpSpecializedLoop(Operation *op) {
-  if (!op)
-    return true;
-  for (Operation *parent = op->getParentOp(); parent;
-       parent = parent->getParentOp())
-    if (auto forOp = dyn_cast<scf::ForOp>(parent))
-      return hasWarpSpecializeTag(forOp);
-  return true;
-}
-
-static bool canPromoteYieldProducerPayload(const SyncEdge *edge) {
-  return edge && edge->srcYieldRegion && !edge->dstYieldRegion &&
-         destinationAccessIsInWarpSpecializedLoop(edge->dstOp);
-}
-
 static void resolvePlannedReleaseState(PlannedRelease &action,
                                        SyncAnchorKind kind, Operation *anchor,
                                        const OptSyncDag &dag,
@@ -630,14 +601,6 @@ static void resolvePlannedReleaseState(PlannedRelease &action,
           : (edge ? edge->asyncPayload : getAsyncPayload(payloadOp));
   action.useCarriedPayload =
       terminalDstReadRelease || terminalLoopExitReadRelease;
-  if (group.isTmem() && canPromoteYieldProducerPayload(edge) &&
-      !terminalDstReadRelease && !terminalLoopExitReadRelease &&
-      action.payload == AsyncOp::NONE)
-    if (const AccessEvent *producer =
-            findLastProducerInRegion(edge->srcYieldRegion, group,
-                                     dag.resource.second))
-      if (sameOwner(producer->owner, edge->srcOwner))
-        action.payload = getAsyncPayload(producer->op);
   if (plannedReleaseForcesNonePayload(syncGroup, sp, edge, kind)) {
     action.payload = AsyncOp::NONE;
     action.useCarriedPayload = false;
@@ -988,201 +951,6 @@ static void resolveEmitterTransitionPlacement(EmitterTransitionPlan &transitions
   }
 }
 
-static bool linearChainNeedsPerEdgeFulls(const SyncGroup &syncGroup,
-                                         const SyncPlan &sp,
-                                         BufferGroup &group,
-                                         int64_t resourceKey) {
-  if (!group.isTmem())
-    return false;
-  std::optional<int64_t> firstOffset;
-  for (unsigned edgeIdx : syncGroup.edgeIdxs) {
-    for (const AccessTouch &touch : sp.edges[edgeIdx].touches) {
-      if (touch.resourceKey != resourceKey ||
-          touch.memberIdx >= group.members.size())
-        continue;
-      int64_t offset = group.members[touch.memberIdx].offset;
-      if (!firstOffset) {
-        firstOffset = offset;
-        continue;
-      }
-      if (*firstOffset != offset)
-        return true;
-    }
-  }
-  return false;
-}
-
-static bool linearChainAnchorsLoopExit(const SyncGroup &syncGroup,
-                                       const SyncPlan &sp, Operation *forOp,
-                                       Region *region) {
-  if (!forOp || !region)
-    return false;
-  for (unsigned edgeIdx : syncGroup.edgeIdxs) {
-    const SyncEdge &edge = sp.edges[edgeIdx];
-    if (edge.srcOp == forOp || edge.dstOp == forOp ||
-        edge.srcYieldRegion == region || edge.dstYieldRegion == region)
-      return true;
-  }
-  return false;
-}
-
-static bool linearChainNeedsLoopExitDrain(unsigned groupIdx,
-                                          const SyncGroup &syncGroup,
-                                          Operation *forOp, Region *region,
-                                          const EmitterTransitionPlan &transitions,
-                                          const OptSyncDag &dag,
-                                          const SyncPlan &sp) {
-  if (!forOp || !region)
-    return false;
-  if (auto it = transitions.opExitReleases.find(forOp);
-      it != transitions.opExitReleases.end())
-    for (const PlannedRelease &action : it->second)
-      if (action.groupIdx == groupIdx)
-        return true;
-  if (dag.skippedInitialLoopCarrierRegion.lookup(groupIdx) == region)
-    for (unsigned edgeIdx : syncGroup.edgeIdxs)
-      if (dag.edgesDeferringToSkippedLoopExit.contains(edgeIdx))
-        return true;
-  for (unsigned edgeIdx : syncGroup.edgeIdxs) {
-    const SyncEdge &edge = sp.edges[edgeIdx];
-    if (dag.loopEntryHandoffAccess.contains(edgeIdx))
-      return true;
-    if (edge.dstYieldRegion == region &&
-        dag.terminalLoopReadEdgesDeferringToExit.contains(edgeIdx))
-      return true;
-  }
-  return false;
-}
-
-static AsyncOp getLoopExitPayload(scf::ForOp forOp, BufferGroup &group,
-                                  int64_t resourceKey) {
-  Operation *lastWriter = nullptr;
-  for (const AccessEvent &event : group.events)
-    if (event.op && forOp->isProperAncestor(event.op) &&
-        eventProduces(event, resourceKey))
-      lastWriter = event.op;
-  return getAsyncPayload(lastWriter);
-}
-
-static std::optional<PlannedLoopExitDrain>
-buildLoopExitDrainForGroup(scf::ForOp forOp, Region *region, unsigned gi,
-                           const EmitterTransitionPlan &transitions,
-                           const OptSyncDag &dag, const SyncPlan &sp,
-                           BufferGroup &group) {
-  const SyncGroup &syncGroup = dag.groups[gi];
-  if (syncGroup.kind != SyncGroupKind::LinearChain ||
-      syncGroup.edgeIdxs.size() < 2)
-    return std::nullopt;
-  if (linearChainNeedsPerEdgeFulls(syncGroup, sp, group, dag.resource.second))
-    return std::nullopt;
-  if (!linearChainNeedsLoopExitDrain(gi, syncGroup, forOp.getOperation(),
-                                     region, transitions, dag, sp))
-    return std::nullopt;
-
-  bool skipsInitialCarrier =
-      dag.skippedInitialLoopCarrierRegion.lookup(gi) == region;
-  if (skipsInitialCarrier) {
-    for (unsigned edgeIdx : syncGroup.edgeIdxs) {
-      const SyncEdge &edge = sp.edges[edgeIdx];
-      if (!dag.edgesDeferringToSkippedLoopExit.contains(edgeIdx))
-        continue;
-      PlannedLoopExitDrain drain;
-      drain.fullRelease.edgeIdx = edgeIdx;
-      drain.fullRelease.useCurrentOwner = true;
-      drain.fullRelease.payload = edge.asyncPayload;
-      drain.singleReleaseOnly = true;
-      return drain;
-    }
-  }
-
-  unsigned firstEdgeIdx = syncGroup.edgeIdxs.front();
-  unsigned secondEdgeIdx = syncGroup.edgeIdxs[1];
-  const SyncEdge &firstEdge = sp.edges[firstEdgeIdx];
-  const SyncEdge &secondEdge = sp.edges[secondEdgeIdx];
-  std::optional<unsigned> loopEntryHandoffEdgeIdx;
-  for (unsigned edgeIdx : syncGroup.edgeIdxs)
-    if (dag.loopEntryHandoffAccess.contains(edgeIdx)) {
-      loopEntryHandoffEdgeIdx = edgeIdx;
-      break;
-    }
-  bool deferredTerminalLoopRead = llvm::any_of(
-      syncGroup.edgeIdxs, [&](unsigned edgeIdx) {
-        const SyncEdge &edge = sp.edges[edgeIdx];
-        return edge.dstYieldRegion == region &&
-               dag.terminalLoopReadEdgesDeferringToExit.contains(edgeIdx);
-      });
-
-  std::optional<PartitionId> drainOwner = firstEdge.dstOwner;
-  PlannedLoopExitDrain drain;
-  drain.fullRelease.edgeIdx = loopEntryHandoffEdgeIdx.value_or(firstEdgeIdx);
-  drain.fullRelease.useCurrentOwner = !loopEntryHandoffEdgeIdx;
-  drain.emptyRelease.edgeIdx = secondEdgeIdx;
-
-  if (loopEntryHandoffEdgeIdx) {
-    const SyncEdge &handoffEdge = sp.edges[*loopEntryHandoffEdgeIdx];
-    drain.fullRelease.owner = handoffEdge.srcOwner;
-    drainOwner = handoffEdge.dstOwner;
-    drain.emptyRelease.payload =
-        getLoopExitPayload(forOp, group, dag.resource.second);
-  } else if (skipsInitialCarrier) {
-    drainOwner = secondEdge.dstOwner;
-    drain.fullRelease.payload =
-        getLoopExitPayload(forOp, group, dag.resource.second);
-  } else if (deferredTerminalLoopRead) {
-    drain.emptyRelease.payload =
-        getLoopExitPayload(forOp, group, dag.resource.second);
-  } else if (firstEdge.dstOp == forOp.getOperation()) {
-    drain.fullRelease.payload = secondEdge.asyncPayload;
-  } else if (isa_and_nonnull<MMAv5OpInterface>(firstEdge.srcOp) &&
-             edgeDstReads(firstEdge, group, dag.resource.second) &&
-             !edgeDstWrites(firstEdge, group, dag.resource.second)) {
-    drain.fullRelease.payload =
-        getLoopExitPayload(forOp, group, dag.resource.second);
-  } else if (isa_and_nonnull<MMAv5OpInterface>(secondEdge.srcOp) &&
-             edgeDstReads(secondEdge, group, dag.resource.second) &&
-             !edgeDstWrites(secondEdge, group, dag.resource.second)) {
-    drain.emptyRelease.payload = secondEdge.asyncPayload;
-  }
-
-  if (auto it = transitions.opExitReleases.find(forOp.getOperation());
-      it != transitions.opExitReleases.end())
-    for (const PlannedRelease &action : it->second)
-      if (llvm::is_contained(action.edgeIdxs, drain.fullRelease.edgeIdx))
-        drain.plannedFullRelease = action;
-  drain.acquireOwner = drainOwner;
-  drain.emptyRelease.owner = drainOwner;
-  return drain;
-}
-
-static void buildLoopExitDrainPlans(EmitterTransitionPlan &transitions,
-                                    const OptSyncDag &dag, const SyncPlan &sp,
-                                    BufferGroup &group) {
-  if (!group.isTmem())
-    return;
-  for (Operation *loopOp : dag.threadForOps) {
-    auto forOp = dyn_cast<scf::ForOp>(loopOp);
-    if (!hasWarpSpecializeTag(forOp))
-      continue;
-
-    Region *region = &forOp.getRegion();
-    SmallVector<unsigned, 2> groupIds;
-    if (auto it = transitions.regionEntryAcquires.find(region);
-        it != transitions.regionEntryAcquires.end()) {
-      groupIds.append(it->second.begin(), it->second.end());
-    } else {
-      for (auto [idx, syncGroup] : llvm::enumerate(dag.groups))
-        if (syncGroup.kind == SyncGroupKind::LinearChain &&
-            linearChainAnchorsLoopExit(syncGroup, sp, forOp.getOperation(), region))
-          groupIds.push_back(static_cast<unsigned>(idx));
-    }
-    for (unsigned gi : groupIds)
-      if (std::optional<PlannedLoopExitDrain> drain =
-              buildLoopExitDrainForGroup(forOp, region, gi, transitions, dag, sp,
-                                         group))
-        transitions.loopExitDrains[forOp.getOperation()].push_back(*drain);
-  }
-}
-
 static EmitterTransitionPlan
 buildEmitterTransitionPlan(const OptSyncDag &dag, const SyncPlan &sp,
                            BufferGroup &group,
@@ -1446,7 +1214,6 @@ buildEmitterTransitionPlan(const OptSyncDag &dag, const SyncPlan &sp,
   resolveRegionReleases(transitions.regionExitReleases,
                         SyncAnchorKind::ReleaseAfterYield);
   resolveEmitterTransitionPlacement(transitions, dag, sp, group);
-  buildLoopExitDrainPlans(transitions, dag, sp, group);
   return transitions;
 }
 

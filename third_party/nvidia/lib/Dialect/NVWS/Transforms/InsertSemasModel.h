@@ -292,21 +292,6 @@ inline bool operator==(const PlannedRelease &lhs,
   return lhs.groupIdx == rhs.groupIdx && lhs.edgeIdxs == rhs.edgeIdxs;
 }
 
-struct PlannedDrainRelease {
-  unsigned edgeIdx = 0;
-  std::optional<PartitionId> owner;
-  bool useCurrentOwner = false;
-  AsyncOp payload = AsyncOp::NONE;
-};
-
-struct PlannedLoopExitDrain {
-  PlannedDrainRelease fullRelease;
-  std::optional<PlannedRelease> plannedFullRelease;
-  std::optional<PartitionId> acquireOwner;
-  PlannedDrainRelease emptyRelease;
-  bool singleReleaseOnly = false;
-};
-
 struct EmitterTransitionPlan {
   llvm::MapVector<Operation *, SmallVector<PlannedRelease, 2>> opEntryReleases,
       opExitReleases;
@@ -320,7 +305,6 @@ struct EmitterTransitionPlan {
   DenseMap<Region *, Operation *> regionEntryReleaseInsertAfter,
       regionEntryReleaseInsertBefore;
   DenseMap<Operation *, SmallVector<Operation *, 2>> deferredOpExitAnchors;
-  DenseMap<Operation *, SmallVector<PlannedLoopExitDrain, 2>> loopExitDrains;
 };
 
 struct OptSyncDag {

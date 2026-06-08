@@ -50,13 +50,15 @@ Plan checked: `plans/emiiter-tmem-semaphore-state-machine-plan.md`.
      `test/NVWS/insert_semas_nested_carrier.mlir`, and full lit baseline.
 
 6. TMEM linear loop-exit drain is no longer semantic emitter logic.
-   - Evidence to re-check: no `emitTmemLinearLoopExitDrain` in
-     `InsertSemas*.{h,cpp}`. `EmitterTransitionPlan::loopExitDrains` carries
-     `PlannedLoopExitDrain` records from `InsertSemasOptSyncDag.h`, and
-     `emitPlannedLoopExitDrains` consumes those records mechanically.
-   - Current status: closed. Verified with build, focused NVWS tests including
-     `test/NVWS/insert_semas_tmem_no_loop_exit_drain.mlir`, and full lit
-     baseline.
+   - Evidence to re-check: no `emitTmemLinearLoopExitDrain`,
+     `PlannedLoopExitDrain`, `PlannedDrainRelease`, `loopExitDrains`,
+     `buildLoopExitDrain*`, `emitPlannedLoopExitDrains`, or
+     `emitPlannedDrainRelease` in `InsertSemas*.{h,cpp}`.
+     `closeLoopSemaphoreStateAfter` / `closeLinearChainLoopStateAfter` close
+     the loop from `EmitState::current` after the loop body has been walked.
+   - Current status: closed. Verified with build, the 20-test
+     `insert_semas` lit filter, `test/NVWS/tmem-buffer-reuse-semas.mlir`, and
+     full NVWS lit.
 
 7. LoC target is met.
    - Evidence to re-check:
@@ -65,6 +67,17 @@ Plan checked: `plans/emiiter-tmem-semaphore-state-machine-plan.md`.
    - Current status: closed. The obsolete `InsertSemasEmitSchedule.h`
      action-list diagnostic is deleted; the `RELEASED-SEMAPHORES` dump is
      retained without the old M1 violation text.
+
+8. Source-yield producer payload promotion is no longer a transition-plan
+   payload derivation rule.
+   - Evidence to re-check: no `useCarriedProducerPayload`,
+     `findLastProducerInRegion`, `canPromoteYieldProducerPayload`, or
+     `destinationAccessIsInWarpSpecializedLoop` in `InsertSemas*.{h,cpp}`.
+     `ActiveSemaphoreState` carries `producerPayload` plus `producerOwner`;
+     `EmitState::release` uses `releaseShouldUseCarriedProducerState` to
+     decide whether the current carried producer state is valid for the release.
+   - Current status: closed. Verified with build, the 20-test
+     `insert_semas` lit filter, and full NVWS lit.
 
 ## Caveats To Revisit Later
 
@@ -81,18 +94,6 @@ Plan checked: `plans/emiiter-tmem-semaphore-state-machine-plan.md`.
    - Current status: accepted caveat. Blindly appending new carriers changed
      golden loop arity and broke the plan's byte-identical constraint, so the
      implementation keeps local slot selection plus local normalization.
-
-3. Source-yield producer payload promotion is still a transition-plan
-   derivation rule.
-   - Current status: accepted caveat for now. The emitter consumes the planned
-     payload mechanically, but `resolvePlannedReleaseState` still decides when
-     a source-yield producer payload should be promoted for byte-identical
-     output.
-
-4. Loop-exit drain classification still lives in transition-plan derivation.
-   - Current status: accepted caveat for now. The emitter consumes
-     `PlannedLoopExitDrain` records mechanically, but `buildLoopExitDrainPlans`
-     and its helper predicates still decide which drain record is needed.
 
 ## Remaining Gaps
 

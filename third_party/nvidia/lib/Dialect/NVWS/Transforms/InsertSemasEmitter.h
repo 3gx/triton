@@ -18,6 +18,8 @@ struct ActiveSemaphoreState {
   Value token, semaphore;
   std::optional<PartitionId> owner;
   std::optional<AsyncOp> payload;
+  std::optional<AsyncOp> producerPayload;
+  std::optional<PartitionId> producerOwner;
   SmallVector<Value, 4> buffers;
 
   bool canReuseBuffer(Value sem, Value tok, unsigned bufferCount) const {
@@ -35,11 +37,19 @@ struct ActiveSemaphoreState {
     clearBuffers();
   }
   void setAfterAccess(Value sem, Value tok, std::optional<PartitionId> newOwner,
-                      AsyncOp newPayload) {
+                      AsyncOp newPayload, bool writes) {
     semaphore = sem;
     token = tok;
     owner = newOwner;
     payload = newPayload;
+    if (writes || newPayload != AsyncOp::NONE) {
+      producerPayload = newPayload;
+      producerOwner = newOwner;
+    }
+  }
+  void clearProducer() {
+    producerPayload = std::nullopt;
+    producerOwner = std::nullopt;
   }
   void setToken(Value tok) { token = tok; clearBuffers(); }
   void setTokenOwner(Value tok, std::optional<PartitionId> newOwner) {
@@ -1214,8 +1224,42 @@ static LogicalResult emitAccessTransition(OpBuilder &b, AccessEvent &event,
     setPartitionFromTokenIfParentPartitioned(retargetOp, token);
 
   state.eventToken[op] = token;
-  state.current.setAfterAccess(sem, token, event.owner, getAsyncPayload(retargetOp));
+  state.current.setAfterAccess(sem, token, event.owner, getAsyncPayload(retargetOp),
+                               writes);
   return success();
+}
+
+static bool releaseDestinationIsWsScoped(Operation *op) {
+  if (!op)
+    return true;
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp())
+    if (auto forOp = dyn_cast<scf::ForOp>(parent))
+      return hasWarpSpecializeTag(forOp);
+  return true;
+}
+
+static bool releaseShouldUseCarriedProducerState(
+    SyncAnchorKind kind, Operation *anchor, const PlannedRelease &action,
+    const SyncGroup &syncGroup, const SyncEdge *edge, const OptSyncDag &dag,
+    BufferGroup &group) {
+  if (!group.isTmem() || !edge || !edge->srcYieldRegion ||
+      edge->dstYieldRegion || action.payload != AsyncOp::NONE)
+    return false;
+  std::optional<unsigned> edgeIdx =
+      action.edgeIdxs.empty() ? std::nullopt
+                              : std::optional<unsigned>(action.edgeIdxs.front());
+  bool terminalDstReadRelease =
+      (syncGroup.kind == SyncGroupKind::LinearChain ||
+       syncGroup.kind == SyncGroupKind::Singleton) &&
+      kind == SyncAnchorKind::ReleaseAfterOp && edge->dstOp == anchor &&
+      edge->srcOp != anchor;
+  bool terminalLoopExitReadRelease =
+      syncGroup.kind == SyncGroupKind::Singleton &&
+      kind == SyncAnchorKind::ReleaseAfterOp && anchor && edgeIdx &&
+      dag.tmemLoopExitRead.lookup(*edgeIdx) == anchor;
+  return !terminalDstReadRelease && !terminalLoopExitReadRelease &&
+         releaseDestinationIsWsScoped(edge->dstOp);
 }
 
 static bool valueScopeCanReachBlock(Value value, Block *block) {
@@ -1257,6 +1301,7 @@ LogicalResult EmitState::release(OpBuilder &b, Location loc, SyncAnchorKind kind
   if (groupIdx >= dag.groups.size())
     return group.members.front().allocOp->emitError(
         "nvws-insert-semas: planned release references an invalid group");
+  const SyncGroup &syncGroup = dag.groups[groupIdx];
   if (action.edgeIdxs.empty())
     return group.members.front().allocOp->emitError(
         "nvws-insert-semas: planned release has no transition edge");
@@ -1295,9 +1340,14 @@ LogicalResult EmitState::release(OpBuilder &b, Location loc, SyncAnchorKind kind
     return failure();
   std::optional<PartitionId> owner =
       action.useCarriedOwner && current.owner ? current.owner : action.owner;
-  AsyncOp payload = action.useCarriedPayload && current.payload
-                        ? *current.payload
-                        : action.payload;
+  AsyncOp payload = action.payload;
+  if (releaseShouldUseCarriedProducerState(kind, anchor, action, syncGroup, edge,
+                                           dag, group) &&
+      current.producerPayload &&
+      sameOwner(current.producerOwner, edge ? edge->srcOwner : std::nullopt))
+    payload = *current.producerPayload;
+  else if (action.useCarriedPayload && current.payload)
+    payload = *current.payload;
   SemaphoreReleaseOp release =
       emitRelease(b, loc, sem, *token, owner, stageCluster, payload);
   if (useStructuredCarrier && structuredCarrierPartition.size() == 1 && !owner) {
@@ -1495,72 +1545,240 @@ static LogicalResult emitDeferredNestedExitTransitions(
   return success();
 }
 
-static FailureOr<Value>
-emitPlannedDrainRelease(OpBuilder &b, Location loc, scf::ForOp forOp,
-                        const PlannedDrainRelease &release, Value token,
-                        const SyncPlan &sp, EmitState &state) {
-  if (release.edgeIdx >= sp.edges.size())
+static bool linearChainNeedsPerEdgeFulls(const SyncGroup &syncGroup,
+                                         const SyncPlan &sp,
+                                         BufferGroup &group,
+                                         int64_t resourceKey) {
+  if (!group.isTmem())
+    return false;
+  std::optional<int64_t> firstOffset;
+  for (unsigned edgeIdx : syncGroup.edgeIdxs) {
+    for (const AccessTouch &touch : sp.edges[edgeIdx].touches) {
+      if (touch.resourceKey != resourceKey ||
+          touch.memberIdx >= group.members.size())
+        continue;
+      int64_t offset = group.members[touch.memberIdx].offset;
+      if (!firstOffset) {
+        firstOffset = offset;
+        continue;
+      }
+      if (*firstOffset != offset)
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool linearChainAnchorsLoopExit(const SyncGroup &syncGroup,
+                                       const SyncPlan &sp, Operation *forOp,
+                                       Region *region) {
+  if (!forOp || !region)
+    return false;
+  for (unsigned edgeIdx : syncGroup.edgeIdxs) {
+    const SyncEdge &edge = sp.edges[edgeIdx];
+    if (edge.srcOp == forOp || edge.dstOp == forOp ||
+        edge.srcYieldRegion == region || edge.dstYieldRegion == region)
+      return true;
+  }
+  return false;
+}
+
+static bool linearChainNeedsLoopExitClosure(
+    unsigned groupIdx, const SyncGroup &syncGroup, Operation *forOp,
+    Region *region, const EmitterTransitionPlan &transitions,
+    const OptSyncDag &dag, const SyncPlan &sp) {
+  if (!forOp || !region)
+    return false;
+  if (auto it = transitions.opExitReleases.find(forOp);
+      it != transitions.opExitReleases.end())
+    for (const PlannedRelease &action : it->second)
+      if (action.groupIdx == groupIdx)
+        return true;
+  if (dag.skippedInitialLoopCarrierRegion.lookup(groupIdx) == region)
+    for (unsigned edgeIdx : syncGroup.edgeIdxs)
+      if (dag.edgesDeferringToSkippedLoopExit.contains(edgeIdx))
+        return true;
+  for (unsigned edgeIdx : syncGroup.edgeIdxs) {
+    const SyncEdge &edge = sp.edges[edgeIdx];
+    if (dag.loopEntryHandoffAccess.contains(edgeIdx))
+      return true;
+    if (edge.dstYieldRegion == region &&
+        dag.terminalLoopReadEdgesDeferringToExit.contains(edgeIdx))
+      return true;
+  }
+  return false;
+}
+
+static FailureOr<Value> emitLoopExitStateRelease(
+    OpBuilder &b, Location loc, scf::ForOp forOp, unsigned edgeIdx, Value token,
+    std::optional<PartitionId> owner, AsyncOp payload, const SyncPlan &sp,
+    EmitState &state) {
+  if (edgeIdx >= sp.edges.size())
     return forOp->emitError(
         "nvws-insert-semas: loop-exit drain release references an invalid edge");
-  const SyncEdge &edge = sp.edges[release.edgeIdx];
+  const SyncEdge &edge = sp.edges[edgeIdx];
   if (!edgeRequiresRelease(edge))
     return forOp->emitError(
         "nvws-insert-semas: loop-exit drain release is not backed by a "
         "partition transition edge");
-  Value sem = state.semas.forClass(sp, release.edgeIdx);
-  std::optional<PartitionId> owner =
-      release.useCurrentOwner ? state.current.owner : release.owner;
-  emitRelease(b, loc, sem, token, owner, StageCluster{}, release.payload);
+  Value sem = state.semas.forClass(sp, edgeIdx);
+  emitRelease(b, loc, sem, token, owner, StageCluster{}, payload);
   return sem;
 }
 
-static LogicalResult emitPlannedLoopExitDrains(scf::ForOp forOp,
-                                               const OptSyncDag &dag,
-                                               const SyncPlan &sp,
-                                               BufferGroup &group,
-                                               EmitState &state) {
-  if (!state.current.token)
-    return success();
+static AsyncOp carriedProducerPayloadForOwner(
+    const EmitState &state, std::optional<PartitionId> owner) {
+  if (state.current.producerPayload &&
+      sameOwner(state.current.producerOwner, owner))
+    return *state.current.producerPayload;
+  return AsyncOp::NONE;
+}
+
+static FailureOr<bool> closeLinearChainLoopStateAfter(
+    scf::ForOp forOp, Region *region, unsigned groupIdx, const OptSyncDag &dag,
+    const SyncPlan &sp, BufferGroup &group, EmitState &state) {
   const EmitterTransitionPlan &transitions = state.transitionPlan();
-  auto it = transitions.loopExitDrains.find(forOp.getOperation());
-  if (it == transitions.loopExitDrains.end())
-    return success();
+  const SyncGroup &syncGroup = dag.groups[groupIdx];
+  if (syncGroup.kind != SyncGroupKind::LinearChain ||
+      syncGroup.edgeIdxs.size() < 2)
+    return false;
+  if (linearChainNeedsPerEdgeFulls(syncGroup, sp, group, dag.resource.second))
+    return false;
+  if (!linearChainNeedsLoopExitClosure(groupIdx, syncGroup, forOp.getOperation(),
+                                       region, transitions, dag, sp))
+    return false;
 
   OpBuilder b(forOp);
   b.setInsertionPointAfter(forOp);
   Location loc = forOp.getLoc();
-  for (const PlannedLoopExitDrain &drain : it->second) {
-    if (drain.singleReleaseOnly) {
-      FailureOr<Value> sem = emitPlannedDrainRelease(
-          b, loc, forOp, drain.fullRelease, state.current.token, sp, state);
+
+  bool skipsInitialCarrier =
+      dag.skippedInitialLoopCarrierRegion.lookup(groupIdx) == region;
+  if (skipsInitialCarrier) {
+    for (unsigned edgeIdx : syncGroup.edgeIdxs) {
+      const SyncEdge &edge = sp.edges[edgeIdx];
+      if (!dag.edgesDeferringToSkippedLoopExit.contains(edgeIdx))
+        continue;
+      FailureOr<Value> sem = emitLoopExitStateRelease(
+          b, loc, forOp, edgeIdx, state.current.token, state.current.owner,
+          edge.asyncPayload, sp, state);
       if (failed(sem))
         return failure();
       state.current.setSemaphore(*sem);
-      return success();
+      return true;
     }
+  }
 
-    Value fullSem = state.semas.forClass(sp, drain.fullRelease.edgeIdx);
-    if (drain.plannedFullRelease) {
+  unsigned firstEdgeIdx = syncGroup.edgeIdxs.front();
+  unsigned secondEdgeIdx = syncGroup.edgeIdxs[1];
+  const SyncEdge &firstEdge = sp.edges[firstEdgeIdx];
+  const SyncEdge &secondEdge = sp.edges[secondEdgeIdx];
+  std::optional<unsigned> loopEntryHandoffEdgeIdx;
+  for (unsigned edgeIdx : syncGroup.edgeIdxs)
+    if (dag.loopEntryHandoffAccess.contains(edgeIdx)) {
+      loopEntryHandoffEdgeIdx = edgeIdx;
+      break;
+    }
+  bool deferredTerminalLoopRead = llvm::any_of(
+      syncGroup.edgeIdxs, [&](unsigned edgeIdx) {
+        const SyncEdge &edge = sp.edges[edgeIdx];
+        return edge.dstYieldRegion == region &&
+               dag.terminalLoopReadEdgesDeferringToExit.contains(edgeIdx);
+      });
+
+  unsigned fullEdgeIdx = loopEntryHandoffEdgeIdx.value_or(firstEdgeIdx);
+  std::optional<PartitionId> fullOwner =
+      loopEntryHandoffEdgeIdx ? sp.edges[*loopEntryHandoffEdgeIdx].srcOwner
+                              : state.current.owner;
+  std::optional<PartitionId> drainOwner =
+      loopEntryHandoffEdgeIdx ? sp.edges[*loopEntryHandoffEdgeIdx].dstOwner
+                              : firstEdge.dstOwner;
+  AsyncOp fullPayload = AsyncOp::NONE;
+  AsyncOp emptyPayload = AsyncOp::NONE;
+
+  if (loopEntryHandoffEdgeIdx) {
+    emptyPayload = carriedProducerPayloadForOwner(state, drainOwner);
+  } else if (skipsInitialCarrier) {
+    drainOwner = secondEdge.dstOwner;
+    fullPayload = carriedProducerPayloadForOwner(state, fullOwner);
+  } else if (deferredTerminalLoopRead) {
+    emptyPayload = carriedProducerPayloadForOwner(state, drainOwner);
+  } else if (firstEdge.dstOp == forOp.getOperation()) {
+    fullPayload = secondEdge.asyncPayload;
+  } else if (isa_and_nonnull<MMAv5OpInterface>(firstEdge.srcOp) &&
+             edgeDstReads(firstEdge, group, dag.resource.second) &&
+             !edgeDstWrites(firstEdge, group, dag.resource.second)) {
+    fullPayload = carriedProducerPayloadForOwner(state, fullOwner);
+  } else if (isa_and_nonnull<MMAv5OpInterface>(secondEdge.srcOp) &&
+             edgeDstReads(secondEdge, group, dag.resource.second) &&
+             !edgeDstWrites(secondEdge, group, dag.resource.second)) {
+    emptyPayload = secondEdge.asyncPayload;
+  }
+
+  Value fullSem = state.semas.forClass(sp, fullEdgeIdx);
+  bool emittedPlannedFullRelease = false;
+  if (auto it = transitions.opExitReleases.find(forOp.getOperation());
+      it != transitions.opExitReleases.end())
+    for (const PlannedRelease &action : it->second) {
+      if (!llvm::is_contained(action.edgeIdxs, fullEdgeIdx))
+        continue;
       if (failed(state.release(b, loc, SyncAnchorKind::ReleaseAfterOp,
-                               forOp.getOperation(), nullptr,
-                               *drain.plannedFullRelease, dag, sp, group,
+                               forOp.getOperation(), nullptr, action, dag, sp, group,
                                StageCluster{})))
         return failure();
-    } else {
-      FailureOr<Value> sem = emitPlannedDrainRelease(
-          b, loc, forOp, drain.fullRelease, state.current.token, sp, state);
-      if (failed(sem))
-        return failure();
-      fullSem = *sem;
+      emittedPlannedFullRelease = true;
+      break;
     }
-    SemaphoreAcquireOp acquire =
-        emitAcquire(b, loc, fullSem, drain.acquireOwner, StageCluster{});
-    FailureOr<Value> emptySem = emitPlannedDrainRelease(
-        b, loc, forOp, drain.emptyRelease, acquire.getToken(), sp, state);
-    if (failed(emptySem))
+
+  if (!emittedPlannedFullRelease) {
+    FailureOr<Value> sem = emitLoopExitStateRelease(
+        b, loc, forOp, fullEdgeIdx, state.current.token, fullOwner, fullPayload,
+        sp, state);
+    if (failed(sem))
       return failure();
-    state.current.setCarrier(*emptySem, acquire.getToken(), drain.acquireOwner);
+    fullSem = *sem;
+  }
+
+  SemaphoreAcquireOp acquire =
+      emitAcquire(b, loc, fullSem, drainOwner, StageCluster{});
+  FailureOr<Value> emptySem =
+      emitLoopExitStateRelease(b, loc, forOp, secondEdgeIdx, acquire.getToken(),
+                               drainOwner, emptyPayload, sp, state);
+  if (failed(emptySem))
+    return failure();
+  state.current.setCarrier(*emptySem, acquire.getToken(), drainOwner);
+  return true;
+}
+
+static LogicalResult closeLoopSemaphoreStateAfter(scf::ForOp forOp,
+                                                  Region *region,
+                                                  const OptSyncDag &dag,
+                                                  const SyncPlan &sp,
+                                                  BufferGroup &group,
+                                                  EmitState &state) {
+  if (!group.isTmem() || !state.current.token || !hasWarpSpecializeTag(forOp))
     return success();
+
+  const EmitterTransitionPlan &transitions = state.transitionPlan();
+  SmallVector<unsigned, 2> groupIds;
+  if (auto it = transitions.regionEntryAcquires.find(region);
+      it != transitions.regionEntryAcquires.end()) {
+    groupIds.append(it->second.begin(), it->second.end());
+  } else {
+    for (auto [idx, syncGroup] : llvm::enumerate(dag.groups))
+      if (syncGroup.kind == SyncGroupKind::LinearChain &&
+          linearChainAnchorsLoopExit(syncGroup, sp, forOp.getOperation(), region))
+        groupIds.push_back(static_cast<unsigned>(idx));
+  }
+
+  for (unsigned groupIdx : groupIds) {
+    FailureOr<bool> closed =
+        closeLinearChainLoopStateAfter(forOp, region, groupIdx, dag, sp, group,
+                                       state);
+    if (failed(closed))
+      return failure();
+    if (*closed)
+      return success();
   }
   return success();
 }
@@ -2122,7 +2340,8 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
       SmallVector<const AccessTouch *, 4> prebufferTouches;
       if (threaded && canPrebufferLocalRegionEntry(
                           forOp.getOperation(), forOp.getRegion(), acquires,
-                          state.transitionPlan(), dag, group, prebufferTouches)) {
+                          state.transitionPlan(), dag, group,
+                          prebufferTouches)) {
         OpBuilder prebufferBuilder(forOp);
         prebufferLocalRegionEntry(prebufferBuilder, forOp.getOperation(),
                                   prebufferTouches, acquires.front(), group,
@@ -2130,6 +2349,11 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
         bodyState = state;
         threaded = false;
       }
+      std::optional<AsyncOp> incomingProducerPayload =
+          state.current.producerPayload;
+      std::optional<PartitionId> incomingProducerOwner =
+          state.current.producerOwner;
+      bodyState.current.clearProducer();
       OpBuilder loopBuilder(forOp);
       if (threaded) {
         FailureOr<scf::ForOp> threadedFor =
@@ -2143,26 +2367,39 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
                                     group, backing, bodyState,
                                     plannedForRegion)))
         return failure();
+      std::optional<AsyncOp> loopProducerPayload =
+          bodyState.current.producerPayload;
+      std::optional<PartitionId> loopProducerOwner =
+          bodyState.current.producerOwner;
       if (threaded) {
         std::optional<PartitionId> ownerAtYield = bodyState.current.owner;
         bool overrideOwnerAtYield = false;
         auto regionOwnerIt = plan.regionOwners.find(plannedForRegion);
         if (regionOwnerIt != plan.regionOwners.end() &&
             (!linearChainEntersFor(oldForOp, dag, sp) ||
-             state.transitionPlan().regionEntryAcquires.contains(plannedForRegion))) {
+             state.transitionPlan().regionEntryAcquires.contains(
+                 plannedForRegion))) {
           ownerAtYield = regionOwnerIt->second.exit;
           overrideOwnerAtYield = true;
         }
         closeCarrierForLoop(activeForOp, bodyState, state, ownerAtYield,
                             overrideOwnerAtYield);
-        if (failed(emitPlannedLoopExitDrains(activeForOp, dag, sp, group,
-                                             state)))
+        if (failed(closeLoopSemaphoreStateAfter(activeForOp, plannedForRegion,
+                                                dag, sp, group, state)))
           return failure();
       } else {
         closeExistingCarrierForLoop(activeForOp, bodyState, state);
       }
-      if (failed(emitOperationExitTransitions(oldForOp, activeForOp.getOperation(),
-                                              dag, sp, group, state)))
+      if (loopProducerPayload) {
+        state.current.producerPayload = loopProducerPayload;
+        state.current.producerOwner = loopProducerOwner;
+      } else {
+        state.current.producerPayload = incomingProducerPayload;
+        state.current.producerOwner = incomingProducerOwner;
+      }
+      if (failed(emitOperationExitTransitions(oldForOp,
+                                              activeForOp.getOperation(), dag,
+                                              sp, group, state)))
         return failure();
       if (failed(emitDeferredNestedExitTransitions(activeForOp.getOperation(),
                                                    dag, sp, group, state)))
@@ -2213,17 +2450,35 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
       }
       Value incomingToken = state.current.token;
       Value incomingSemaphore = state.current.semaphore;
+      std::optional<AsyncOp> incomingProducerPayload =
+          state.current.producerPayload;
+      std::optional<PartitionId> incomingProducerOwner =
+          state.current.producerOwner;
       EmitState thenState = state;
+      thenState.current.clearProducer();
       if (failed(emitResourceRegion(activeIfOp.getThenRegion(), dag, sp, plan,
                                     group, backing, thenState,
                                     plannedThenRegion)))
         return failure();
       EmitState elseState = state;
+      elseState.current.clearProducer();
       if (!activeIfOp.getElseRegion().empty() &&
           failed(emitResourceRegion(activeIfOp.getElseRegion(), dag, sp, plan,
                                     group, backing, elseState,
                                     plannedElseRegion)))
         return failure();
+      std::optional<AsyncOp> mergedProducerPayload;
+      std::optional<PartitionId> mergedProducerOwner;
+      if (elseState.current.producerPayload) {
+        mergedProducerPayload = elseState.current.producerPayload;
+        mergedProducerOwner = elseState.current.producerOwner;
+      } else if (thenState.current.producerPayload) {
+        mergedProducerPayload = thenState.current.producerPayload;
+        mergedProducerOwner = thenState.current.producerOwner;
+      } else {
+        mergedProducerPayload = incomingProducerPayload;
+        mergedProducerOwner = incomingProducerOwner;
+      }
       if (threaded) {
         Value thenToken =
             thenState.current.token ? thenState.current.token : incomingToken;
@@ -2300,10 +2555,14 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
                                      ? *reusableIfTokenResult
                                      : oldNumResults),
             outOwner);
+        joinedState.current.producerPayload = mergedProducerPayload;
+        joinedState.current.producerOwner = mergedProducerOwner;
         state = joinedState;
       } else {
         mergeProtectedAccesses(state, thenState);
         mergeProtectedAccesses(state, elseState);
+        state.current.producerPayload = mergedProducerPayload;
+        state.current.producerOwner = mergedProducerOwner;
       }
       if (failed(emitOperationExitTransitions(oldIfOp, activeIfOp.getOperation(),
                                               dag, sp, group, state)))
