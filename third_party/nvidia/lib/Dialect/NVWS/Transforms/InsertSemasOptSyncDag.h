@@ -176,17 +176,14 @@ static const SyncEdge *findEdgeForAnchor(const SyncGroup &group,
       if (edge.dstYieldRegion == yieldRegion) return &edge;
       break;
     case SyncAnchorKind::ReleaseAfterEnter:
-      if (sameOwner(edge.dstRegionOwner.entry, edge.srcOwner))
+      if (SyncRenderSite site = getRenderedReleaseSite(edge);
+          site.kind == SyncRenderSiteKind::Enter && site.region == yieldRegion)
         return &edge;
       break;
     case SyncAnchorKind::ReleaseAfterOp:
-      if (edge.srcOp == anchor)
+      if (SyncRenderSite site = getRenderedReleaseSite(edge);
+          site.kind == SyncRenderSiteKind::Op && site.anchor == anchor)
         return &edge;
-      if (Operation *ancestorAnchor = liveAnchor ? liveAnchor : anchor)
-        if (isa<scf::ForOp>(ancestorAnchor) && edge.srcOp &&
-            ancestorAnchor->isProperAncestor(edge.srcOp) &&
-            (!edge.dstOp || !ancestorAnchor->isProperAncestor(edge.dstOp)))
-          return &edge;
       break;
     case SyncAnchorKind::ReleaseAfterYield:
       if (edge.srcYieldRegion == yieldRegion) return &edge;
@@ -201,14 +198,6 @@ static const SyncEdge *findEdgeForAnchor(const SyncGroup &group,
       const SyncEdge &edge = sp.edges[ei];
       auto joinIt = dag.ifYieldJoinAccess.find(ei);
       if (joinIt != dag.ifYieldJoinAccess.end() && joinIt->second == anchor)
-        return &edge;
-    }
-  }
-  if (group.kind == SyncGroupKind::LinearChain &&
-      kind == SyncAnchorKind::ReleaseAfterOp && anchor) {
-    for (unsigned ei : group.edgeIdxs) {
-      const SyncEdge &edge = sp.edges[ei];
-      if (edge.dstOp == anchor)
         return &edge;
     }
   }
@@ -658,62 +647,8 @@ buildEmitterTransitionPlan(const OptSyncDag &dag, const SyncPlan &sp,
   auto siteIsYield = [](SyncRenderSite site) {
     return site.anchor && isa<scf::YieldOp>(site.anchor);
   };
-  auto regionContainsOp = [](Region *region, Operation *op) {
-    if (!region || !op)
-      return false;
-    Region *opRegion = op->getParentRegion();
-    return opRegion == region || region->isAncestor(opRegion);
-  };
-  auto regionContainsRegion = [](Region *region, Region *other) {
-    if (!region || !other)
-      return false;
-    return other == region || region->isAncestor(other);
-  };
-  auto siteReleaseIsAfterEnter = [&](SyncRenderSite site,
-                                     ArrayRef<unsigned> edgeIdxs) {
-    if (!site.region || siteIsYield(site) || edgeIdxs.empty())
-      return false;
-    for (unsigned edgeIdx : edgeIdxs) {
-      if (edgeIdx >= sp.edges.size())
-        return false;
-      const SyncEdge &edge = sp.edges[edgeIdx];
-      if (!sameOwner(edge.srcOwner, edge.dstRegionOwner.entry))
-        return false;
-      if (regionContainsOp(site.region, edge.srcOp) ||
-          regionContainsRegion(site.region, edge.srcYieldRegion))
-        return false;
-    }
-    return true;
-  };
-  auto findSourceReleaseAnchor = [&](const SyncEdge &edge) -> Operation * {
-    if (edge.srcYieldRegion)
-      return edge.srcYieldRegion->getParentOp();
-    Operation *srcAnchor = edge.srcOp;
-    if (!srcAnchor)
-      return nullptr;
-    Operation *dstAnchor =
-        edge.dstOp ? edge.dstOp
-                   : (edge.dstYieldRegion ? edge.dstYieldRegion->getParentOp()
-                                          : nullptr);
-    Operation *best = srcAnchor;
-    for (Operation *parent = srcAnchor->getParentOp(); parent;
-         parent = parent->getParentOp()) {
-      if (!isa<scf::ForOp, scf::IfOp>(parent))
-        continue;
-      if (dstAnchor &&
-          (parent == dstAnchor || parent->isProperAncestor(dstAnchor)))
-        break;
-      best = parent;
-    }
-    return best;
-  };
-  auto addSourceReleases = [&](SyncRenderSite site, unsigned groupIdx,
-                               ArrayRef<unsigned> edgeIdxs) {
-    if (siteReleaseIsAfterEnter(site, edgeIdxs)) {
-      addPlannedRelease(transitions.regionStartReleases, site.region, sp,
-                        groupIdx, edgeIdxs);
-      return;
-    }
+  auto addSourceReleases = [&](unsigned groupIdx, ArrayRef<unsigned> edgeIdxs) {
+    llvm::MapVector<Region *, SmallVector<unsigned, 4>> edgesByEnter;
     llvm::MapVector<Operation *, SmallVector<unsigned, 4>> edgesByAnchor;
     for (unsigned edgeIdx : edgeIdxs) {
       if (edgeIdx >= sp.edges.size())
@@ -721,16 +656,24 @@ buildEmitterTransitionPlan(const OptSyncDag &dag, const SyncPlan &sp,
       const SyncEdge &edge = sp.edges[edgeIdx];
       if (!edgeRequiresRelease(edge))
         continue;
-      if (Operation *anchor = findSourceReleaseAnchor(edge))
-        edgesByAnchor[anchor].push_back(edgeIdx);
+      SyncRenderSite releaseSite = getRenderedReleaseSite(edge);
+      if (releaseSite.kind == SyncRenderSiteKind::Enter) {
+        if (releaseSite.region)
+          edgesByEnter[releaseSite.region].push_back(edgeIdx);
+        continue;
+      }
+      if (releaseSite.anchor)
+        edgesByAnchor[releaseSite.anchor].push_back(edgeIdx);
     }
+    for (auto &[region, regionEdges] : edgesByEnter)
+      addPlannedRelease(transitions.regionStartReleases, region, sp, groupIdx,
+                        regionEdges);
     for (auto &[anchor, anchoredEdges] : edgesByAnchor)
       addPlannedRelease(transitions.opExitReleases, anchor, sp, groupIdx,
                         anchoredEdges);
   };
-  auto addSiteRelease = [&](SyncRenderSite site, unsigned groupIdx,
-                            unsigned edgeIdx) {
-    addSourceReleases(site, groupIdx, ArrayRef<unsigned>(&edgeIdx, 1));
+  auto addSiteRelease = [&](unsigned groupIdx, unsigned edgeIdx) {
+    addSourceReleases(groupIdx, ArrayRef<unsigned>(&edgeIdx, 1));
   };
   auto addSiteAcquire = [&](SyncRenderSite site, unsigned groupIdx,
                             bool unique = false) {
@@ -769,19 +712,19 @@ buildEmitterTransitionPlan(const OptSyncDag &dag, const SyncPlan &sp,
       break;
     case SyncGroupKind::ReadyFanout:
       if (!readyFanoutReleaseSeen[groupIdx]) {
-        addSourceReleases(site, groupIdx, syncGroup.edgeIdxs);
+        addSourceReleases(groupIdx, syncGroup.edgeIdxs);
         readyFanoutReleaseSeen[groupIdx] = 1;
       }
       addSiteAcquire(site, groupIdx);
       break;
     case SyncGroupKind::DoneFanin:
-      addSiteRelease(site, groupIdx, edgeIdx);
+      addSiteRelease(groupIdx, edgeIdx);
       if (!llvm::is_contained(faninHere, groupIdx))
         faninHere.push_back(groupIdx);
       break;
     case SyncGroupKind::Singleton:
     case SyncGroupKind::LinearChain:
-      addSiteRelease(site, groupIdx, edgeIdx);
+      addSiteRelease(groupIdx, edgeIdx);
       addSiteAcquire(site, groupIdx);
       break;
       }

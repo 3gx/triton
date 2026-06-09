@@ -677,12 +677,76 @@ struct OptDumpCtx {
   DenseSet<unsigned> rendered;
 };
 
+enum class SyncRenderSiteKind { Op, Yield, Enter };
+
 struct SyncRenderSite {
+  SyncRenderSiteKind kind = SyncRenderSiteKind::Op;
   Region *region = nullptr;
   Block *block = nullptr;
   Operation *anchor = nullptr;
   unsigned ordinal = 0;
 };
+
+static SyncRenderSite makeOpRenderSite(Operation *op, unsigned ordinal = 0) {
+  return {SyncRenderSiteKind::Op, op ? op->getParentRegion() : nullptr,
+          op ? op->getBlock() : nullptr, op, ordinal};
+}
+
+static SyncRenderSite makeYieldRenderSite(Region &region,
+                                          unsigned ordinal = 0) {
+  Operation *yieldOp = region.empty() ? nullptr : region.front().getTerminator();
+  return {SyncRenderSiteKind::Yield, &region,
+          region.empty() ? nullptr : &region.front(), yieldOp, ordinal};
+}
+
+static SyncRenderSite makeEnterRenderSite(Region &region,
+                                          unsigned ordinal = 0) {
+  return {SyncRenderSiteKind::Enter, &region,
+          region.empty() ? nullptr : &region.front(), region.getParentOp(),
+          ordinal};
+}
+
+static bool renderSiteRegionContainsOp(Region *region, Operation *op) {
+  if (!region || !op)
+    return false;
+  Region *opRegion = op->getParentRegion();
+  return opRegion == region || region->isAncestor(opRegion);
+}
+
+static bool renderSiteRegionContainsRegion(Region *region, Region *other) {
+  if (!region || !other)
+    return false;
+  return other == region || region->isAncestor(other);
+}
+
+static SyncRenderSite getRenderedReleaseSite(const SyncEdge &edge) {
+  if (edge.srcYieldRegion)
+    return makeOpRenderSite(edge.srcYieldRegion->getParentOp());
+
+  Region *dstRegion =
+      edge.dstOp ? edge.dstOp->getParentRegion() : edge.dstYieldRegion;
+  if (dstRegion && sameOwner(edge.srcOwner, edge.dstRegionOwner.entry) &&
+      !renderSiteRegionContainsOp(dstRegion, edge.srcOp) &&
+      !renderSiteRegionContainsRegion(dstRegion, edge.srcYieldRegion))
+    return makeEnterRenderSite(*dstRegion);
+
+  Operation *srcAnchor = edge.srcOp;
+  Operation *dstAnchor =
+      edge.dstOp
+          ? edge.dstOp
+          : (edge.dstYieldRegion ? edge.dstYieldRegion->getParentOp() : nullptr);
+  Operation *best = srcAnchor;
+  for (Operation *parent = srcAnchor ? srcAnchor->getParentOp() : nullptr;
+       parent; parent = parent->getParentOp()) {
+    if (!isa<scf::ForOp, scf::IfOp>(parent))
+      continue;
+    if (dstAnchor &&
+        (parent == dstAnchor || parent->isProperAncestor(dstAnchor)))
+      break;
+    best = parent;
+  }
+  return makeOpRenderSite(best);
+}
 
 static bool sameSyncRenderRegion(const SyncRenderSite &lhs,
                                  const SyncRenderSite &rhs) {
@@ -817,13 +881,11 @@ static LogicalResult walkRenderedSyncSites(
   std::function<LogicalResult(Block &)> walkBlock;
 
   auto visitOpSite = [&](Operation *op, ArrayRef<unsigned> edges) {
-    SyncRenderSite site{op->getParentRegion(), op->getBlock(), op, ordinal++};
+    SyncRenderSite site = makeOpRenderSite(op, ordinal++);
     return fn(edges, site);
   };
   auto visitYieldSite = [&](Region &region, ArrayRef<unsigned> edges) {
-    Operation *yieldOp = region.empty() ? nullptr : region.front().getTerminator();
-    SyncRenderSite site{&region, region.empty() ? nullptr : &region.front(),
-                        yieldOp, ordinal++};
+    SyncRenderSite site = makeYieldRenderSite(region, ordinal++);
     return fn(edges, site);
   };
 
