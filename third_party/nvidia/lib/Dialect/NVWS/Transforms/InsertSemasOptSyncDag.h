@@ -176,13 +176,13 @@ static const SyncEdge *findEdgeForAnchor(const SyncGroup &group,
       if (edge.dstYieldRegion == yieldRegion) return &edge;
       break;
     case SyncAnchorKind::ReleaseAfterEnter:
-      if (SyncRenderSite site = getRenderedReleaseSite(edge);
-          site.kind == SyncRenderSiteKind::Enter && site.region == yieldRegion)
+      if (edge.releaseSiteKind == SyncReleaseSiteKind::AfterEnter &&
+          edge.releaseAfterEnterRegion == yieldRegion)
         return &edge;
       break;
     case SyncAnchorKind::ReleaseAfterOp:
-      if (SyncRenderSite site = getRenderedReleaseSite(edge);
-          site.kind == SyncRenderSiteKind::Op && site.anchor == anchor)
+      if (edge.releaseSiteKind == SyncReleaseSiteKind::AfterOp &&
+          edge.releaseAfterOp == anchor)
         return &edge;
       break;
     case SyncAnchorKind::ReleaseAfterYield:
@@ -656,14 +656,16 @@ buildEmitterTransitionPlan(const OptSyncDag &dag, const SyncPlan &sp,
       const SyncEdge &edge = sp.edges[edgeIdx];
       if (!edgeRequiresRelease(edge))
         continue;
-      SyncRenderSite releaseSite = getRenderedReleaseSite(edge);
-      if (releaseSite.kind == SyncRenderSiteKind::Enter) {
-        if (releaseSite.region)
-          edgesByEnter[releaseSite.region].push_back(edgeIdx);
+      if (edge.releaseSiteKind == SyncReleaseSiteKind::AfterEnter) {
+        if (edge.releaseAfterEnterRegion)
+          edgesByEnter[edge.releaseAfterEnterRegion].push_back(edgeIdx);
         continue;
       }
-      if (releaseSite.anchor)
-        edgesByAnchor[releaseSite.anchor].push_back(edgeIdx);
+      if (edge.releaseSiteKind == SyncReleaseSiteKind::AfterOp) {
+        if (edge.releaseAfterOp)
+          edgesByAnchor[edge.releaseAfterOp].push_back(edgeIdx);
+        continue;
+      }
     }
     for (auto &[region, regionEdges] : edgesByEnter)
       addPlannedRelease(transitions.regionStartReleases, region, sp, groupIdx,

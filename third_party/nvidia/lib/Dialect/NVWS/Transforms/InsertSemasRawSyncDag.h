@@ -211,6 +211,17 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
   auto populateEdgeInfo = [&](SyncEdge &edge, SyncEdgeKind kind,
                               unsigned producedEpoch, Owner preOwner,
                               Owner postOwner) {
+    auto regionContainsOp = [](Region *region, Operation *op) {
+      if (!region || !op)
+        return false;
+      Region *opRegion = op->getParentRegion();
+      return opRegion == region || region->isAncestor(opRegion);
+    };
+    auto regionContainsRegion = [](Region *region, Region *other) {
+      if (!region || !other)
+        return false;
+      return other == region || region->isAncestor(other);
+    };
     edge.kind = kind;
     edge.producedVersion = {rp.resource.second, producedEpoch};
     edge.preOwner = preOwner;
@@ -247,6 +258,42 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
           edge.touches.push_back(*touch);
       }
     }
+
+    Region *dstRegion =
+        edge.dstOp ? edge.dstOp->getParentRegion() : edge.dstYieldRegion;
+    if (edge.srcYieldRegion) {
+      edge.releaseSiteKind = SyncReleaseSiteKind::AfterOp;
+      edge.releaseAfterOp = edge.srcYieldRegion->getParentOp();
+      edge.releaseAfterEnterRegion = nullptr;
+      return;
+    }
+    if (dstRegion && sameOwner(edge.srcOwner, edge.dstRegionOwner.entry) &&
+        !regionContainsOp(dstRegion, edge.srcOp) &&
+        !regionContainsRegion(dstRegion, edge.srcYieldRegion)) {
+      edge.releaseSiteKind = SyncReleaseSiteKind::AfterEnter;
+      edge.releaseAfterOp = nullptr;
+      edge.releaseAfterEnterRegion = dstRegion;
+      return;
+    }
+    Operation *srcAnchor = edge.srcOp;
+    Operation *dstAnchor =
+        edge.dstOp
+            ? edge.dstOp
+            : (edge.dstYieldRegion ? edge.dstYieldRegion->getParentOp()
+                                   : nullptr);
+    Operation *best = srcAnchor;
+    for (Operation *parent = srcAnchor ? srcAnchor->getParentOp() : nullptr;
+         parent; parent = parent->getParentOp()) {
+      if (!isa<scf::ForOp, scf::IfOp>(parent))
+        continue;
+      if (dstAnchor &&
+          (parent == dstAnchor || parent->isProperAncestor(dstAnchor)))
+        break;
+      best = parent;
+    }
+    edge.releaseSiteKind = SyncReleaseSiteKind::AfterOp;
+    edge.releaseAfterOp = best;
+    edge.releaseAfterEnterRegion = nullptr;
   };
 
   // Apply the "close cross-readers + optional handoff" rule. Used by W
@@ -677,10 +724,7 @@ struct OptDumpCtx {
   DenseSet<unsigned> rendered;
 };
 
-enum class SyncRenderSiteKind { Op, Yield, Enter };
-
 struct SyncRenderSite {
-  SyncRenderSiteKind kind = SyncRenderSiteKind::Op;
   Region *region = nullptr;
   Block *block = nullptr;
   Operation *anchor = nullptr;
@@ -688,64 +732,15 @@ struct SyncRenderSite {
 };
 
 static SyncRenderSite makeOpRenderSite(Operation *op, unsigned ordinal = 0) {
-  return {SyncRenderSiteKind::Op, op ? op->getParentRegion() : nullptr,
-          op ? op->getBlock() : nullptr, op, ordinal};
+  return {op ? op->getParentRegion() : nullptr, op ? op->getBlock() : nullptr,
+          op, ordinal};
 }
 
 static SyncRenderSite makeYieldRenderSite(Region &region,
                                           unsigned ordinal = 0) {
   Operation *yieldOp = region.empty() ? nullptr : region.front().getTerminator();
-  return {SyncRenderSiteKind::Yield, &region,
-          region.empty() ? nullptr : &region.front(), yieldOp, ordinal};
-}
-
-static SyncRenderSite makeEnterRenderSite(Region &region,
-                                          unsigned ordinal = 0) {
-  return {SyncRenderSiteKind::Enter, &region,
-          region.empty() ? nullptr : &region.front(), region.getParentOp(),
+  return {&region, region.empty() ? nullptr : &region.front(), yieldOp,
           ordinal};
-}
-
-static bool renderSiteRegionContainsOp(Region *region, Operation *op) {
-  if (!region || !op)
-    return false;
-  Region *opRegion = op->getParentRegion();
-  return opRegion == region || region->isAncestor(opRegion);
-}
-
-static bool renderSiteRegionContainsRegion(Region *region, Region *other) {
-  if (!region || !other)
-    return false;
-  return other == region || region->isAncestor(other);
-}
-
-static SyncRenderSite getRenderedReleaseSite(const SyncEdge &edge) {
-  if (edge.srcYieldRegion)
-    return makeOpRenderSite(edge.srcYieldRegion->getParentOp());
-
-  Region *dstRegion =
-      edge.dstOp ? edge.dstOp->getParentRegion() : edge.dstYieldRegion;
-  if (dstRegion && sameOwner(edge.srcOwner, edge.dstRegionOwner.entry) &&
-      !renderSiteRegionContainsOp(dstRegion, edge.srcOp) &&
-      !renderSiteRegionContainsRegion(dstRegion, edge.srcYieldRegion))
-    return makeEnterRenderSite(*dstRegion);
-
-  Operation *srcAnchor = edge.srcOp;
-  Operation *dstAnchor =
-      edge.dstOp
-          ? edge.dstOp
-          : (edge.dstYieldRegion ? edge.dstYieldRegion->getParentOp() : nullptr);
-  Operation *best = srcAnchor;
-  for (Operation *parent = srcAnchor ? srcAnchor->getParentOp() : nullptr;
-       parent; parent = parent->getParentOp()) {
-    if (!isa<scf::ForOp, scf::IfOp>(parent))
-      continue;
-    if (dstAnchor &&
-        (parent == dstAnchor || parent->isProperAncestor(dstAnchor)))
-      break;
-    best = parent;
-  }
-  return makeOpRenderSite(best);
 }
 
 static bool sameSyncRenderRegion(const SyncRenderSite &lhs,

@@ -196,6 +196,7 @@ struct ProducedVersionKey {
 };
 
 enum class CarrierTokenChoice { None, Source, Destination };
+enum class SyncReleaseSiteKind { AfterOp, AfterEnter };
 
 struct SyncEdge {
   std::string name;
@@ -216,6 +217,9 @@ struct SyncEdge {
   bool acquireOutsideControlFlow = false;
   bool forceFullSemaphore = false;
   CarrierTokenChoice carrierChoice = CarrierTokenChoice::None;
+  SyncReleaseSiteKind releaseSiteKind = SyncReleaseSiteKind::AfterOp;
+  Operation *releaseAfterOp = nullptr;
+  Region *releaseAfterEnterRegion = nullptr;
   StageCluster releaseStageCluster;
   StageCluster acquireStageCluster;
   AsyncOp asyncPayload = AsyncOp::NONE;
