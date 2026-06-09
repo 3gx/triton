@@ -299,6 +299,7 @@ struct EmitterTransitionPlan {
   llvm::MapVector<Operation *, SmallVector<PlannedRelease, 2>> opEntryReleases,
       opExitReleases;
   llvm::MapVector<Operation *, SmallVector<unsigned, 2>> opEntryAcquires;
+  llvm::MapVector<Region *, SmallVector<PlannedRelease, 2>> regionStartReleases;
   llvm::MapVector<Region *, SmallVector<PlannedRelease, 2>> regionEntryReleases;
   llvm::MapVector<Region *, SmallVector<unsigned, 2>> regionEntryAcquires;
 };
@@ -346,6 +347,7 @@ enum class SyncAnchorKind {
   AcquireBeforeYield,
   ReleaseBeforeOp,
   ReleaseBeforeYield,
+  ReleaseAfterEnter,
   ReleaseAfterOp,
   ReleaseAfterYield
 };

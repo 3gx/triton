@@ -1462,15 +1462,6 @@ static LogicalResult emitOperationEntryTransitions(
   const EmitterTransitionPlan &transitions = state.transitionPlan();
   OpBuilder b(anchor);
   b.setInsertionPoint(anchor);
-  auto rIt = transitions.opEntryReleases.find(anchor);
-  if (rIt != transitions.opEntryReleases.end())
-    for (const PlannedRelease &release : rIt->second) {
-      if (failed(state.release(
-              b, anchor->getLoc(), SyncAnchorKind::ReleaseBeforeOp,
-              anchor, nullptr, release, dag, sp, group,
-              stageForReleaseAction(release, sp, state, getStageCluster(anchor)))))
-        return failure();
-    }
   auto aIt = transitions.opEntryAcquires.find(anchor);
   if (aIt != transitions.opEntryAcquires.end())
     for (unsigned gi : aIt->second)
@@ -1904,17 +1895,6 @@ static LogicalResult emitRegionCloseTransitions(
   const EmitterTransitionPlan &transitions = state.transitionPlan();
   OpBuilder b(yieldOp);
   b.setInsertionPoint(yieldOp);
-  auto rIt = transitions.regionEntryReleases.find(region);
-  if (rIt != transitions.regionEntryReleases.end())
-    for (const PlannedRelease &release : rIt->second) {
-      const SyncEdge *edge = getRepresentativeReleaseEdge(release, sp);
-      if (failed(state.release(
-              b, yieldOp->getLoc(),
-              SyncAnchorKind::ReleaseBeforeYield, nullptr, region, release, dag, sp,
-              group,
-              stageForYieldOwner(edge ? edge->srcOwner : std::nullopt, state))))
-        return failure();
-    }
   auto aIt = transitions.regionEntryAcquires.find(region);
   if (aIt != transitions.regionEntryAcquires.end())
     for (unsigned gi : aIt->second) {
@@ -2287,6 +2267,44 @@ static LogicalResult emitResourceBlock(Block &block, const OptSyncDag &dag,
                                        BufferGroup &group, const GroupBacking &backing,
                                        EmitState &state, Region *plannedRegion);
 
+static LogicalResult emitRegionStartTransitions(Region &region,
+                                                Region *regionKey,
+                                                const OptSyncDag &dag,
+                                                const SyncPlan &sp,
+                                                BufferGroup &group,
+                                                EmitState &state) {
+  const EmitterTransitionPlan &transitions = state.transitionPlan();
+  auto rIt = transitions.regionStartReleases.find(regionKey);
+  if (rIt == transitions.regionStartReleases.end())
+    return success();
+  Operation *parentOp = region.getParentOp();
+  if (!parentOp)
+    return group.members.front().allocOp->emitError(
+        "nvws-insert-semas: region-start release has no parent op");
+  if (region.empty())
+    return parentOp->emitError(
+        "nvws-insert-semas: region-start release has no entry block");
+
+  Block &entryBlock = region.front();
+  OpBuilder b(parentOp->getContext());
+  Location loc = parentOp->getLoc();
+  if (entryBlock.empty()) {
+    b.setInsertionPointToEnd(&entryBlock);
+  } else {
+    Operation *insertBefore = &entryBlock.front();
+    b.setInsertionPoint(insertBefore);
+    loc = insertBefore->getLoc();
+  }
+
+  for (const PlannedRelease &release : rIt->second)
+    if (failed(state.release(
+            b, loc, SyncAnchorKind::ReleaseAfterEnter, nullptr, regionKey,
+            release, dag, sp, group,
+            stageForReleaseAction(release, sp, state, getStageCluster(parentOp)))))
+      return failure();
+  return success();
+}
+
 static bool isOperationTransitionAnchor(Operation *op, const EmitState &state,
                                         const EmitterTransitionPlan &transitions) {
   if (state.completedTransitionAnchors.contains(op))
@@ -2302,6 +2320,9 @@ static LogicalResult emitResourceRegion(Region &region, const OptSyncDag &dag,
                                         EmitState &state,
                                         Region *plannedRegion = nullptr) {
   Region *regionKey = plannedRegion ? plannedRegion : &region;
+  if (failed(emitRegionStartTransitions(region, regionKey, dag, sp, group,
+                                        state)))
+    return failure();
   for (Block &block : region)
     if (failed(emitResourceBlock(block, dag, sp, plan, group, backing, state,
                                  regionKey)))
@@ -2924,9 +2945,9 @@ static void splitSemaphoreIfForLoopScheduler(triton::FuncOp funcOp) {
       continue;
 
     b.setInsertionPointAfter(ifOp);
-    auto enterIf = scf::IfOp::create(b, loc, TypeRange{b.getType<AsyncTokenType>()},
-                                     ifOp.getCondition(),
-                                     /*withElseRegion=*/true);
+    auto enterIf = scf::IfOp::create(
+        b, loc, TypeRange{b.getType<AsyncTokenType>()}, ifOp.getCondition(),
+        /*withElseRegion=*/true);
     Block *enterAcquireBlock =
         candidate.branchIsThen ? enterIf.thenBlock() : enterIf.elseBlock();
     candidate.acquireOp->moveBefore(enterAcquireBlock,
