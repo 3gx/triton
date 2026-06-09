@@ -1784,29 +1784,12 @@ static LogicalResult closeLoopSemaphoreStateAfter(scf::ForOp forOp,
                                                   const SyncPlan &sp,
                                                   BufferGroup &group,
                                                   EmitState &state) {
-  if (!group.isTmem() || !state.current.token || !hasWarpSpecializeTag(forOp))
-    return success();
-
-  const EmitterTransitionPlan &transitions = state.transitionPlan();
-  if (transitions.regionEntryReleases.contains(region) ||
-      transitions.regionEntryAcquires.contains(region))
-    return success();
-
-  SmallVector<unsigned, 2> groupIds;
-  for (auto [idx, syncGroup] : llvm::enumerate(dag.groups))
-    if (syncGroup.kind == SyncGroupKind::LinearChain &&
-        groupTouchesLoopBoundary(syncGroup, sp, forOp.getOperation(), region))
-      groupIds.push_back(static_cast<unsigned>(idx));
-
-  for (unsigned groupIdx : groupIds) {
-    FailureOr<bool> closed =
-        closeStateMachineLoopTransitionAfter(forOp, region, groupIdx, dag, sp,
-                                             group, state);
-    if (failed(closed))
-      return failure();
-    if (*closed)
-      return success();
-  }
+  (void)forOp;
+  (void)region;
+  (void)dag;
+  (void)sp;
+  (void)group;
+  (void)state;
   return success();
 }
 

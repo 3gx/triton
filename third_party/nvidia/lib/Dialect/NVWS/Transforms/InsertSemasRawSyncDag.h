@@ -179,11 +179,17 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
   // is bumped every time the writer is updated, so edges that share a
   // (srcOwner, srcEpoch) provably came from the same producer event.
   using Owner = std::optional<PartitionId>;
+  struct ReleaseSiteState {
+    SyncReleaseSiteKind kind = SyncReleaseSiteKind::AfterOp;
+    Operation *afterOp = nullptr;
+    Region *afterEnterRegion = nullptr;
+  };
   struct State {
     bool writerSet = false;
     Owner writer;
     Operation *writerOp = nullptr;
     Region *writerYieldRegion = nullptr;
+    ReleaseSiteState writerReleaseSite;
     unsigned writerEpoch = 0;
     // Parallel arrays indexed together: `readers[i]` is the partition,
     // `readerOps[i]` / `readerYields[i]` is where its last access for
@@ -192,6 +198,7 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
     SmallVector<Owner, 4> readers;
     SmallVector<Operation *, 4> readerOps;
     SmallVector<Region *, 4> readerYields;
+    SmallVector<ReleaseSiteState, 4> readerReleaseSites;
     SmallVector<unsigned, 4> readerEpochs;
   };
 
@@ -202,6 +209,69 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
   unsigned serial = 0;
   unsigned writerEpochCtr = 0;
 
+  auto regionContainsOp = [](Region *region, Operation *op) {
+    if (!region || !op)
+      return false;
+    Region *opRegion = op->getParentRegion();
+    return opRegion == region || region->isAncestor(opRegion);
+  };
+  auto regionContainsRegion = [](Region *region, Region *other) {
+    if (!region || !other)
+      return false;
+    return other == region || region->isAncestor(other);
+  };
+  auto setReleaseSiteAfterOp = [](ReleaseSiteState &site, Operation *op) {
+    site.kind = SyncReleaseSiteKind::AfterOp;
+    site.afterOp = op;
+    site.afterEnterRegion = nullptr;
+  };
+  auto setReleaseSiteAfterEnter = [](ReleaseSiteState &site, Region *region) {
+    site.kind = SyncReleaseSiteKind::AfterEnter;
+    site.afterOp = nullptr;
+    site.afterEnterRegion = region;
+  };
+  auto copyReleaseSiteToEdge = [](const ReleaseSiteState &site, SyncEdge &edge) {
+    edge.releaseSiteKind = site.kind;
+    edge.releaseAfterOp = site.afterOp;
+    edge.releaseAfterEnterRegion = site.afterEnterRegion;
+  };
+  auto siteLivesInRegion = [&](const ReleaseSiteState &site, Region *region) {
+    if (!region)
+      return false;
+    if (site.kind == SyncReleaseSiteKind::AfterEnter)
+      return site.afterEnterRegion == region;
+    return regionContainsOp(region, site.afterOp);
+  };
+  auto reanchorSiteForRegionEnter = [&](ReleaseSiteState &site, const Owner &owner,
+                                        Region &region) {
+    auto it = rp.regionOwners.find(&region);
+    if (it == rp.regionOwners.end())
+      return;
+    if (!sameOwner(owner, it->second.entry))
+      return;
+    if (siteLivesInRegion(site, &region))
+      return;
+    setReleaseSiteAfterEnter(site, &region);
+  };
+  auto reanchorSiteForRegionExit = [&](ReleaseSiteState &site, Region &region) {
+    if (!siteLivesInRegion(site, &region))
+      return;
+    setReleaseSiteAfterOp(site, region.getParentOp());
+  };
+  auto reanchorStateForRegionEnter = [&](State &state, Region &region) {
+    if (state.writerSet)
+      reanchorSiteForRegionEnter(state.writerReleaseSite, state.writer, region);
+    for (unsigned i = 0; i < state.readers.size(); ++i)
+      reanchorSiteForRegionEnter(state.readerReleaseSites[i], state.readers[i],
+                                 region);
+  };
+  auto reanchorStateForRegionExit = [&](State &state, Region &region) {
+    if (state.writerSet)
+      reanchorSiteForRegionExit(state.writerReleaseSite, region);
+    for (ReleaseSiteState &site : state.readerReleaseSites)
+      reanchorSiteForRegionExit(site, region);
+  };
+
   auto readerIdx = [&](const State &s, const Owner &p) -> int {
     for (unsigned i = 0; i < s.readers.size(); ++i)
       if (sameOwner(s.readers[i], p)) return static_cast<int>(i);
@@ -211,17 +281,6 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
   auto populateEdgeInfo = [&](SyncEdge &edge, SyncEdgeKind kind,
                               unsigned producedEpoch, Owner preOwner,
                               Owner postOwner) {
-    auto regionContainsOp = [](Region *region, Operation *op) {
-      if (!region || !op)
-        return false;
-      Region *opRegion = op->getParentRegion();
-      return opRegion == region || region->isAncestor(opRegion);
-    };
-    auto regionContainsRegion = [](Region *region, Region *other) {
-      if (!region || !other)
-        return false;
-      return other == region || region->isAncestor(other);
-    };
     edge.kind = kind;
     edge.producedVersion = {rp.resource.second, producedEpoch};
     edge.preOwner = preOwner;
@@ -258,42 +317,6 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
           edge.touches.push_back(*touch);
       }
     }
-
-    Region *dstRegion =
-        edge.dstOp ? edge.dstOp->getParentRegion() : edge.dstYieldRegion;
-    if (edge.srcYieldRegion) {
-      edge.releaseSiteKind = SyncReleaseSiteKind::AfterOp;
-      edge.releaseAfterOp = edge.srcYieldRegion->getParentOp();
-      edge.releaseAfterEnterRegion = nullptr;
-      return;
-    }
-    if (dstRegion && sameOwner(edge.srcOwner, edge.dstRegionOwner.entry) &&
-        !regionContainsOp(dstRegion, edge.srcOp) &&
-        !regionContainsRegion(dstRegion, edge.srcYieldRegion)) {
-      edge.releaseSiteKind = SyncReleaseSiteKind::AfterEnter;
-      edge.releaseAfterOp = nullptr;
-      edge.releaseAfterEnterRegion = dstRegion;
-      return;
-    }
-    Operation *srcAnchor = edge.srcOp;
-    Operation *dstAnchor =
-        edge.dstOp
-            ? edge.dstOp
-            : (edge.dstYieldRegion ? edge.dstYieldRegion->getParentOp()
-                                   : nullptr);
-    Operation *best = srcAnchor;
-    for (Operation *parent = srcAnchor ? srcAnchor->getParentOp() : nullptr;
-         parent; parent = parent->getParentOp()) {
-      if (!isa<scf::ForOp, scf::IfOp>(parent))
-        continue;
-      if (dstAnchor &&
-          (parent == dstAnchor || parent->isProperAncestor(dstAnchor)))
-        break;
-      best = parent;
-    }
-    edge.releaseSiteKind = SyncReleaseSiteKind::AfterOp;
-    edge.releaseAfterOp = best;
-    edge.releaseAfterEnterRegion = nullptr;
   };
 
   // Apply the "close cross-readers + optional handoff" rule. Used by W
@@ -337,6 +360,7 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
           edge.dstOp = anchorOp;
         else
           edge.dstYieldRegion = anchorYieldRegion;
+        copyReleaseSiteToEdge(state.readerReleaseSites[i], edge);
         populateEdgeInfo(edge,
                          sameOwnerReadAfterWrite ? SyncEdgeKind::Handoff
                                                  : SyncEdgeKind::Done,
@@ -369,6 +393,7 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
           edge.dstOp = anchorOp;
         else
           edge.dstYieldRegion = anchorYieldRegion;
+        copyReleaseSiteToEdge(state.writerReleaseSite, edge);
         populateEdgeInfo(edge, SyncEdgeKind::Handoff, state.writerEpoch,
                          state.writer, P);
         recordEdge(sp, edge);
@@ -380,10 +405,16 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
       state.writer = P;
       state.writerOp = anchorOp;
       state.writerYieldRegion = anchorYieldRegion;
+      if (anchorOp)
+        setReleaseSiteAfterOp(state.writerReleaseSite, anchorOp);
+      else if (anchorYieldRegion)
+        setReleaseSiteAfterOp(state.writerReleaseSite,
+                              anchorYieldRegion->getParentOp());
       state.writerEpoch = ++writerEpochCtr;
       state.readers.clear();
       state.readerOps.clear();
       state.readerYields.clear();
+      state.readerReleaseSites.clear();
       state.readerEpochs.clear();
     } else if (fired) {
       // Structural row only promotes itself to writer when it actually
@@ -392,6 +423,11 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
       state.writer = P;
       state.writerOp = anchorOp;
       state.writerYieldRegion = anchorYieldRegion;
+      if (anchorOp)
+        setReleaseSiteAfterOp(state.writerReleaseSite, anchorOp);
+      else if (anchorYieldRegion)
+        setReleaseSiteAfterOp(state.writerReleaseSite,
+                              anchorYieldRegion->getParentOp());
       state.writerEpoch = ++writerEpochCtr;
     }
     return fired;
@@ -408,6 +444,7 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
       edge.srcYieldRegion = state.writerYieldRegion;
       edge.srcEpoch = state.writerEpoch;
       edge.dstOp = anchorOp;
+      copyReleaseSiteToEdge(state.writerReleaseSite, edge);
       populateEdgeInfo(edge, SyncEdgeKind::Ready, state.writerEpoch,
                        state.writer, P);
       recordEdge(sp, edge);
@@ -418,10 +455,13 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
       state.readers.push_back(P);
       state.readerOps.push_back(anchorOp);
       state.readerYields.push_back(nullptr);
+      state.readerReleaseSites.push_back({});
+      setReleaseSiteAfterOp(state.readerReleaseSites.back(), anchorOp);
       state.readerEpochs.push_back(readEpoch);
     } else {
       state.readerOps[idx] = anchorOp;
       state.readerYields[idx] = nullptr;
+      setReleaseSiteAfterOp(state.readerReleaseSites[idx], anchorOp);
       state.readerEpochs[idx] = readEpoch;
     }
   };
@@ -452,16 +492,19 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
             state.writer = pp;
             state.writerOp = &op;
             state.writerYieldRegion = nullptr;
+            setReleaseSiteAfterOp(state.writerReleaseSite, &op);
             state.writerEpoch = ++writerEpochCtr;
             state.readers.clear();
             state.readerOps.clear();
             state.readerYields.clear();
+            state.readerReleaseSites.clear();
             state.readerEpochs.clear();
           } else {
             // Transition at the scf.for header row.
             emitClose(state, pp, &op, /*anchorYieldRegion=*/nullptr,
                       /*isW=*/false, rank);
           }
+          reanchorStateForRegionEnter(state, forOp.getRegion());
           walkRegion(forOp.getRegion(), state);
           // Transition at the body's YIELD row (loop-carry close). op2 is the
           // loop's next-iteration ENTER (body has events by the precondition
@@ -471,6 +514,7 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
           unsigned yieldRank = opRank.lookup(yieldOp);
           emitClose(state, pp, /*anchorOp=*/nullptr, &forOp.getRegion(),
                     /*isW=*/false, yieldRank, /*consumerGuaranteed=*/true);
+          reanchorStateForRegionExit(state, forOp.getRegion());
           continue;
         }
         if (auto ifOp = dyn_cast<scf::IfOp>(&op)) {
@@ -491,6 +535,7 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
           // Walk each branch from a snapshot of the post-header state.
           State snap = state;
           State thenExit = snap;
+          reanchorStateForRegionEnter(thenExit, ifOp.getThenRegion());
           walkRegion(ifOp.getThenRegion(), thenExit);
           {
             Operation *thenYield =
@@ -498,16 +543,19 @@ static SyncPlan buildSyncPlan(BufferGroup &group, const ResourcePlan &rp,
             unsigned ry = opRank.lookup(thenYield);
             emitClose(thenExit, pp, /*anchorOp=*/nullptr,
                       &ifOp.getThenRegion(), /*isW=*/false, ry);
+            reanchorStateForRegionExit(thenExit, ifOp.getThenRegion());
           }
           State elseExit = snap;
           bool hasElse = !ifOp.getElseRegion().empty();
           if (hasElse) {
+            reanchorStateForRegionEnter(elseExit, ifOp.getElseRegion());
             walkRegion(ifOp.getElseRegion(), elseExit);
             Operation *elseYield =
                 ifOp.getElseRegion().front().getTerminator();
             unsigned ry = opRank.lookup(elseYield);
             emitClose(elseExit, pp, /*anchorOp=*/nullptr,
                       &ifOp.getElseRegion(), /*isW=*/false, ry);
+            reanchorStateForRegionExit(elseExit, ifOp.getElseRegion());
           }
           // Planner enforces branches converge. Use last walked branch.
           state = hasElse ? elseExit : thenExit;
