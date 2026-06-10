@@ -215,6 +215,12 @@ struct GroupDag {
   SmallVector<Operation *, 1> ttDescriptorFedMembers; // tt-form descriptor-
                                           // fed sourceful allocs (pipeline-
                                           // invariant guard, contract D)
+  DenseSet<Operation *> accessRowOps;     // emit-time: every Access-row
+                                          // anchor — the sourceful-alloc
+                                          // RAUW must not steal their
+                                          // operands (each row retargets
+                                          // itself with its own owner's
+                                          // view). Lookup-only.
   SmallVector<std::unique_ptr<Node>> nodes; // pool; pointer-stable
   Node *root = nullptr;                     // Func node of current snapshot
   SemaTable semaTable;

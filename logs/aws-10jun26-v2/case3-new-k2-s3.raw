@@ -1,0 +1,396 @@
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @attention_inner_loop_kernel
+groups: 7
+GROUP buffer.id=none#1 memory=tmem members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @attention_inner_loop_kernel
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  ttng.tc_gen5_mma {2}
+|  |  |- R  m0  ttng.tmem_load {0}
+OWNER-DAG
+|- func @attention_inner_loop_kernel
+|  |- scf.for (WS, tag=0) pieces{P0:W:{2}}
+|  |  |- ENTER pieces{P0:W:{2}}
+|  |  |- W  m0  ttng.tc_gen5_mma {2}
+|  |  |- R  m0  ttng.tmem_load {0}
+|  |  |- EXIT pieces{P0:W:{2}}
+SYNC-DAG
+|- func @attention_inner_loop_kernel
+|  |- a  S1  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{2}} parts{0,2} thread{c0:{2}}
+|  |  |- ENTER pieces{P0:W:{2}}
+|  |  |- W m0  ttng.tc_gen5_mma {2}
+|  |  |- r  S0  {2} [tc5mma]
+|  |  |- a  S0  {0}
+|  |  |- R m0  ttng.tmem_load {0}
+|  |  |- r  S1  {0} [none]
+|  |  |- a  S1  {2}
+|  |  |- EXIT pieces{P0:W:{2}} yield{c0: a S1}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.2}}
+  BACKING: numStages=2 anchor=before scf.for(tag=0)
+GROUP buffer.id=none#2 memory=tmem members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @attention_inner_loop_kernel
+|  |- W  m0  ttng.tmem_store root
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- R  m0  ttng.tmem_load {1}
+|  |  |- W  m0  ttng.tmem_store {1}
+|  |  |- W  m0  ttng.tc_gen5_mma {2}
+|  |- R  m0  ttng.tmem_load root
+OWNER-DAG
+|- func @attention_inner_loop_kernel
+|  |- W  m0  ttng.tmem_store root
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- R  m0  ttng.tmem_load {1}
+|  |  |- W  m0  ttng.tmem_store {1}
+|  |  |- W  m0  ttng.tc_gen5_mma {2}
+|  |  |- EXIT pieces{P0:W:{1}}
+|  |- R  m0  ttng.tmem_load root
+SYNC-DAG
+|- func @attention_inner_loop_kernel
+|  |- a  S1  root  ; entry
+|  |- W m0  ttng.tmem_store root
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}} parts{1,2} thread{c0:{1}}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- R m0  ttng.tmem_load {1}
+|  |  |- W m0  ttng.tmem_store {1}
+|  |  |- r  S0  {1} [none]
+|  |  |- a  S0  {2}
+|  |  |- W m0  ttng.tc_gen5_mma {2}
+|  |  |- r  S1  {2} [tc5mma]
+|  |  |- a  S1  {1}
+|  |  |- EXIT pieces{P0:W:{1}} yield{c0: a S1}
+|  |- r  S2  {@0.1} [none]
+|  |- a  S2  root
+|  |- R m0  ttng.tmem_load root
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit=root} S2{count=1}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+GROUP buffer.id=none#7 memory=tmem members=1
+  members: m0[0,64)
+  pieces: P0=[0,64){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @attention_inner_loop_kernel
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  ttng.tmem_alloc {0}
+|  |  |- R  m0  ttng.tc_gen5_mma {2}
+OWNER-DAG
+|- func @attention_inner_loop_kernel
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W  m0  ttng.tmem_alloc {0}
+|  |  |- R  m0  ttng.tc_gen5_mma {2}
+|  |  |- EXIT pieces{P0:W:{0}}
+SYNC-DAG
+|- func @attention_inner_loop_kernel
+|  |- a  S1  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}} parts{0,2} thread{c0:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W m0  ttng.tmem_alloc {0}
+|  |  |- r  S0  {0} [none]
+|  |  |- a  S0  {2}
+|  |  |- R m0  ttng.tc_gen5_mma {2}
+|  |  |- r  S1  {2} [tc5mma]
+|  |  |- a  S1  {0}
+|  |  |- EXIT pieces{P0:W:{0}} yield{c0: a S1}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.0}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+GROUP buffer.id=none#3 memory=local members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @attention_inner_loop_kernel
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  ttg.local_store {0}
+|  |  |- R  m0  ttg.local_load {1}
+OWNER-DAG
+|- func @attention_inner_loop_kernel
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W  m0  ttg.local_store {0}
+|  |  |- R  m0  ttg.local_load {1}
+|  |  |- EXIT pieces{P0:W:{0}}
+SYNC-DAG
+|- func @attention_inner_loop_kernel
+|  |- a  S1  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}} parts{0,1} thread{c0:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W m0  ttg.local_store {0}
+|  |  |- r  S0  {0} [none]
+|  |  |- a  S0  {1}
+|  |  |- R m0  ttg.local_load {1}
+|  |  |- r  S1  {1} [none]
+|  |  |- a  S1  {0}
+|  |  |- EXIT pieces{P0:W:{0}} yield{c0: a S1}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.0}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+GROUP buffer.id=none#4 memory=local members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @attention_inner_loop_kernel
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  nvws.descriptor_load {3}
+|  |  |- R  m0  ttng.tc_gen5_mma {2}
+OWNER-DAG
+|- func @attention_inner_loop_kernel
+|  |- scf.for (WS, tag=0) pieces{P0:W:{3}}
+|  |  |- ENTER pieces{P0:W:{3}}
+|  |  |- W  m0  nvws.descriptor_load {3}
+|  |  |- R  m0  ttng.tc_gen5_mma {2}
+|  |  |- EXIT pieces{P0:W:{3}}
+SYNC-DAG
+|- func @attention_inner_loop_kernel
+|  |- a  S1  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{3}} parts{2,3} thread{c0:{3}}
+|  |  |- ENTER pieces{P0:W:{3}}
+|  |  |- W m0  nvws.descriptor_load {3}
+|  |  |- r  S0  {3} [tma_load]
+|  |  |- a  S0  {2}
+|  |  |- R m0  ttng.tc_gen5_mma {2}
+|  |  |- r  S1  {2} [tc5mma]
+|  |  |- a  S1  {3}
+|  |  |- EXIT pieces{P0:W:{3}} yield{c0: a S1}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.3}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+GROUP buffer.id=none#5 memory=local members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @attention_inner_loop_kernel
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  nvws.descriptor_load {3}
+|  |  |- R  m0  ttng.tc_gen5_mma {2}
+OWNER-DAG
+|- func @attention_inner_loop_kernel
+|  |- scf.for (WS, tag=0) pieces{P0:W:{3}}
+|  |  |- ENTER pieces{P0:W:{3}}
+|  |  |- W  m0  nvws.descriptor_load {3}
+|  |  |- R  m0  ttng.tc_gen5_mma {2}
+|  |  |- EXIT pieces{P0:W:{3}}
+SYNC-DAG
+|- func @attention_inner_loop_kernel
+|  |- a  S1  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{3}} parts{2,3} thread{c0:{3}}
+|  |  |- ENTER pieces{P0:W:{3}}
+|  |  |- W m0  nvws.descriptor_load {3}
+|  |  |- r  S0  {3} [tma_load]
+|  |  |- a  S0  {2}
+|  |  |- R m0  ttng.tc_gen5_mma {2}
+|  |  |- r  S1  {2} [tc5mma]
+|  |  |- a  S1  {3}
+|  |  |- EXIT pieces{P0:W:{3}} yield{c0: a S1}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.3}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+GROUP buffer.id=none#6 memory=local members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @attention_inner_loop_kernel
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  ttg.local_store {0}
+|  |  |- R  m0  ttg.local_load {1}
+OWNER-DAG
+|- func @attention_inner_loop_kernel
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W  m0  ttg.local_store {0}
+|  |  |- R  m0  ttg.local_load {1}
+|  |  |- EXIT pieces{P0:W:{0}}
+SYNC-DAG
+|- func @attention_inner_loop_kernel
+|  |- a  S1  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}} parts{0,1} thread{c0:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W m0  ttg.local_store {0}
+|  |  |- r  S0  {0} [none]
+|  |  |- a  S0  {1}
+|  |  |- R m0  ttg.local_load {1}
+|  |  |- r  S1  {1} [none]
+|  |  |- a  S1  {0}
+|  |  |- EXIT pieces{P0:W:{0}} yield{c0: a S1}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.0}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+// -----// IR Dump After NVWSInsertSemas (nvws-insert-semas) //----- //
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#shared2 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:103", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @attention_inner_loop_kernel(%arg0: !tt.tensordesc<tensor<128x128xf16, #shared>>, %arg1: i32, %arg2: i32, %arg3: i64, %arg4: i64, %arg5: !tt.tensordesc<tensor<128x128xf16, #shared>>, %arg6: i32, %arg7: i32, %arg8: i64, %arg9: i64, %arg10: !tt.tensordesc<tensor<128x128xf16, #shared>>, %arg11: i32, %arg12: i32, %arg13: i64, %arg14: i64, %arg15: !tt.tensordesc<tensor<128x128xf16, #shared>>, %arg16: i32, %arg17: i32, %arg18: i64, %arg19: i64, %arg20: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg21: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg22: i32 {tt.divisibility = 16 : i32}, %arg23: i32 {tt.divisibility = 16 : i32}, %arg24: f32) attributes {noinline = false} {
+    %false = arith.constant false
+    %true = arith.constant true
+    %c128_i32 = arith.constant 128 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #linear>
+    %cst_0 = arith.constant dense<0xFF800000> : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+    %cst_1 = arith.constant dense<1.000000e+00> : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+    %0 = tt.get_program_id x : i32
+    %1 = arith.muli %0, %c128_i32 : i32
+    %2 = tt.descriptor_load %arg0[%1, %c0_i32] : !tt.tensordesc<tensor<128x128xf16, #shared>> -> tensor<128x128xf16, #blocked>
+    %3 = ttg.local_alloc %2 : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem>
+    %4 = tt.splat %arg24 : f32 -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+    %5 = tt.splat %arg24 : f32 -> tensor<128x128xf32, #linear>
+    %result = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %6 = nvws.semaphore.create %result true {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>
+    %7 = nvws.semaphore.create %result false {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>
+    %result_2 = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %8 = nvws.semaphore.create %result_2 true {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>
+    %9 = nvws.semaphore.create %result_2 false {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>
+    %10 = nvws.semaphore.create %result_2 false {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>
+    %11 = nvws.semaphore.acquire %8 : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+    %12 = nvws.semaphore.buffer %8, %11 : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+    %13 = ttng.tmem_store %cst, %12[], %true : tensor<128x128xf32, #linear> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+    %14 = ttg.local_alloc : () -> !ttg.memdesc<1x128xf32, #shared1, #smem, mutable>
+    %15 = nvws.semaphore.create %14 true {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]>
+    %16 = nvws.semaphore.create %14 false {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]>
+    %17 = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
+    %18 = nvws.semaphore.create %17 true {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    %19 = nvws.semaphore.create %17 false {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    %20 = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    %21 = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
+    %22 = nvws.semaphore.create %21 true {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    %23 = nvws.semaphore.create %21 false {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    %24 = ttg.local_alloc : () -> !ttg.memdesc<1x128xf32, #shared1, #smem, mutable>
+    %25 = nvws.semaphore.create %24 true {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]>
+    %26 = nvws.semaphore.create %24 false {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]>
+    %result_3 = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf16, #tmem, #ttng.tensor_memory, mutable>
+    %27 = nvws.semaphore.create %result_3 true {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #tmem, #ttng.tensor_memory, mutable>]>
+    %28 = nvws.semaphore.create %result_3 false {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #tmem, #ttng.tensor_memory, mutable>]>
+    %29 = nvws.semaphore.acquire %6 {ttg.partition = array<i32: 2>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+    %30 = nvws.semaphore.acquire %27 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<1x128x128xf16, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+    %31 = nvws.semaphore.acquire %15 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]> -> !ttg.async.token
+    %32 = nvws.semaphore.acquire %18 {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
+    %33 = nvws.semaphore.acquire %22 {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
+    %34 = nvws.semaphore.acquire %25 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]> -> !ttg.async.token
+    %35:10 = scf.for %arg25 = %c0_i32 to %arg23 step %c128_i32 iter_args(%arg26 = %cst_0, %arg27 = %cst_1, %arg28 = %false, %arg29 = %29, %arg30 = %11, %arg31 = %30, %arg32 = %31, %arg33 = %32, %arg34 = %33, %arg35 = %34) -> (tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, i1, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token)  : i32 {
+      nvws.semaphore.release %28, %arg31 [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf16, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
+      %51 = nvws.semaphore.buffer %15, %arg32 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128xf32, #shared1, #smem, mutable>
+      ttg.local_store %arg26, %51 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> -> !ttg.memdesc<128xf32, #shared1, #smem, mutable>
+      nvws.semaphore.release %16, %arg32 [#nvws.async_op<none>] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]>, !ttg.async.token
+      %52 = nvws.semaphore.buffer %18, %arg33 {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      nvws.descriptor_load %arg5[%arg25, %c0_i32] 32768 %52 {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, i32, i32, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      nvws.semaphore.release %19, %arg33 [#nvws.async_op<tma_load>] {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
+      %53 = ttg.memdesc_trans %20 {loop.cluster = 2 : i32, loop.stage = 2 : i32, order = array<i32: 1, 0>, ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared2, #smem, mutable>
+      %54 = nvws.semaphore.buffer %6, %arg29 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
+      %55 = nvws.semaphore.acquire %19 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
+      %56 = nvws.semaphore.buffer %19, %55 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      %57 = ttg.memdesc_trans %56 {loop.cluster = 2 : i32, loop.stage = 2 : i32, order = array<i32: 1, 0>, ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared2, #smem, mutable>
+      %58 = ttng.tc_gen5_mma %3, %57, %54[], %false, %true {loop.cluster = 2 : i32, loop.stage = 2 : i32, tt.self_latency = 1 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf16, #shared2, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
+      nvws.semaphore.release %18, %55 [#nvws.async_op<tc5mma>] {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
+      nvws.semaphore.release %7, %arg29 [#nvws.async_op<tc5mma>] {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
+      %59 = nvws.semaphore.acquire %7 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+      %60 = nvws.semaphore.buffer %7, %59 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
+      %result_5, %token_6 = ttng.tmem_load %60[] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128> -> tensor<128x128xf32, #linear>
+      nvws.semaphore.release %6, %59 [#nvws.async_op<none>] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
+      %61 = "tt.reduce"(%result_5) <{axis = 1 : i32, reduction_ordering = "unordered"}> ({
+      ^bb0(%arg36: f32, %arg37: f32):
+        %105 = arith.maxnumf %arg36, %arg37 {ttg.partition = array<i32: 0>} : f32
+        tt.reduce.return %105 {ttg.partition = array<i32: 0>} : f32
+      }) {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>, ttg.partition.outputs = [array<i32: 0>]} : (tensor<128x128xf32, #linear>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %62 = arith.mulf %61, %4 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %63 = arith.maxnumf %arg26, %62 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %64 = nvws.semaphore.buffer %25, %arg35 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128xf32, #shared1, #smem, mutable>
+      ttg.local_store %63, %64 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> -> !ttg.memdesc<128xf32, #shared1, #smem, mutable>
+      nvws.semaphore.release %26, %arg35 [#nvws.async_op<none>] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]>, !ttg.async.token
+      %65 = arith.mulf %result_5, %5 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear>
+      %66 = tt.expand_dims %63 {axis = 1 : i32, loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<128x1xf32, #linear>
+      %67 = tt.broadcast %66 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128x1xf32, #linear> -> tensor<128x128xf32, #linear>
+      %68 = arith.subf %65, %67 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear>
+      %69 = math.exp2 %68 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear>
+      %70 = arith.subf %arg26, %63 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %71 = nvws.semaphore.acquire %16 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]> -> !ttg.async.token
+      %72 = nvws.semaphore.buffer %16, %71 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128xf32, #shared1, #smem, mutable>
+      %73 = ttg.local_load %72 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128xf32, #shared1, #smem, mutable> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      nvws.semaphore.release %15, %71 [#nvws.async_op<none>] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]>, !ttg.async.token
+      %74 = nvws.semaphore.acquire %26 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]> -> !ttg.async.token
+      %75 = nvws.semaphore.buffer %26, %74 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128xf32, #shared1, #smem, mutable>
+      %76 = ttg.local_load %75 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128xf32, #shared1, #smem, mutable> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      nvws.semaphore.release %25, %74 [#nvws.async_op<none>] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]>, !ttg.async.token
+      %77 = arith.subf %73, %76 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %78 = math.exp2 %70 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %79 = math.exp2 %77 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %80 = "tt.reduce"(%69) <{axis = 1 : i32, reduction_ordering = "unordered"}> ({
+      ^bb0(%arg36: f32, %arg37: f32):
+        %105 = arith.addf %arg36, %arg37 {ttg.partition = array<i32: 0>} : f32
+        tt.reduce.return %105 {ttg.partition = array<i32: 0>} : f32
+      }) {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>, ttg.partition.outputs = [array<i32: 0>]} : (tensor<128x128xf32, #linear>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %81 = tt.expand_dims %79 {axis = 1 : i32, loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<128x1xf32, #linear>
+      %82 = tt.broadcast %81 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : tensor<128x1xf32, #linear> -> tensor<128x128xf32, #linear>
+      %83 = nvws.semaphore.buffer %8, %arg30 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+      %result_7, %token_8 = ttng.tmem_load %83[] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128> -> tensor<128x128xf32, #linear>
+      %84 = arith.mulf %result_7, %82 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : tensor<128x128xf32, #linear>
+      %85 = nvws.semaphore.buffer %22, %arg34 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      nvws.descriptor_load %arg10[%arg25, %c0_i32] 32768 %85 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 3>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, i32, i32, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      nvws.semaphore.release %23, %arg34 [#nvws.async_op<tma_load>] {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
+      %86 = arith.truncf %69 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear> to tensor<128x128xf16, #linear>
+      %87 = nvws.semaphore.buffer %27, %arg31 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf16, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+      %true_9 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} true
+      ttng.tmem_store %86, %87, %true_9 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128x128xf16, #linear> -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+      %88 = ttng.tmem_store %84, %83[], %true {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : tensor<128x128xf32, #linear> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+      nvws.semaphore.release %9, %arg30 [#nvws.async_op<none>] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
+      %89 = nvws.semaphore.acquire %9 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+      %90 = nvws.semaphore.buffer %9, %89 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+      %91 = nvws.semaphore.acquire %28 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+      %92 = nvws.semaphore.buffer %28, %91 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+      %93 = nvws.semaphore.acquire %23 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
+      %94 = nvws.semaphore.buffer %23, %93 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      %95 = ttng.tc_gen5_mma %87, %94, %90[], %arg28, %true {loop.cluster = 0 : i32, loop.stage = 4 : i32, tt.self_latency = 1 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable, 1x128x128>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+      nvws.semaphore.release %22, %93 [#nvws.async_op<tc5mma>] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
+      nvws.semaphore.release %27, %91 [#nvws.async_op<tc5mma>] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
+      nvws.semaphore.release %8, %89 [#nvws.async_op<tc5mma>] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
+      %96 = arith.mulf %arg27, %78 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %97 = arith.addf %96, %80 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %98 = nvws.semaphore.acquire %6 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+      %99 = nvws.semaphore.acquire %8 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+      %100 = nvws.semaphore.acquire %27 {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf16, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+      %101 = nvws.semaphore.acquire %15 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]> -> !ttg.async.token
+      %102 = nvws.semaphore.acquire %18 {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
+      %103 = nvws.semaphore.acquire %22 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
+      %104 = nvws.semaphore.acquire %25 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128xf32, #shared1, #smem, mutable>]> -> !ttg.async.token
+      scf.yield {ttg.partition = array<i32: 0, 1, 2, 3>} %63, %97, %true, %98, %99, %100, %101, %102, %103, %104 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, i1, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token
+    } {tt.scheduled_max_stage = 4 : i32, tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2, 3>, ttg.partition.outputs = [array<i32: 0>, array<i32: 0>, array<i32: 2>, array<i32: 2>, array<i32: 1>, array<i32: 0>, array<i32: 0>, array<i32: 3>, array<i32: 3>, array<i32: 0>], ttg.partition.stages = [0 : i32, 0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    nvws.semaphore.release %10, %35#4 [#nvws.async_op<none>] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
+    %36 = nvws.semaphore.acquire %10 : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+    %37 = nvws.semaphore.buffer %10, %36 : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+    %result_4, %token = ttng.tmem_load %37[] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128> -> tensor<128x128xf32, #linear>
+    %38 = arith.truncf %result_4 : tensor<128x128xf32, #linear> to tensor<128x128xf16, #linear>
+    %39 = ttg.convert_layout %38 : tensor<128x128xf16, #linear> -> tensor<128x128xf16, #blocked>
+    tt.descriptor_store %arg15[%1, %c0_i32], %39 : !tt.tensordesc<tensor<128x128xf16, #shared>>, tensor<128x128xf16, #blocked>
+    %40 = tt.addptr %arg20, %1 : !tt.ptr<f16>, i32
+    %41 = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked1>
+    %42 = tt.splat %40 : !tt.ptr<f16> -> tensor<128x!tt.ptr<f16>, #blocked1>
+    %43 = tt.addptr %42, %41 : tensor<128x!tt.ptr<f16>, #blocked1>, tensor<128xi32, #blocked1>
+    %44 = arith.truncf %35#1 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> to tensor<128xf16, #ttg.slice<{dim = 1, parent = #linear}>>
+    %45 = ttg.convert_layout %44 : tensor<128xf16, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<128xf16, #blocked1>
+    tt.store %43, %45 : tensor<128x!tt.ptr<f16>, #blocked1>
+    %46 = tt.addptr %arg21, %1 : !tt.ptr<f16>, i32
+    %47 = tt.splat %46 : !tt.ptr<f16> -> tensor<128x!tt.ptr<f16>, #blocked1>
+    %48 = tt.addptr %47, %41 : tensor<128x!tt.ptr<f16>, #blocked1>, tensor<128xi32, #blocked1>
+    %49 = arith.truncf %35#0 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> to tensor<128xf16, #ttg.slice<{dim = 1, parent = #linear}>>
+    %50 = ttg.convert_layout %49 : tensor<128xf16, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<128xf16, #blocked1>
+    tt.store %48, %50 : tensor<128x!tt.ptr<f16>, #blocked1>
+    tt.return
+  }
+}
+
+
+/home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/python/test/unit/language/test_warp_specialization.py:427:27: warning: non-root partition #0 has direct SSA consumer
+        acc = tl.dot(p, v, acc)
+                          ^
+/home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/python/test/unit/language/test_warp_specialization.py:427:27: note: use at distance 0 in partition #2 here

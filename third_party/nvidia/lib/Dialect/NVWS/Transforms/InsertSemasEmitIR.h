@@ -241,9 +241,11 @@ static LogicalResult emitBackingsAndCreates(EmitCtx &ctx, GroupDag &g) {
     if (m.allocOp->getBlock() == anchor->getBlock() &&
         m.allocOp->isBeforeInBlock(anchor))
       anchor = m.allocOp;
-  // Hoist to function level (above the outermost enclosing op) — backings
-  // and creates carry no partition attrs and must dominate all uses.
-  while (anchor->getParentOp() != ctx.func)
+  // Hoist out of enclosing scf.for ops only — above the outermost WS
+  // loop — but NEVER across an scf.if: a guarded WS loop keeps backings,
+  // creates, and entry acquires inside the involving branch (plan
+  // contract A; gate-2 oracle fact 10jun26).
+  while (isa<scf::ForOp>(anchor->getParentOp()))
     anchor = anchor->getParentOp();
   b.setInsertionPoint(anchor);
   Location loc = anchor->getLoc();
@@ -593,9 +595,6 @@ static unsigned slotIndexFor(EmitCtx &ctx, Operation *op, GroupDag *g,
   llvm_unreachable("missing slot");
 }
 
-static CompId compOfMember(GroupDag &g, MemberId m) {
-  return g.pieceTable.pieceComp[g.pieceTable.footprint[m].front()];
-}
 
 // Materialize (or fetch) the view of `member`, replaying the access's alias
 // chain (mining gap 4 rules).
@@ -661,9 +660,13 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
                                  RenderState &rs,
                                  DenseMap<Node *, Value> &emitted);
 
+// `anchor` reports the op that anchors this row in the emitted IR: the
+// original access op, or the synthesized store replacing a sourceful
+// alloc (the original is erased; its pointer must not be touched again).
 static LogicalResult renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
-                                  RenderState &rs) {
+                                  RenderState &rs, Operation *&anchor) {
   Operation *op = n->op;
+  anchor = op;
   if (n->owner)
     rs.stageCache[ownerKey(n->owner)] = gpu::getStageCluster(op);
   for (const Touch &t : n->touches) {
@@ -675,16 +678,18 @@ static LogicalResult renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
       auto vTrue = emitInto<arith::ConstantOp>(b, op->getLoc(), n->owner,
                                                pidsc.second,
                                                b.getBoolAttr(true));
-      emitInto<nvidia_gpu::TMEMStoreOp>(b, op->getLoc(), n->owner,
-                                        pidsc.second, Type(), view, Value(),
-                                        ta.getSrc(), vTrue);
+      anchor = emitInto<nvidia_gpu::TMEMStoreOp>(b, op->getLoc(), n->owner,
+                                                 pidsc.second, Type(), view,
+                                                 Value(), ta.getSrc(), vTrue);
       // RAUW dominated uses, excluding creates and the new store.
       ta.getResult().replaceUsesWithIf(view, [&](OpOperand &use) {
         return !isa<nvws::SemaphoreCreateOp>(use.getOwner()) &&
-               use.getOwner() != view.getDefiningOp();
+               use.getOwner() != view.getDefiningOp() &&
+               !g.accessRowOps.contains(use.getOwner());
       });
-      op->erase();
-      g.pieceTable.members[t.member].allocOp = nullptr; // erased
+      // Deferred erase: later access rows of this group still reference
+      // the original result until THEY retarget (their own owner's view);
+      // the final cleanup erases it once use-empty.
       return success();
     }
     if (auto la = dyn_cast<gpu::LocalAllocOp>(op)) {
@@ -699,13 +704,14 @@ static LogicalResult renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
             src);
         src = splat.getResult();
       }
-      emitInto<gpu::LocalStoreOp>(b, op->getLoc(), n->owner,
-                                  gpu::getStageCluster(op), src, view);
+      anchor = emitInto<gpu::LocalStoreOp>(b, op->getLoc(), n->owner,
+                                           gpu::getStageCluster(op), src,
+                                           view);
       la.getResult().replaceUsesWithIf(view, [&](OpOperand &use) {
-        return !isa<nvws::SemaphoreCreateOp>(use.getOwner());
+        return !isa<nvws::SemaphoreCreateOp>(use.getOwner()) &&
+               !g.accessRowOps.contains(use.getOwner());
       });
-      op->erase();
-      g.pieceTable.members[t.member].allocOp = nullptr; // erased
+      // Deferred erase (see TMEMAlloc branch above).
       return success();
     }
     // Plain access: retarget the matching operand(s).
@@ -767,7 +773,13 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
       yield->setOperand(idx, body.carrier.lookup(c.comp));
       rs.carrier[c.comp] = forOp.getResult(idx);
     }
-    rs.stageCache = std::move(body.stageCache);
+    if (!gpu::hasWarpSpecializeTag(forOp))
+      rs.stageCache = std::move(body.stageCache);
+    // Stage facts flow out of inner (non-WS) loop bodies — the epilogue
+    // release after an inner loop inherits its in-body stage (oracle fact,
+    // gate-2 case 3) — but never escape the WS-tagged loop itself: outside
+    // it, loop.stage/cluster are meaningless and must not be stamped
+    // (oracle fact, m2/m3 outside-loop releases).
     rs.view.clear();
     return success();
   }
@@ -872,16 +884,14 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
       break;
     }
     case Node::Access: {
-      Operation *op = n->op;
-      if (failed(renderAccess(ctx, g, n, rs)))
+      Operation *anchor = nullptr;
+      if (failed(renderAccess(ctx, g, n, rs, anchor)))
         return failure();
-      // op may have been erased (sourceful allocs); track the live anchor.
-      lastReal = n->op && n->op->getBlock() ? n->op : lastReal;
-      if (n->owner)
-        rs.stageCache[ownerKey(n->owner)] = lastReal
-                                                ? gpu::getStageCluster(lastReal)
-                                                : gpu::StageCluster{};
-      (void)op;
+      if (anchor) {
+        lastReal = anchor;
+        if (n->owner)
+          rs.stageCache[ownerKey(n->owner)] = gpu::getStageCluster(anchor);
+      }
       break;
     }
     case Node::For:
@@ -1217,8 +1227,20 @@ static LogicalResult emitIR(triton::FuncOp funcOp,
   }
   // Step 1.
   for (GroupDag &g : groups)
-    if (!g.semaTable.semas.empty())
+    if (!g.semaTable.semas.empty()) {
       nukeGroupTokens(ctx, g);
+      std::function<void(Node *)> collect = [&](Node *head) {
+        for (Node *n = head; n; n = n->next) {
+          if (n->kind == Node::Access && n->op)
+            g.accessRowOps.insert(n->op);
+          if (n->kind == Node::For || n->kind == Node::If)
+            for (Node *child : n->children)
+              collect(child);
+        }
+      };
+      if (!g.root->children.empty())
+        collect(g.root->children[0]);
+    }
   // Step 1b: erase the dead token slots the nuke leaves behind (fixpoint).
   while (eraseDeadTokenSlots(ctx, groups)) {
   }
@@ -1259,6 +1281,27 @@ static LogicalResult emitIR(triton::FuncOp funcOp,
   // Step 7.
   if (failed(workaroundLoopScheduler(ctx)))
     return failure();
+  // Erase dead alias-view chains (fixpoint, leaf-first): retargeting left
+  // the original memdesc view ops dead, and they pin the original allocs
+  // (and carry stale partition stamps that partition-loops rejects as
+  // cross-partition SSA edges — gate-2 case 3, 10jun26).
+  {
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      SmallVector<Operation *> aliasOps;
+      ctx.func.walk([&](Operation *op) {
+        if (isSupportedAliasOp(op))
+          aliasOps.push_back(op);
+      });
+      for (Operation *op : llvm::reverse(aliasOps))
+        if (llvm::all_of(op->getResults(),
+                         [](Value v) { return v.use_empty(); })) {
+          op->erase();
+          changed = true;
+        }
+    }
+  }
   // Erase fully-retargeted original member allocs (uses-before-defs order:
   // these are leaves once their results are unused).
   for (GroupDag &g : groups) {

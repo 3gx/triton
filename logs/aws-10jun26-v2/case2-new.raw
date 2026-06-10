@@ -1,0 +1,373 @@
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @matmul_tma_persistent_ws_kernel
+groups: 3
+GROUP buffer.id=none#1 memory=tmem members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @matmul_tma_persistent_ws_kernel
+|  |- scf.if effects{P0:W}
+|  |  |- then
+|  |  |- else
+|  |  |  |- W  m0  ttng.tmem_store root
+|  |  |  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |  |  |- scf.if effects{P0:R}
+|  |  |  |  |  |- then
+|  |  |  |  |  |  |- R  m0  ttng.tmem_load {0}
+|  |  |  |  |  |- else
+OWNER-DAG
+|- func @matmul_tma_persistent_ws_kernel
+|  |- scf.if pieces{P0:W:root}
+|  |  |- then
+|  |  |  |- ENTER
+|  |  |  |- EXIT
+|  |  |- else
+|  |  |  |- ENTER pieces{P0:W:root}
+|  |  |  |- W  m0  ttng.tmem_store root
+|  |  |  |- scf.for (WS, tag=0) pieces{P0:W:{1}}
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |  |  |- scf.if pieces{P0:R:{1}}
+|  |  |  |  |  |- then
+|  |  |  |  |  |  |- ENTER pieces{P0:R:{1}}
+|  |  |  |  |  |  |- R  m0  ttng.tmem_load {0}
+|  |  |  |  |  |  |- EXIT pieces{P0:R:{1}}
+|  |  |  |  |  |- else
+|  |  |  |  |  |  |- ENTER
+|  |  |  |  |  |  |- EXIT
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- EXIT pieces{P0:W:root}
+SYNC-DAG
+|- func @matmul_tma_persistent_ws_kernel
+|  |- scf.if pieces{P0:W:root} parts{0,1} thread{c0:{@0.1}}
+|  |  |- then
+|  |  |  |- ENTER
+|  |  |  |- EXIT yield{c0: pass}
+|  |  |- else
+|  |  |  |- ENTER pieces{P0:W:root}
+|  |  |  |- a  S1  root  ; entry
+|  |  |  |- W m0  ttng.tmem_store root
+|  |  |  |- scf.for (WS, tag=0) pieces{P0:W:{1}} parts{0,1} thread{c0:{1}}
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- W m0  ttng.tc_gen5_mma {1}
+|  |  |  |  |- scf.if pieces{P0:R:{1}} parts{0,1} thread{c0:{1}}
+|  |  |  |  |  |- then
+|  |  |  |  |  |  |- ENTER pieces{P0:R:{1}}
+|  |  |  |  |  |  |- r  S0  {1} [tc5mma]
+|  |  |  |  |  |  |- a  S0  {0}
+|  |  |  |  |  |  |- R m0  ttng.tmem_load {0}
+|  |  |  |  |  |  |- r  S1  {0} [none]
+|  |  |  |  |  |  |- a  S1  {1}
+|  |  |  |  |  |  |- EXIT pieces{P0:R:{1}} yield{c0: a S1}
+|  |  |  |  |  |- else
+|  |  |  |  |  |  |- ENTER
+|  |  |  |  |  |  |- EXIT yield{c0: pass}
+|  |  |  |  |- EXIT pieces{P0:W:{1}} yield{c0: scf.if}
+|  |  |  |- EXIT pieces{P0:W:root} yield{c0: scf.for}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit=root}
+  BACKING: numStages=2 anchor=before scf.for(tag=0)
+GROUP buffer.id=none#2 memory=local members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @matmul_tma_persistent_ws_kernel
+|  |- scf.if effects{P0:W}
+|  |  |- then
+|  |  |- else
+|  |  |  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |  |  |- W  m0  nvws.descriptor_load {2}
+|  |  |  |  |- R  m0  ttng.tc_gen5_mma {1}
+OWNER-DAG
+|- func @matmul_tma_persistent_ws_kernel
+|  |- scf.if pieces{P0:W:root}
+|  |  |- then
+|  |  |  |- ENTER
+|  |  |  |- EXIT
+|  |  |- else
+|  |  |  |- ENTER pieces{P0:W:root}
+|  |  |  |- scf.for (WS, tag=0) pieces{P0:W:{2}}
+|  |  |  |  |- ENTER pieces{P0:W:{2}}
+|  |  |  |  |- W  m0  nvws.descriptor_load {2}
+|  |  |  |  |- R  m0  ttng.tc_gen5_mma {1}
+|  |  |  |  |- EXIT pieces{P0:W:{2}}
+|  |  |  |- EXIT pieces{P0:W:root}
+SYNC-DAG
+|- func @matmul_tma_persistent_ws_kernel
+|  |- scf.if pieces{P0:W:root} parts{1,2} thread{c0:{@0.2}}
+|  |  |- then
+|  |  |  |- ENTER
+|  |  |  |- EXIT yield{c0: pass}
+|  |  |- else
+|  |  |  |- ENTER pieces{P0:W:root}
+|  |  |  |- a  S1  root  ; entry
+|  |  |  |- scf.for (WS, tag=0) pieces{P0:W:{2}} parts{1,2} thread{c0:{2}}
+|  |  |  |  |- ENTER pieces{P0:W:{2}}
+|  |  |  |  |- W m0  nvws.descriptor_load {2}
+|  |  |  |  |- r  S0  {2} [tma_load]
+|  |  |  |  |- a  S0  {1}
+|  |  |  |  |- R m0  ttng.tc_gen5_mma {1}
+|  |  |  |  |- r  S1  {1} [tc5mma]
+|  |  |  |  |- a  S1  {2}
+|  |  |  |  |- EXIT pieces{P0:W:{2}} yield{c0: a S1}
+|  |  |  |- EXIT pieces{P0:W:root} yield{c0: scf.for}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.2}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+GROUP buffer.id=none#3 memory=local members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @matmul_tma_persistent_ws_kernel
+|  |- scf.if effects{P0:W}
+|  |  |- then
+|  |  |- else
+|  |  |  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |  |  |- W  m0  nvws.descriptor_load {2}
+|  |  |  |  |- R  m0  ttng.tc_gen5_mma {1}
+OWNER-DAG
+|- func @matmul_tma_persistent_ws_kernel
+|  |- scf.if pieces{P0:W:root}
+|  |  |- then
+|  |  |  |- ENTER
+|  |  |  |- EXIT
+|  |  |- else
+|  |  |  |- ENTER pieces{P0:W:root}
+|  |  |  |- scf.for (WS, tag=0) pieces{P0:W:{2}}
+|  |  |  |  |- ENTER pieces{P0:W:{2}}
+|  |  |  |  |- W  m0  nvws.descriptor_load {2}
+|  |  |  |  |- R  m0  ttng.tc_gen5_mma {1}
+|  |  |  |  |- EXIT pieces{P0:W:{2}}
+|  |  |  |- EXIT pieces{P0:W:root}
+SYNC-DAG
+|- func @matmul_tma_persistent_ws_kernel
+|  |- scf.if pieces{P0:W:root} parts{1,2} thread{c0:{@0.2}}
+|  |  |- then
+|  |  |  |- ENTER
+|  |  |  |- EXIT yield{c0: pass}
+|  |  |- else
+|  |  |  |- ENTER pieces{P0:W:root}
+|  |  |  |- a  S1  root  ; entry
+|  |  |  |- scf.for (WS, tag=0) pieces{P0:W:{2}} parts{1,2} thread{c0:{2}}
+|  |  |  |  |- ENTER pieces{P0:W:{2}}
+|  |  |  |  |- W m0  nvws.descriptor_load {2}
+|  |  |  |  |- r  S0  {2} [tma_load]
+|  |  |  |  |- a  S0  {1}
+|  |  |  |  |- R m0  ttng.tc_gen5_mma {1}
+|  |  |  |  |- r  S1  {1} [tc5mma]
+|  |  |  |  |- a  S1  {2}
+|  |  |  |  |- EXIT pieces{P0:W:{2}} yield{c0: a S1}
+|  |  |  |- EXIT pieces{P0:W:root} yield{c0: scf.for}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.2}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+// -----// IR Dump After NVWSInsertSemas (nvws-insert-semas) //----- //
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [8, 1], order = [1, 0]}>
+#linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0], [0, 64]], block = []}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:103", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @matmul_tma_persistent_ws_kernel(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg3: i32 {tt.divisibility = 16 : i32}, %arg4: i32 {tt.divisibility = 16 : i32}, %arg5: i32 {tt.divisibility = 16 : i32}, %arg6: i32 {tt.divisibility = 16 : i32}, %arg7: i32 {tt.divisibility = 16 : i32}, %arg8: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %0 = ub.poison : !ttg.async.token
+    %false = arith.constant false
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf16, #blocked>
+    %true = arith.constant true
+    %c1_i64 = arith.constant 1 : i64
+    %c128_i32 = arith.constant 128 : i32
+    %c150_i32 = arith.constant 150 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c127_i32 = arith.constant 127 : i32
+    %c8_i32 = arith.constant 8 : i32
+    %cst_0 = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #linear>
+    %1 = arith.extsi %arg3 : i32 to i64
+    %2 = tt.make_tensor_descriptor %arg0, [%arg6, %arg8], [%1, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x128xf16, #shared>>
+    %3 = arith.extsi %arg4 : i32 to i64
+    %4 = tt.make_tensor_descriptor %arg1, [%arg7, %arg8], [%3, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x128xf16, #shared>>
+    %5 = arith.extsi %arg5 : i32 to i64
+    %6 = tt.make_tensor_descriptor %arg2, [%arg6, %arg7], [%5, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x128xf16, #shared>>
+    %7 = tt.get_program_id x : i32
+    %8 = arith.addi %arg6, %c127_i32 : i32
+    %9 = arith.divsi %8, %c128_i32 : i32
+    %10 = arith.addi %arg7, %c127_i32 : i32
+    %11 = arith.divsi %10, %c128_i32 : i32
+    %12 = arith.addi %arg8, %c127_i32 : i32
+    %13 = arith.divsi %12, %c128_i32 : i32
+    %14 = arith.muli %9, %11 : i32
+    %15 = arith.muli %11, %c8_i32 : i32
+    %16 = arith.cmpi eq, %13, %c0_i32 : i32
+    %result = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %17 = nvws.semaphore.create %result true {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>
+    %18 = nvws.semaphore.create %result false {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>
+    %19 = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
+    %20 = nvws.semaphore.create %19 true {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    %21 = nvws.semaphore.create %19 false {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    %22 = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
+    %23 = nvws.semaphore.create %22 true {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    %24 = nvws.semaphore.create %22 false {nvws.dag_pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    %25:3 = scf.if %16 -> (!ttg.async.token, !ttg.async.token, !ttg.async.token) {
+      scf.for %arg9 = %7 to %14 step %c150_i32  : i32 {
+        %26 = arith.divsi %arg9, %15 : i32
+        %27 = arith.muli %26, %c8_i32 : i32
+        %28 = arith.subi %9, %27 : i32
+        %29 = arith.minsi %28, %c8_i32 : i32
+        %30 = arith.remsi %arg9, %29 : i32
+        %31 = arith.addi %27, %30 : i32
+        %32 = arith.remsi %arg9, %15 : i32
+        %33 = arith.divsi %32, %29 : i32
+        %34 = arith.muli %31, %c128_i32 : i32
+        %35 = arith.muli %33, %c128_i32 : i32
+        tt.descriptor_store %6[%34, %35], %cst : !tt.tensordesc<tensor<128x128xf16, #shared>>, tensor<128x128xf16, #blocked>
+      } {tt.flatten, tt.num_stages = 2 : i32}
+      scf.yield %0, %0, %0 : !ttg.async.token, !ttg.async.token, !ttg.async.token
+    } else {
+      %26 = arith.subi %14, %7 : i32
+      %27 = arith.ceildivsi %26, %c150_i32 : i32
+      %28 = arith.maxsi %13, %c1_i32 : i32
+      %29 = arith.muli %27, %28 : i32
+      %30 = arith.subi %7, %c150_i32 : i32
+      %31 = arith.subi %28, %c1_i32 : i32
+      %32 = arith.subi %28, %c1_i32 : i32
+      %33 = nvws.semaphore.acquire %17 : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+      %34 = nvws.semaphore.buffer %17, %33 : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
+      %35 = ttng.tmem_store %cst_0, %34[], %true : tensor<128x128xf32, #linear> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
+      %36 = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      %37 = nvws.semaphore.acquire %20 {ttg.partition = array<i32: 2>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
+      %38 = nvws.semaphore.acquire %23 {ttg.partition = array<i32: 2>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
+      %39:9 = scf.for %arg9 = %c0_i32 to %29 step %c1_i32 iter_args(%arg10 = %c0_i32, %arg11 = %30, %arg12 = %c0_i32, %arg13 = %c0_i32, %arg14 = %c0_i32, %arg15 = %false, %arg16 = %33, %arg17 = %37, %arg18 = %38) -> (i32, i32, i32, i32, i32, i1, !ttg.async.token, !ttg.async.token, !ttg.async.token)  : i32 {
+        %40 = arith.cmpi eq, %arg10, %c0_i32 {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0, 2>} : i32
+        %41 = arith.select %40, %c0_i32, %arg12 {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : i32
+        %42:3 = scf.if %40 -> (i32, i32, i32) {
+          %65 = arith.addi %arg11, %c150_i32 {ttg.partition = array<i32: 0, 2>} : i32
+          %66 = arith.divsi %65, %15 {ttg.partition = array<i32: 0, 2>} : i32
+          %67 = arith.muli %66, %c8_i32 {ttg.partition = array<i32: 0, 2>} : i32
+          %68 = arith.subi %9, %67 {ttg.partition = array<i32: 0, 2>} : i32
+          %69 = arith.minsi %68, %c8_i32 {ttg.partition = array<i32: 0, 2>} : i32
+          %70 = arith.remsi %65, %69 {ttg.partition = array<i32: 0, 2>} : i32
+          %71 = arith.addi %67, %70 {ttg.partition = array<i32: 0, 2>} : i32
+          %72 = arith.remsi %65, %15 {ttg.partition = array<i32: 0, 2>} : i32
+          %73 = arith.divsi %72, %69 {ttg.partition = array<i32: 0, 2>} : i32
+          %74 = arith.muli %71, %c128_i32 {ttg.partition = array<i32: 0, 2>} : i32
+          %75 = arith.muli %73, %c128_i32 {ttg.partition = array<i32: 0, 2>} : i32
+          scf.yield {ttg.partition = array<i32: 0, 2>} %74, %75, %65 : i32, i32, i32
+        } else {
+          scf.yield {ttg.partition = array<i32: 0, 2>} %arg13, %arg14, %arg11 : i32, i32, i32
+        } {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0, 2>, ttg.partition.outputs = [array<i32: 0, 2>, array<i32: 0, 2>, array<i32: 0, 2>]}
+        %43 = arith.muli %41, %c128_i32 {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : i32
+        %44 = nvws.semaphore.buffer %20, %arg17 {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+        nvws.descriptor_load %2[%42#0, %43] 32768 %44 {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, i32, i32, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+        nvws.semaphore.release %21, %arg17 [#nvws.async_op<tma_load>] {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
+        %45 = nvws.semaphore.buffer %23, %arg18 {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+        nvws.descriptor_load %4[%42#1, %43] 32768 %45 {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, i32, i32, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+        nvws.semaphore.release %24, %arg18 [#nvws.async_op<tma_load>] {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
+        %46 = ttg.memdesc_trans %36 {loop.cluster = 5 : i32, loop.stage = 1 : i32, order = array<i32: 1, 0>, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared1, #smem, mutable>
+        %47 = nvws.semaphore.buffer %17, %arg16 {loop.cluster = 5 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
+        %48 = nvws.semaphore.acquire %21 {loop.cluster = 5 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
+        %49 = nvws.semaphore.buffer %21, %48 {loop.cluster = 5 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+        %50 = nvws.semaphore.acquire %24 {loop.cluster = 5 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
+        %51 = nvws.semaphore.buffer %24, %50 {loop.cluster = 5 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+        %52 = ttg.memdesc_trans %51 {loop.cluster = 5 : i32, loop.stage = 1 : i32, order = array<i32: 1, 0>, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared1, #smem, mutable>
+        %53 = ttng.tc_gen5_mma %49, %52, %47[], %arg15, %true {loop.cluster = 5 : i32, loop.stage = 1 : i32, tt.self_latency = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared1, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
+        nvws.semaphore.release %23, %50 [#nvws.async_op<tc5mma>] {loop.cluster = 5 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
+        nvws.semaphore.release %20, %48 [#nvws.async_op<tc5mma>] {loop.cluster = 5 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
+        %54 = arith.addi %41, %c1_i32 {loop.cluster = 6 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 2>} : i32
+        %55 = arith.cmpi eq, %arg10, %31 {loop.cluster = 4 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 0, 1>} : i32
+        %56 = arith.select %55, %false, %true {loop.cluster = 4 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 1>} : i1
+        scf.if %55 {
+          nvws.semaphore.release %18, %arg16 [#nvws.async_op<tc5mma>] {loop.cluster = 5 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
+        } {loop.cluster = 5 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>}
+        %57 = ub.poison : !ttg.async.token
+        %58 = scf.if %55 -> (!ttg.async.token) {
+          %65 = nvws.semaphore.acquire %18 {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+          %66 = nvws.semaphore.buffer %18, %65 {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128>
+          %result_1, %token = ttng.tmem_load %66[] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 2x128x128> -> tensor<128x128xf32, #linear>
+          nvws.semaphore.release %17, %65 [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
+          %67 = arith.truncf %result_1 {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear> to tensor<128x128xf16, #linear>
+          %68 = ttg.convert_layout %67 {ttg.partition = array<i32: 0>} : tensor<128x128xf16, #linear> -> tensor<128x128xf16, #blocked>
+          tt.descriptor_store %6[%42#0, %42#1], %68 {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, tensor<128x128xf16, #blocked>
+          scf.yield {ttg.partition = array<i32: 0, 1>} %57 : !ttg.async.token
+        } else {
+          scf.yield {ttg.partition = array<i32: 0, 1>} %57 : !ttg.async.token
+        } {loop.cluster = 8 : i32, loop.stage = 3 : i32, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 1>]}
+        %59 = scf.if %55 -> (!ttg.async.token) {
+          %65 = nvws.semaphore.acquire %17 {loop.cluster = 5 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+          scf.yield {ttg.partition = array<i32: 1>} %65 : !ttg.async.token
+        } else {
+          scf.yield {ttg.partition = array<i32: 1>} %arg16 : !ttg.async.token
+        } {loop.cluster = 5 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>, ttg.partition.outputs = [array<i32: 1>]}
+        %60 = arith.addi %arg10, %c1_i32 {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0, 1, 2>} : i32
+        %61 = arith.cmpi eq, %arg10, %32 {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0, 1, 2>} : i32
+        %62 = arith.select %61, %c0_i32, %60 {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0, 1, 2>} : i32
+        %63 = nvws.semaphore.acquire %20 {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
+        %64 = nvws.semaphore.acquire %23 {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
+        scf.yield {ttg.partition = array<i32: 0, 1, 2>} %62, %42#2, %54, %42#0, %42#1, %56, %59, %63, %64 : i32, i32, i32, i32, i32, i1, !ttg.async.token, !ttg.async.token, !ttg.async.token
+      } {tt.num_stages = 2 : i32, tt.scheduled_max_stage = 3 : i32, tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.outputs = [array<i32: 0, 1, 2>, array<i32: 0, 2>, array<i32: 2>, array<i32: 0, 2>, array<i32: 0, 2>, array<i32: 1>, array<i32: 1>, array<i32: 2>, array<i32: 2>], ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+      scf.yield %39#6, %39#7, %39#8 : !ttg.async.token, !ttg.async.token, !ttg.async.token
+    }
+    tt.return
+  }
+}
+
+
+triton-opt: /home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/third_party/nvidia/lib/Dialect/NVWS/Transforms/AssignStagePhase.cpp:1021: void mlir::triton::{anonymous}::AssignStagePhase::assignStateInIfOp(mlir::scf::IfOp, State&): Assertion `hasPartition(ifOp)' failed.
+PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace and instructions to reproduce the bug.
+Stack dump:
+0.	Program arguments: /home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/build/cmake.linux-x86_64-cpython-3.12/bin/triton-opt logs/aws-10jun26-v2/case2-before-aws.mlir -allow-unregistered-dialect --mlir-print-ir-after=nvws-insert-semas -tritongpu-automatic-warp-specialization=num-stages=2
+ #0 0x00005e3addb75ff7 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) Signals.cpp:0:0
+ #1 0x00005e3addb738a5 llvm::sys::RunSignalHandlers() Signals.cpp:0:0
+ #2 0x00005e3addb76e65 SignalHandler(int, siginfo_t*, void*) Signals.cpp:0:0
+ #3 0x00007b8918c45330 (/usr/lib/x86_64-linux-gnu/libc.so.6+0x45330)
+ #4 0x00007b8918c9eb2c __pthread_kill_implementation ./nptl/pthread_kill.c:44:76
+ #5 0x00007b8918c9eb2c __pthread_kill_internal ./nptl/pthread_kill.c:78:10
+ #6 0x00007b8918c9eb2c pthread_kill ./nptl/pthread_kill.c:89:10
+ #7 0x00007b8918c4527e raise ./signal/../sysdeps/posix/raise.c:27:6
+ #8 0x00007b8918c288ff abort ./stdlib/abort.c:81:7
+ #9 0x00007b8918c2881b _nl_load_domain ./intl/loadmsgcat.c:1177:9
+#10 0x00007b8918c3b517 (/usr/lib/x86_64-linux-gnu/libc.so.6+0x3b517)
+#11 0x00005e3ad8ad383e mlir::triton::(anonymous namespace)::AssignStagePhase::assignStateInIfOp(mlir::scf::IfOp, mlir::triton::(anonymous namespace)::AssignStagePhase::State&) /home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/third_party/nvidia/lib/Dialect/NVWS/Transforms/AssignStagePhase.cpp:1021:5
+#12 0x00005e3ad8ad4732 mlir::triton::(anonymous namespace)::AssignStagePhase::assignStateInBlock(mlir::Block*, mlir::triton::(anonymous namespace)::AssignStagePhase::State) /home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/third_party/nvidia/lib/Dialect/NVWS/Transforms/AssignStagePhase.cpp:1142:26
+#13 0x00005e3ad8ad8238 ~_Rb_tree /usr/include/c++/13/bits/stl_tree.h:986:17
+#14 0x00005e3ad8ad8238 ~map /usr/include/c++/13/bits/stl_map.h:314:7
+#15 0x00005e3ad8ad8238 ~State /home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/third_party/nvidia/lib/Dialect/NVWS/Transforms/AssignStagePhase.cpp:79:10
+#16 0x00005e3ad8ad8238 mlir::triton::(anonymous namespace)::AssignStagePhase::run(llvm::ArrayRef<mlir::triton::nvws::SemaphoreCreateOp>) /home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/third_party/nvidia/lib/Dialect/NVWS/Transforms/AssignStagePhase.cpp:1219:28
+#17 0x00005e3ad8ad9409 assignStagePhase /home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/third_party/nvidia/lib/Dialect/NVWS/Transforms/AssignStagePhase.cpp:1396:5
+#18 0x00005e3ad8ad9409 mlir::triton::NVWSAssignStagePhase::runOnOperation()::'lambda'(mlir::triton::FuncOp)::operator()(mlir::triton::FuncOp) const /home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/third_party/nvidia/lib/Dialect/NVWS/Transforms/AssignStagePhase.cpp:1448:17
+#19 0x00005e3ad8ad9409 _ZZN4mlir6detail4walkILNS_9WalkOrderE1ENS_15ForwardIteratorEZNS_6triton20NVWSAssignStagePhase14runOnOperationEvEUlNS4_6FuncOpEE_S6_vEENSt9enable_ifIXaantsrSt11disjunctionIJSt7is_sameIT2_PNS_9OperationEESA_ISB_PNS_6RegionEESA_ISB_PNS_5BlockEEEE5valuesrSA_IT3_vE5valueESM_E4typeESD_OT1_ENKUlSD_E_clESD_ /home/scratch.egaburov_sw/dot_triton/llvm/llvm-a992f294-ubuntu-x64/include/mlir/IR/Visitors.h:304:15
+#20 0x00005e3ad8ad9409 _ZN4llvm12function_refIFvPN4mlir9OperationEEE11callback_fnIZNS1_6detail4walkILNS1_9WalkOrderE1ENS1_15ForwardIteratorEZNS1_6triton20NVWSAssignStagePhase14runOnOperationEvEUlNSB_6FuncOpEE_SD_vEENSt9enable_ifIXaantsrSt11disjunctionIJSt7is_sameIT2_S3_ESH_ISI_PNS1_6RegionEESH_ISI_PNS1_5BlockEEEE5valuesrSH_IT3_vE5valueESR_E4typeES3_OT1_EUlS3_E_EEvlS3_ /home/scratch.egaburov_sw/dot_triton/llvm/llvm-a992f294-ubuntu-x64/include/llvm/ADT/STLFunctionalExtras.h:46:52
+#21 0x00005e3ad84fcac3 llvm::ilist_iterator<llvm::ilist_detail::node_options<mlir::Operation, true, false, void, false, void>, false, false>::operator++() /home/scratch.egaburov_sw/dot_triton/llvm/llvm-a992f294-ubuntu-x64/include/llvm/ADT/ilist_iterator.h:187:13
+#22 0x00005e3ad84fcac3 llvm::ilist_iterator<llvm::ilist_detail::node_options<mlir::Operation, true, false, void, false, void>, false, false>::operator++(int) /home/scratch.egaburov_sw/dot_triton/llvm/llvm-a992f294-ubuntu-x64/include/llvm/ADT/ilist_iterator.h:197:5
+#23 0x00005e3ad84fcac3 llvm::early_inc_iterator_impl<llvm::ilist_iterator<llvm::ilist_detail::node_options<mlir::Operation, true, false, void, false, void>, false, false>>::operator*() /home/scratch.egaburov_sw/dot_triton/llvm/llvm-a992f294-ubuntu-x64/include/llvm/ADT/STLExtras.h:597:22
+#24 0x00005e3ad84fcac3 void mlir::detail::walk<mlir::ForwardIterator>(mlir::Operation*, llvm::function_ref<void (mlir::Operation*)>, mlir::WalkOrder) /home/scratch.egaburov_sw/dot_triton/llvm/llvm-a992f294-ubuntu-x64/include/mlir/IR/Visitors.h:145:7
+#25 0x00005e3ad8aca97a mlir::triton::NVWSAssignStagePhase::runOnOperation() /home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/third_party/nvidia/lib/Dialect/NVWS/Transforms/AssignStagePhase.cpp:1451:3
+#26 0x00005e3ad90d955a mlir::detail::OpToOpPassAdaptor::run(mlir::Pass*, mlir::Operation*, mlir::AnalysisManager, bool, unsigned int) Pass.cpp:0:0
+#27 0x00005e3ad90da16a mlir::detail::OpToOpPassAdaptor::runPipeline(mlir::OpPassManager&, mlir::Operation*, mlir::AnalysisManager, bool, unsigned int, mlir::PassInstrumentor*, mlir::PassInstrumentation::PipelineParentInfo const*) Pass.cpp:0:0
+#28 0x00005e3ad90e40ab llvm::LogicalResult llvm::function_ref<llvm::LogicalResult (mlir::OpPassManager&, mlir::Operation*)>::callback_fn<mlir::detail::OpToOpPassAdaptor::run(mlir::Pass*, mlir::Operation*, mlir::AnalysisManager, bool, unsigned int)::$_43>(long, mlir::OpPassManager&, mlir::Operation*) Pass.cpp:0:0
+#29 0x00005e3ad8ae9167 mlir::triton::NVWSLowerSemaphore::runOnOperation() /home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/third_party/nvidia/lib/Dialect/NVWS/Transforms/LowerAref.cpp:1215:5
+#30 0x00005e3ad90d955a mlir::detail::OpToOpPassAdaptor::run(mlir::Pass*, mlir::Operation*, mlir::AnalysisManager, bool, unsigned int) Pass.cpp:0:0
+#31 0x00005e3ad90da16a mlir::detail::OpToOpPassAdaptor::runPipeline(mlir::OpPassManager&, mlir::Operation*, mlir::AnalysisManager, bool, unsigned int, mlir::PassInstrumentor*, mlir::PassInstrumentation::PipelineParentInfo const*) Pass.cpp:0:0
+#32 0x00005e3ad90e40ab llvm::LogicalResult llvm::function_ref<llvm::LogicalResult (mlir::OpPassManager&, mlir::Operation*)>::callback_fn<mlir::detail::OpToOpPassAdaptor::run(mlir::Pass*, mlir::Operation*, mlir::AnalysisManager, bool, unsigned int)::$_43>(long, mlir::OpPassManager&, mlir::Operation*) Pass.cpp:0:0
+#33 0x00005e3ad8a1e481 (anonymous namespace)::AutomaticWarpSpecialization::runOnOperation() /home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/lib/Dialect/TritonGPU/Transforms/WarpSpecialization/AutomaticWarpSpecialization.cpp:127:3
+#34 0x00005e3ad90d955a mlir::detail::OpToOpPassAdaptor::run(mlir::Pass*, mlir::Operation*, mlir::AnalysisManager, bool, unsigned int) Pass.cpp:0:0
+#35 0x00005e3ad90da16a mlir::detail::OpToOpPassAdaptor::runPipeline(mlir::OpPassManager&, mlir::Operation*, mlir::AnalysisManager, bool, unsigned int, mlir::PassInstrumentor*, mlir::PassInstrumentation::PipelineParentInfo const*) Pass.cpp:0:0
+#36 0x00005e3ad90e1492 mlir::PassManager::runPasses(mlir::Operation*, mlir::AnalysisManager) Pass.cpp:0:0
+#37 0x00005e3ad90e0ad2 mlir::PassManager::run(mlir::Operation*) Pass.cpp:0:0
+#38 0x00005e3ad90cb5fa performActions(llvm::raw_ostream&, std::shared_ptr<llvm::SourceMgr> const&, mlir::MLIRContext*, mlir::MlirOptMainConfig const&) MlirOptMain.cpp:0:0
+#39 0x00005e3ad90ca87e llvm::LogicalResult llvm::function_ref<llvm::LogicalResult (std::unique_ptr<llvm::MemoryBuffer, std::default_delete<llvm::MemoryBuffer>>, llvm::MemoryBufferRef const&, llvm::raw_ostream&)>::callback_fn<mlir::MlirOptMain(llvm::raw_ostream&, std::unique_ptr<llvm::MemoryBuffer, std::default_delete<llvm::MemoryBuffer>>, mlir::DialectRegistry&, mlir::MlirOptMainConfig const&)::$_3>(long, std::unique_ptr<llvm::MemoryBuffer, std::default_delete<llvm::MemoryBuffer>>, llvm::MemoryBufferRef const&, llvm::raw_ostream&) MlirOptMain.cpp:0:0
+#40 0x00005e3add8d1f18 mlir::splitAndProcessBuffer(std::unique_ptr<llvm::MemoryBuffer, std::default_delete<llvm::MemoryBuffer>>, llvm::function_ref<llvm::LogicalResult (std::unique_ptr<llvm::MemoryBuffer, std::default_delete<llvm::MemoryBuffer>>, llvm::MemoryBufferRef const&, llvm::raw_ostream&)>, llvm::raw_ostream&, llvm::StringRef, llvm::StringRef) ToolUtilities.cpp:0:0
+#41 0x00005e3ad90bed82 mlir::MlirOptMain(llvm::raw_ostream&, std::unique_ptr<llvm::MemoryBuffer, std::default_delete<llvm::MemoryBuffer>>, mlir::DialectRegistry&, mlir::MlirOptMainConfig const&) MlirOptMain.cpp:0:0
+#42 0x00005e3ad90bf0b9 mlir::MlirOptMain(int, char**, llvm::StringRef, llvm::StringRef, mlir::DialectRegistry&) MlirOptMain.cpp:0:0
+#43 0x00005e3ad90bf2fd mlir::MlirOptMain(int, char**, llvm::StringRef, mlir::DialectRegistry&) MlirOptMain.cpp:0:0
+#44 0x00005e3ad90a434d llvm::SmallVectorBase<unsigned int>::size() const /home/scratch.egaburov_sw/dot_triton/llvm/llvm-a992f294-ubuntu-x64/include/llvm/ADT/SmallVector.h:80:32
+#45 0x00005e3ad90a434d llvm::SmallVectorTemplateCommon<std::pair<mlir::TypeID, std::unique_ptr<mlir::DialectExtensionBase, std::default_delete<mlir::DialectExtensionBase>>>, void>::end() /home/scratch.egaburov_sw/dot_triton/llvm/llvm-a992f294-ubuntu-x64/include/llvm/ADT/SmallVector.h:273:41
+#46 0x00005e3ad90a434d llvm::SmallVector<std::pair<mlir::TypeID, std::unique_ptr<mlir::DialectExtensionBase, std::default_delete<mlir::DialectExtensionBase>>>, 0u>::~SmallVector() /home/scratch.egaburov_sw/dot_triton/llvm/llvm-a992f294-ubuntu-x64/include/llvm/ADT/SmallVector.h:1209:24
+#47 0x00005e3ad90a434d llvm::MapVector<mlir::TypeID, std::unique_ptr<mlir::DialectExtensionBase, std::default_delete<mlir::DialectExtensionBase>>, llvm::DenseMap<mlir::TypeID, unsigned int, llvm::DenseMapInfo<mlir::TypeID, void>, llvm::detail::DenseMapPair<mlir::TypeID, unsigned int>>, llvm::SmallVector<std::pair<mlir::TypeID, std::unique_ptr<mlir::DialectExtensionBase, std::default_delete<mlir::DialectExtensionBase>>>, 0u>>::~MapVector() /home/scratch.egaburov_sw/dot_triton/llvm/llvm-a992f294-ubuntu-x64/include/llvm/ADT/MapVector.h:36:7
+#48 0x00005e3ad90a434d mlir::DialectRegistry::~DialectRegistry() /home/scratch.egaburov_sw/dot_triton/llvm/llvm-a992f294-ubuntu-x64/include/mlir/IR/DialectRegistry.h:139:7
+#49 0x00005e3ad90a434d main /home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/bin/triton-opt.cpp:11:1
+#50 0x00007b8918c2a1ca __libc_start_call_main ./csu/../sysdeps/nptl/libc_start_call_main.h:74:3
+#51 0x00007b8918c2a28b call_init ./csu/../csu/libc-start.c:128:20
+#52 0x00007b8918c2a28b __libc_start_main ./csu/../csu/libc-start.c:347:5
+#53 0x00005e3ad84df3d5 _start (/home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/build/cmake.linux-x86_64-cpython-3.12/bin/triton-opt+0x33b13d5)
+timeout: the monitored command dumped core

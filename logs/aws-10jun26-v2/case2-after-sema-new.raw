@@ -1,0 +1,3 @@
+logs/aws-10jun26-v2/case2-before-aws.mlir:1:2: error: expected operation name in quotes
+ (tritongpu-automatic-warp-specialization) ('builtin.module' operation) //----- //
+ ^

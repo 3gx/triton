@@ -754,6 +754,10 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
 // Crossings (threading facts ON the nodes) + requiredParts (clone sets).
 // Post-order: nested region rows resolve before their parents.
 // ---------------------------------------------------------------------------
+static CompId compOfMember(GroupDag &g, MemberId m) {
+  return g.pieceTable.pieceComp[g.pieceTable.footprint[m].front()];
+}
+
 static Node *chainFinalForComp(GroupDag &g, Node *head, CompId comp) {
   Node *final = nullptr;
   for (Node *n = head; n; n = n->next) {
@@ -799,6 +803,69 @@ static void computeCrossings(GroupDag &g, Node *head, unsigned numComps) {
         n->crossings.push_back(std::move(cr));
     }
   }
+}
+
+
+// ---------------------------------------------------------------------------
+// Liveness prune for If crossings (spec node table): a crossing survives
+// only if the escaped carrier is consumed after the If — a later component
+// row in the chain, or the enclosing region's own surviving crossing
+// (For-body recurrence / live parent branch). Function-chain end consumes
+// nothing. Reverse chain order so later prunes are visible to earlier
+// rows; parents prune before children descend.
+// ---------------------------------------------------------------------------
+static bool carrierConsumedAfter(GroupDag &g, Node *start, CompId comp) {
+  for (Node *n = start; n; n = n->next) {
+    switch (n->kind) {
+    case Node::Acquire:
+      if (g.semaTable.semas[n->sema].component == comp)
+        return false; // fresh carrier supersedes the escaped one
+      break;
+    case Node::Release:
+      if (g.semaTable.semas[n->sema].component == comp)
+        return true;
+      break;
+    case Node::Access:
+      for (const Touch &t : n->touches)
+        if (compOfMember(g, t.member) == comp)
+          return true;
+      break;
+    case Node::For:
+    case Node::If:
+      for (const Crossing &c : n->crossings)
+        if (c.comp == comp)
+          return true;
+      break;
+    default:
+      break;
+    }
+  }
+  return false;
+}
+
+static bool regionLiveFor(const Node *region, CompId comp) {
+  if (!region)
+    return false; // function chain
+  for (const Crossing &c : region->crossings)
+    if (c.comp == comp)
+      return true;
+  return false;
+}
+
+static void pruneDeadIfCrossings(GroupDag &g, Node *head, Node *region) {
+  SmallVector<Node *, 8> rows;
+  for (Node *n = head; n; n = n->next)
+    rows.push_back(n);
+  for (Node *n : llvm::reverse(rows))
+    if (n->kind == Node::If)
+      llvm::erase_if(n->crossings, [&](const Crossing &c) {
+        return !carrierConsumedAfter(g, n->next, c.comp) &&
+               !regionLiveFor(region, c.comp);
+      });
+  for (Node *n : rows)
+    if (n->kind == Node::For || n->kind == Node::If)
+      for (Node *child : n->children)
+        pruneDeadIfCrossings(g, child, n);
 }
 
 static void collectParts(Node *head, SmallVector<int, 4> &parts) {
@@ -1016,6 +1083,7 @@ static LogicalResult buildSyncDag(GroupDag &g, triton::FuncOp funcOp,
     numComps = std::max(numComps, c + 1);
   if (!g.root->children.empty()) {
     computeCrossings(g, g.root->children[0], numComps);
+    pruneDeadIfCrossings(g, g.root->children[0], /*region=*/nullptr);
     computeRequiredParts(g.root->children[0]);
   }
   computeBackingPlan(g, funcOp, useMetaPartitioner, numTmemBlocks);

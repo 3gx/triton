@@ -1,0 +1,600 @@
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#shared2 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:103", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @attention_inner_loop_kernel(%arg0: !tt.tensordesc<tensor<128x128xf16, #shared>>, %arg1: i32, %arg2: i32, %arg3: i64, %arg4: i64, %arg5: !tt.tensordesc<tensor<128x128xf16, #shared>>, %arg6: i32, %arg7: i32, %arg8: i64, %arg9: i64, %arg10: !tt.tensordesc<tensor<128x128xf16, #shared>>, %arg11: i32, %arg12: i32, %arg13: i64, %arg14: i64, %arg15: !tt.tensordesc<tensor<128x128xf16, #shared>>, %arg16: i32, %arg17: i32, %arg18: i64, %arg19: i64, %arg20: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg21: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg22: i32 {tt.divisibility = 16 : i32}, %arg23: i32 {tt.divisibility = 16 : i32}, %arg24: f32) attributes {noinline = false} {
+    %0 = ub.poison : !ttg.async.token
+    %1 = ub.poison : !ttg.async.token
+    %2 = ub.poison : !ttg.async.token
+    %3 = ub.poison : !ttg.async.token
+    %4 = ub.poison : !ttg.async.token
+    %5 = ub.poison : !ttg.async.token
+    %6 = ub.poison : !ttg.async.token
+    %false = arith.constant false
+    %true = arith.constant true
+    %c128_i32 = arith.constant 128 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #linear>
+    %cst_0 = arith.constant dense<0xFF800000> : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+    %cst_1 = arith.constant dense<1.000000e+00> : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+    %7 = tt.get_program_id x : i32
+    %8 = arith.muli %7, %c128_i32 : i32
+    %9 = tt.descriptor_load %arg0[%8, %c0_i32] : !tt.tensordesc<tensor<128x128xf16, #shared>> -> tensor<128x128xf16, #blocked>
+    %10 = ttg.local_alloc %9 : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem>
+    %11 = tt.splat %arg24 : f32 -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+    %12 = tt.splat %arg24 : f32 -> tensor<128x128xf32, #linear>
+    %result = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %13 = ttg.local_alloc : () -> !ttg.memdesc<2x1xi64, #shared1, #smem, mutable>
+    %c0_i32_2 = arith.constant 0 : i32
+    %14 = ttg.memdesc_index %13[%c0_i32_2] : !ttg.memdesc<2x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %14, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32 = arith.constant 1 : i32
+    %15 = ttg.memdesc_index %13[%c1_i32] : !ttg.memdesc<2x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %15, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %16 = ttg.local_alloc : () -> !ttg.memdesc<2x1xi64, #shared1, #smem, mutable>
+    %c0_i32_3 = arith.constant 0 : i32
+    %17 = ttg.memdesc_index %16[%c0_i32_3] : !ttg.memdesc<2x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %17, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_4 = arith.constant 1 : i32
+    %18 = ttg.memdesc_index %16[%c1_i32_4] : !ttg.memdesc<2x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %18, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_5 = arith.constant 1 : i32
+    %c0_i32_6 = arith.constant 0 : i32
+    %c1_i32_7 = arith.constant 1 : i32
+    %result_8 = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %19 = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %c0_i32_9 = arith.constant 0 : i32
+    %20 = ttg.memdesc_index %19[%c0_i32_9] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %20, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %21 = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %c0_i32_10 = arith.constant 0 : i32
+    %22 = ttg.memdesc_index %21[%c0_i32_10] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %22, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %23 = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %c0_i32_11 = arith.constant 0 : i32
+    %24 = ttg.memdesc_index %23[%c0_i32_11] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %24, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c0_i32_12 = arith.constant 0 : i32
+    %c0_i32_13 = arith.constant 0 : i32
+    %c1_i32_14 = arith.constant 1 : i32
+    %c1_i32_15 = arith.constant 1 : i32
+    %c1_i32_16 = arith.constant 1 : i32
+    %25 = arith.addi %c0_i32_12, %c1_i32_16 : i32
+    %c1_i32_17 = arith.constant 1 : i32
+    %26 = arith.cmpi eq, %25, %c1_i32_17 : i32
+    %c0_i32_18 = arith.constant 0 : i32
+    %27 = arith.select %26, %c0_i32_18, %25 : i32
+    %c1_i32_19 = arith.constant 1 : i32
+    %28 = arith.xori %c0_i32_13, %c1_i32_19 : i32
+    %c0_i32_20 = arith.constant 0 : i32
+    %29 = arith.cmpi eq, %27, %c0_i32_20 : i32
+    %30 = arith.select %29, %28, %c0_i32_13 : i32
+    %c1_i32_21 = arith.constant 1 : i32
+    %31 = arith.xori %c0_i32_13, %c1_i32_21 : i32
+    %c0_i32_22 = arith.constant 0 : i32
+    %32 = arith.cmpi eq, %27, %c0_i32_22 : i32
+    %33 = arith.select %32, %31, %c0_i32_13 : i32
+    %34 = ttg.memdesc_index %19[%27] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.wait_barrier %34, %33 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %35 = ttg.memdesc_index %result_8[%27] : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %36 = ttng.tmem_store %cst, %35[], %true : tensor<128x128xf32, #linear> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %37 = ttg.local_alloc : () -> !ttg.memdesc<1x128xf32, #shared1, #smem, mutable>
+    %38 = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %c0_i32_23 = arith.constant 0 : i32
+    %39 = ttg.memdesc_index %38[%c0_i32_23] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %39, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %40 = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %c0_i32_24 = arith.constant 0 : i32
+    %41 = ttg.memdesc_index %40[%c0_i32_24] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %41, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c0_i32_25 = arith.constant 0 : i32
+    %c0_i32_26 = arith.constant 0 : i32
+    %c1_i32_27 = arith.constant 1 : i32
+    %42 = ttg.local_alloc : () -> !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable>
+    %43 = ttg.local_alloc : () -> !ttg.memdesc<3x1xi64, #shared1, #smem, mutable>
+    %c0_i32_28 = arith.constant 0 : i32
+    %44 = ttg.memdesc_index %43[%c0_i32_28] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %44, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_29 = arith.constant 1 : i32
+    %45 = ttg.memdesc_index %43[%c1_i32_29] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %45, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c2_i32 = arith.constant 2 : i32
+    %46 = ttg.memdesc_index %43[%c2_i32] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %46, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %47 = ttg.local_alloc : () -> !ttg.memdesc<3x1xi64, #shared1, #smem, mutable>
+    %c0_i32_30 = arith.constant 0 : i32
+    %48 = ttg.memdesc_index %47[%c0_i32_30] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %48, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_31 = arith.constant 1 : i32
+    %49 = ttg.memdesc_index %47[%c1_i32_31] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %49, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c2_i32_32 = arith.constant 2 : i32
+    %50 = ttg.memdesc_index %47[%c2_i32_32] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %50, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c2_i32_33 = arith.constant 2 : i32
+    %c0_i32_34 = arith.constant 0 : i32
+    %c1_i32_35 = arith.constant 1 : i32
+    %51 = ttg.local_alloc : () -> !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable>
+    %52 = ttg.local_alloc : () -> !ttg.memdesc<3x1xi64, #shared1, #smem, mutable>
+    %c0_i32_36 = arith.constant 0 : i32
+    %53 = ttg.memdesc_index %52[%c0_i32_36] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %53, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_37 = arith.constant 1 : i32
+    %54 = ttg.memdesc_index %52[%c1_i32_37] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %54, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c2_i32_38 = arith.constant 2 : i32
+    %55 = ttg.memdesc_index %52[%c2_i32_38] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %55, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %56 = ttg.local_alloc : () -> !ttg.memdesc<3x1xi64, #shared1, #smem, mutable>
+    %c0_i32_39 = arith.constant 0 : i32
+    %57 = ttg.memdesc_index %56[%c0_i32_39] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %57, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_40 = arith.constant 1 : i32
+    %58 = ttg.memdesc_index %56[%c1_i32_40] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %58, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c2_i32_41 = arith.constant 2 : i32
+    %59 = ttg.memdesc_index %56[%c2_i32_41] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %59, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c2_i32_42 = arith.constant 2 : i32
+    %c0_i32_43 = arith.constant 0 : i32
+    %c1_i32_44 = arith.constant 1 : i32
+    %60 = ttg.local_alloc : () -> !ttg.memdesc<1x128xf32, #shared1, #smem, mutable>
+    %61 = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %c0_i32_45 = arith.constant 0 : i32
+    %62 = ttg.memdesc_index %61[%c0_i32_45] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %62, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %63 = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %c0_i32_46 = arith.constant 0 : i32
+    %64 = ttg.memdesc_index %63[%c0_i32_46] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %64, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c0_i32_47 = arith.constant 0 : i32
+    %c0_i32_48 = arith.constant 0 : i32
+    %c1_i32_49 = arith.constant 1 : i32
+    %result_50 = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf16, #tmem, #ttng.tensor_memory, mutable>
+    %65 = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %c0_i32_51 = arith.constant 0 : i32
+    %66 = ttg.memdesc_index %65[%c0_i32_51] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %66, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %67 = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %c0_i32_52 = arith.constant 0 : i32
+    %68 = ttg.memdesc_index %67[%c0_i32_52] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %68, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c0_i32_53 = arith.constant 0 : i32
+    %c0_i32_54 = arith.constant 0 : i32
+    %c1_i32_55 = arith.constant 1 : i32
+    %c1_i32_56 = arith.constant {ttg.partition = array<i32: 0, 2>, ttg.warp_specialize.tag = 0 : i32} 1 : i32
+    %69 = arith.addi %c1_i32_5, %c1_i32_56 {ttg.partition = array<i32: 0, 2>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c2_i32_57 = arith.constant {ttg.partition = array<i32: 0, 2>, ttg.warp_specialize.tag = 0 : i32} 2 : i32
+    %70 = arith.cmpi eq, %69, %c2_i32_57 {ttg.partition = array<i32: 0, 2>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c0_i32_58 = arith.constant {ttg.partition = array<i32: 0, 2>, ttg.warp_specialize.tag = 0 : i32} 0 : i32
+    %71 = arith.select %70, %c0_i32_58, %69 {ttg.partition = array<i32: 0, 2>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c1_i32_59 = arith.constant {ttg.partition = array<i32: 2>, ttg.warp_specialize.tag = 0 : i32} 1 : i32
+    %72 = arith.xori %c0_i32_6, %c1_i32_59 {ttg.partition = array<i32: 2>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c0_i32_60 = arith.constant {ttg.partition = array<i32: 2>, ttg.warp_specialize.tag = 0 : i32} 0 : i32
+    %73 = arith.cmpi eq, %71, %c0_i32_60 {ttg.partition = array<i32: 2>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %74 = arith.select %73, %72, %c0_i32_6 {ttg.partition = array<i32: 2>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %75 = ttg.memdesc_index %13[%71] {ttg.partition = array<i32: 2>, ttg.warp_specialize.tag = 0 : i32} : !ttg.memdesc<2x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.wait_barrier %75, %74 {ttg.partition = array<i32: 2>, ttg.warp_specialize.tag = 0 : i32} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_61 = arith.constant {ttg.partition = array<i32: 0, 2>, ttg.warp_specialize.tag = 0 : i32} 1 : i32
+    %76 = arith.addi %c0_i32_53, %c1_i32_61 {ttg.partition = array<i32: 0, 2>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c1_i32_62 = arith.constant {ttg.partition = array<i32: 0, 2>, ttg.warp_specialize.tag = 0 : i32} 1 : i32
+    %77 = arith.cmpi eq, %76, %c1_i32_62 {ttg.partition = array<i32: 0, 2>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c0_i32_63 = arith.constant {ttg.partition = array<i32: 0, 2>, ttg.warp_specialize.tag = 0 : i32} 0 : i32
+    %78 = arith.select %77, %c0_i32_63, %76 {ttg.partition = array<i32: 0, 2>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c1_i32_64 = arith.constant {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} 1 : i32
+    %79 = arith.xori %c0_i32_54, %c1_i32_64 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c0_i32_65 = arith.constant {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} 0 : i32
+    %80 = arith.cmpi eq, %78, %c0_i32_65 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %81 = arith.select %80, %79, %c0_i32_54 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %82 = ttg.memdesc_index %65[%78] {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.wait_barrier %82, %81 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_66 = arith.constant {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32} 1 : i32
+    %83 = arith.addi %c0_i32_25, %c1_i32_66 {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c1_i32_67 = arith.constant {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32} 1 : i32
+    %84 = arith.cmpi eq, %83, %c1_i32_67 {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c0_i32_68 = arith.constant {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32} 0 : i32
+    %85 = arith.select %84, %c0_i32_68, %83 {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c1_i32_69 = arith.constant {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} 1 : i32
+    %86 = arith.xori %c0_i32_26, %c1_i32_69 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c0_i32_70 = arith.constant {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} 0 : i32
+    %87 = arith.cmpi eq, %85, %c0_i32_70 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %88 = arith.select %87, %86, %c0_i32_26 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %89 = ttg.memdesc_index %38[%85] {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.wait_barrier %89, %88 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_71 = arith.constant {ttg.partition = array<i32: 2, 3>, ttg.warp_specialize.tag = 0 : i32} 1 : i32
+    %90 = arith.addi %c2_i32_33, %c1_i32_71 {ttg.partition = array<i32: 2, 3>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c3_i32 = arith.constant {ttg.partition = array<i32: 2, 3>, ttg.warp_specialize.tag = 0 : i32} 3 : i32
+    %91 = arith.cmpi eq, %90, %c3_i32 {ttg.partition = array<i32: 2, 3>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c0_i32_72 = arith.constant {ttg.partition = array<i32: 2, 3>, ttg.warp_specialize.tag = 0 : i32} 0 : i32
+    %92 = arith.select %91, %c0_i32_72, %90 {ttg.partition = array<i32: 2, 3>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c1_i32_73 = arith.constant {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} 1 : i32
+    %93 = arith.xori %c0_i32_34, %c1_i32_73 {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c0_i32_74 = arith.constant {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} 0 : i32
+    %94 = arith.cmpi eq, %92, %c0_i32_74 {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %95 = arith.select %94, %93, %c0_i32_34 {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %96 = ttg.memdesc_index %43[%92] {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.wait_barrier %96, %95 {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_75 = arith.constant {ttg.partition = array<i32: 2, 3>, ttg.warp_specialize.tag = 0 : i32} 1 : i32
+    %97 = arith.addi %c2_i32_42, %c1_i32_75 {ttg.partition = array<i32: 2, 3>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c3_i32_76 = arith.constant {ttg.partition = array<i32: 2, 3>, ttg.warp_specialize.tag = 0 : i32} 3 : i32
+    %98 = arith.cmpi eq, %97, %c3_i32_76 {ttg.partition = array<i32: 2, 3>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c0_i32_77 = arith.constant {ttg.partition = array<i32: 2, 3>, ttg.warp_specialize.tag = 0 : i32} 0 : i32
+    %99 = arith.select %98, %c0_i32_77, %97 {ttg.partition = array<i32: 2, 3>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c1_i32_78 = arith.constant {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} 1 : i32
+    %100 = arith.xori %c0_i32_43, %c1_i32_78 {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c0_i32_79 = arith.constant {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} 0 : i32
+    %101 = arith.cmpi eq, %99, %c0_i32_79 {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %102 = arith.select %101, %100, %c0_i32_43 {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %103 = ttg.memdesc_index %52[%99] {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.wait_barrier %103, %102 {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_80 = arith.constant {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32} 1 : i32
+    %104 = arith.addi %c0_i32_47, %c1_i32_80 {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c1_i32_81 = arith.constant {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32} 1 : i32
+    %105 = arith.cmpi eq, %104, %c1_i32_81 {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c0_i32_82 = arith.constant {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32} 0 : i32
+    %106 = arith.select %105, %c0_i32_82, %104 {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c1_i32_83 = arith.constant {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} 1 : i32
+    %107 = arith.xori %c0_i32_48, %c1_i32_83 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %c0_i32_84 = arith.constant {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} 0 : i32
+    %108 = arith.cmpi eq, %106, %c0_i32_84 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %109 = arith.select %108, %107, %c0_i32_48 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : i32
+    %110 = ttg.memdesc_index %61[%106] {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.wait_barrier %110, %109 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %111:31 = scf.for %arg25 = %c0_i32 to %arg23 step %c128_i32 iter_args(%arg26 = %cst_0, %arg27 = %cst_1, %arg28 = %false, %arg29 = %6, %arg30 = %5, %arg31 = %0, %arg32 = %4, %arg33 = %3, %arg34 = %2, %arg35 = %1, %arg36 = %71, %arg37 = %c1_i32_7, %arg38 = %74, %arg39 = %27, %arg40 = %30, %arg41 = %c1_i32_14, %arg42 = %85, %arg43 = %88, %arg44 = %c1_i32_27, %arg45 = %92, %arg46 = %c1_i32_35, %arg47 = %95, %arg48 = %99, %arg49 = %c1_i32_44, %arg50 = %102, %arg51 = %106, %arg52 = %109, %arg53 = %c1_i32_49, %arg54 = %78, %arg55 = %81, %arg56 = %c1_i32_55) -> (tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, i1, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32)  : i32 {
+      %156 = ttg.memdesc_index %37[%arg42] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1x128xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128xf32, #shared1, #smem, mutable>
+      ttg.local_store %arg26, %156 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> -> !ttg.memdesc<128xf32, #shared1, #smem, mutable>
+      %157 = ttg.memdesc_index %40[%arg42] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.arrive_barrier %157, 1 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %158 = ttg.memdesc_index %42[%arg45] {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      %159 = ttg.memdesc_index %47[%arg45] {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %true_113 = arith.constant {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} true
+      ttng.barrier_expect %159, 32768 {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>}, %true_113 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.async_tma_copy_global_to_local %arg5[%arg25, %c0_i32] %158, %159, %true_113 {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      %160 = ttg.memdesc_index %result[%arg36] {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %c1_i32_114 = arith.constant {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} 1 : i32
+      %161 = arith.xori %arg46, %c1_i32_114 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : i32
+      %c0_i32_115 = arith.constant {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} 0 : i32
+      %162 = arith.cmpi eq, %arg45, %c0_i32_115 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : i32
+      %163 = arith.select %162, %161, %arg46 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : i32
+      %164 = ttg.memdesc_index %47[%arg45] {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.wait_barrier %164, %163 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %165 = ttg.memdesc_index %42[%arg45] {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      %166 = ttg.memdesc_trans %165 {loop.cluster = 2 : i32, loop.stage = 2 : i32, order = array<i32: 1, 0>, ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared2, #smem, mutable>
+      %167 = ttng.tc_gen5_mma %10, %166, %160[], %false, %true {is_async, loop.cluster = 2 : i32, loop.stage = 2 : i32, tt.self_latency = 1 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf16, #shared2, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %168 = ttg.memdesc_index %43[%arg45] {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.tc_gen5_commit %168 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %169 = ttg.memdesc_index %16[%arg36] {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<2x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.tc_gen5_commit %169 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %c1_i32_116 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} 1 : i32
+      %170 = arith.xori %arg37, %c1_i32_116 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : i32
+      %c0_i32_117 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} 0 : i32
+      %171 = arith.cmpi eq, %arg36, %c0_i32_117 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : i32
+      %172 = arith.select %171, %170, %arg37 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : i32
+      %173 = ttg.memdesc_index %16[%arg36] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<2x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.wait_barrier %173, %172 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %174 = ttg.memdesc_index %result[%arg36] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %result_118, %token_119 = ttng.tmem_load %174[] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear>
+      %175 = ttg.memdesc_index %13[%arg36] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<2x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.arrive_barrier %175, 1 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %176 = "tt.reduce"(%result_118) <{axis = 1 : i32, reduction_ordering = "unordered"}> ({
+      ^bb0(%arg57: f32, %arg58: f32):
+        %285 = arith.maxnumf %arg57, %arg58 {ttg.partition = array<i32: 0>} : f32
+        tt.reduce.return %285 {ttg.partition = array<i32: 0>} : f32
+      }) {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>, ttg.partition.outputs = [array<i32: 0>]} : (tensor<128x128xf32, #linear>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %177 = arith.mulf %176, %11 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %178 = arith.maxnumf %arg26, %177 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %179 = ttg.memdesc_index %60[%arg51] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1x128xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128xf32, #shared1, #smem, mutable>
+      ttg.local_store %178, %179 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> -> !ttg.memdesc<128xf32, #shared1, #smem, mutable>
+      %180 = ttg.memdesc_index %63[%arg51] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.arrive_barrier %180, 1 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %181 = arith.mulf %result_118, %12 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear>
+      %182 = tt.expand_dims %178 {axis = 1 : i32, loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<128x1xf32, #linear>
+      %183 = tt.broadcast %182 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128x1xf32, #linear> -> tensor<128x128xf32, #linear>
+      %184 = arith.subf %181, %183 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear>
+      %185 = math.exp2 %184 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear>
+      %186 = arith.subf %arg26, %178 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %c1_i32_120 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} 1 : i32
+      %187 = arith.xori %arg44, %c1_i32_120 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : i32
+      %c0_i32_121 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} 0 : i32
+      %188 = arith.cmpi eq, %arg42, %c0_i32_121 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : i32
+      %189 = arith.select %188, %187, %arg44 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : i32
+      %190 = ttg.memdesc_index %40[%arg42] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.wait_barrier %190, %189 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %191 = ttg.memdesc_index %37[%arg42] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<1x128xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128xf32, #shared1, #smem, mutable>
+      %192 = ttg.local_load %191 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128xf32, #shared1, #smem, mutable> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %193 = ttg.memdesc_index %38[%arg42] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.arrive_barrier %193, 1 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %c1_i32_122 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} 1 : i32
+      %194 = arith.xori %arg53, %c1_i32_122 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : i32
+      %c0_i32_123 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} 0 : i32
+      %195 = arith.cmpi eq, %arg51, %c0_i32_123 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : i32
+      %196 = arith.select %195, %194, %arg53 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : i32
+      %197 = ttg.memdesc_index %63[%arg51] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.wait_barrier %197, %196 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %198 = ttg.memdesc_index %60[%arg51] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<1x128xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128xf32, #shared1, #smem, mutable>
+      %199 = ttg.local_load %198 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128xf32, #shared1, #smem, mutable> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %200 = ttg.memdesc_index %61[%arg51] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.arrive_barrier %200, 1 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %201 = arith.subf %192, %199 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %202 = math.exp2 %186 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %203 = math.exp2 %201 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %204 = "tt.reduce"(%185) <{axis = 1 : i32, reduction_ordering = "unordered"}> ({
+      ^bb0(%arg57: f32, %arg58: f32):
+        %285 = arith.addf %arg57, %arg58 {ttg.partition = array<i32: 0>} : f32
+        tt.reduce.return %285 {ttg.partition = array<i32: 0>} : f32
+      }) {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>, ttg.partition.outputs = [array<i32: 0>]} : (tensor<128x128xf32, #linear>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %205 = tt.expand_dims %203 {axis = 1 : i32, loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<128x1xf32, #linear>
+      %206 = tt.broadcast %205 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : tensor<128x1xf32, #linear> -> tensor<128x128xf32, #linear>
+      %207 = ttg.memdesc_index %result_8[%arg39] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %result_124, %token_125 = ttng.tmem_load %207[] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear>
+      %208 = arith.mulf %result_124, %206 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : tensor<128x128xf32, #linear>
+      %209 = ttg.memdesc_index %51[%arg48] {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 3>} : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      %210 = ttg.memdesc_index %56[%arg48] {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 3>} : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %true_126 = arith.constant {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 3>} true
+      ttng.barrier_expect %210, 32768 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 3>}, %true_126 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.async_tma_copy_global_to_local %arg10[%arg25, %c0_i32] %209, %210, %true_126 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 3>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      %211 = arith.truncf %185 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear> to tensor<128x128xf16, #linear>
+      %212 = ttg.memdesc_index %result_50[%arg54] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1x128x128xf16, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
+      %true_127 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} true
+      ttng.tmem_store %211, %212, %true_127 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128x128xf16, #linear> -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
+      %213 = ttg.memdesc_index %67[%arg54] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.arrive_barrier %213, 1 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %214 = ttng.tmem_store %208, %207[], %true {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : tensor<128x128xf32, #linear> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %215 = ttg.memdesc_index %21[%arg39] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.arrive_barrier %215, 1 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %c1_i32_128 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1, 2>} 1 : i32
+      %216 = arith.addi %arg39, %c1_i32_128 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1, 2>} : i32
+      %c1_i32_129 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1, 2>} 1 : i32
+      %217 = arith.cmpi eq, %216, %c1_i32_129 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1, 2>} : i32
+      %c0_i32_130 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1, 2>} 0 : i32
+      %218 = arith.select %217, %c0_i32_130, %216 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1, 2>} : i32
+      %c1_i32_131 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} 1 : i32
+      %219 = arith.xori %arg41, %c1_i32_131 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : i32
+      %c0_i32_132 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} 0 : i32
+      %220 = arith.cmpi eq, %218, %c0_i32_132 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : i32
+      %221 = arith.select %220, %219, %arg41 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : i32
+      %222 = ttg.memdesc_index %21[%218] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.wait_barrier %222, %221 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %223 = ttg.memdesc_index %result_8[%218] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %c1_i32_133 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} 1 : i32
+      %224 = arith.xori %arg56, %c1_i32_133 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : i32
+      %c0_i32_134 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} 0 : i32
+      %225 = arith.cmpi eq, %arg54, %c0_i32_134 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : i32
+      %226 = arith.select %225, %224, %arg56 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : i32
+      %227 = ttg.memdesc_index %67[%arg54] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.wait_barrier %227, %226 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %c1_i32_135 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} 1 : i32
+      %228 = arith.xori %arg49, %c1_i32_135 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : i32
+      %c0_i32_136 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} 0 : i32
+      %229 = arith.cmpi eq, %arg48, %c0_i32_136 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : i32
+      %230 = arith.select %229, %228, %arg49 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : i32
+      %231 = ttg.memdesc_index %56[%arg48] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.wait_barrier %231, %230 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %232 = ttg.memdesc_index %51[%arg48] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      %233 = ttng.tc_gen5_mma %212, %232, %223[], %arg28, %true {is_async, loop.cluster = 0 : i32, loop.stage = 4 : i32, tt.self_latency = 1 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %234 = ttg.memdesc_index %52[%arg48] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.tc_gen5_commit %234 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %235 = ttg.memdesc_index %65[%arg54] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.tc_gen5_commit %235 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %236 = ttg.memdesc_index %19[%218] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.tc_gen5_commit %236 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %237 = arith.mulf %arg27, %202 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %238 = arith.addf %237, %204 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
+      %c1_i32_137 = arith.constant {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 0, 2>} 1 : i32
+      %239 = arith.addi %arg36, %c1_i32_137 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 0, 2>} : i32
+      %c2_i32_138 = arith.constant {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 0, 2>} 2 : i32
+      %240 = arith.cmpi eq, %239, %c2_i32_138 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 0, 2>} : i32
+      %c0_i32_139 = arith.constant {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 0, 2>} 0 : i32
+      %241 = arith.select %240, %c0_i32_139, %239 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 0, 2>} : i32
+      %c1_i32_140 = arith.constant {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} 1 : i32
+      %242 = arith.xori %arg38, %c1_i32_140 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : i32
+      %c0_i32_141 = arith.constant {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} 0 : i32
+      %243 = arith.cmpi eq, %241, %c0_i32_141 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : i32
+      %244 = arith.select %243, %242, %arg38 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : i32
+      %245 = ttg.memdesc_index %13[%241] {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<2x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.wait_barrier %245, %244 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %c1_i32_142 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} 1 : i32
+      %246 = arith.xori %arg40, %c1_i32_142 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : i32
+      %c0_i32_143 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} 0 : i32
+      %247 = arith.cmpi eq, %218, %c0_i32_143 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : i32
+      %248 = arith.select %247, %246, %arg40 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : i32
+      %249 = ttg.memdesc_index %19[%218] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.wait_barrier %249, %248 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %c1_i32_144 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 2>} 1 : i32
+      %250 = arith.addi %arg54, %c1_i32_144 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 2>} : i32
+      %c1_i32_145 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 2>} 1 : i32
+      %251 = arith.cmpi eq, %250, %c1_i32_145 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 2>} : i32
+      %c0_i32_146 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 2>} 0 : i32
+      %252 = arith.select %251, %c0_i32_146, %250 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 2>} : i32
+      %c1_i32_147 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} 1 : i32
+      %253 = arith.xori %arg55, %c1_i32_147 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : i32
+      %c0_i32_148 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} 0 : i32
+      %254 = arith.cmpi eq, %252, %c0_i32_148 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : i32
+      %255 = arith.select %254, %253, %arg55 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : i32
+      %256 = ttg.memdesc_index %65[%252] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.wait_barrier %256, %255 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %c1_i32_149 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1>} 1 : i32
+      %257 = arith.addi %arg42, %c1_i32_149 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1>} : i32
+      %c1_i32_150 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1>} 1 : i32
+      %258 = arith.cmpi eq, %257, %c1_i32_150 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1>} : i32
+      %c0_i32_151 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1>} 0 : i32
+      %259 = arith.select %258, %c0_i32_151, %257 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1>} : i32
+      %c1_i32_152 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} 1 : i32
+      %260 = arith.xori %arg43, %c1_i32_152 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : i32
+      %c0_i32_153 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} 0 : i32
+      %261 = arith.cmpi eq, %259, %c0_i32_153 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : i32
+      %262 = arith.select %261, %260, %arg43 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : i32
+      %263 = ttg.memdesc_index %38[%259] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.wait_barrier %263, %262 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %c1_i32_154 = arith.constant {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2, 3>} 1 : i32
+      %264 = arith.addi %arg45, %c1_i32_154 {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2, 3>} : i32
+      %c3_i32_155 = arith.constant {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2, 3>} 3 : i32
+      %265 = arith.cmpi eq, %264, %c3_i32_155 {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2, 3>} : i32
+      %c0_i32_156 = arith.constant {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2, 3>} 0 : i32
+      %266 = arith.select %265, %c0_i32_156, %264 {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2, 3>} : i32
+      %c1_i32_157 = arith.constant {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} 1 : i32
+      %267 = arith.xori %arg47, %c1_i32_157 {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : i32
+      %c0_i32_158 = arith.constant {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} 0 : i32
+      %268 = arith.cmpi eq, %266, %c0_i32_158 {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : i32
+      %269 = arith.select %268, %267, %arg47 {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : i32
+      %270 = ttg.memdesc_index %43[%266] {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.wait_barrier %270, %269 {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %c1_i32_159 = arith.constant {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2, 3>} 1 : i32
+      %271 = arith.addi %arg48, %c1_i32_159 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2, 3>} : i32
+      %c3_i32_160 = arith.constant {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2, 3>} 3 : i32
+      %272 = arith.cmpi eq, %271, %c3_i32_160 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2, 3>} : i32
+      %c0_i32_161 = arith.constant {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2, 3>} 0 : i32
+      %273 = arith.select %272, %c0_i32_161, %271 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2, 3>} : i32
+      %c1_i32_162 = arith.constant {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 3>} 1 : i32
+      %274 = arith.xori %arg50, %c1_i32_162 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 3>} : i32
+      %c0_i32_163 = arith.constant {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 3>} 0 : i32
+      %275 = arith.cmpi eq, %273, %c0_i32_163 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 3>} : i32
+      %276 = arith.select %275, %274, %arg50 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 3>} : i32
+      %277 = ttg.memdesc_index %52[%273] {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 3>} : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.wait_barrier %277, %276 {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 3>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      %c1_i32_164 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1>} 1 : i32
+      %278 = arith.addi %arg51, %c1_i32_164 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1>} : i32
+      %c1_i32_165 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1>} 1 : i32
+      %279 = arith.cmpi eq, %278, %c1_i32_165 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1>} : i32
+      %c0_i32_166 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1>} 0 : i32
+      %280 = arith.select %279, %c0_i32_166, %278 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0, 1>} : i32
+      %c1_i32_167 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} 1 : i32
+      %281 = arith.xori %arg52, %c1_i32_167 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : i32
+      %c0_i32_168 = arith.constant {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} 0 : i32
+      %282 = arith.cmpi eq, %280, %c0_i32_168 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : i32
+      %283 = arith.select %282, %281, %arg52 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : i32
+      %284 = ttg.memdesc_index %61[%280] {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      ttng.wait_barrier %284, %283 {loop.cluster = 0 : i32, loop.stage = 4 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+      scf.yield {ttg.partition = array<i32: 0, 1, 2, 3>} %178, %238, %true, %6, %5, %0, %4, %3, %2, %1, %241, %172, %244, %218, %248, %221, %259, %262, %189, %266, %163, %269, %273, %230, %276, %280, %283, %196, %252, %255, %226 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, i1, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32
+    } {tt.scheduled_max_stage = 4 : i32, tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2, 3>, ttg.partition.outputs = [array<i32: 0>, array<i32: 0>, array<i32: 2>, array<i32: 2>, array<i32: 1>, array<i32: 0>, array<i32: 0>, array<i32: 3>, array<i32: 3>, array<i32: 0>, array<i32: 0, 2>, array<i32: 0>, array<i32: 2>, array<i32: 0, 1, 2>, array<i32: 1>, array<i32: 2>, array<i32: 0, 1>, array<i32: 0>, array<i32: 1>, array<i32: 2, 3>, array<i32: 2>, array<i32: 3>, array<i32: 2, 3>, array<i32: 2>, array<i32: 3>, array<i32: 0, 1>, array<i32: 0>, array<i32: 1>, array<i32: 0, 2>, array<i32: 0>, array<i32: 2>], ttg.partition.stages = [0 : i32, 0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    %c0_i32_85 = arith.constant 0 : i32
+    %112 = ttg.memdesc_index %13[%c0_i32_85] : !ttg.memdesc<2x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %112 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_86 = arith.constant 1 : i32
+    %113 = ttg.memdesc_index %13[%c1_i32_86] : !ttg.memdesc<2x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %113 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttg.local_dealloc %13 : !ttg.memdesc<2x1xi64, #shared1, #smem, mutable>
+    %c0_i32_87 = arith.constant 0 : i32
+    %114 = ttg.memdesc_index %16[%c0_i32_87] : !ttg.memdesc<2x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %114 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_88 = arith.constant 1 : i32
+    %115 = ttg.memdesc_index %16[%c1_i32_88] : !ttg.memdesc<2x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %115 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttg.local_dealloc %16 : !ttg.memdesc<2x1xi64, #shared1, #smem, mutable>
+    %c0_i32_89 = arith.constant 0 : i32
+    %116 = ttg.memdesc_index %19[%c0_i32_89] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %116 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttg.local_dealloc %19 : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %c0_i32_90 = arith.constant 0 : i32
+    %117 = ttg.memdesc_index %21[%c0_i32_90] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %117 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttg.local_dealloc %21 : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %c0_i32_91 = arith.constant 0 : i32
+    %118 = ttg.memdesc_index %38[%c0_i32_91] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %118 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttg.local_dealloc %38 : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %c0_i32_92 = arith.constant 0 : i32
+    %119 = ttg.memdesc_index %40[%c0_i32_92] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %119 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttg.local_dealloc %40 : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %c0_i32_93 = arith.constant 0 : i32
+    %120 = ttg.memdesc_index %43[%c0_i32_93] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %120 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_94 = arith.constant 1 : i32
+    %121 = ttg.memdesc_index %43[%c1_i32_94] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %121 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c2_i32_95 = arith.constant 2 : i32
+    %122 = ttg.memdesc_index %43[%c2_i32_95] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %122 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttg.local_dealloc %43 : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable>
+    %c0_i32_96 = arith.constant 0 : i32
+    %123 = ttg.memdesc_index %47[%c0_i32_96] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %123 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_97 = arith.constant 1 : i32
+    %124 = ttg.memdesc_index %47[%c1_i32_97] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %124 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c2_i32_98 = arith.constant 2 : i32
+    %125 = ttg.memdesc_index %47[%c2_i32_98] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %125 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttg.local_dealloc %47 : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable>
+    %c0_i32_99 = arith.constant 0 : i32
+    %126 = ttg.memdesc_index %52[%c0_i32_99] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %126 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_100 = arith.constant 1 : i32
+    %127 = ttg.memdesc_index %52[%c1_i32_100] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %127 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c2_i32_101 = arith.constant 2 : i32
+    %128 = ttg.memdesc_index %52[%c2_i32_101] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %128 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttg.local_dealloc %52 : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable>
+    %c0_i32_102 = arith.constant 0 : i32
+    %129 = ttg.memdesc_index %56[%c0_i32_102] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %129 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_103 = arith.constant 1 : i32
+    %130 = ttg.memdesc_index %56[%c1_i32_103] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %130 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c2_i32_104 = arith.constant 2 : i32
+    %131 = ttg.memdesc_index %56[%c2_i32_104] : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %131 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttg.local_dealloc %56 : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable>
+    %c0_i32_105 = arith.constant 0 : i32
+    %132 = ttg.memdesc_index %61[%c0_i32_105] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %132 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttg.local_dealloc %61 : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %c0_i32_106 = arith.constant 0 : i32
+    %133 = ttg.memdesc_index %63[%c0_i32_106] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %133 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttg.local_dealloc %63 : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %c0_i32_107 = arith.constant 0 : i32
+    %134 = ttg.memdesc_index %65[%c0_i32_107] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %134 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttg.local_dealloc %65 : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %c0_i32_108 = arith.constant 0 : i32
+    %135 = ttg.memdesc_index %67[%c0_i32_108] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %135 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttg.local_dealloc %67 : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %136 = ttg.memdesc_index %23[%111#13] {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32} : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.arrive_barrier %136, 1 {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %c1_i32_109 = arith.constant 1 : i32
+    %137 = arith.xori %c1_i32_15, %c1_i32_109 : i32
+    %c0_i32_110 = arith.constant 0 : i32
+    %138 = arith.cmpi eq, %111#13, %c0_i32_110 : i32
+    %139 = arith.select %138, %137, %c1_i32_15 : i32
+    %140 = ttg.memdesc_index %23[%111#13] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.wait_barrier %140, %139 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %141 = ttg.memdesc_index %result_8[%111#13] : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %c0_i32_111 = arith.constant 0 : i32
+    %142 = ttg.memdesc_index %23[%c0_i32_111] : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.inval_barrier %142 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttg.local_dealloc %23 : !ttg.memdesc<1x1xi64, #shared1, #smem, mutable>
+    %result_112, %token = ttng.tmem_load %141[] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear>
+    %143 = arith.truncf %result_112 : tensor<128x128xf32, #linear> to tensor<128x128xf16, #linear>
+    %144 = ttg.convert_layout %143 : tensor<128x128xf16, #linear> -> tensor<128x128xf16, #blocked>
+    tt.descriptor_store %arg15[%8, %c0_i32], %144 : !tt.tensordesc<tensor<128x128xf16, #shared>>, tensor<128x128xf16, #blocked>
+    %145 = tt.addptr %arg20, %8 : !tt.ptr<f16>, i32
+    %146 = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked1>
+    %147 = tt.splat %145 : !tt.ptr<f16> -> tensor<128x!tt.ptr<f16>, #blocked1>
+    %148 = tt.addptr %147, %146 : tensor<128x!tt.ptr<f16>, #blocked1>, tensor<128xi32, #blocked1>
+    %149 = arith.truncf %111#1 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> to tensor<128xf16, #ttg.slice<{dim = 1, parent = #linear}>>
+    %150 = ttg.convert_layout %149 : tensor<128xf16, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<128xf16, #blocked1>
+    tt.store %148, %150 : tensor<128x!tt.ptr<f16>, #blocked1>
+    %151 = tt.addptr %arg21, %8 : !tt.ptr<f16>, i32
+    %152 = tt.splat %151 : !tt.ptr<f16> -> tensor<128x!tt.ptr<f16>, #blocked1>
+    %153 = tt.addptr %152, %146 : tensor<128x!tt.ptr<f16>, #blocked1>, tensor<128xi32, #blocked1>
+    %154 = arith.truncf %111#0 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> to tensor<128xf16, #ttg.slice<{dim = 1, parent = #linear}>>
+    %155 = ttg.convert_layout %154 : tensor<128xf16, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<128xf16, #blocked1>
+    tt.store %153, %155 : tensor<128x!tt.ptr<f16>, #blocked1>
+    tt.return
+  }
+}
+
+
+/home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/python/test/unit/language/test_warp_specialization.py:427:27: warning: non-root partition #0 has direct SSA consumer
+        acc = tl.dot(p, v, acc)
+                          ^
+/home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/python/test/unit/language/test_warp_specialization.py:427:27: note: use at distance 0 in partition #2 here

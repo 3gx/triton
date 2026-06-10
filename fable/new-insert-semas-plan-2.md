@@ -442,8 +442,15 @@ Each item below is what the CHECK lines mandate, with evidence. The plan's
 stages must reproduce these qualitatively (goldens regenerate at commit 4;
 sync shapes may change per spec §9, these structural rules may not).
 
-**A. Backing allocs are new allocs, hoisted to function scope before the
-outermost WS loop — regardless of where the originals sit.**
+**A. Backing allocs are new allocs, hoisted out of enclosing `scf.for`
+ops — above the outermost WS loop — but NEVER across an `scf.if`.** In the
+corpus the outermost WS loop sits at function level, so backings land at
+function scope; in guarded persistent kernels (gate-2 case 2, 10jun26) the
+WS loop lives in a function-level guard if and the oracle keeps backings,
+creates, and entry acquires inside that branch — hoisting past the if
+forces dead token threading through a partition-less if and trips
+AssignStagePhase. Hoist law: from the first member alloc, ascend while the
+parent is an `scf.for`; stop at `scf.if` or the function body.
 `insert_semas_meta_fa_fwd.mlir`: originals for buffer.id=4 include
 `%qk_0` *inside* the WS loop (:168) and the sourceful `%acc_164` *inside the
 inner loop* (:302), yet the backing
@@ -501,6 +508,13 @@ separate backing allocs with `buffer.id`/`buffer.offset` preserved
 placement is realized downstream from the attrs.
 
 **D. Sourceful allocs become acquire + buffer-view + explicit store.**
+Row independence (gate-2 attention evidence, 10jun26): the replacement RAUW
+excludes the group's other access-row ops — each row retargets itself with
+its OWN owner's view at its own render; blanket RAUW left the PV mma on the
+softmax store's partition-0 view (cross-partition SSA edge, rejected by
+partition-loops in case 3, destroyed-with-uses crash in case 4). The
+original alloc's erase is deferred to the final cleanup (it must outlive
+every row that still matches operands against its result).
 `ttng.tmem_alloc %src` → `semaphore.buffer` view + `arith.constant true` +
 `ttng.tmem_store %src, view, true` at the original site
 (`tmem-buffer-reuse-semas.mlir` :22–:25; meta_fa_fwd :302 → :306–:309 —
@@ -534,7 +548,9 @@ poison is a sanctioned exception), then clear dep/token operands of the groups' 
 init and yield — with that single value
 (`tmem-buffer-reuse-semas.mlir` :80/:84/:95, :118/:134).
 Carriers then travel **only** in slots the node crossings own (appended,
-§F). Reusing the original token slots for semaphore carriers (as the old
+§F). If-crossings are LIVENESS-PRUNED at stage 3: no slot when no
+later row consumes the carrier (see spec node table)."
+ Reusing the original token slots for semaphore carriers (as the old
 pass does in meta_fa_fwd :176) is rejected by design — the carrier set does
 not correspond to the original token set, and mixing the two couples the
 emitter to input plumbing it is supposed to erase. Untouched single-owner
@@ -1051,7 +1067,7 @@ selection.**
    Use PYTHONPATH=/home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/python/
 
    ```bash
-   PYTHONPATH=python timeout 60s pytest -q \
+   PYTHONPATH=<above> timeout 60s pytest -q \
      "python/test/unit/language/test_warp_specialization.py::test_warp_specialize_tma_matmul[False-4-2-64-128-128-8192-8192-512]"
    ```
    As well as:
@@ -1062,16 +1078,23 @@ selection.**
    ```
    python/test/unit/language/test_warp_specialization.py::test_warp_specialize_attention_forward[False-4-True-3-128-128-1024-1024]
    ```
+   and
+   ```
+    python/test/unit/language/test_warp_specialization.py::test_warp_specialize_attention_persistent_forward[True-8-True-3-128-128-1024-1024
+    ```
 
 3. **The two FA runtime scripts, 60s timeout each** (canonical deadlock
    regressions — the historical failure class, fan-in counts with
    not-all-live releasers, is excluded by the commit-3 verifiers; these
    runs prove it):
 
+
    ```bash
    PYTHONPATH=python timeout 60s sh run_nvws.sh
    PYTHONPATH=python timeout 60s sh run_nvws_1.sh
    ```
+
+   ADDENDUM: DO NOT RUN THESE YET, when gate 2 is passing come back to user for verification and further instructions.
 
 ## 6. Acceptance criteria
 
