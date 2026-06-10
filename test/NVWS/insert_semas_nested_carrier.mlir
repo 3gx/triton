@@ -173,10 +173,10 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
           // CHECK: [[V68:%.*]] = nvws.semaphore.acquire [[V47]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
           // CHECK: scf.yield {ttg.partition = array<i32: 0, 1>} %{{.*}}, [[V68]] : !ttg.async.token, !ttg.async.token
           // CHECK: nvws.semaphore.release [[V49]], [[V63]]#1 [#nvws.async_op<none>] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
+          // CHECK: nvws.semaphore.release [[V47]], [[V63]]#1 [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
           // CHECK: [[V69:%.*]] = nvws.semaphore.acquire [[V49]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
           // CHECK: [[V70:%.*]] = nvws.semaphore.buffer [[V49]], [[V69]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
           // CHECK: %{{[-A-Za-z0-9_.$#]+}}, %{{[-A-Za-z0-9_.$#]+}} = ttng.tmem_load [[V70]][] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128> -> tensor<128x128xf32, #blocked>
-          // CHECK: nvws.semaphore.release [[V47]], [[V69]] [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
           // CHECK: [[V71:%.*]] = nvws.semaphore.acquire [[V47]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
           // CHECK: scf.yield {ttg.partition = array<i32: 0, 1>} %{{.*}}, [[V71]] : i32, !ttg.async.token
           // CHECK: nvws.semaphore.release [[V46]], [[V59]]#1 [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token

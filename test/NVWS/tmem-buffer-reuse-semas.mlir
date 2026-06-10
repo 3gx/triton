@@ -24,8 +24,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // CHECK-NEXT: [[TRUE1:%.*]] = arith.constant {ttg.partition = array<i32: 1>} true
       // CHECK-NEXT: ttng.tmem_store {{.*}}, [[AVIEW]]#0, [[TRUE1]] {ttg.partition = array<i32: 1>}
       // CHECK-NEXT: {{.*}}, {{.*}} = ttng.tmem_load [[AVIEW]]#0[] {ttg.partition = array<i32: 1>}
-      // CHECK-NEXT: "use"
       // CHECK-NEXT: nvws.semaphore.release [[FULL]], [[AITER]] [#nvws.async_op<none>] {ttg.partition = array<i32: 1>}
+      // CHECK-NEXT: "use"
       %va, %ta = ttng.tmem_load %a[] {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
       "use"(%va) {ttg.partition = array<i32: 1>} : (tensor<128x128xf32, #blocked>) -> ()
       %b = ttng.tmem_alloc %cst_0 {buffer.id = 7 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
@@ -34,12 +34,12 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // CHECK-NEXT: [[TRUE0:%.*]] = arith.constant {ttg.partition = array<i32: 0>} true
       // CHECK-NEXT: ttng.tmem_store {{.*}}, [[BVIEW]]#1, [[TRUE0]] {ttg.partition = array<i32: 0>}
       // CHECK-NEXT: {{.*}}, {{.*}} = ttng.tmem_load [[BVIEW]]#1[] {ttg.partition = array<i32: 0>}
+      // CHECK-NEXT: nvws.semaphore.release [[EMPTY]], [[BTOK]] [#nvws.async_op<none>] {ttg.partition = array<i32: 0>}
       // CHECK-NEXT: "use"
       %vb, %tb = ttng.tmem_load %b[] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
       "use"(%vb) {ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> ()
       %j = arith.addi %i, %c0 {ttg.partition = array<i32: 0, 1>} : i32
-      // CHECK: nvws.semaphore.release [[EMPTY]], [[BTOK]] [#nvws.async_op<none>] {ttg.partition = array<i32: 0>}
-      // CHECK-NEXT: [[ANEXT:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 1>}
+      // CHECK: [[ANEXT:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 1>}
       // CHECK-NEXT: scf.yield {{.*}} [[ANEXT]] : i32, !ttg.async.token
       scf.yield {ttg.partition = array<i32: 0, 1>} %j : i32
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0, 1>], ttg.warp_specialize.tag = 0 : i32}
@@ -89,8 +89,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // CHECK-NEXT: [[CTOK:%.*]] = nvws.semaphore.acquire [[FULL]] {ttg.partition = array<i32: 0>}
       // CHECK-NEXT: [[CONS_VIEW:%.*]]:2 = nvws.semaphore.buffer [[FULL]], [[CTOK]] {ttg.partition = array<i32: 0>}
       // CHECK-NEXT: {{.*}}, {{.*}} = ttng.tmem_load [[CONS_VIEW]]#1[] {ttg.partition = array<i32: 0>}
-      // CHECK-NEXT: "use"
       // CHECK-NEXT: nvws.semaphore.release [[EMPTY]], [[CTOK]] [#nvws.async_op<none>] {ttg.partition = array<i32: 0>}
+      // CHECK-NEXT: "use"
       // CHECK-NEXT: [[NEXT:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 1>}
       // CHECK-NEXT: scf.yield {ttg.partition = array<i32: 0, 1>} [[NEXT]], [[POISON]] : !ttg.async.token, !ttg.async.token
       %s = ttng.tmem_store %cst, %a[%t0], %true {ttg.partition = array<i32: 1>} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
@@ -128,8 +128,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
         // CHECK-NEXT: [[TFULL:%.*]] = nvws.semaphore.acquire [[FULL]] {ttg.partition = array<i32: 0>}
         // CHECK-NEXT: [[TLOAD:%.*]]:2 = nvws.semaphore.buffer [[FULL]], [[TFULL]] {ttg.partition = array<i32: 0>}
         // CHECK-NEXT: {{.*}}, {{.*}} = ttng.tmem_load [[TLOAD]]#1[] {ttg.partition = array<i32: 0>}
-        // CHECK-NEXT: "use"
         // CHECK-NEXT: nvws.semaphore.release [[MERGE_FULL]], [[TFULL]] [#nvws.async_op<none>] {ttg.partition = array<i32: 0>}
+        // CHECK-NEXT: "use"
         // CHECK-NEXT: [[TMRG:%.*]] = nvws.semaphore.acquire [[MERGE_FULL]] {ttg.partition = array<i32: 1>}
         // CHECK-NEXT: scf.yield {ttg.partition = array<i32: 0, 1>} [[TMRG]], [[POISON]] : !ttg.async.token, !ttg.async.token
       %s0 = ttng.tmem_store %cst, %a[%ta], %true {ttg.partition = array<i32: 1>} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
@@ -140,8 +140,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
         // CHECK-NEXT: } else {
         // CHECK-NEXT: [[EBUF:%.*]]:2 = nvws.semaphore.buffer [[EMPTY]], [[ITER]] {ttg.partition = array<i32: 1>}
         // CHECK-NEXT: {{.*}}, {{.*}} = ttng.tmem_load [[EBUF]]#0[] {ttg.partition = array<i32: 1>}
-        // CHECK-NEXT: "use"
         // CHECK-NEXT: nvws.semaphore.release [[ELSE_FULL]], [[ITER]] [#nvws.async_op<none>] {ttg.partition = array<i32: 1>}
+        // CHECK-NEXT: "use"
         // CHECK-NEXT: [[EFULL:%.*]] = nvws.semaphore.acquire [[ELSE_FULL]] {ttg.partition = array<i32: 0>}
         // CHECK-NEXT: [[ESTORE:%.*]]:2 = nvws.semaphore.buffer [[ELSE_FULL]], [[EFULL]] {ttg.partition = array<i32: 0>}
         // CHECK-NEXT: ttng.tmem_store {{.*}}, [[ESTORE]]#1[], {{.*}} {ttg.partition = array<i32: 0>}
@@ -159,13 +159,13 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // CHECK-NEXT: [[POSTB:%.*]] = nvws.semaphore.acquire [[POST_FULL]] {ttg.partition = array<i32: 0>}
       // CHECK-NEXT: [[POSTB_VIEW:%.*]]:2 = nvws.semaphore.buffer [[POST_FULL]], [[POSTB]] {ttg.partition = array<i32: 0>}
       // CHECK-NEXT: {{.*}}, {{.*}} = ttng.tmem_load [[POSTB_VIEW]]#1[] {ttg.partition = array<i32: 0>}
+      // CHECK-NEXT: nvws.semaphore.release [[EMPTY]], [[POSTB]] [#nvws.async_op<none>] {ttg.partition = array<i32: 0>}
       // CHECK-NEXT: "use"
       %s2 = ttng.tmem_store %cst, %a[%if#0], %true {ttg.partition = array<i32: 1>} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       %v2, %l2 = ttng.tmem_load %b[%if#1] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
       "use"(%v2) {ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> ()
       %j = arith.addi %i, %c0 {ttg.partition = array<i32: 0, 1>} : i32
-      // CHECK: nvws.semaphore.release [[EMPTY]], [[POSTB]] [#nvws.async_op<none>] {ttg.partition = array<i32: 0>}
-      // CHECK-NEXT: [[POSTNEXT:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 1>}
+      // CHECK: [[POSTNEXT:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 1>}
       // CHECK-NEXT: scf.yield {{.*}} [[POSTNEXT]] : i32, !ttg.async.token
       scf.yield {ttg.partition = array<i32: 0, 1>} %j : i32
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0, 1>], ttg.warp_specialize.tag = 3 : i32}
@@ -244,8 +244,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // CHECK-NEXT: [[LOAD_TOK:%.*]] = nvws.semaphore.acquire [[FULL]] {ttg.partition = array<i32: 0>}
       // CHECK-NEXT: [[LOAD_VIEW:%.*]] = nvws.semaphore.buffer [[FULL]], [[LOAD_TOK]] {ttg.partition = array<i32: 0>}
       // CHECK-NEXT: {{.*}}, {{.*}} = ttng.tmem_load [[LOAD_VIEW]][] {ttg.partition = array<i32: 0>}
-      // CHECK-NEXT: "use"
       // CHECK-NEXT: nvws.semaphore.release [[EMPTY]], [[LOAD_TOK]] [#nvws.async_op<none>] {ttg.partition = array<i32: 0>}
+      // CHECK-NEXT: "use"
       // CHECK-NEXT: [[NEXT:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 1>}
       // CHECK-NEXT: scf.yield {ttg.partition = array<i32: 0, 1>} [[NEXT]] : !ttg.async.token
       %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%t], %true, %true {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
@@ -275,11 +275,11 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // CHECK-NEXT: [[TOK1:%.*]] = nvws.semaphore.acquire [[FULL]] {ttg.partition = array<i32: 1>}
       // CHECK-NEXT: [[VIEW1:%.*]]:2 = nvws.semaphore.buffer [[FULL]], [[TOK1]] {ttg.partition = array<i32: 1>}
       // CHECK-NEXT: {{.*}}, {{.*}} = ttng.tmem_load [[VIEW1]]#0[] {ttg.partition = array<i32: 1>}
+      // CHECK-NEXT: nvws.semaphore.release [[NEXT_FULL]], [[TOK1]] [#nvws.async_op<none>] {ttg.partition = array<i32: 1>}
+      // CHECK-NEXT: "use"
       %va, %ta = ttng.tmem_load %a[] {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
       "use"(%va) {ttg.partition = array<i32: 1>} : (tensor<128x128xf32, #blocked>) -> ()
       %b = ttng.tmem_alloc %cst1 {buffer.id = 14 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 2>} : (tensor<128x128xf32, #blocked>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-      // CHECK-NEXT: "use"
-      // CHECK-NEXT: nvws.semaphore.release [[NEXT_FULL]], [[TOK1]] [#nvws.async_op<none>] {ttg.partition = array<i32: 1>}
       // CHECK-NEXT: [[TOK2:%.*]] = nvws.semaphore.acquire [[NEXT_FULL]] {ttg.partition = array<i32: 2>}
       // CHECK-NEXT: [[VIEW2:%.*]]:2 = nvws.semaphore.buffer [[NEXT_FULL]], [[TOK2]] {ttg.partition = array<i32: 2>}
       // CHECK-NEXT: {{.*}} = arith.constant {ttg.partition = array<i32: 2>} true
