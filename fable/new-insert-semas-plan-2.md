@@ -1048,6 +1048,8 @@ selection.**
 
 2. **Pytest cases, 60s timeout per test — DO NOT run the entire pytest suite:**
 
+   Use PYTHONPATH=/home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/python/
+
    ```bash
    PYTHONPATH=python timeout 60s pytest -q \
      "python/test/unit/language/test_warp_specialization.py::test_warp_specialize_tma_matmul[False-4-2-64-128-128-8192-8192-512]"
