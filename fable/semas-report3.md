@@ -71,7 +71,13 @@ Per rewritten access, the bracket:
 
 The release payload names the source access's hardware completion mechanism
 and is a table lookup on the op (`getAsyncPayload`), recorded as a DAG fact —
-never recomputed. Tokens that cross a region boundary thread through
+never recomputed. **The lookup applies to every real access row regardless
+of R/W effect**: an MMA reading its operands is an ASYNC READER — it issues
+and returns while the tensor core still streams the operand buffers, so a
+release after the operand-read row must carry `tc5mma` (lowering to a
+completion-gated arrive), or the producer overwrites the operands mid-MMA.
+Synchronous readers (`tmem_load`, `local_load`) map to `none` through the
+same table — never special-case "R rows" to `none`. Tokens that cross a region boundary thread through
 `scf.for` iter_args / `scf.if` results. Buffer groups touched by a single
 owner produce no edges and are left completely untouched.
 
@@ -277,7 +283,8 @@ Owner assignment is a deterministic function of access order — no policy:
   serialize needlessly:
   `W m {1}; FOR{2}[R m]; FOR{3}[R m]; W m {4}` — with effects, both For
   rows are R-touches sharing {1}'s version (loops run concurrently), and
-  `W{4}` fan-ins `acq(2)` from both loop rows. Mixed case:
+  `W{4}` fan-ins from both loop rows plus the producer's
+  redundant-but-safe edge (`acq(3)` — rule 1's direct-only skip). Mixed case:
   `op1{1}; R1{2}; FOR R2{2}; FOR R3{3}; FOR W1{3}; op2{4}` yields
   `op1 → {R1·R2 ∥ R3} → W1 → op2` — the only semaphore into W1 is
   `{2}`'s done-edge after the R2 loop (count 1; `{3}` self-orders R3
@@ -384,8 +391,14 @@ Rows are visited in chain order; the complete rule set:
    off from; the entry acquire covers the permit).
 
 1. **W by `p` on `r`**: emit one edge `lastRow(h) → thisRow` for every
-   holder `h ≠ p` (every reader if Shared, the single owner if Exclusive) —
-   the fan-in. Then `holders(r) := Exclusive(p)`.
+   co-holder `h ≠ p` — readers AND the producer — **minus holders whose
+   `syncedBehind` already contains `p`** (the §5.2 transitive-sync skip;
+   it is deliberately DIRECT-only — full transitive closure is not
+   tracked, so with an all-reader set the producer's edge may survive as
+   redundant-but-safe). Readers-only sourcing would be minimal there but
+   UNSOUND for producer-re-read shapes (`W{1}; R{2}; R{1}; W{3}`: the
+   producer's re-read needs WAR protection too). This is the fan-in.
+   Then `holders(r) := Exclusive(p)`.
 2. **R by `p` on `r`**: if `p ≠ versionProducer(r)` and `p` is not already
    a reader, emit one edge `lastRow(holder) → thisRow` (from the current
    token holder's most recent row) and add `p` to the readers — the
@@ -405,7 +418,9 @@ Rows are visited in chain order; the complete rule set:
    order). Fan-out is therefore never "permitted" by a check — it is
    structurally impossible for a writer to co-hold:
    `W{1}; R{2}; R{2}; R{3}; R{3}; W{4}` shares `{2}∥{3}` and fan-ins
-   `acq(2)` at `{4}`; `W{1}; R{2}; R{2}; R{3}; W{3}; W{4}` still overlaps
+   `acq(3)` at `{4}` — readers `{2}`,`{3}` plus the producer `{1}`, whose
+   edge is redundant (both readers dominate it) but kept by the
+   direct-only skip; `W{1}; R{2}; R{2}; R{3}; W{3}; W{4}` still overlaps
    the *reads* of `{2}` and `{3}`, but `W{3}` waits on `{2}`'s last read
    (edge `R{2}→W{3}`) — the version model: reads overlap, writes gate.
 3. **Same-owner touch**: no edge; update the row. (If one row carries both
@@ -544,8 +559,23 @@ acquire is the ordering witness).
   the regain search then lands on the post-loop acquire — exactly the old
   pass's structure.
 - **Group by destination** (handoff C2): one counting semaphore per
-  destination row; `count = |sources|`; each source releases 1. The fan-in
-  `acquire(N)` **is** this grouping. **For-row destinations unify with
+  **(destination row, destination owner)** pair — the owner is part of the
+  key (old M3 identity): an EXIT row of a multi-piece chain can close
+  pieces with different carried owners, and each owner class is its own
+  phase-tracked waiter; `count = |sources|`; each source releases 1. The
+  fan-in `acquire(N)` **is** this grouping.
+  **Uniform pending count + release multiplicity.** A semaphore's pending
+  count is a per-semaphore CONSTANT: every acquire site carries the same
+  count, and every acquire cycle must receive exactly that many arrives.
+  When several destination groups legally share one semaphore (the For-row
+  unification below, or any future reuse), a group with fewer sources
+  scales its releases: each `Release` node carries an arrive multiplicity
+  (default 1, rendered `r S<k>(n)` only when n > 1), and per group
+  Σ(multiplicities) == the semaphore's count. A single-source group
+  against count k gets one release with multiplicity k; a group whose
+  source total cannot meet the count exactly is a hard diagnostic, never a
+  silent repair. Verifier: all acquire sites of one semaphore have equal
+  counts; per group the multiplicities sum to the count. **For-row destinations unify with
   the loop's regain**: an edge whose destination row is a `For` row is the
   *entry instance of that loop's regain* (the back-edge-as-permit rule
   applied at the nested loop) — iteration 0 is fed by the outside release,
@@ -605,11 +635,15 @@ Rules that produce and govern this shape:
   connected component of pieces (the per-resource token game — components
   are discovered, not declared): one additional `Acquire` of the
   component's *regain* semaphore — the **last** acquire of the component in
-  the loop body's chain, where the search descends into **if-branch
-  chains** (a conditional handback is a valid regain: the permit model is
-  phase-based and a skipped iteration leaves the permit untouched) but
-  **never into nested For bodies** (their acquires fire per inner
-  iteration); "last" in chain order, hence deterministic — placed so it
+  the loop body's chain, where the search descends the body's **entire
+  subtree** — if-branch chains (a conditional handback is a valid regain:
+  the permit model is phase-based and a skipped iteration leaves the
+  permit untouched) AND nested For bodies (an inner-loop regain is a valid
+  seed — the entry instance fires once on the initial permit while the
+  regain instance fires per inner iteration; differing acquire frequencies
+  on one semaphore are exactly the For-row-unification situation, and the
+  old pass's SEMA-UNION seeded nested-loop-carried buffers this way);
+  "last" in chain order, hence deterministic — placed so it
   executes **exactly once**: immediately before the component's first row
   of its **placement chain** (the innermost chain reachable from the top by
   descending through single-involving-row `scf.if` branches — an if branch
@@ -628,9 +662,14 @@ Rules that produce and govern this shape:
   in-loop holder by **carrier inherit**: no release/acquire edge for
   `root -> first holder`; the entry token simply seeds the carrier (v4's
   rule, preserved). The first-holder fact is NOT lost: it is recorded on
-  the semaphore as **`inheritStamp`** — the placement-point holder (a
-  descended chain's ENTER seed owner; otherwise the first involving row's
-  record owner) — and emission stamps the entry-acquire op with it
+  the semaphore as **`inheritStamp`** — the component's **first access
+  owner** (chain order, recursive; root when the component starts with an
+  unannotated access). This matches the old pass's recorded seed acquirers
+  across the whole corpus: root for root-seeded accumulators, the producer
+  partition for operand buffers, and the in-loop first toucher for
+  branch-local buffers (whose placement chain's ENTER owner is root — the
+  ENTER owner is NOT the inherit fact). Emission stamps the entry-acquire
+  op with it
   (`ttg.partition`+tag for a partition, no attrs for root; this is exactly
   what the previous pass emitted: operand entries stamped `{p2, tag 0}`,
   the root-seeded accumulator entry attr-less).

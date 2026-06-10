@@ -20,7 +20,14 @@ the evidence.
    `third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertTmemSemaphore.cpp`:
    - region token threading: `processForRegion` (:979–1025),
      `processIfRegion` (:1027–1088), `processLocalBlock` (:964–977);
-   - the TMEM backing-stage (1x/2x) decision: `isMultiStagedMember`
+   - the TMEM backing-stage (1x/2x) decision — USER RULING: the
+     producer-consumer pattern gate (`hasProducerConsumerPartitioning`) is
+     DROPPED; the per-MMA-user multibuffering chain of
+     `insertTmemSemaphoreSingle` (:1408-1425) is used VERBATIM as the
+     whole decision (start true; every MMA user inside a loop vetoes via
+     !hasAccReadModifyWrite && isAccMultibufferingPossible &&
+     !getDisallowAccMultiBuffer && canDoubleBufferAcc; meta => 1).
+     Historical note: `isMultiStagedMember`
      (:1379–1398; :1400–1434 is duplicate logic in
      `insertTmemSemaphoreSingle`), `canDoubleBufferAcc` (:1297), and the
      cross-group `numTmemBlocks` capacity accumulation (:1431, :1596);
@@ -329,7 +336,8 @@ struct Sema {
                                // dedicated entries) — the balance check
   bool     isEntry;            // first event in chain order is an acquire
                                //   => nvws.semaphore.create ... true
-  Owner    inheritStamp;       // entry semas: the placement-point holder
+  Owner    inheritStamp;       // entry semas: the component's FIRST
+                               // ACCESS owner (old seed-acquirer fact)
                                // (carrier inherit). The entry-acquire NODE
                                // is owned by ROOT (it executes in the root
                                // region); emission stamps the op with this
@@ -458,7 +466,8 @@ not `tt.disallow_acc_multi_buffer` (forces 1x: :587/:616, :1101/:1145,
 InsertTmemSemaphore.cpp:1431/:1596) ; `useMetaPartitioner` ⇒ 1
 (meta_fa_fwd is all 1x). Implemented as `computeBackingStages(group,
 numTmemBlocks&)` in **stage 3** output (BackingPlan), modeled on
-`isMultiStagedMember` (:1379–1398) — never at emit time.
+the :1408-1425 veto chain per the user ruling (pattern gate dropped) —
+never at emit time.
 
 **C. Backing dedup and reuse views — emission per member, coalescing as a
 post-process.** The final-IR shape in the goldens: members with identical
@@ -600,7 +609,9 @@ still fail at the end of this plan (golden regeneration is deferred — §5).
 
 **The verification set** (dumped, archived, §4c-verified at EVERY commit):
 all of `test/NVWS/insert_semas*.mlir`, `test/NVWS/tmem-buffer-reuse-semas.mlir`,
-**plus the real-kernel captures** —
+**plus** `test/NVWS/insert_semas_release_count.mlir` (the release-
+multiplicity lit test: a fan-in-2 regain unified with a single-source
+For-row ready edge => r S(2)), **plus the real-kernel captures** —
 `logs/moe-9jun26-v1/before-insert-semas-pmatmul.mlir` (MoE persistent matmul,
 fp8×mxfp4 dequantize: root-stored accumulator, conditional epilogue read,
 descriptor_load/gather producers, mma_scaled spanning five groups). Captures
@@ -802,10 +813,13 @@ rules 1/2/4; EXIT closes additionally only when load-bearing — under a
 loop or with a later touch in an ancestor chain — never as drains); dedupe
 (incl. the same-owner second collapse: same dst + same source owner +
 different rows -> latest row, payload union — multi-piece games require it);
-group-by-destination with the For-row unification (a For-row destination
-merges into the loop's in-body regain group — same component+acquirer,
-M3-clean; the before-loop acquire shares the semaphore, keeps its own
-count/placement)
+group-by-(destination row, destination OWNER) with the For-row unification
+(a For-row destination merges into the loop's in-body regain group — same
+component+acquirer, M3-clean); UNIFORM PENDING COUNT: all acquire sites of
+one semaphore carry the same count; merged groups with fewer sources scale
+their releases' arrive multiplicity (Node count on Release, default 1,
+rendered r S<k>(n); per group the multiplicities sum to the count — hard
+diagnostic when impossible)
 `(srcRow, dstRow, srcOwner)` with **payload union** on collapse (the
 release's `async_ops` array carries the union); group by destination;
 inject `Acquire`/`Release` nodes with recorded owner/payload/count; entry

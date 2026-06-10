@@ -142,7 +142,7 @@ static void applyTouch(ChainState &st, PieceId p, const Owner &who,
                                 {p}});
     primary->syncedBehind.push_back(ownerKey(who));
   }
-  gm.holders.push_back(HolderRec{who, row, {AsyncOp::NONE}, {}});
+  gm.holders.push_back(HolderRec{who, row, rowPayloads, {}});
 }
 
 // ---------------------------------------------------------------------------
@@ -204,8 +204,12 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SyncCtx &ctx,
             it->second = joinEffect(it->second, t.effect);
         }
       for (auto &[p, e] : eff) {
+        // Payload = the op's completion mechanism, REGARDLESS of R/W: an
+        // MMA reading its operands is an async reader — its release must
+        // gate on tc5mma completion. Synchronous loads map to NONE
+        // through the same table (spec section 1.2).
         SmallVector<AsyncOp, 1> pay;
-        pay.push_back(e == Effect::W ? asyncPayloadOf(n->op) : AsyncOp::NONE);
+        pay.push_back(asyncPayloadOf(n->op));
         applyTouch(st, p, n->owner, e, n, pay, ctx, /*wsAdopt=*/false);
       }
       break;
@@ -423,12 +427,16 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SyncCtx &ctx) {
     SmallVector<unsigned, 2> idxs;
     int sema = -1;
   };
-  llvm::MapVector<Node *, unsigned> dstIndex;
+  // Key = (destination row, destination OWNER): an EXIT row of a
+  // multi-piece chain can close pieces with different carried owners, and
+  // each owner class is its own phase-tracked waiter (old M3 identity).
+  llvm::MapVector<std::pair<Node *, int64_t>, unsigned> dstIndex;
   SmallVector<DstGroup> groups;
   for (auto [i, e] : llvm::enumerate(collapsed)) {
-    auto it = dstIndex.find(e.dst);
+    auto key = std::make_pair(e.dst, ownerKey(e.dstOwner));
+    auto it = dstIndex.find(key);
     if (it == dstIndex.end()) {
-      dstIndex.try_emplace(e.dst, groups.size());
+      dstIndex.try_emplace(key, groups.size());
       groups.push_back(DstGroup{e.dst, {static_cast<unsigned>(i)}, -1});
     } else {
       groups[it->second].idxs.push_back(i);
@@ -447,11 +455,11 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SyncCtx &ctx) {
                              CompId comp) -> int {
     int best = -1;
     for (Node *m = forRow->children[0]; m; m = m->next) {
-      auto it = dstIndex.find(m);
+      auto it = dstIndex.find(std::make_pair(m, ownerKey(acq)));
       if (it == dstIndex.end())
         continue;
       DstGroup &cand = groups[it->second];
-      if (sameOwner(groupAcquirer(cand), acq) && groupComp(cand) == comp)
+      if (groupComp(cand) == comp)
         best = static_cast<int>(it->second);
     }
     return best;
@@ -517,17 +525,35 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SyncCtx &ctx) {
   DenseMap<Node *, Node *> lastAfter; // release insertion cursor per source
   for (DstGroup &grp : groups) {
     Sema &s = g.semaTable.semas[grp.sema];
+    // UNIFORM PENDING COUNT: every acquire site of one semaphore carries
+    // the semaphore's count; a merged group with fewer sources scales its
+    // releases' arrive multiplicity so the per-cycle arrives still sum to
+    // the count (spec section 5.2). m == count -> multiplicity 1;
+    // m == 1 -> one release with multiplicity count; anything else is
+    // inexpressible — hard diagnostic, never a silent repair.
+    unsigned m = grp.idxs.size();
+    unsigned relCount = 1;
+    if (m != s.count) {
+      if (m == 1)
+        relCount = s.count;
+      else
+        return (grp.dst->op ? grp.dst->op : g.root->op)
+            ->emitError("nvws-insert-semas: destination group with ")
+               << m << " sources cannot meet semaphore " << s.name
+               << " pending count " << s.count;
+    }
     Node *acq = g.newNode(Node::Acquire, /*op=*/nullptr, grp.dst->parent);
     acq->owner = groupAcquirer(grp);
     acq->sema = static_cast<SemaId>(grp.sema);
-    acq->count = grp.idxs.size();
+    acq->count = s.count;
     spliceBefore(acq, grp.dst);
-    s.expectedReleases += grp.idxs.size();
+    s.expectedReleases += m * relCount;
     for (unsigned idx : grp.idxs) {
       EdgeRec &e = collapsed[idx];
       Node *rel = g.newNode(Node::Release, /*op=*/nullptr, e.src->parent);
       rel->owner = e.srcOwner;
       rel->sema = static_cast<SemaId>(grp.sema);
+      rel->count = relCount; // arrive multiplicity (default 1)
       rel->payloads = e.payloads;
       rel->sat = acq;
       Node *anchor = lastAfter.lookup(e.src);
@@ -561,17 +587,19 @@ static bool nodeInvolvesComp(GroupDag &g, Node *n, CompId comp) {
   return false;
 }
 
-// Regain search: the LAST acquire of the component in the chain, descending
-// into if-branch chains (a conditional handback is a valid regain — the
-// permit is phase-based and skipped iterations leave it untouched) but
-// NEVER into nested For bodies (their acquires fire per inner iteration).
+// Regain search: the LAST acquire of the component in the body's ENTIRE
+// subtree — if branches (a conditional handback is a valid regain) and
+// nested For bodies (an inner-loop regain is a valid seed: the entry
+// instance fires once on the initial permit; differing acquire
+// frequencies on one semaphore are the For-row-unification situation, and
+// the old pass's SEMA-UNION seeded nested-loop buffers this way).
 static Node *lastAcquireOfCompInChain(GroupDag &g, Node *head, CompId comp) {
   Node *found = nullptr;
   for (Node *n = head; n; n = n->next) {
     if (n->kind == Node::Acquire &&
         g.semaTable.semas[n->sema].component == comp)
       found = n;
-    if (n->kind == Node::If)
+    if (n->kind == Node::If || n->kind == Node::For)
       for (Node *child : n->children)
         if (Node *f = lastAcquireOfCompInChain(g, child, comp))
           found = f;
@@ -579,14 +607,25 @@ static Node *lastAcquireOfCompInChain(GroupDag &g, Node *head, CompId comp) {
   return found;
 }
 
-// Owner record a row carries for the component (Access: its owner;
-// region/bracket rows: the pieceInfo owner of the comp's first piece).
-static Owner rowOwnerForComp(GroupDag &g, Node *n, CompId comp) {
-  if (n->kind == Node::Access)
-    return n->owner;
-  for (auto &[p, pi] : sortedPieceInfo(n))
-    if (g.pieceTable.pieceComp[p] == comp)
-      return pi.owner;
+// The component's first access row's owner, chain order, recursive.
+static Owner firstAccessOwnerOfComp(GroupDag &g, Node *head, CompId comp,
+                                    bool &found) {
+  for (Node *n = head; n; n = n->next) {
+    if (n->kind == Node::Access) {
+      for (const Touch &t : n->touches)
+        for (PieceId p : g.pieceTable.footprint[t.member])
+          if (g.pieceTable.pieceComp[p] == comp) {
+            found = true;
+            return n->owner;
+          }
+    }
+    if (n->kind == Node::For || n->kind == Node::If)
+      for (Node *child : n->children) {
+        Owner o = firstAccessOwnerOfComp(g, child, comp, found);
+        if (found)
+          return o;
+      }
+  }
   return std::nullopt;
 }
 
@@ -644,13 +683,16 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
       return g.root->op->emitError(
           "nvws-insert-semas: component with sync but no placement rows");
 
-    // First holder = the piece-holder at the placement point: a descended
-    // chain's ENTER seed owner; otherwise the first involving row's own
-    // record owner. (Ground truth: the previous pass's emitted entry
-    // acquires carry the first holder's partition+tag, or no attr = root.)
-    Owner firstHolder = chainHead->kind == Node::Enter
-                            ? rowOwnerForComp(g, chainHead, comp)
-                            : rowOwnerForComp(g, rows.front(), comp);
+    // Inherit fact = the component's FIRST ACCESS owner, chain order,
+    // recursive (ground truth: matches the old pass's recorded seed
+    // acquirers across the corpus — root for root-seeded accumulators,
+    // the producer partition for operand buffers, the in-loop first
+    // toucher for branch-local buffers).
+    bool fhFound = false;
+    Owner firstHolder = firstAccessOwnerOfComp(g, top, comp, fhFound);
+    if (!fhFound)
+      return g.root->op->emitError(
+          "nvws-insert-semas: component has no access rows");
 
     // Regain: the carried owner's last acquire in the body's OWN chain of
     // the last top-level loop carrying the component.
@@ -789,45 +831,6 @@ static void computeRequiredParts(Node *head) {
 // BackingPlan (plan contract B; reference semantics from
 // InsertTmemSemaphore.cpp:1297/1340/1379 — re-derived, not copied).
 // ---------------------------------------------------------------------------
-static void collectAccessSeq(GroupDag &g, Node *head,
-                             SmallVector<Node *, 8> &seq) {
-  for (Node *n = head; n; n = n->next) {
-    if (n->kind == Node::Access)
-      seq.push_back(n);
-    if (n->kind == Node::For || n->kind == Node::If)
-      for (Node *child : n->children)
-        collectAccessSeq(g, child, seq);
-  }
-}
-
-// Producer-consumer partitioning: the access sequence has exactly two
-// partition transitions (producer block, consumer block, producer block)
-// with store/MMA ops in producer phases and loads in consumer phases.
-static bool hasProducerConsumerPartitioning(GroupDag &g) {
-  SmallVector<Node *, 8> seq;
-  collectAccessSeq(g, g.root->children.empty() ? nullptr : g.root->children[0],
-                   seq);
-  if (seq.size() < 2)
-    return false;
-  bool expectProducer = true;
-  int changeGroup = 0;
-  bool valid = true;
-  for (size_t i = 0; i + 1 < seq.size(); ++i) {
-    Operation *op = seq[i]->op;
-    if (isa<nvidia_gpu::TMEMLoadOp, nvidia_gpu::TMEMStoreOp,
-            nvidia_gpu::MMAv5OpInterface>(op))
-      valid = valid && (expectProducer
-                            ? isa<nvidia_gpu::TMEMStoreOp,
-                                  nvidia_gpu::MMAv5OpInterface>(op)
-                            : isa<nvidia_gpu::TMEMLoadOp>(op));
-    if (ownerKey(seq[i]->owner) != ownerKey(seq[i + 1]->owner)) {
-      expectProducer = !expectProducer;
-      ++changeGroup;
-    }
-  }
-  return valid && changeGroup == 2;
-}
-
 static bool canDoubleBufferAcc(nvidia_gpu::MMAv5OpInterface mmaOp,
                                int numTmemBlocks) {
   auto tmemDesc = mmaOp.getAccumulator().getType();
@@ -852,25 +855,32 @@ static scf::ForOp outerWSLoop(scf::ForOp loop) {
   return ws;
 }
 
+// USER RULING (plan ground rule 2): the producer-consumer pattern gate is
+// dropped; the per-MMA-user multibuffering veto chain of
+// InsertTmemSemaphore.cpp:1408-1425 is used VERBATIM as the whole decision.
 static bool isMultiStagedGroup(GroupDag &g, int numTmemBlocks) {
-  if (!hasProducerConsumerPartitioning(g))
-    return false;
-  bool valid = true;
+  bool isMultiStaged = true;
   for (const Member &m : g.pieceTable.members) {
     for (Operation *user : m.allocOp->getResult(0).getUsers()) {
-      auto mmaOp = dyn_cast<nvidia_gpu::MMAv5OpInterface>(user);
-      if (!mmaOp || mmaOp.getAccumulator() != m.allocOp->getResult(0))
-        continue;
-      if (auto loop = dyn_cast<scf::ForOp>(user->getParentOp())) {
-        scf::ForOp wsLoop = outerWSLoop(loop);
-        valid = valid && !nvidia_gpu::hasAccReadModifyWrite(mmaOp, loop) &&
-                nvidia_gpu::isAccMultibufferingPossible(mmaOp, loop) &&
-                !getDisallowAccMultiBuffer(wsLoop) &&
-                canDoubleBufferAcc(mmaOp, numTmemBlocks);
+      if (auto mmaOp = dyn_cast<nvidia_gpu::MMAv5OpInterface>(user)) {
+        if (auto loop = dyn_cast<scf::ForOp>(user->getParentOp())) {
+          scf::ForOp wsLoop = outerWSLoop(loop);
+          // Determine if the MMA accumulator can be multibuffered.
+          bool accIsMultiBuffered =
+              // MMAs in subsequent iterations can be overlapped.
+              !nvidia_gpu::hasAccReadModifyWrite(mmaOp, loop) &&
+              // The accumulator is reset at some point, thus allowing
+              // multibuffering.
+              nvidia_gpu::isAccMultibufferingPossible(mmaOp, loop) &&
+              // The user didn't disable it with a flag.
+              !getDisallowAccMultiBuffer(wsLoop) &&
+              canDoubleBufferAcc(mmaOp, numTmemBlocks);
+          isMultiStaged = isMultiStaged && accIsMultiBuffered;
+        }
       }
     }
   }
-  return valid;
+  return isMultiStaged;
 }
 
 static void computeBackingPlan(GroupDag &g, triton::FuncOp funcOp,
@@ -912,7 +922,7 @@ static LogicalResult verifySyncDag(GroupDag &g) {
   std::function<LogicalResult(Node *)> walk = [&](Node *head) -> LogicalResult {
     for (Node *n = head; n; n = n->next) {
       if (n->kind == Node::Release) {
-        releaseCount[n->sema]++;
+        releaseCount[n->sema] += std::max(1u, n->count);
         if (n->payloads.empty())
           return g.root->op->emitError(
               "nvws-insert-semas: release without payload record");
@@ -954,6 +964,11 @@ static LogicalResult verifySyncDag(GroupDag &g) {
                                                std::nullopt);
   std::function<LogicalResult(Node *)> m3 = [&](Node *head) -> LogicalResult {
     for (Node *n = head; n; n = n->next) {
+      if (n->kind == Node::Acquire &&
+          n->count != g.semaTable.semas[n->sema].count)
+        return g.root->op->emitError("nvws-insert-semas: semaphore ")
+               << g.semaTable.semas[n->sema].name
+               << " acquired with non-uniform pending count";
       if (n->kind == Node::Acquire && n->owner.has_value()) {
         int64_t k = ownerKey(n->owner);
         if (acqClass[n->sema] && *acqClass[n->sema] != k)
@@ -1088,17 +1103,15 @@ static void dumpSyncChain(GroupDag &g, const Node *head, unsigned depth,
     Operation *anchor = n->parent ? n->parent->op : nullptr;
     switch (n->kind) {
     case Node::Access: {
-      Effect rowEffect = Effect::R;
-      for (const Touch &t : n->touches)
-        rowEffect = joinEffect(rowEffect, t.effect);
-      os << treePrefix(depth) << "|- " << (rowEffect == Effect::W ? "W" : "R")
-         << "  ";
+      // Per-member effects (one op = one row; a member the op only reads
+      // is shown R even when another member is written).
+      os << treePrefix(depth) << "|- ";
       bool first = true;
       for (const Touch &t : n->touches) {
         if (!first)
           os << ",";
         first = false;
-        os << "m" << t.member;
+        os << (t.effect == Effect::W ? "W" : "R") << " m" << t.member;
       }
       os << "  " << n->op->getName().getStringRef() << " "
          << ownerStr(n->op, n->owner) << "\n";
@@ -1119,7 +1132,10 @@ static void dumpSyncChain(GroupDag &g, const Node *head, unsigned depth,
     }
     case Node::Release: {
       const Sema &s = g.semaTable.semas[n->sema];
-      os << treePrefix(depth) << "|- r  " << s.name << "  "
+      os << treePrefix(depth) << "|- r  " << s.name;
+      if (n->count > 1)
+        os << "(" << n->count << ")";
+      os << "" << "  "
          << ownerStr(anchor, n->owner) << " [";
       bool first = true;
       for (AsyncOp p : n->payloads) {
