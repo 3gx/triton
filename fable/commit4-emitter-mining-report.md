@@ -70,8 +70,12 @@ diffed against spec §6 and plan commit-4. Produced by a background explorer,
    src is a `tt.descriptor_load/gather`): old pass converted to
    `nvws.descriptor_load/gather` writing the view directly; new contract D
    would round-trip through registers via local_store. No corpus input
-   exercises it today; needs an explicit decision (keep contract D and
-   document, or adopt the conversion).
+   exercises it today. **RULED (user): non-issue — dead code.**
+   `nvws-insert-allocas` (InsertAllocas.cpp:451/:562/:575), which runs
+   immediately before insert-semas, already converts cross-partition
+   tt-form pairs to nvws form; tt-form pairs reaching insert-semas are
+   same-partition -> untouched. Stage 1 hard-errors on the (impossible)
+   managed tt-form shape to document the pipeline invariant.
 7. **Scalar-sourced local alloc** → `triton::SplatOp` (owner+stage stamped)
    then local_store. Contract D assumes tensor sources; one sentence fixes it.
 8. **Synthesized sourceful-store triple stamping**: the emitted store (and

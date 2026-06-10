@@ -510,13 +510,16 @@ in-inner-loop sourceful alloc stores into view member #4 and releases
 (and its `arith.constant true` / splat) inherits the ORIGINAL alloc's
 owner and stage/cluster (mining gap 8). A SCALAR `%src`
 (float/int) first materializes via `triton::SplatOp`, owner+stage
-stamped, then the local_store (mining gap 7). **OPEN DECISION (mining
-gap 6, user ruling pending):** a managed `ttg.local_alloc %src` whose
-source is a `tt.descriptor_load/gather` — old pass converted it to
-`nvws.descriptor_load/gather` writing the view directly (no register
-round-trip); contract D as written would store through registers. No
-corpus input exercises it; stage 1 must DETECT the shape and surface a
-named diagnostic until ruled.
+stamped, then the local_store (mining gap 7). **RESOLVED (mining gap 6,
+user ruling):** a managed descriptor-fed buffer NEVER reaches this pass in
+`tt.` form — `nvws-insert-allocas` (the immediately preceding pass,
+InsertAllocas.cpp:451/:562/:575) converts cross-partition
+`tt.descriptor_load/gather`+alloc pairs to `nvws.descriptor_load/gather`
+upstream; a pair still in tt-form here is same-partition -> zero
+semaphores -> untouched (contract H). The old emitter's conversion path
+was dead code in the current pipeline. Stage 1 hard-errors if a managed
+tt-form descriptor-fed alloc ever appears — documenting the pipeline
+invariant, not guessing a behavior.
 
 **E. ALL original TMEM tokens are nuked — as a pre-process, before any
 semaphore IR is emitted.** Design rule: nuke *all* TMEM async-token plumbing
