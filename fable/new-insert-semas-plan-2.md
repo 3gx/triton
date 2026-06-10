@@ -43,7 +43,9 @@ the evidence.
    counts are implicit in the IR (one acquire op, N release sites; counted
    by `nvws-lower-semaphore`); the count lives only in the SYNC-DAG.
 5. **All decisions before any mutation.** Stages 1–3 are pure analysis and
-   additionally produce the **BackingPlan** and **ThreadingPlan** (§2). The
+   additionally produce the **BackingPlan** and the per-node **Crossing**
+   facts (§2 — crossings live on For/If DAG nodes; "ThreadingPlan" is their
+   derived emission-time aggregation). The
    emitter applies plans; it decides nothing. In particular the TMEM 1x/2x
    stage check runs on the *unmodified* input IR, in the analysis path.
    Emission itself is bracketed by mechanical normalizations: a
@@ -69,7 +71,7 @@ the evidence.
      deterministic key first (program-order rank, member index, piece id,
      edge id).
    - Every assigned ID (pieces, semaphore names `S0…`, components,
-     ThreadingPlan slots, backing order) is allocated in program/insertion
+     crossing slot numbering, backing order) is allocated in program/insertion
      order — never in hash order.
    - The mechanical check, part of §4c self-verification at **every**
      commit: run the pass twice over the whole verification set and `diff`
@@ -114,12 +116,12 @@ InsertSemas.cpp          pass + dispatcher (~150 LoC): gate on a WS-tagged
                          loop, then per group: stage 1 → 2 → 3, then stage 4;
                          includes the headers below in order
 InsertSemas.h            shared model: Node, PieceTable, SemaTable,
-                         BackingPlan, ThreadingPlan, traversal, owner/payload
+                         BackingPlan, Crossing, traversal, owner/payload
                          helpers, dump/verifier shared utilities
 InsertSemasAccessDag.h   stage 1: discovery + pieces + events + dump (commit 1)
 InsertSemasOwnerDag.h    stage 2: Enter/Exit + owners + invariants + dump (commit 2)
 InsertSemasSyncDag.h     stage 3: walk + grouping + entry acquires +
-                         BackingPlan/ThreadingPlan + verifiers + dump (commit 3)
+                         BackingPlan/node crossings + verifiers + dump (commit 3)
 InsertSemasEmitIR.h      stage 4: token-nuke pre-process, plan application,
                          render, post-emit verifier, coalescing + loop-scheduler
                          post-processes (commit 4)
@@ -157,8 +159,13 @@ enum class Effect { R, W };    // R = provably load-only; W = everything else
 // ---- region-row boundary plan, per piece (spec §4) ----
 struct PieceInfo {
   Owner  owner;                // carried owner (loop: first toucher;
-                               //  if: FIRST IN-BRANCH TOUCHER — then chain
-                               //  first, then else; no fallbacks)
+                               //  if: RULE A — the INCOMING owner (most
+                               //  recent prior toucher in the chain;
+                               //  fallback: first in-subtree toucher).
+                               //  RULE B (post-if-toucher override) is a
+                               //  recorded extension, NOT implemented —
+                               //  see spec section 4 and the marked choke
+                               //  point in InsertSemasOwnerDag.h)
   Effect effect;               // W iff ANY subtree access to the piece writes
 };
 
@@ -196,6 +203,23 @@ struct Node {
                                     // re-anchoring — spec §5.1)
   Node *sat = nullptr;              // Release -> the ONE Acquire it satisfies
                                     // (an Acquire has count-many incoming)
+  SmallVector<Crossing, 1> crossings; // For/If only, filled at stage 3:
+                                      // carrier slots crossing this region
+                                      // (see Crossing below) — rendered as
+                                      // thread{c0:{1}} + per-chain EXIT
+                                      // yield{} routes
+  SmallVector<int, 2> requiredParts;  // For/If only, filled at stage 3:
+                                      // sorted union of subtree row
+                                      // partitions = the partitions that
+                                      // receive a clone of this region
+                                      // skeleton after partition-loops.
+                                      // Emission extends the op's
+                                      // ttg.partition array to exactly this
+                                      // (the C10 rule — a transcription,
+                                      // not a render-time derivation).
+                                      // Rendered as parts{0,1}. ENTER/EXIT
+                                      // need no owner: they execute once
+                                      // per clone, in every parts{} member.
 };
 // AsyncOp is the existing NVWS enum (NONE | TC5MMA | TMALoad) — not a new type.
 ```
@@ -243,11 +267,13 @@ What each snapshot populates (one Node type; fields fill in by stage):
 | pieceInfo.owner (+ Enter/Exit rows, both halves copied) | — | ✓ | ✓ |
 | sema / count / payload | — | — | ✓ (sync nodes) |
 | `sat` | — (empty) | — (empty) | ✓ |
+| crossings (For/If rows) | — | — | ✓ (slotOwner + per-chain finals) |
+| requiredParts (For/If rows) | — | — | ✓ (clone set; C10 array) |
 
 The chain is
 an intrusive doubly-linked list so that stage-3 injection of sync nodes is
 an O(1) splice that never invalidates any held `Node*` (edges, `sat`,
-SemaTable, ThreadingPlan, op→node maps). The splice ↔ MLIR insertion
+SemaTable, node crossings, op→node maps). The splice ↔ MLIR insertion
 correspondence is exact and exhausts all cases: a Release spliced between
 `src` and `src->next` (DAG insertAfter) emits via
 `setInsertionPointAfter(prev->op)`; an Acquire spliced between `dst->prev`
@@ -314,19 +340,51 @@ struct BackingPlan {
 };
 
 // ---- stage 3: carrier threading plan (per function, all groups) ----
-struct ThreadingPlan {
-  // CROSSING RULE (mechanical): region op R gets a slot for component c
-  // iff R's subtree contains >=1 Acquire node of c. Wiring at render:
-  //   For: init := enclosing carrier, yield := body-final carrier;
-  //   If:  then yields the branch-final carrier, else (real or
-  //        materialized) yields the incoming carrier unchanged.
-  // Outer loops follow automatically (their subtree contains the inner
-  // acquires) — reproduces meta_fa_fwd's two-level threading (contract F).
-  llvm::MapVector<Operation*, SmallVector<std::pair<unsigned /*groupIdx*/,
-                                                    CompId>>> crossings;
-  // slot index of a crossing = its position in the vector (appended after
-  // the op's original iter_args/results); MapVector = deterministic order
+// Crossings LIVE ON THE DAG (a field of For/If Nodes — the DAG is the
+// authority; no Operation*-keyed side table, hence nothing extra to patch
+// during the commit-4 op-replacement fixup). Computed at stage 3, rendered
+// by the SYNC dump on the region row as thread{c0:{1} final=a S1}.
+struct Crossing {
+  CompId comp;         // which token game (group implicit: the node's DAG)
+  Owner slotOwner;     // the partition stamped on this slot's
+                       // ttg.partition.outputs entry and yield attrs.
+                       // Always equals the region row's pieceInfo owner
+                       // for the component's pieces: EVERY chain's final
+                       // carrier is held by that owner (EXIT-close hands
+                       // back; pass-through was already held) — a COMMIT-3
+                       // FACT (ground rule 5: emission decides nothing).
+  SmallVector<Node *, 2> finals; // PER CHAIN, parallel to children: the
+                       // chain's last carrier-producing row for the
+                       // component (an Acquire node, or a nested region
+                       // row with its own c-crossing — resolved
+                       // hierarchically, innermost first). Its token is
+                       // what THAT chain's yield returns — the NEW token.
+                       // nullptr = PASS-THROUGH: that chain yields the
+                       // INCOMING carrier unchanged — the OLD token (the
+                       // skipped-path case; needs no other fact, which is
+                       // why bare else brackets carry nothing).
 };
+// CROSSING RULE (mechanical): region op R gets a Crossing for component c
+// iff R's subtree contains >=1 Acquire node of c. Wiring at render (pure
+// transcription): For: init := enclosing carrier, yield := finals[0]'s
+// token; If: thenYield := finals[0]'s token or incoming if null,
+// elseYield := finals[1]'s token or incoming if null. Outer loops follow
+// automatically (their subtree contains the inner acquires) —
+// meta_fa_fwd's two-level threading (contract F). Dump rendering,
+// faithful to the fields and INDEXED WHERE THEY APPLY: the region row
+// prints the slot (thread{c0:{1}}), and EACH CHAIN'S EXIT row prints ITS
+// OWN finals[] entry, so the route is reviewable per path:
+//   EXIT ... yield{c0: a S1}     finals[i] = that Acquire row (NEW token)
+//   EXIT ... yield{c0: scf.if}   finals[i] = a nested region row's result
+//   EXIT ... yield{c0: pass}     finals[i] = nullptr — the OLD/incoming
+//                                token passes through (the skipped path)
+// yield{} is a ROUTE annotation, not an access/owner record: it never
+// claims the branch touches a piece, so bare brackets stay honest.
+//
+// "ThreadingPlan" is therefore NOT a stored artifact: it is the DERIVED,
+// emission-time aggregation of node crossings — commit-4 step 3 walks all
+// groups' region rows in group order to number the appended slots across
+// groups. Pure transcription; zero facts of its own.
 
 // ---- per group, the whole artifact handed from stage to stage ----
 struct GroupDag {
@@ -342,7 +400,8 @@ struct GroupDag {
 //  - int numTmemBlocks                            (capacity accumulator,
 //                                                  fed group-by-group into
 //                                                  computeBackingStages)
-//  - ThreadingPlan threading                      (aggregated, stage 3)
+//  - (slot numbering: derived at emit step 3 by walking all groups'
+//     region-row crossings in group order — not stored)
 //  - DenseMap<Operation*, Operation*> opFixup     (emit step 3: old->new
 //                                                  scf ops; lookup only)
 //  - Value poisonToken                            (emit step 1: the single
@@ -432,7 +491,7 @@ inside loops), then clear dep/token operands of the groups' access ops
 :322/:329) and RAUW their token results and dead token iter_arg slots —
 init and yield — with that single value
 (`tmem-buffer-reuse-semas.mlir` :80/:84/:95, :118/:134).
-Carriers then travel **only** in slots the ThreadingPlan owns (appended,
+Carriers then travel **only** in slots the node crossings own (appended,
 §F). Reusing the original token slots for semaphore carriers (as the old
 pass does in meta_fa_fwd :176) is rejected by design — the carrier set does
 not correspond to the original token set, and mixing the two couples the
@@ -524,12 +583,22 @@ shape — one covering 1x128x128xf32 alloc + four subslice/reinterpret views
 Dump-only until commit 4; lit `insert_semas*` fails during bring-up AND may
 still fail at the end of this plan (golden regeneration is deferred — §5).
 
+**The verification set** (dumped, archived, §4c-verified at EVERY commit):
+all of `test/NVWS/insert_semas*.mlir`, `test/NVWS/tmem-buffer-reuse-semas.mlir`,
+**plus the real-kernel captures** —
+`logs/moe-9jun26-v1/before-insert-semas-pmatmul.mlir` (MoE persistent matmul,
+fp8×mxfp4 dequantize: root-stored accumulator, conditional epilogue read,
+descriptor_load/gather producers, mma_scaled spanning five groups). Captures
+are run WITHOUT `-split-input-file`; new captures of real kernels may be
+appended to this list as they appear.
+
 **4a. User-runnable diagnostics at every commit.** Like the current
 `InsertSemas.cpp`, `NVWS_INSERT_SEMA_DUMP_DAG=1` prints, per backing group,
 every stage built so far — cumulative as commits land: commit 1 → ACCESS-DAG
 diagnostic; commit 2 → + OWNER-DAG diagnostic; commit 3 → + SYNC-DAG
 diagnostic (entry acquires, counts, semaphore table, BackingPlan/
-ThreadingPlan summaries); commit 4 → all three remain available alongside
+thread{...} crossing annotations on region rows + semaphore/backing
+tables); commit 4 → all three remain available alongside
 the transformed IR. The dump format is normatively defined by the spec's
 examples (§4.1 E1–E6, §5.3, §5.5 — ENTER/EXIT rows, `R`/`W` access rows,
 `r`/`a` sync rows with owners and counts); the old pass's dumps are not the
@@ -592,8 +661,12 @@ function/group in it:
   corpus expects them.
 - **Commit 2 (OWNER-DAG)**: for each region and piece, the carried owner is
   re-derived by hand from the commit-1 access order (loop = first toucher;
-  if = first in-branch toucher) and matches the dump; ENTER/EXIT effects are
-  verified as exact copies of the commit-1 For/If summaries; ENTER/EXIT rows present
+  if = RULE A, the incoming owner — most recent prior toucher, falling back
+  to the first in-subtree toucher; with the WS scope barrier: a WS-tagged
+  For row contributes root upward) and matches the dump; bracket records are
+  verified as **restrictions** — each branch's ENTER/EXIT carry only that
+  branch's own footprint with branch-local effects (owners from the region
+  row; non-accessing branches bare — nothing invented); ENTER/EXIT rows present
   with the owner invariants holding (`For == Enter == Exit`,
   `If == then.* == else.*`); WS scope-barrier and root/`{@tag.p}` rendering
   correct; each of the spec §4.1 cases E1–E6 located in the corpus and
@@ -609,7 +682,7 @@ function/group in it:
   toucher differs); per-execution balance re-checked by hand on at least
   the keystone (meta_fa_fwd buffer.id=4 end-to-end) plus every conditional
   test; BackingPlan numbers (1x/2x per group) checked against the corpus
-  evidence list in contract B; ThreadingPlan crossings checked against the
+  evidence list in contract B; node crossings checked against the
   crossing rule (slot iff subtree contains an Acquire of the component);
   hand-balancing uses the lowering's arrive formula — Σ over a wave's
   distinct releasing partitions of `|async_ops|`, one arrive per array
@@ -656,8 +729,15 @@ buffer.id 2/3/4/5 — plus 6 synthetic-id locals) are the acid test.
 ### Commit 2 — OWNER-DAG (creates `InsertSemasOwnerDag.h`)
 Clone; `Enter`/`Exit` per region; the **owner half** of `pieceInfo` by the
 deterministic rules (spec §4: loop carried owner = first toucher per piece;
-if-branch owner = first in-branch toucher, then chain first — no fallbacks;
-super-node; WS scope barrier; root) —
+if-branch owner = RULE A, the incoming owner — conditional code costs sync
+only when taken; RULE B (post-if-toucher override, hoists the handoff when
+consumption continues after the join) is a recorded extension that reduces
+to A when its shape is absent — adopt only on profiled need, at the single
+marked choke point; super-node; the WS scope barrier as the operational
+toucher-contribution
+rule — a WS-tagged For row contributes ROOT upward, its own record keeps
+the carried owner, so every region row outside a WS loop is root except
+intrinsic-tag deciders; root propagates freely) —
 where the commit-1 effect summaries make the toucher scans flat: a region
 row is an ordinary toucher of exactly the pieces in its summary, no
 recursive subtree probing. Effects are **copied** from the For/If stage-1
@@ -685,7 +765,9 @@ holders only, the parent state is touched solely by the super-node row as
 one R- or W-touch per its effect; payloads tracked as
 `(lastRow, lastPayload)` per holder per piece — releases source from real
 access rows with that op's payload, or are ENTER-sourced with the
-same-partition pre-region acquire as witness (spec rule-5 theorem); If-row
+seed-imported producer payload (rule 5's import — load-bearing for rule A's
+producer-brackets-own-branch epilogues) or, for non-producer owners, none
+with the same-partition pre-region acquire as witness; If-row
 outgoing payload = union over its branch games; destination-then-recurse
 walk order pinned; WS-For root
 adoption — contract H; the virtual else carries no sync rows); dedupe
@@ -701,8 +783,12 @@ Also computed here, read-only (ground rule 5):
   accumulated `numTmemBlocks` (contract B) and hoist anchors. (The
   covering/view shape is NOT planned here — it is the attr-driven commit-4
   step-6 post-process, contract C.)
-- **ThreadingPlan**: for each `scf.for`/`scf.if`, the components whose
-  carrier crosses it (slot order fixed here).
+- **Node crossings**: for each `scf.for`/`scf.if` DAG row, the components whose
+  carrier crosses it (slot order fixed here), **and per crossing the
+  `slotOwner` + per-chain `finals[]` facts** — resolved hierarchically from the
+  SYNC-DAG (the region's last Acquire of the component, or a nested region
+  row's own slot), innermost regions first. Emission transcribes these;
+  it never re-derives an owner or searches for a carrier at render time.
 
 Verifiers (hard errors, spec §7): edges same-region + forward; if-branch
 holder states identical; fan-in sources same-chain siblings **and
@@ -739,13 +825,15 @@ Strict order — pre-process, apply frozen plans, render, post-process:
    they need no loop signatures). This ordering exists because step 3
    needs the entry tokens as real SSA init values; the step-4 traversal
    marks these nodes already-emitted and skips them.
-3. **Signature rewrites** (ThreadingPlan): each `scf.for` gets its token
+3. **Signature rewrites** (aggregating node crossings across all groups,
+   in group order — the derived "ThreadingPlan"): each `scf.for` gets its token
    iter_args appended via `addIterArgsToLoop` (init values = the step-2
    entry tokens / enclosing carriers), each `scf.if` its token results via
    `replaceIfOpWithNewSignature` — **exactly once per op**, aggregated
    across all groups; structured ops are processed **outside-in** (an inner
    loop's init may be the enclosing loop's new iter_arg, which must exist
-   first). Extend `ttg.partition.outputs` for new results
+   first). Extend `ttg.partition.outputs` for new results using each
+   Crossing's recorded `slotOwner` — a commit-3 fact, never derived here
    (contract F). Utility asymmetries an implementer must handle:
    `addIterArgsToLoop` **erases** the old loop, `replaceIfOpWithNewSignature`
    **does not** — the husk `scf.if` must be erased manually; appended
@@ -769,15 +857,19 @@ Strict order — pre-process, apply frozen plans, render, post-process:
    body carrier := iter_arg, yield operand := body-final carrier, after :=
    loop result; If (cf. :1043–1087) — branch walks on copies, **assert**
    equal exit carrier owner (no reconcile-toggling; inequality = verifier
-   failure), set both yields, carrier := if result; no-crossing regions
+   failure), set both yields per the Crossing facts (each branch := its
+   `finals[]` entry's token, or the incoming carrier when null — SSA
+   pass-through; yield partition attrs := `slotOwner`), carrier := if
+   result; no-crossing regions
    balance locally (cf. :964–977). Access nodes: retarget memdesc operands
    through the recorded alias chain onto the member's view; sourceful
    allocs → explicit store (contract D); descriptor destinations retargeted
-   only (contract G). A sync row owned by `{P}` placed inside a region whose
-   op does not list `P` **extends the region op's `ttg.partition` array**
-   (the region skeleton must exist in `P`'s stream for partition-loops
-   routing), with the condition/bounds availability to `P` verified (spec
-   §6) — note `--tritongpu-partition-loops` does **not** rematerialize
+   only (contract G). Region ops' `ttg.partition` arrays are extended to
+   their node's recorded `requiredParts` (the stage-3 fact rendered as
+   `parts{…}` — the C10 rule as transcription: the region skeleton must
+   exist in every listed partition's stream for partition-loops routing),
+   with the condition/bounds availability to each added partition verified
+   (spec §6) — note `--tritongpu-partition-loops` does **not** rematerialize
    condition chains into a partition's stream; if the condition's defining
    ops do not already carry `P`, that is a hard diagnostic, not a fixup. Erase fully-retargeted originals.
 5. **Post-emit verifier**: emitted-op ↔ node bijection; every view token

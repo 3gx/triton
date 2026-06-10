@@ -401,6 +401,10 @@ static void printEffects(llvm::raw_ostream &os, const Node *n) {
 static void dumpAccessChain(GroupDag &g, const Node *head, unsigned depth) {
   auto &os = llvm::errs();
   for (const Node *n = head; n; n = n->next) {
+    // The ACCESS view filters later-stage rows (the tree is extended in
+    // place; each stage's dump shows only the kinds it owns).
+    if (n->kind == Node::Enter || n->kind == Node::Exit)
+      continue;
     if (n->kind == Node::For) {
       os << treePrefix(depth) << "|- scf.for";
       if (gpu::hasWarpSpecializeTag(n->op))
@@ -411,16 +415,21 @@ static void dumpAccessChain(GroupDag &g, const Node *head, unsigned depth) {
       continue;
     }
     if (n->kind == Node::If) {
+      // Faithful rendering (spec section 3): `then` always renders (an
+      // scf.if always has a then region), even when empty; `else` renders
+      // iff the IR op has an else region — the VIRTUAL else enters the DAG
+      // only at stage 2 and belongs to the OWNER view. Empty branches are
+      // bare labels: absence means absent from the DAG, nothing else.
       os << treePrefix(depth) << "|- scf.if";
       printEffects(os, n);
       os << "\n";
-      if (n->children[0]) {
-        os << treePrefix(depth + 1) << "|- then\n";
+      os << treePrefix(depth + 1) << "|- then\n";
+      if (n->children[0])
         dumpAccessChain(g, n->children[0], depth + 2);
-      }
-      if (n->children.size() > 1 && n->children[1]) {
+      if (cast<scf::IfOp>(n->op).elseBlock()) {
         os << treePrefix(depth + 1) << "|- else\n";
-        dumpAccessChain(g, n->children[1], depth + 2);
+        if (n->children.size() > 1 && n->children[1])
+          dumpAccessChain(g, n->children[1], depth + 2);
       }
       continue;
     }

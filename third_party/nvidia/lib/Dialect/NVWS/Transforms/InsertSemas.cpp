@@ -39,6 +39,7 @@ namespace nvws = triton::nvws;
 // fable/new-insert-semas-plan-2.md section 1).
 #include "InsertSemas.h"
 #include "InsertSemasAccessDag.h"
+#include "InsertSemasOwnerDag.h"
 
 // ---------------------------------------------------------------------------
 // Dispatcher. Commit 1 of the plan: stage 1 (ACCESS-DAG) only — pure
@@ -63,12 +64,21 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner) {
     if (failed(buildAccessDag(g, funcOp)))
       return failure();
 
+  // Stage 2: Enter/Exit brackets + per-piece carried owners (in-place
+  // extension; the ACCESS dump filters bracket rows).
+  for (GroupDag &g : groups)
+    if (failed(buildOwnerDag(g)))
+      return failure();
+
   if (shouldDumpDag()) {
-    llvm::errs() << "==== NVWS InsertSemas (commit 1: ACCESS-DAG) ====\n";
+    llvm::errs()
+        << "==== NVWS InsertSemas (commit 2: ACCESS-DAG + OWNER-DAG) ====\n";
     llvm::errs() << "function: @" << funcOp.getName() << "\n";
     llvm::errs() << "groups: " << groups.size() << "\n";
-    for (GroupDag &g : groups)
+    for (GroupDag &g : groups) {
       dumpGroupAccessDag(g, funcOp);
+      dumpGroupOwnerDag(g, funcOp);
+    }
   }
   return success();
 }

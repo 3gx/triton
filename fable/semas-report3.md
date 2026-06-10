@@ -179,7 +179,12 @@ Built directly from the IR, uniformly for TMEM and local:
 
 Dump: per group, the member/piece table plus the access tree (control-flow
 shape, `R`/`W` rows with member, op name, owner; `FOR`/`IF` rows annotated
-with their per-piece effects).
+with their per-piece effects). **Faithful-rendering rule**: the dump is the
+exact rendering of the stage's DAG — a missing row means missing from the
+DAG, an empty branch renders as a bare label. An `IF` row always shows
+`then` (even with no access rows under it); it shows `else` iff the IR op
+has an else region (the *virtual* else enters the DAG only at stage 2 and
+renders there as `else (virtual)`).
 
 ---
 
@@ -206,22 +211,41 @@ Owner assignment is a deterministic function of access order — no policy:
   **first toucher** of that piece (a nested region counts via its own carried
   owner; the WS scope-barrier rule applies). `Enter`, `Exit`, and the `For`
   node all carry this owner. Invariant: `For == Enter == Exit` per piece.
-- **`scf.if`**: per piece, branch owner := owner of the **first toucher of
-  the piece in the if's subtree** (then chain first, then else chain, in
-  chain order). No fallbacks: an if-row exists for a piece only when its
-  summary contains it, so a first in-branch toucher always exists. This
-  choice is load-bearing: it puts the handoff to/from the branch at the
-  **body level**, sourced from real access rows (a cross-owner if as a
-  loop body's last toucher then produces the body-level regain
-  `IfRow → EXIT` that the entry acquire duplicates — token genesis is the
-  standard rule, no special case), and it minimizes foreign-owner sync
-  rows inside branches. The not-taken path costs one empty, unconditional
-  acquire→release bracket on the owner's stream — balanced by
-  construction, and the shape downstream's loop scheduler prefers anyway
-  (sync outside the `scf.if`). (This also covers an if that is
-  the piece's only toucher in its region — without this the owner, and with
-  it the regain/entry acquire, would be undefined). Both branches get
-  identical `Enter`/`Exit` owners.
+- **`scf.if` — RULE A: the if keeps the incoming owner.** Per piece, the
+  if-owner := the contribution of the **most recent toucher of the piece
+  before the if in its chain** (same contribution filter as every scan:
+  access row → its owner; plain region row → its record; WS-tagged For row
+  → root). Fallback, only when the if is the piece's first toucher in its
+  region (no incoming exists): the contribution of the first toucher
+  **inside** the if's subtree (then chain first, then else). The rationale
+  is load-bearing: **conditional code is sometimes skipped, and a skipped
+  iteration must cost zero sync.** Keeping the incoming owner makes the if
+  row a same-owner touch at the parent level (no per-iteration edges) and
+  places the handoff pair **inside the branch**, firing iff taken — the
+  not-taken path performs nothing. (This is why the step-7 loop-scheduler
+  workaround stays load-bearing for conditional shapes, as in the old
+  pass.)
+  **RULE B — a recorded, contained extension (NOT implemented):** override
+  the owner with the piece's next toucher **after** the if in the same
+  chain, when one exists — hoisting the handoff before the if. Profitable
+  only in the read-inside-then-read-after shape, where it saves one
+  round-trip per TAKEN iteration; **it reduces to rule A whenever no
+  post-if toucher exists**, so adopting it later changes output only in
+  the shapes it was added for. Adopt only if a profiled workload shows
+  that shape hot. The extension touches exactly one choke point (the
+  stage-2 if-owner function) and requires right-to-left resolution of ifs
+  within a chain (a forward scan may hit a later, not-yet-assigned if
+  row). Downstream stages MUST consume `pieceInfo.owner` opaquely — never
+  assume if-owner == incoming owner — so the override slot stays open.
+  **Bracket records are restrictions, never copies of the union.** A
+  branch's `Enter`/`Exit` carry only the pieces **that branch actually
+  accesses** (its own chain footprint), with the **branch-local** effects;
+  the owner per piece is the if-level branch owner, so owners agree
+  piece-wise wherever both branches touch a piece. A branch with no
+  accesses gets bare `Enter`/`Exit` — it is just there; nothing is
+  invented, and at stage 3 no game exists for a piece the branch does not
+  touch. Only the **if row itself** carries the union over both branches —
+  its parent-facing super-node face.
   **Else rule:** every managed `scf.if` gets an else chain in the DAG —
   `Enter`+`Exit` rows — even when the IR has no else region (a **virtual
   else**; DAG nodes are ours, the IR is untouched until emission). Under
@@ -233,8 +257,11 @@ Owner assignment is a deterministic function of access order — no policy:
   fixing inside the else. The else chain exists so both branch games are
   uniform objects and so token-result threading has a place to yield; at
   emission the else region is materialized iff the if carries token
-  results (`replaceIfOpWithNewSignature` creates it automatically).
-  Invariant: `If == then.Enter == then.Exit == else.Enter == else.Exit`.
+  results (`replaceIfOpWithNewSignature` creates it automatically). The
+  virtual else's brackets are always bare (its footprint is empty).
+  Invariant: `If == then.Enter == then.Exit == else.Enter == else.Exit`
+  **piece-wise on each branch's own footprint** (owners equal where
+  present; bracket footprints are the branches' own).
 - **Super-node rule**: in its parent's chain, a `For`/`If` node is **one
   row** whose per-piece owner is its carried owner. Parents never look
   inside; bodies never look outside. All cross-region interaction goes
@@ -256,9 +283,27 @@ Owner assignment is a deterministic function of access order — no policy:
   `{2}`'s done-edge after the R2 loop (count 1; `{3}` self-orders R3
   before W1 by program order, and `op1 → W1` is transitive), so a long R2
   overlaps R3 with no race and no deadlock.
-- **Scope barrier / root**: a WS-tagged `scf.for` is a scope boundary for
-  owner propagation; root propagates freely; an op carrying both partition
-  and an intrinsic WS tag is an ordinary owner everywhere.
+- **Scope barrier / root — the toucher-contribution rule (operational).**
+  Partition owners exist only **within the WS-tagged `scf.for` that defines
+  them**; outside it (the function chain, and every region that *contains*
+  the WS loop) only the default-warp root stream exists. Mechanically, in
+  any first-toucher scan the toucher's **contribution** is:
+  - a **WS-tagged `For` row contributes `root`** — its partition system is
+    sealed; its own record keeps the carried owner (the boundary's two
+    faces: `scf.for (WS, tag=0) {1}` on the row itself, so the parent game
+    can attribute its edges — a post-loop release is owned `{@0.1}` and
+    tag-stamped — while nothing partition-valued escapes upward);
+  - a plain `For`/`If` row contributes its carried owner (same scope
+    continues; if its subtree's owners came from a deeper WS loop, its own
+    carried owner is already `root` transitively);
+  - an access row contributes its resolved owner (root when unannotated or
+    outside any WS loop — root propagates freely, inside or outside; an
+    **intrinsic-tag** op carrying both `ttg.partition` and
+    `ttg.warp_specialize.tag` on itself self-names its partition system and
+    is an ordinary owner anywhere, displayed `{@T.P}`).
+  Consequence (matches the v4-era dumps): every region row and bracket
+  strictly outside a WS loop is `root` unless an intrinsic-tag toucher
+  decides it.
 
 ### 4.1 ENTER/EXIT are the virtual first and last touchers
 
@@ -290,12 +335,12 @@ followed directly by `EXIT`:
 ENTER {1} · W{1} · r S0{1} · a S0{2} · R{2} · r S1{2} · a S1{1} · EXIT {1}
 ```
 
-**E3 — carried owner has no first access in *this* chain.** Under
-first-toucher ownership this arises only for the *other* branch of an if
-whose piece is touched in both branches by different partitions (the owner
-is the then-chain's first toucher, so in the else chain it may have no
-access); it cannot arise for loops or single-branch ifs. `Enter` then
-sources the first release — `ENTER` followed immediately by the release:
+**E3 — carried owner has no first access in *this* chain.** Under rule A
+this is the **normal conditional-consumption shape**: the branch owner is
+the *incoming* owner, who typically has no access inside the branch.
+`Enter` then sources the first release — `ENTER` followed immediately by
+the release (carrying the seed-imported payload when the owner is the
+producer):
 
 ```
 ENTER {1} · r S0{1} · a S0{2} · R{2} · r S1{2} · a S1{1} · EXIT {1}
@@ -306,8 +351,9 @@ both brackets are virtual — E3's shape; the owner's only rows are the
 region-start release and the pre-exit acquire. Fires only when the region
 executes; releases and acquires stay balanced per execution.
 
-**E5 — empty branch** (`ENTER {1} · EXIT {1}`): holders already equal the
-carried owner on that path; no edges. Both branches of an `scf.if` therefore
+**E5 — empty branch** (bare `ENTER · EXIT`, no piece records — a branch
+that accesses nothing is just there, nothing invented): no game is seeded,
+no edges. Both branches of an `scf.if` therefore
 exit with identical holder states — branch reconciliation is an invariant to
 assert, never a choice to make.
 
@@ -368,7 +414,9 @@ Rows are visited in chain order; the complete rule set:
    (the carried owner's continuation), so no "release into void" case
    exists.
 5. **ENTER row — seeds the region's local game.** Every region body walks
-   a **fresh local state**, per piece in the region's summary:
+   a **fresh local state**, per piece in the **chain's own footprint** (a
+   branch that does not touch a piece has no game for it — nothing seeded,
+   nothing invented):
    `holders(r) := Exclusive(carried owner)`, `lastRow := Enter`,
    `lastPayload := none`, plus one imported read-only fact:
    `versionProducer(r) :=` the parent game's current version producer for
@@ -378,15 +426,19 @@ Rows are visited in chain order; the complete rule set:
    body**, and the body never modifies the parent's state — region
    locality at the *state* level, which is what makes the §4.1
    `ENTER == EXIT == carried owner` identity hold by construction.
-   **Why `lastPayload := none` is safe (theorem, not assumption):** under
-   first-toucher ownership the seed owner is the region's first toucher,
-   so every in-region cross edge sources from one of the owner's *real*
-   access rows (payload correct by construction) — an `Enter`-sourced
-   edge can only arise in the other-branch E3 case, where the owner
-   provably acquired the piece through a correctly-payloaded parent edge
-   before the region, and its branch-start release follows that acquire by
-   its own program order: the async completion is already ordered, `none`
-   adds nothing and misses nothing. All in-body edges stay in-body.
+   **Payload seed — an import, not `none` (load-bearing under rule A):**
+   `lastPayload[piece] :=` the carried owner's **parent-game**
+   `lastPayload` for the piece when the carried owner is the parent game's
+   current producer; `none` otherwise. Rule A makes the producer-brackets-
+   its-own-branch shape the *normal* conditional-consumption case (e.g.
+   `W mma {1}; if{ R {0} }` — if-owner `{1}` = the producer), and there
+   the branch's `Enter`-sourced release MUST carry the producer's async
+   payload (`tc5mma`) — a `none` release would let the consumer read
+   mid-MMA, with no intervening acquire to witness completion. The `none`
+   case stays safe by transitivity: a non-producer owner acquired the
+   piece through a correctly-payloaded parent edge before the region, and
+   its branch-start release follows that acquire by its own program
+   order. All in-body edges stay in-body.
 6. **Region super-node rows — uniform for `For` and `If`.** In the
    *parent's* game, a region row is one ordinary touch per piece in its
    summary, by its carried owner, with its per-piece **effect** (§4): an
@@ -426,8 +478,9 @@ a payload always survives a row becoming virtual: a post-loop release whose
 loop's last real write was an MMA carries `tc5mma` (lowering to the tcgen05
 commit, arriving on MMA *completion*; a `none` release arrives at issue
 time). The only `none`-payloaded releases with an async producer upstream
-are `Enter`-sourced (rule 5's theorem): there, the same-partition
-pre-region acquire is the ordering witness.
+are `Enter`-sourced by a **non-producer** owner (rule 5's import seeds the
+producer's payload; for non-producers the same-partition pre-region
+acquire is the ordering witness).
 
 ### 5.2 From edges to semaphores
 
@@ -500,10 +553,17 @@ Rules that produce and govern this shape:
   once**: immediately before the component's first access, hoisted before the
   outermost enclosing loop. Its owner is the component's first holder (root,
   if the component starts with an unannotated producer). Its token seeds the
-  carrier. If the component is not loop-carried (no regain acquire exists —
-  a purely acyclic chain at function level), the entry acquire gets a
+  carrier. If no regain acquire exists in the body's own chain — either
+  the component is not loop-carried (a purely acyclic chain at function
+  level), **or the carried owner's only acquires live inside conditional
+  branch games** (rule A's normal epilogue shape: a conditional acquire
+  cannot serve as the per-iteration regain) — the entry acquire gets a
   dedicated semaphore, released once immediately after the component's
-  terminal access.
+  terminal row at the same chain level (the region row when the terminal
+  access sits inside it); the carrier crosses skipped iterations unchanged
+  and re-enters taken branches via the if's token results (the
+  ThreadingPlan crossing rule covers this: the if contains acquires, so it
+  gets a slot).
 - **Initial permits — a static, per-create fact.** A semaphore whose *first
   event in chain order is an acquire* (exactly the entry-acquired ones) is
   created with **initial permits equal to that acquire's count** (`k`
@@ -589,26 +649,26 @@ collects both holders with one `acquire(2)`; `st q` of iteration *i* precedes
 handoff doc's target output — produced by the single walk plus
 group-by-destination, with no second DAG and no combine pass.
 
-**Conditional consumption** (`W{1}; if { R{2} }; W{1}'`) — branch owner =
-first in-branch toucher `{2}`; all sync is **body-level and unconditional**,
-sourced from real rows:
+**Conditional consumption** (`W{1}; if { R{2} }; W{1}'`) — if-owner =
+**incoming owner `{1}`** (rule A); all sync is **in-branch and
+conditional** — a skipped iteration performs no sync at all:
 
 ```
 W {1}
-r S0 {1}                        ; real source: the W row — payload correct by construction
-a S0 {2}                        ; before the if; fires every path
-IF(R) {2}
-   then: ENTER {2} · R {2} · EXIT {2}     ; same-owner — no in-branch sync
-   else: ENTER {2} · EXIT {2}             ; empty
-r S1 {2}                        ; IfRow → W' close; after the if, fires every path
-a S1 {1}
-W' {1}
+IF(R) {1}                       ; same-owner touch at the parent level — no edges
+   then: ENTER {1}
+         r S0 {1}               ; Enter-sourced; payload = seed import (W's payload)
+         a S0 {2} · R {2}
+         r S1 {2} · a S1 {1}    ; handback before the branch exits
+         EXIT {1}
+   else: ENTER · EXIT           ; bare — not taken ⇒ ZERO sync
+W' {1}                          ; same owner — no edge, carrier inherit
 ```
 
-`S0`/`S1` fire exactly once per execution on **both** paths (a not-taken
-iteration is an empty acquire→release bracket on `{2}`) — path-independent
-balance, and the sync sits outside the `scf.if`, the shape the loop
-scheduler wants.
+`S0`/`S1` fire **iff the branch executes** — balanced per path. This is
+the rule-A payoff: conditional consumption costs sync only when the
+condition is true (cf. the pmatmul epilogue: `tmem_load {0}` on the rare
+last-K iteration costs the hot path nothing).
 
 Dump: v4-style tree, region rows annotated with their per-piece effect
 (e.g. `FOR(R) {2}` / `FOR(W) {3}`; the examples above omit it for brevity),
@@ -629,7 +689,7 @@ the terminator) holds by construction:
 
 | node | action |
 |---|---|
-| `Func`/`For`/`If` | recurse; thread the live carrier tokens through `iter_args` / if-results (both branches yield the reconciled carrier; one slot per live component) |
+| `Func`/`For`/`If` | recurse; thread the live carrier tokens through `iter_args` / if-results — one slot per live component; the slot's owner and its final-carrier row are **stage-3 ThreadingPlan facts** (then/body yields the recorded final carrier's token; else/skip yields the incoming carrier unchanged — an SSA pass-through, which is why bare else brackets need no record) |
 | `Enter`/`Exit` | insertion-point markers only |
 | `Acquire` | emit `nvws.semaphore.acquire`; its token becomes the owner's carrier; emit/cache the `nvws.semaphore.buffer` view |
 | `Access` | retarget the op's memdesc operands onto the view (via the recorded alias chain); erase its original async-token plumbing |
@@ -684,9 +744,12 @@ Per stage, checked mechanically before the next stage runs:
   subtree write); unsupported alias ⇒ hard error.
 - **OWNER**: `For == Enter == Exit` owner per piece;
   `If == then.Enter == then.Exit == else.Enter == else.Exit`; WS scope
-  barrier respected; `Enter`/`Exit` `pieceInfo` (both halves) equals its
-  region op's record — effects are copies of the stage-1 summaries, never
-  recomputed.
+  barrier respected; each bracket's `pieceInfo` equals its **own chain's
+  footprint** with branch-local effects and owners drawn from the region
+  row's record (Enter == Exit; a For body's footprint equals its region
+  summary, so For brackets equal the For record; a non-accessing if-branch
+  has bare brackets) — owners are never invented for pieces a branch does
+  not touch.
 - **SYNC**: every edge connects two rows of the same region chain and points
   forward; the reader-set invariant holds (`Shared` sets are R-only for the
   current version — rule 2); both if-branch walks exit with identical
@@ -695,8 +758,10 @@ Per stage, checked mechanically before the next stage runs:
   execution-uniform) **and are pairwise-distinct partitions** (the lowering
   counts arrives per wave — §5.3 formula); every release either sources
   from a real access row with that op's payload (union across pieces /
-  branch games where merged), or is `Enter`-sourced with a same-partition
-  pre-region acquire as its ordering witness (rule 5's theorem) — any other
+  branch games where merged), or is `Enter`-sourced carrying the seed
+  import (the producer-owner case — rule 5), or is `Enter`-sourced `none`
+  by a non-producer with its same-partition pre-region acquire as the
+  ordering witness — any other
   `none` downstream of an async producer is a hard error; per-semaphore
   balance:
   within each region execution,
