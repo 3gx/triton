@@ -271,7 +271,13 @@ struct Member {
                                // (buffer.* attrs live on it, preserved)
   MemDescType type;
   int64_t     offset, extent;  // [offset, offset+extent) in native units:
-                               // TMEM columns / SMEM bytes (getMemDescSize)
+                               // TMEM = columns (getMemDescSize ->
+                               // getTmemAllocSizes().numCols); local = the
+                               // LEADING DIM of the memdesc shape — the
+                               // planner's offset unit, corpus-proven
+                               // (local_buffer_reuse: 128x128xf16 members at
+                               // offsets 0/64 overlap, 0/256 do NOT — byte
+                               // extents of 32768 would break the latter)
 };
 struct Piece {                 // cut-point interval (spec §3 item 2)
   int64_t lo, hi;              // [lo, hi) in native units
@@ -632,7 +638,9 @@ Delete the seven headers; gut `InsertSemas.cpp`; build green.
 ### Commit 1 — ACCESS-DAG (creates `InsertSemas.h`, `InsertSemasAccessDag.h`)
 Discovery (groups by `buffer.id`, synthetic ids; TMEM = every
 `ttng.tmem_alloc`, local = mutable-memdesc `ttg.local_alloc`; member
-intervals in native units via `getMemDescSize` — f16/f32 element width
+intervals in native units: TMEM = columns via `getMemDescSize`, local =
+leading dim of the memdesc shape (NOT bytes — see the `Member` comment in
+§2) — f16/f32 element width
 matters: meta_fa_fwd's 128x128xf16 p-member spans 64 columns, half of qk's
 128). Pieces (cut-point construction; unknown offset ⇒ whole-group
 footprint). Events with owner + touches, R/W per spec §1.1 (MMA A/B operand

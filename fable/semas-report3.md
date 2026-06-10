@@ -27,7 +27,8 @@ Post-AutoWS IR: warp-specialized `scf.for` loops (`tt.warp_specialize`,
 annotations. The program is still sequential; partitions communicate values
 through aliasing memory buffers. Allocs carry `buffer.id` (logical group =
 one backing allocation) and `buffer.offset`; member extents come from the
-memdesc type (TMEM columns / SMEM bytes).
+memdesc type (TMEM: tensor-memory columns; local: the leading dim of the
+memdesc shape — the memory planner's offset unit, corpus-proven).
 
 The communicating accesses, **uniform over both memory spaces**. R means
 provably load-only; **everything else is W**:
@@ -140,7 +141,12 @@ Built directly from the IR, uniformly for TMEM and local:
 
 1. **Groups and members**: bucket allocs by `buffer.id` (fresh synthetic id
    when absent). Each member: interval `[offset, offset + extent)` in the
-   space's native unit.
+   space's native unit — TMEM: columns (`getTmemAllocSizes().numCols`;
+   f16 packs two elements per 32-bit column, so 128x128xf16 spans 64);
+   local: the leading dim of the memdesc shape, which is the planner's
+   `buffer.offset` unit (corpus-proven by `insert_semas_local_buffer_reuse`:
+   128x128xf16 members at offsets 0/64 must overlap while 0/256 must not —
+   byte extents would merge the disjoint pair).
 2. **Pieces** (the handoff doc's Phase A): collect every member's start/end
    as cut points; each interval between adjacent cuts gets a cover set
    (which members contain it); merge equal-cover neighbors; drop empty
