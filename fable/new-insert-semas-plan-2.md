@@ -320,9 +320,24 @@ struct PieceTable {            // one per group
 struct Sema {
   CompId   component;          // the token game this semaphore belongs to
   SmallVector<PieceId, 2> pieces; // pieces its edges protect (dump/verify)
-  unsigned count;              // pending count = |distinct source partitions|
+  unsigned count;              // pending count of the PRIMARY acquire (the
+                               // first destination group); For-row groups
+                               // merged onto this semaphore add their own
+                               // acquire instances with their own counts
+  unsigned expectedReleases;   // total release sites across all groups
+                               // sharing this semaphore (+1 terminal for
+                               // dedicated entries) — the balance check
   bool     isEntry;            // first event in chain order is an acquire
                                //   => nvws.semaphore.create ... true
+  Owner    inheritStamp;       // entry semas: the placement-point holder
+                               // (carrier inherit). The entry-acquire NODE
+                               // is owned by ROOT (it executes in the root
+                               // region); emission stamps the op with this
+                               // fact instead (partition+tag, or no attrs
+                               // for root) — matches the previous pass's
+                               // emitted IR. M3 verifier: per semaphore,
+                               // acquirers = at most ONE concrete
+                               // partition, root additionally allowed.
   Value    create;             // filled at emit step 2 (create op result)
 };
 struct SemaTable {             // index = SemaId; allocation order = the order
@@ -639,7 +654,17 @@ commit without explicit approval.
 **4c. Definition of "self-verified".** Self-verified means the DAG dumps
 have been checked to be **100% consistent with this plan and the spec — no
 violation of any plan contract** — by exhaustive per-file review, not spot
-checks. At **every** commit this includes the determinism check (ground
+checks. **Fix-ordering obligation:** every rule change or bug fix lands in
+the order spec -> plan -> code -> verification prompts; a fix that exists
+in code or in a verifier prompt but not in the spec is itself a finding
+(that is how spec gaps are born — the fleet would keep "verifying" a rule
+the spec contradicts). **Old-reference cross-check:** for files with a
+previous-architecture reference dump (`logs/per-edge-plan/commit5/`,
+`-prev-semas` fixtures), structural correspondence of loop chains, entry
+placement, and semaphore unification is part of the review — spec-faithful
+output that diverges structurally from the old architecture without a
+documented design reason is a finding, because the fleets verify against
+the spec and are blind to spec gaps by construction. At **every** commit this includes the determinism check (ground
 rule 6): run the pass twice over the whole verification set and `diff`
 dumps and output IR byte-for-byte — any difference is a blocking finding.
 Concretely, for **every** file in the verification set and **every**
@@ -770,7 +795,17 @@ producer-brackets-own-branch epilogues) or, for non-producer owners, none
 with the same-partition pre-region acquire as witness; If-row
 outgoing payload = union over its branch games; destination-then-recurse
 walk order pinned; WS-For root
-adoption — contract H; the virtual else carries no sync rows); dedupe
+adoption — contract H; the virtual else carries no sync rows; the
+transitive-sync skip: per holder, partitions that already took an edge
+from it since its lastRow are recorded (syncedBehind) and never re-edged —
+rules 1/2/4; EXIT closes additionally only when load-bearing — under a
+loop or with a later touch in an ancestor chain — never as drains); dedupe
+(incl. the same-owner second collapse: same dst + same source owner +
+different rows -> latest row, payload union — multi-piece games require it);
+group-by-destination with the For-row unification (a For-row destination
+merges into the loop's in-body regain group — same component+acquirer,
+M3-clean; the before-loop acquire shares the semaphore, keeps its own
+count/placement)
 `(srcRow, dstRow, srcOwner)` with **payload union** on collapse (the
 release's `async_ops` array carries the union); group by destination;
 inject `Acquire`/`Release` nodes with recorded owner/payload/count; entry
@@ -783,6 +818,12 @@ Also computed here, read-only (ground rule 5):
   accumulated `numTmemBlocks` (contract B) and hoist anchors. (The
   covering/view shape is NOT planned here — it is the attr-driven commit-4
   step-6 post-process, contract C.)
+- **Entry acquires**: root-owned rows (carrier inherit), placed at the
+  component's placement chain (descend single-involving-row if branches,
+  never For rows); regain search descends if-branch chains (conditional
+  handbacks are valid regains), never nested For bodies; acyclic
+  components get a dedicated entry semaphore + terminal release;
+  `inheritStamp` recorded per entry semaphore; M3 acquirer-class check.
 - **Node crossings**: for each `scf.for`/`scf.if` DAG row, the components whose
   carrier crosses it (slot order fixed here), **and per crossing the
   `slotOwner` + per-chain `finals[]` facts** — resolved hierarchically from the

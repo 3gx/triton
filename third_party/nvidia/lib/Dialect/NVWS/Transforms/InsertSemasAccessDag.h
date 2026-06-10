@@ -403,7 +403,8 @@ static void dumpAccessChain(GroupDag &g, const Node *head, unsigned depth) {
   for (const Node *n = head; n; n = n->next) {
     // The ACCESS view filters later-stage rows (the tree is extended in
     // place; each stage's dump shows only the kinds it owns).
-    if (n->kind == Node::Enter || n->kind == Node::Exit)
+    if (n->kind == Node::Enter || n->kind == Node::Exit ||
+        n->kind == Node::Acquire || n->kind == Node::Release)
       continue;
     if (n->kind == Node::For) {
       os << treePrefix(depth) << "|- scf.for";

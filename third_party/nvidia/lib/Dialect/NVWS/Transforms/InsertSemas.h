@@ -76,6 +76,25 @@ struct Touch {
 // edges); children = region-chain heads of For/If rows; sat = the single
 // dependency relation, injected only at the SYNC stage.
 // ---------------------------------------------------------------------------
+struct Node;
+
+// Carrier-threading facts, computed at stage 3 and stored ON the For/If
+// node (the DAG is the authority; "ThreadingPlan" is only the derived
+// emission-time aggregation across groups).
+struct Crossing {
+  CompId comp = 0;     // which token game (group implicit: the node's DAG)
+  Owner slotOwner;     // partition stamped on this slot's
+                       // ttg.partition.outputs entry and yield attrs —
+                       // the owner of every chain's final carrier
+  SmallVector<Node *, 2> finals; // PER CHAIN, parallel to children: the
+                       // chain's last carrier-producing row (an Acquire of
+                       // the component, or a nested region row with its
+                       // own crossing). Its token is what that chain's
+                       // yield returns — the NEW token. nullptr =
+                       // PASS-THROUGH: that chain yields the INCOMING
+                       // carrier unchanged (the OLD token).
+};
+
 struct Node {
   enum Kind { Func, For, If, Enter, Exit, Access, Acquire, Release };
   Kind kind = Access;
@@ -89,8 +108,17 @@ struct Node {
                                           // sorted by PieceId (determinism)
   SemaId sema = 0;
   unsigned count = 0;              // Acquire pending count
-  AsyncOp payload = AsyncOp::NONE; // Release payload (recorded fact)
+  SmallVector<AsyncOp, 1> payloads; // Release payload(s): the source
+                                    // holder's last real access payload —
+                                    // a UNION after dedupe merges (emitted
+                                    // as the release's async_ops array)
   Node *sat = nullptr;             // Release -> the ONE Acquire it satisfies
+  SmallVector<Crossing, 1> crossings; // For/If only (stage 3): carrier
+                                      // slots crossing this region
+  SmallVector<int, 2> requiredParts;  // For/If only (stage 3): sorted union
+                                      // of subtree row partitions = the
+                                      // clone set after partition-loops
+                                      // (the C10 ttg.partition array)
 };
 
 // Deterministic iteration over a node's pieceInfo.
@@ -132,11 +160,22 @@ struct PieceTable { // one per group
 // Stage-3 side tables (defined now per plan section 2; filled at commit 3).
 // ---------------------------------------------------------------------------
 struct Sema {
+  std::string name;     // "S<k>" per group in creation order; "E<k>" for
+                        // dedicated entry semaphores (deterministic)
   CompId component = 0;
   SmallVector<PieceId, 2> pieces;
-  unsigned count = 0; // pending count = |distinct source partitions|
+  unsigned count = 0; // pending count of the PRIMARY acquire (the first
+                      // destination group); merged For-row groups add their
+                      // own acquire instances with their own counts
+  unsigned expectedReleases = 0; // total release sites across all groups
+                                 // sharing this semaphore (balance check)
   bool isEntry = false; // first event in chain order is an acquire
                         //   => nvws.semaphore.create ... true
+  Owner inheritStamp;   // entry semas: the placement-point holder (carrier
+                        // inherit). The entry-acquire NODE is owned by
+                        // ROOT; emission stamps the op with THIS fact
+                        // (partition+tag, or no attrs for root) — matching
+                        // the previous pass's emitted IR.
   Value create;         // backpatch slot, filled at emit step 2
 };
 
@@ -150,13 +189,9 @@ struct BackingPlan {
   SmallVector<Value> backing;        // per member; backpatch slot (emit step 2)
 };
 
-struct ThreadingPlan {
-  // CROSSING RULE (mechanical): region op R gets a slot for component c
-  // iff R's subtree contains >=1 Acquire node of c (plan section 2).
-  llvm::MapVector<Operation *,
-                  SmallVector<std::pair<unsigned /*groupIdx*/, CompId>>>
-      crossings;
-};
+// NOTE: there is no stored ThreadingPlan — crossings live on For/If Nodes
+// (Crossing above). The emission-time slot numbering across groups is a
+// derived aggregation (plan section 2).
 
 // ---------------------------------------------------------------------------
 // Per group: the whole artifact handed from stage to stage.

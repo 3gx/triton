@@ -7,6 +7,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
+#include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
@@ -40,15 +41,17 @@ namespace nvws = triton::nvws;
 #include "InsertSemas.h"
 #include "InsertSemasAccessDag.h"
 #include "InsertSemasOwnerDag.h"
+#include "InsertSemasSyncDag.h"
 
 // ---------------------------------------------------------------------------
 // Dispatcher. Commit 1 of the plan: stage 1 (ACCESS-DAG) only — pure
 // analysis + diagnostics + dump. The pass mutates nothing until the EMIT-IR
 // commit lands; lit failures of test/NVWS/insert_semas* are expected.
 // ---------------------------------------------------------------------------
+// useMetaPartitioner has exactly ONE consumer in this pass: the TMEM
+// backing-stage decision (meta => numStages=1; see computeBackingPlan in
+// InsertSemasSyncDag.h). It influences nothing else.
 LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner) {
-  (void)useMetaPartitioner; // consumed by the BackingPlan stage (commit 3+)
-
   // Only process functions that contain a warp-specialized loop.
   auto walkResult = funcOp.walk([&](scf::ForOp forOp) {
     if (forOp->hasAttr(triton::kWarpSpecializeAttrName))
@@ -70,14 +73,23 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner) {
     if (failed(buildOwnerDag(g)))
       return failure();
 
+  // Stage 3: the ownership walk -> edges -> semaphores (in-place sync-node
+  // injection) -> entry acquires, crossings, requiredParts, BackingPlan.
+  // numTmemBlocks accumulates the 1x/2x capacity check across groups.
+  int numTmemBlocks = 0;
+  for (GroupDag &g : groups)
+    if (failed(buildSyncDag(g, funcOp, useMetaPartitioner, numTmemBlocks)))
+      return failure();
+
   if (shouldDumpDag()) {
-    llvm::errs()
-        << "==== NVWS InsertSemas (commit 2: ACCESS-DAG + OWNER-DAG) ====\n";
+    llvm::errs() << "==== NVWS InsertSemas (commit 3: ACCESS-DAG + "
+                    "OWNER-DAG + SYNC-DAG) ====\n";
     llvm::errs() << "function: @" << funcOp.getName() << "\n";
     llvm::errs() << "groups: " << groups.size() << "\n";
     for (GroupDag &g : groups) {
       dumpGroupAccessDag(g, funcOp);
       dumpGroupOwnerDag(g, funcOp);
+      dumpGroupSyncDag(g, funcOp);
     }
   }
   return success();

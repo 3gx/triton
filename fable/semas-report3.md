@@ -378,6 +378,11 @@ Per piece `r`: `holders(r)` — either `Exclusive(p)` or
 `Shared(producer p, readers {q…})` — and per holder its most recent row.
 Rows are visited in chain order; the complete rule set:
 
+0. **First touch of an unheld piece** (function-level games start empty;
+   region games are seeded by rule 5): the toucher initializes
+   `Exclusive(toucher)` — **no edge** (there is no prior holder to hand
+   off from; the entry acquire covers the permit).
+
 1. **W by `p` on `r`**: emit one edge `lastRow(h) → thisRow` for every
    holder `h ≠ p` (every reader if Shared, the single owner if Exclusive) —
    the fan-in. Then `holders(r) := Exclusive(p)`.
@@ -409,10 +414,21 @@ Rows are visited in chain order; the complete rule set:
    W wins, rule 1 applies.)
 4. **EXIT row** (carried owner `c`): closes the **region's own game**: for
    every piece whose *in-body* holders ≠ `{c}`, emit `lastRow(h) → EXIT`
-   per in-body cross holder. The region's local state then ends; the
+   per in-body cross holder — with two qualifiers:
+   - **transitive-sync skip** (§5.2 bullet): a holder whose `syncedBehind`
+     already contains `c` is NOT closed — `c`'s own acquire since that
+     holder's last row already ordered it behind the holder's work;
+   - **no drains**: the close is emitted only when it is load-bearing —
+     the chain sits inside some loop (the recurrence reaches back every
+     iteration), or the piece is touched again later in an ancestor chain
+     (the re-anchored owner becomes the future release's ordering
+     witness). A close with neither is a pure drain and is never
+     synthesized (the `no_loop_exit_drain` golden; e.g. an if at function
+     level whose buffer dies with the branch closes nothing).
+   The region's local state then ends; the
    parent's state was never touched by the body. The consumer is guaranteed
-   (the carried owner's continuation), so no "release into void" case
-   exists.
+   (the carried owner's continuation) whenever a close IS emitted, so no
+   "release into void" case exists.
 5. **ENTER row — seeds the region's local game.** Every region body walks
    a **fresh local state**, per piece in the **chain's own footprint** (a
    branch that does not touch a piece has no game for it — nothing seeded,
@@ -429,7 +445,10 @@ Rows are visited in chain order; the complete rule set:
    **Payload seed — an import, not `none` (load-bearing under rule A):**
    `lastPayload[piece] :=` the carried owner's **parent-game**
    `lastPayload` for the piece when the carried owner is the parent game's
-   current producer; `none` otherwise. Rule A makes the producer-brackets-
+   current producer — both producer identity and payload taken from the
+   **pre-touch snapshot** (captured just before the region row's own
+   super-node touch transitions the parent game); `none` otherwise. Rule A
+   makes the producer-brackets-
    its-own-branch shape the *normal* conditional-consumption case (e.g.
    `W mma {1}; if{ R {0} }` — if-owner `{1}` = the producer), and there
    the branch's `Enter`-sourced release MUST carry the producer's async
@@ -499,9 +518,45 @@ acquire is the ordering witness).
   and the emitted release names all of them — `async_ops` is already an
   array attribute. Picking one would be a race; splitting into two releases
   by the same partition would break the per-wave distinct-partition count.
+  **Same-owner collapse (second pass):** edges with the same destination
+  and the same source OWNER but **different source rows** (one partition
+  holding different pieces at different rows — multi-piece games make this
+  routine, e.g. meta_fa's qk overwrite closing one piece held at a store
+  row and another held at a load row) collapse to the **latest source row**
+  in chain order, payloads/pieces unioned: a partition's later release
+  subsumes its earlier one (same instruction stream — an arrive after the
+  later row implies the earlier row's work is complete, and `async_ops`
+  counting covers the earlier async op at the later site). After both
+  passes a destination's sources are pairwise-distinct partitions by
+  construction — the §5.3 count formula's precondition, kept as a verifier
+  assert.
+- **Transitive-sync skip (all edge-emitting rules — 1, 2, and 4).** Per
+  holder, the walk records which partitions have taken an edge FROM it
+  since its `lastRow` (`syncedBehind`; cleared whenever `lastRow` moves).
+  An edge whose destination partition is already in the source holder's
+  set is **omitted**: that partition's acquire already happened after the
+  holder's work, so the obligation is discharged transitively (its own
+  program order carries it forward). This recovers the old token-transfer
+  model's minimality inside the N-readers model — e.g.
+  `live_tag_source_after_prior_loop_threading`: the post-loop reader's
+  acquire discharges the inner-loop producer, so the outer EXIT emits **no
+  close** (the spurious extra semaphore the unrefined rule produced), and
+  the regain search then lands on the post-loop acquire — exactly the old
+  pass's structure.
 - **Group by destination** (handoff C2): one counting semaphore per
   destination row; `count = |sources|`; each source releases 1. The fan-in
-  `acquire(N)` **is** this grouping. Grouping by destination is always safe;
+  `acquire(N)` **is** this grouping. **For-row destinations unify with
+  the loop's regain**: an edge whose destination row is a `For` row is the
+  *entry instance of that loop's regain* (the back-edge-as-permit rule
+  applied at the nested loop) — iteration 0 is fed by the outside release,
+  iterations 1..N by the in-loop release; same acquirer class, M3-clean.
+  Grouping therefore merges a For-row destination group into the loop's
+  in-body regain group (the LAST destination group in the body's own
+  chain with the same component and the same acquiring owner); the
+  before-loop acquire keeps its own placement and count but shares the
+  semaphore — the old pass's unified `S0`. No in-body match (e.g. the
+  regain lives in a conditional branch) → a separate semaphore: sound,
+  one extra. Grouping by destination is always safe;
   grouping by source is forbidden (token stealing) — a producer with N
   readers performs N releases on N semaphores, exactly as in the handoff
   doc's output (`use q; rel s1; rel s2`). There is no fan-out combine and no
@@ -523,7 +578,9 @@ The required shape of the SYNC-DAG for a loop whose carried owner is `p1`
 (brackets mark rows that may be absent — see E1–E4):
 
 ```
-a  S1(k) {p1}                  ; ENTRY ACQUIRE — executes exactly once, before the loop
+a  S1(k) root                  ; ENTRY ACQUIRE — executes exactly once, before the
+                               ; loop, in the root region (carrier inherit; the
+                               ; semaphore's inheritStamp records {p1} for emission)
 FOR (WS, tag=T) {p1}
    ENTER {p1}
    [ use … {p1} ]              ; optional — ENTER may be followed directly by the release
@@ -544,26 +601,44 @@ Rules that produce and govern this shape:
   `nvws.semaphore.buffer` requires one; there are no poison tokens and no
   tokenless accesses. An access without its own acquire uses the **carrier**:
   the token of its owner's most recent acquire in chain order.
-- **Entry acquire (token genesis).** Per connected component of pieces (the
-  per-resource token game — components are discovered, not declared): one
-  additional `Acquire` of the component's *regain* semaphore — the carried
-  owner's **last** acquire in the loop body's own chain — child chains
-  excluded, "last" in chain order, hence deterministic (`S1` above, whether it sits
-  before a real access or before `EXIT`) — is placed so it executes **exactly
-  once**: immediately before the component's first access, hoisted before the
-  outermost enclosing loop. Its owner is the component's first holder (root,
-  if the component starts with an unannotated producer). Its token seeds the
-  carrier. If no regain acquire exists in the body's own chain — either
-  the component is not loop-carried (a purely acyclic chain at function
-  level), **or the carried owner's only acquires live inside conditional
-  branch games** (rule A's normal epilogue shape: a conditional acquire
-  cannot serve as the per-iteration regain) — the entry acquire gets a
-  dedicated semaphore, released once immediately after the component's
-  terminal row at the same chain level (the region row when the terminal
-  access sits inside it); the carrier crosses skipped iterations unchanged
-  and re-enters taken branches via the if's token results (the
-  ThreadingPlan crossing rule covers this: the if contains acquires, so it
-  gets a slot).
+- **Entry acquire (token genesis) — root-owned, carrier inherit.** Per
+  connected component of pieces (the per-resource token game — components
+  are discovered, not declared): one additional `Acquire` of the
+  component's *regain* semaphore — the **last** acquire of the component in
+  the loop body's chain, where the search descends into **if-branch
+  chains** (a conditional handback is a valid regain: the permit model is
+  phase-based and a skipped iteration leaves the permit untouched) but
+  **never into nested For bodies** (their acquires fire per inner
+  iteration); "last" in chain order, hence deterministic — placed so it
+  executes **exactly once**: immediately before the component's first row
+  of its **placement chain** (the innermost chain reachable from the top by
+  descending through single-involving-row `scf.if` branches — an if branch
+  executes at most once; never through a For row — so the entry stays with
+  the create and fires only on the path that uses the buffer). If no
+  regain exists (a purely acyclic chain), the entry acquires a dedicated
+  semaphore, released once immediately after the component's terminal row
+  at the placement-chain level, **owned by that terminal row's record
+  owner** (an access row's owner; a region row's pieceInfo owner for the
+  component's first piece), payload `none` (no waiter exists — the permit
+  merely returns). The carrier crosses skipped iterations
+  unchanged and re-enters taken branches via the if's token results (the
+  crossing rule covers this: the if contains acquires, so it gets a slot).
+  **The entry row is owned by ROOT** — it executes in the root region
+  (function level / pre-loop), and root passes the permit to the first
+  in-loop holder by **carrier inherit**: no release/acquire edge for
+  `root -> first holder`; the entry token simply seeds the carrier (v4's
+  rule, preserved). The first-holder fact is NOT lost: it is recorded on
+  the semaphore as **`inheritStamp`** — the placement-point holder (a
+  descended chain's ENTER seed owner; otherwise the first involving row's
+  record owner) — and emission stamps the entry-acquire op with it
+  (`ttg.partition`+tag for a partition, no attrs for root; this is exactly
+  what the previous pass emitted: operand entries stamped `{p2, tag 0}`,
+  the root-seeded accumulator entry attr-less).
+  **M3 acquirer-class criterion (verifier, hard error):** for every
+  semaphore, the set of acquiring owners may contain **at most one
+  concrete partition**; `root` is additionally allowed (the inherit case).
+  `{root, p}` is valid; two distinct partitions — with or without root —
+  are not expressible as one phase-tracked semaphore.
 - **Initial permits — a static, per-create fact.** A semaphore whose *first
   event in chain order is an acquire* (exactly the entry-acquired ones) is
   created with **initial permits equal to that acquire's count** (`k`
@@ -673,7 +748,8 @@ last-K iteration costs the hot path nothing).
 Dump: v4-style tree, region rows annotated with their per-piece effect
 (e.g. `FOR(R) {2}` / `FOR(W) {3}`; the examples above omit it for brevity),
 `r`/`a` rows inline at chain depth, semaphore names
-`S0, S1, …` per component, pending counts on grouped acquires, entry
+`S0, S1, …` per group in creation order (`E<k>` for dedicated entry
+semaphores), pending counts on grouped acquires, entry
 acquires rendered before their loop. One sync view per group — there is one
 SYNC-DAG per group, no RAW/OPT split.
 
@@ -767,7 +843,9 @@ Per stage, checked mechanically before the next stage runs:
   within each region execution,
   releases == acquires×count, with entry acquires covered exactly by initial
   permits; every access is preceded in chain order by an acquire of its
-  component (the carrier exists — guaranteed by the entry acquire).
+  component (the carrier exists — guaranteed by the entry acquire); **M3
+  acquirer classes**: per semaphore, the acquiring owners contain at most
+  one concrete partition (root additionally allowed — the inherit case).
 - **EMIT**: bijection between emitted `nvws.semaphore.{acquire,release}` ops
   and `Acquire`/`Release` nodes; every rewritten access uses a
   `semaphore.buffer` view whose token traces to a DAG acquire; no token
