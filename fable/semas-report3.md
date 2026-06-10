@@ -808,6 +808,7 @@ the terminator) holds by construction:
 | `Enter`/`Exit` | insertion-point markers only |
 | `Acquire` | emit `nvws.semaphore.acquire`; its token becomes the owner's carrier. Buffer VIEWS are NOT emitted here: `nvws.semaphore.buffer` is materialized lazily at each consuming access, in that access's region, stamped with that access's owner and stage/cluster; the view cache clears at every acquire and at every region boundary (a carried token gets a fresh view per region); one buffer op yields all member views of a multi-member semaphore |
 | `Access` | retarget the op's memdesc operands onto the view (via the recorded alias chain); erase its original async-token plumbing |
+| *(post-nuke)* | the token nuke leaves dead token-typed **signature slots** (a `scf.for` iter_arg whose region arg and result are both unused; a `scf.if` result that is unused); these are erased to a fixpoint before any semaphore IR is emitted — dropping the matching init/yield operands and `ttg.partition.outputs` entries. Gate-1 evidence (automatic-warp-specialization.mlir): surviving poison-husk slots change region signatures and break the downstream loop scheduler |
 | `Release` | emit `nvws.semaphore.release` with the node's recorded payload, consuming the owner's carrier token |
 
 Plus the mechanical stamping rules: every sync op carries its node's owner

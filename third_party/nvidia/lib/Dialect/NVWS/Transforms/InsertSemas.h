@@ -59,6 +59,8 @@ struct PieceInfo {
 struct AliasStep {
   Operation *op = nullptr; // ttg.memdesc_{index,subview,trans,reinterpret,reshape}
   unsigned operandIdx = 0; // which operand carries the source memdesc
+  Type resultType;         // captured at stage 1 (context-owned — survives
+                           // op erasure during render)
 };
 
 // One buffer-touch of one access op. Pieces are DERIVED, never stored:
@@ -67,6 +69,9 @@ struct Touch {
   MemberId member = 0;
   Effect effect = Effect::R;
   Value accessValue;                // the memdesc SSA value the op uses
+  Type accessType;                  // its type, captured at stage 1
+                                    // (erase-proof; values may dangle after
+                                    // sourceful allocs are replaced)
   SmallVector<AliasStep, 2> alias;  // chain: member alloc -> accessValue
 };
 
@@ -207,6 +212,9 @@ struct GroupDag {
   // Alias map: tracked memdesc SSA value -> (member, view chain from the
   // member's alloc). Lookup-only (never iterated for output).
   DenseMap<Value, std::pair<MemberId, SmallVector<AliasStep, 2>>> aliases;
+  SmallVector<Operation *, 1> ttDescriptorFedMembers; // tt-form descriptor-
+                                          // fed sourceful allocs (pipeline-
+                                          // invariant guard, contract D)
   SmallVector<std::unique_ptr<Node>> nodes; // pool; pointer-stable
   Node *root = nullptr;                     // Func node of current snapshot
   SemaTable semaTable;

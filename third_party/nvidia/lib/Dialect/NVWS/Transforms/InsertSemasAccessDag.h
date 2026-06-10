@@ -158,7 +158,8 @@ static FailureOr<bool> tryExtendAlias(GroupDag &g, Operation *op) {
       return op->emitError("nvws-insert-semas: unsupported memdesc alias use ")
              << op->getName();
     auto chain = it->second; // copy {member, steps}
-    chain.second.push_back({op, static_cast<unsigned>(idx)});
+    chain.second.push_back(
+        {op, static_cast<unsigned>(idx), op->getResult(0).getType()});
     g.aliases.try_emplace(op->getResult(0), std::move(chain));
     return true;
   }
@@ -174,6 +175,7 @@ static void addTouch(GroupDag &g, SmallVectorImpl<Touch> &touches, Value v,
   t.member = it->second.first;
   t.effect = effect;
   t.accessValue = v;
+  t.accessType = v.getType();
   t.alias = it->second.second;
   touches.push_back(std::move(t));
 }
@@ -188,8 +190,19 @@ static LogicalResult collectTouches(GroupDag &g, Operation *op,
     return success();
   }
   if (auto localAlloc = dyn_cast<gpu::LocalAllocOp>(op)) {
-    if (localAlloc.getSrc())
+    if (Value src = localAlloc.getSrc()) {
+      // Pipeline invariant (plan contract D, mining gap 6): a MANAGED
+      // descriptor-fed buffer never reaches this pass in tt form —
+      // nvws-insert-allocas converts cross-partition pairs upstream. A
+      // tt-form pair here must be same-partition (it will produce no
+      // semaphores and stay untouched); if it ever turns out managed,
+      // fail loudly rather than silently emit a register round-trip.
+      if (Operation *def = src.getDefiningOp())
+        if (isa<triton::DescriptorLoadOp, triton::DescriptorGatherOp>(def) &&
+            g.aliases.count(localAlloc.getResult())) // member of THIS group
+          g.ttDescriptorFedMembers.push_back(localAlloc);
       addTouch(g, touches, localAlloc.getResult(), Effect::W);
+    }
     return success();
   }
   if (auto load = dyn_cast<nvidia_gpu::TMEMLoadOp>(op)) {

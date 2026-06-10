@@ -1,0 +1,99 @@
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @conditional_multi_result_if_token
+groups: 1
+GROUP buffer.id=none#1 memory=tmem members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @conditional_multi_result_if_token
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |- scf.if effects{P0:R}
+|  |  |  |- then
+|  |  |  |  |- R  m0  ttng.tmem_load {0}
+|  |  |  |- else
+OWNER-DAG
+|- func @conditional_multi_result_if_token
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |- scf.if pieces{P0:R:{1}}
+|  |  |  |- then
+|  |  |  |  |- ENTER pieces{P0:R:{1}}
+|  |  |  |  |- R  m0  ttng.tmem_load {0}
+|  |  |  |  |- EXIT pieces{P0:R:{1}}
+|  |  |  |- else
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT
+|  |  |- EXIT pieces{P0:W:{1}}
+SYNC-DAG
+|- func @conditional_multi_result_if_token
+|  |- a  S1  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}} parts{0,1} thread{c0:{1}}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- W m0  ttng.tc_gen5_mma {1}
+|  |  |- scf.if pieces{P0:R:{1}} parts{0,1} thread{c0:{1}}
+|  |  |  |- then
+|  |  |  |  |- ENTER pieces{P0:R:{1}}
+|  |  |  |  |- r  S0  {1} [tc5mma]
+|  |  |  |  |- a  S0  {0}
+|  |  |  |  |- R m0  ttng.tmem_load {0}
+|  |  |  |  |- r  S1  {0} [none]
+|  |  |  |  |- a  S1  {1}
+|  |  |  |  |- EXIT pieces{P0:R:{1}} yield{c0: a S1}
+|  |  |  |- else
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT yield{c0: pass}
+|  |  |- EXIT pieces{P0:W:{1}} yield{c0: scf.if}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.1}}
+  BACKING: numStages=2 anchor=before scf.for(tag=0)
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @guarded_tokenless_if_deferred_initial_acquire
+groups: 1
+GROUP buffer.id=none#1 memory=tmem members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @guarded_tokenless_if_deferred_initial_acquire
+|  |- scf.if effects{P0:W}
+|  |  |- then
+|  |  |  |- scf.for (WS, tag=1) effects{P0:W}
+|  |  |  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |  |  |- R  m0  ttng.tmem_load {0}
+OWNER-DAG
+|- func @guarded_tokenless_if_deferred_initial_acquire
+|  |- scf.if pieces{P0:W:root}
+|  |  |- then
+|  |  |  |- ENTER pieces{P0:W:root}
+|  |  |  |- scf.for (WS, tag=1) pieces{P0:W:{1}}
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |  |  |- R  m0  ttng.tmem_load {0}
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- EXIT pieces{P0:W:root}
+|  |  |- else (virtual)
+|  |  |  |- ENTER
+|  |  |  |- EXIT
+SYNC-DAG
+|- func @guarded_tokenless_if_deferred_initial_acquire
+|  |- scf.if pieces{P0:W:root} parts{0,1} thread{c0:{@1.1}}
+|  |  |- then
+|  |  |  |- ENTER pieces{P0:W:root}
+|  |  |  |- a  S1  root  ; entry
+|  |  |  |- scf.for (WS, tag=1) pieces{P0:W:{1}} parts{0,1} thread{c0:{1}}
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- W m0  ttng.tc_gen5_mma {1}
+|  |  |  |  |- r  S0  {1} [tc5mma]
+|  |  |  |  |- a  S0  {0}
+|  |  |  |  |- R m0  ttng.tmem_load {0}
+|  |  |  |  |- r  S1  {0} [none]
+|  |  |  |  |- a  S1  {1}
+|  |  |  |  |- EXIT pieces{P0:W:{1}} yield{c0: a S1}
+|  |  |  |- EXIT pieces{P0:W:root} yield{c0: scf.for}
+|  |  |- else (virtual)
+|  |  |  |- ENTER
+|  |  |  |- EXIT yield{c0: pass}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@1.1}}
+  BACKING: numStages=2 anchor=before scf.for(tag=1)

@@ -1,0 +1,102 @@
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @container_with_disjoint_subviews
+groups: 1
+GROUP buffer.id=900 memory=tmem members=4
+  members: m0[0,256) m1[0,128) m2[128,192) m3[192,256)
+  pieces: P0=[0,128){m0,m1}c0 P1=[128,192){m0,m2}c0 P2=[192,256){m0,m3}c0
+  footprints: m0={P0,P1,P2} m1={P0} m2={P1} m3={P2}
+ACCESS-DAG
+|- func @container_with_disjoint_subviews
+|  |- scf.for (WS, tag=0) effects{P0:W,P1:W,P2:W}
+|  |  |- W  m0  ttng.tmem_alloc {0}
+|  |  |- W  m1  ttng.tmem_alloc {1}
+|  |  |- W  m2  ttng.tmem_alloc {2}
+|  |  |- W  m3  ttng.tmem_alloc {3}
+|  |  |- R  m1  ttng.tmem_load {1}
+|  |  |- R  m2  ttng.tmem_load {2}
+|  |  |- R  m3  ttng.tmem_load {3}
+OWNER-DAG
+|- func @container_with_disjoint_subviews
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0},P1:W:{0},P2:W:{0}}
+|  |  |- ENTER pieces{P0:W:{0},P1:W:{0},P2:W:{0}}
+|  |  |- W  m0  ttng.tmem_alloc {0}
+|  |  |- W  m1  ttng.tmem_alloc {1}
+|  |  |- W  m2  ttng.tmem_alloc {2}
+|  |  |- W  m3  ttng.tmem_alloc {3}
+|  |  |- R  m1  ttng.tmem_load {1}
+|  |  |- R  m2  ttng.tmem_load {2}
+|  |  |- R  m3  ttng.tmem_load {3}
+|  |  |- EXIT pieces{P0:W:{0},P1:W:{0},P2:W:{0}}
+SYNC-DAG
+|- func @container_with_disjoint_subviews
+|  |- a  S3(3)  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0},P1:W:{0},P2:W:{0}} parts{0,1,2,3} thread{c0:{0}}
+|  |  |- ENTER pieces{P0:W:{0},P1:W:{0},P2:W:{0}}
+|  |  |- W m0  ttng.tmem_alloc {0}
+|  |  |- r  S0  {0} [none]
+|  |  |- r  S1  {0} [none]
+|  |  |- r  S2  {0} [none]
+|  |  |- a  S0  {1}
+|  |  |- W m1  ttng.tmem_alloc {1}
+|  |  |- a  S1  {2}
+|  |  |- W m2  ttng.tmem_alloc {2}
+|  |  |- a  S2  {3}
+|  |  |- W m3  ttng.tmem_alloc {3}
+|  |  |- R m1  ttng.tmem_load {1}
+|  |  |- r  S3  {1} [none]
+|  |  |- R m2  ttng.tmem_load {2}
+|  |  |- r  S3  {2} [none]
+|  |  |- R m3  ttng.tmem_load {3}
+|  |  |- r  S3  {3} [none]
+|  |  |- a  S3(3)  {0}
+|  |  |- EXIT pieces{P0:W:{0},P1:W:{0},P2:W:{0}} yield{c0: a S3}
+  SEMAS c0: S0{count=1} S1{count=1} S2{count=1} S3{count=3 entry inherit={@0.0}}
+  BACKING: numStages=2 anchor=before scf.for(tag=0)
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @container_with_overlapping_subviews
+groups: 1
+GROUP buffer.id=901 memory=tmem members=3
+  members: m0[0,256) m1[0,128) m2[64,192)
+  pieces: P0=[0,64){m0,m1}c0 P1=[64,128){m0,m1,m2}c0 P2=[128,192){m0,m2}c0 P3=[192,256){m0}c0
+  footprints: m0={P0,P1,P2,P3} m1={P0,P1} m2={P1,P2}
+ACCESS-DAG
+|- func @container_with_overlapping_subviews
+|  |- scf.for (WS, tag=0) effects{P0:W,P1:W,P2:W,P3:W}
+|  |  |- W  m0  ttng.tmem_alloc {0}
+|  |  |- W  m1  ttng.tmem_alloc {1}
+|  |  |- W  m2  ttng.tmem_alloc {2}
+|  |  |- R  m1  ttng.tmem_load {1}
+|  |  |- R  m2  ttng.tmem_load {2}
+OWNER-DAG
+|- func @container_with_overlapping_subviews
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0},P1:W:{0},P2:W:{0},P3:W:{0}}
+|  |  |- ENTER pieces{P0:W:{0},P1:W:{0},P2:W:{0},P3:W:{0}}
+|  |  |- W  m0  ttng.tmem_alloc {0}
+|  |  |- W  m1  ttng.tmem_alloc {1}
+|  |  |- W  m2  ttng.tmem_alloc {2}
+|  |  |- R  m1  ttng.tmem_load {1}
+|  |  |- R  m2  ttng.tmem_load {2}
+|  |  |- EXIT pieces{P0:W:{0},P1:W:{0},P2:W:{0},P3:W:{0}}
+SYNC-DAG
+|- func @container_with_overlapping_subviews
+|  |- a  S3(2)  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0},P1:W:{0},P2:W:{0},P3:W:{0}} parts{0,1,2} thread{c0:{0}}
+|  |  |- ENTER pieces{P0:W:{0},P1:W:{0},P2:W:{0},P3:W:{0}}
+|  |  |- W m0  ttng.tmem_alloc {0}
+|  |  |- r  S0  {0} [none]
+|  |  |- r  S1  {0} [none]
+|  |  |- a  S0  {1}
+|  |  |- W m1  ttng.tmem_alloc {1}
+|  |  |- r  S1  {1} [none]
+|  |  |- a  S1(2)  {2}
+|  |  |- W m2  ttng.tmem_alloc {2}
+|  |  |- r  S2  {2} [none]
+|  |  |- a  S2  {1}
+|  |  |- R m1  ttng.tmem_load {1}
+|  |  |- r  S3  {1} [none]
+|  |  |- R m2  ttng.tmem_load {2}
+|  |  |- r  S3  {2} [none]
+|  |  |- a  S3(2)  {0}
+|  |  |- EXIT pieces{P0:W:{0},P1:W:{0},P2:W:{0},P3:W:{0}} yield{c0: a S3}
+  SEMAS c0: S0{count=1} S1{count=2} S2{count=1} S3{count=2 entry inherit={@0.0}}
+  BACKING: numStages=2 anchor=before scf.for(tag=0)

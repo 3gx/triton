@@ -1019,6 +1019,15 @@ static LogicalResult buildSyncDag(GroupDag &g, triton::FuncOp funcOp,
     computeRequiredParts(g.root->children[0]);
   }
   computeBackingPlan(g, funcOp, useMetaPartitioner, numTmemBlocks);
+  // Pipeline-invariant guard (contract D / mining gap 6): a managed (=
+  // synchronized) group must not contain a tt-form descriptor-fed
+  // sourceful alloc — nvws-insert-allocas normalizes those upstream.
+  if (!g.semaTable.semas.empty())
+    for (Operation *alloc : g.ttDescriptorFedMembers)
+      return alloc->emitError(
+          "nvws-insert-semas: managed local_alloc sourced from a tt-form "
+          "descriptor load — nvws-insert-allocas must convert this "
+          "upstream (pipeline invariant violated)");
   return verifySyncDag(g);
 }
 

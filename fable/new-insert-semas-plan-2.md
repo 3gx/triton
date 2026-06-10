@@ -538,8 +538,14 @@ Carriers then travel **only** in slots the node crossings own (appended,
 pass does in meta_fa_fwd :176) is rejected by design — the carrier set does
 not correspond to the original token set, and mixing the two couples the
 emitter to input plumbing it is supposed to erase. Untouched single-owner
-groups (contract H) keep their tokens. Expected golden churn: more poisoned
-dead slots, appended carrier slots.
+groups (contract H) keep their tokens. After the nuke, dead token-typed
+signature slots are ERASED to a fixpoint (scf.for iter_arg with region arg
+AND result unused; scf.if result unused) — inits/yield operands dropped,
+ttg.partition.outputs entries filtered, DAG anchors fixed up. The original
+expectation that poisoned dead slots survive was FALSIFIED by gate 1
+(10jun26): husk slots change loop/if signatures, the AWS loop scheduler
+mis-stages, and descriptor ops never lower. Expected golden churn: dead
+slots gone, appended carrier slots.
 
 **F. Carrier threading: slots appended to `scf.for` iter_args / `scf.if`
 results, set at yields, partition-stamped.** meta_fa_fwd: outer for 1→11
@@ -1040,11 +1046,19 @@ passes UNMODIFIED. A timeout at any gate is a hang CAUSED BY THE CURRENT
 CHANGE — stop and root-cause it; never retry, never broaden the test
 selection.**
 
-2. **One pytest case, 60s timeout — DO NOT run the entire pytest suite:**
+2. **Pytest cases, 60s timeout per test — DO NOT run the entire pytest suite:**
 
    ```bash
    PYTHONPATH=python timeout 60s pytest -q \
      "python/test/unit/language/test_warp_specialization.py::test_warp_specialize_tma_matmul[False-4-2-64-128-128-8192-8192-512]"
+   ```
+   As well as:
+   ```
+   python/test/unit/language/test_warp_specialization.py::test_warp_specialize_tma_matmul_persistent[True-False-8-2-128-128-128-32-32-32]
+   ```
+   and
+   ```
+   python/test/unit/language/test_warp_specialization.py::test_warp_specialize_attention_forward[False-4-True-3-128-128-1024-1024]
    ```
 
 3. **The two FA runtime scripts, 60s timeout each** (canonical deadlock

@@ -1,0 +1,87 @@
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @live_tag_source_after_prior_loop_threading
+groups: 2
+GROUP buffer.id=900 memory=tmem members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @live_tag_source_after_prior_loop_threading
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  ttng.tmem_alloc {0}
+|  |  |- scf.for effects{P0:W}
+|  |  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |  |- R  m0  ttng.tmem_load {0}
+|  |  |- R  m0  ttng.tmem_load {0}
+OWNER-DAG
+|- func @live_tag_source_after_prior_loop_threading
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W  m0  ttng.tmem_alloc {0}
+|  |  |- scf.for pieces{P0:W:{1}}
+|  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |  |- R  m0  ttng.tmem_load {0}
+|  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |- R  m0  ttng.tmem_load {0}
+|  |  |- EXIT pieces{P0:W:{0}}
+SYNC-DAG
+|- func @live_tag_source_after_prior_loop_threading
+|  |- a  S2  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}} parts{0,1} thread{c0:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W m0  ttng.tmem_alloc {0}
+|  |  |- r  S0  {0} [none]
+|  |  |- a  S0  {1}
+|  |  |- scf.for pieces{P0:W:{1}} parts{0,1} thread{c0:{1}}
+|  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |- W m0  ttng.tc_gen5_mma {1}
+|  |  |  |- r  S1  {1} [tc5mma]
+|  |  |  |- a  S1  {0}
+|  |  |  |- R m0  ttng.tmem_load {0}
+|  |  |  |- r  S0  {0} [none]
+|  |  |  |- a  S0  {1}
+|  |  |  |- EXIT pieces{P0:W:{1}} yield{c0: a S0}
+|  |  |- r  S2  {1} [tc5mma]
+|  |  |- a  S2  {0}
+|  |  |- R m0  ttng.tmem_load {0}
+|  |  |- EXIT pieces{P0:W:{0}} yield{c0: a S2}
+  SEMAS c0: S0{count=1} S1{count=1} S2{count=1 entry inherit={@0.0}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+GROUP buffer.id=910 memory=local members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @live_tag_source_after_prior_loop_threading
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  ttg.local_store {2}
+|  |  |- scf.for effects{P0:R}
+|  |  |  |- R  m0  ttg.local_load {1}
+OWNER-DAG
+|- func @live_tag_source_after_prior_loop_threading
+|  |- scf.for (WS, tag=0) pieces{P0:W:{2}}
+|  |  |- ENTER pieces{P0:W:{2}}
+|  |  |- W  m0  ttg.local_store {2}
+|  |  |- scf.for pieces{P0:R:{1}}
+|  |  |  |- ENTER pieces{P0:R:{1}}
+|  |  |  |- R  m0  ttg.local_load {1}
+|  |  |  |- EXIT pieces{P0:R:{1}}
+|  |  |- EXIT pieces{P0:W:{2}}
+SYNC-DAG
+|- func @live_tag_source_after_prior_loop_threading
+|  |- a  S1  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{2}} parts{1,2} thread{c0:{2}}
+|  |  |- ENTER pieces{P0:W:{2}}
+|  |  |- W m0  ttg.local_store {2}
+|  |  |- r  S0  {2} [none]
+|  |  |- a  S0  {1}
+|  |  |- scf.for pieces{P0:R:{1}} parts{1}
+|  |  |  |- ENTER pieces{P0:R:{1}}
+|  |  |  |- R m0  ttg.local_load {1}
+|  |  |  |- EXIT pieces{P0:R:{1}}
+|  |  |- r  S1  {1} [none]
+|  |  |- a  S1  {2}
+|  |  |- EXIT pieces{P0:W:{2}} yield{c0: a S1}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.2}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)

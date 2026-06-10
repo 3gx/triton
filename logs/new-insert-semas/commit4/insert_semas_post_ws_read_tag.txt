@@ -1,0 +1,35 @@
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @post_ws_tmem_read_carrier_tag
+groups: 1
+GROUP buffer.id=none#1 memory=tmem members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @post_ws_tmem_read_carrier_tag
+|  |- W  m0  ttng.tmem_store root
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |- R  m0  ttng.tmem_load root
+OWNER-DAG
+|- func @post_ws_tmem_read_carrier_tag
+|  |- W  m0  ttng.tmem_store root
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |- EXIT pieces{P0:W:{1}}
+|  |- R  m0  ttng.tmem_load root
+SYNC-DAG
+|- func @post_ws_tmem_read_carrier_tag
+|  |- a  E1  root  ; entry
+|  |- W m0  ttng.tmem_store root
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}} parts{1}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- W m0  ttng.tc_gen5_mma {1}
+|  |  |- EXIT pieces{P0:W:{1}}
+|  |- r  S0  {@0.1} [tc5mma]
+|  |- a  S0  root
+|  |- R m0  ttng.tmem_load root
+|  |- r  E1  root [none]
+  SEMAS c0: S0{count=1} E1{count=1 entry inherit=root}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)

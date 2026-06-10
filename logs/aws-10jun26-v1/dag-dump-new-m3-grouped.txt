@@ -1,0 +1,138 @@
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @grouped_matmul_tma_kernel
+groups: 3
+GROUP buffer.id=none#1 memory=tmem members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @grouped_matmul_tma_kernel
+|  |- W  m0  ttng.tmem_alloc root
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- scf.for effects{P0:W}
+|  |  |  |- scf.for effects{P0:W}
+|  |  |  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |  |- R  m0  ttng.tmem_load {0}
+OWNER-DAG
+|- func @grouped_matmul_tma_kernel
+|  |- W  m0  ttng.tmem_alloc root
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- scf.for pieces{P0:W:{1}}
+|  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |- scf.for pieces{P0:W:{1}}
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- R  m0  ttng.tmem_load {0}
+|  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |- EXIT pieces{P0:W:{1}}
+SYNC-DAG
+|- func @grouped_matmul_tma_kernel
+|  |- a  S1  root  ; entry
+|  |- W m0  ttng.tmem_alloc root
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}} parts{0,1} thread{c0:{1}}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- scf.for pieces{P0:W:{1}} parts{0,1} thread{c0:{1}}
+|  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |- scf.for pieces{P0:W:{1}} parts{1}
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- W m0  ttng.tc_gen5_mma {1}
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- r  S0  {1} [tc5mma]
+|  |  |  |- a  S0  {0}
+|  |  |  |- R m0  ttng.tmem_load {0}
+|  |  |  |- r  S1  {0} [none]
+|  |  |  |- a  S1  {1}
+|  |  |  |- EXIT pieces{P0:W:{1}} yield{c0: a S1}
+|  |  |- EXIT pieces{P0:W:{1}} yield{c0: scf.for}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit=root}
+  BACKING: numStages=2 anchor=before scf.for(tag=0)
+GROUP buffer.id=none#2 memory=local members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @grouped_matmul_tma_kernel
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- scf.for effects{P0:W}
+|  |  |  |- scf.for effects{P0:W}
+|  |  |  |  |- W  m0  nvws.descriptor_load {2}
+|  |  |  |  |- R  m0  ttng.tc_gen5_mma {1}
+OWNER-DAG
+|- func @grouped_matmul_tma_kernel
+|  |- scf.for (WS, tag=0) pieces{P0:W:{2}}
+|  |  |- ENTER pieces{P0:W:{2}}
+|  |  |- scf.for pieces{P0:W:{2}}
+|  |  |  |- ENTER pieces{P0:W:{2}}
+|  |  |  |- scf.for pieces{P0:W:{2}}
+|  |  |  |  |- ENTER pieces{P0:W:{2}}
+|  |  |  |  |- W  m0  nvws.descriptor_load {2}
+|  |  |  |  |- R  m0  ttng.tc_gen5_mma {1}
+|  |  |  |  |- EXIT pieces{P0:W:{2}}
+|  |  |  |- EXIT pieces{P0:W:{2}}
+|  |  |- EXIT pieces{P0:W:{2}}
+SYNC-DAG
+|- func @grouped_matmul_tma_kernel
+|  |- a  S1  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{2}} parts{1,2} thread{c0:{2}}
+|  |  |- ENTER pieces{P0:W:{2}}
+|  |  |- scf.for pieces{P0:W:{2}} parts{1,2} thread{c0:{2}}
+|  |  |  |- ENTER pieces{P0:W:{2}}
+|  |  |  |- scf.for pieces{P0:W:{2}} parts{1,2} thread{c0:{2}}
+|  |  |  |  |- ENTER pieces{P0:W:{2}}
+|  |  |  |  |- W m0  nvws.descriptor_load {2}
+|  |  |  |  |- r  S0  {2} [tma_load]
+|  |  |  |  |- a  S0  {1}
+|  |  |  |  |- R m0  ttng.tc_gen5_mma {1}
+|  |  |  |  |- r  S1  {1} [tc5mma]
+|  |  |  |  |- a  S1  {2}
+|  |  |  |  |- EXIT pieces{P0:W:{2}} yield{c0: a S1}
+|  |  |  |- EXIT pieces{P0:W:{2}} yield{c0: scf.for}
+|  |  |- EXIT pieces{P0:W:{2}} yield{c0: scf.for}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.2}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+GROUP buffer.id=none#3 memory=local members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @grouped_matmul_tma_kernel
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- scf.for effects{P0:W}
+|  |  |  |- scf.for effects{P0:W}
+|  |  |  |  |- W  m0  nvws.descriptor_load {2}
+|  |  |  |  |- R  m0  ttng.tc_gen5_mma {1}
+OWNER-DAG
+|- func @grouped_matmul_tma_kernel
+|  |- scf.for (WS, tag=0) pieces{P0:W:{2}}
+|  |  |- ENTER pieces{P0:W:{2}}
+|  |  |- scf.for pieces{P0:W:{2}}
+|  |  |  |- ENTER pieces{P0:W:{2}}
+|  |  |  |- scf.for pieces{P0:W:{2}}
+|  |  |  |  |- ENTER pieces{P0:W:{2}}
+|  |  |  |  |- W  m0  nvws.descriptor_load {2}
+|  |  |  |  |- R  m0  ttng.tc_gen5_mma {1}
+|  |  |  |  |- EXIT pieces{P0:W:{2}}
+|  |  |  |- EXIT pieces{P0:W:{2}}
+|  |  |- EXIT pieces{P0:W:{2}}
+SYNC-DAG
+|- func @grouped_matmul_tma_kernel
+|  |- a  S1  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{2}} parts{1,2} thread{c0:{2}}
+|  |  |- ENTER pieces{P0:W:{2}}
+|  |  |- scf.for pieces{P0:W:{2}} parts{1,2} thread{c0:{2}}
+|  |  |  |- ENTER pieces{P0:W:{2}}
+|  |  |  |- scf.for pieces{P0:W:{2}} parts{1,2} thread{c0:{2}}
+|  |  |  |  |- ENTER pieces{P0:W:{2}}
+|  |  |  |  |- W m0  nvws.descriptor_load {2}
+|  |  |  |  |- r  S0  {2} [tma_load]
+|  |  |  |  |- a  S0  {1}
+|  |  |  |  |- R m0  ttng.tc_gen5_mma {1}
+|  |  |  |  |- r  S1  {1} [tc5mma]
+|  |  |  |  |- a  S1  {2}
+|  |  |  |  |- EXIT pieces{P0:W:{2}} yield{c0: a S1}
+|  |  |  |- EXIT pieces{P0:W:{2}} yield{c0: scf.for}
+|  |  |- EXIT pieces{P0:W:{2}} yield{c0: scf.for}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.2}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)

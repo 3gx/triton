@@ -1,0 +1,218 @@
+==== NVWS InsertSemas (commit 5: discovery + ACCESS DAG + OWNERSHIP DAG + RAW-SYNC DAG + OPT-SYNC DAG + EMIT) ====
+function: _p_matmul_NNT_fp8e4nvxfp8e4nvxmxfp4_128x256x128x1_dequantize_mxfp8
+backing buffers: 5
+NVWS-SEMA-DAG buffer.id=0 memory=tmem
+  members: m0(offset=0,extent=256,resourceKey=0)
+ACCESS-DAG
+|- W  m0  ttng.tmem_store root
+|- scf.for (WS, tag=0)
+|  |- W  m0  ttng.tc_gen5_mma_scaled {1}
+|  |- scf.if
+|  |  |- R  m0  ttng.tmem_load {0}
+OWNERSHIP-DAG buffer.id=0 resourceKey=0 members: m0
+|- func region @_p_matmul_NNT_fp8e4nvxfp8e4nvxmxfp4_128x256x128x1_dequantize_mxfp8
+|  |- W  m0  ttng.tmem_store  use root
+|  |- scf.for (WS, tag=0) {1}
+|  |  |- ENTER {1}
+|  |  |- W  m0  ttng.tc_gen5_mma_scaled  use {1}
+|  |  |- scf.if {1}
+|  |  |  |- then
+|  |  |  |  |- ENTER {1}
+|  |  |  |  |- R  m0  ttng.tmem_load  use {0}
+|  |  |  |  |- YIELD {1}
+|  |  |  |- else
+|  |  |  |  |- ENTER {1}
+|  |  |  |  |- YIELD {1}
+|  |  |- YIELD {1}
+RAW-SYNC-DAG buffer.id=0 resourceKey=0 edges=2
+|  semaphore-classes: {S1=SEED}
+|- func region @_p_matmul_NNT_fp8e4nvxfp8e4nvxmxfp4_128x256x128x1_dequantize_mxfp8
+|  |- a  S1  acquire  root
+|  |- W  m0  ttng.tmem_store  root
+|  |- scf.for (WS, tag=0) {1}
+|  |  |- ENTER {1}
+|  |  |- W  m0  ttng.tc_gen5_mma_scaled  {1}
+|  |  |- scf.if {1}
+|  |  |  |- then
+|  |  |  |  |- ENTER {1}
+|  |  |  |  |- r  S0  release  {1} -> {0}
+|  |  |  |  |- a  S0  acquire  {0}
+|  |  |  |  |- R  m0  ttng.tmem_load  {0}
+|  |  |  |  |- r  S1  release  {0} -> {1}
+|  |  |  |  |- a  S1  acquire  {1}
+|  |  |  |  |- YIELD {1}
+|  |  |  |- else
+|  |  |  |  |- ENTER {1}
+|  |  |  |  |- YIELD {1}
+|  |  |- YIELD {1}
+OPT-SYNC-DAG buffer.id=0 resourceKey=0 groups=2 (initial-empty=1 singleton=0 ready-fanout=0 done-fanin=0 linear-chain=1)
+|- func region @_p_matmul_NNT_fp8e4nvxfp8e4nvxmxfp4_128x256x128x1_dequantize_mxfp8
+|  |- a  S1  acquire  root
+|  |- W  m0  ttng.tmem_store  root
+|  |- scf.for (WS, tag=0) {1}
+|  |  |- ENTER {1}
+|  |  |- W  m0  ttng.tc_gen5_mma_scaled  {1}
+|  |  |- scf.if {1}
+|  |  |  |- then
+|  |  |  |  |- ENTER {1}
+|  |  |  |  |- r  S0  release  {1} -> {0}
+|  |  |  |  |- a  S0  acquire  {0}
+|  |  |  |  |- R  m0  ttng.tmem_load  {0}
+|  |  |  |  |- r  S1  release  {0} -> {1}
+|  |  |  |  |- a  S1  acquire  {1}
+|  |  |  |  |- YIELD {1}
+|  |  |  |- else
+|  |  |  |  |- ENTER {1}
+|  |  |  |  |- YIELD {1}
+|  |  |- YIELD {1}
+RELEASED-SEMAPHORES buffer.id=0 resourceKey=0 seeded=yes count=1
+  seed: group=0 (S_g0, kind=0) acquirer={root}
+NVWS-SEMA-DAG buffer.id=1 memory=tmem
+  members: m0(offset=0,extent=4,resourceKey=0)
+ACCESS-DAG
+|- scf.for (WS, tag=0)
+|  |- W  m0  ttng.tmem_alloc {1}
+|  |- R  m0  ttng.tc_gen5_mma_scaled {1}
+OWNERSHIP-DAG buffer.id=1 resourceKey=0 members: m0
+|- func region @_p_matmul_NNT_fp8e4nvxfp8e4nvxmxfp4_128x256x128x1_dequantize_mxfp8
+|  |- scf.for (WS, tag=0) {1}
+|  |  |- ENTER {1}
+|  |  |- W  m0  ttng.tmem_alloc  use {1}
+|  |  |- R  m0  ttng.tc_gen5_mma_scaled  use {1}
+|  |  |- YIELD {1}
+RAW-SYNC-DAG buffer.id=1 resourceKey=0 edges=0
+|- func region @_p_matmul_NNT_fp8e4nvxfp8e4nvxmxfp4_128x256x128x1_dequantize_mxfp8
+|  |- scf.for (WS, tag=0) {1}
+|  |  |- ENTER {1}
+|  |  |- W  m0  ttng.tmem_alloc  {1}
+|  |  |- R  m0  ttng.tc_gen5_mma_scaled  {1}
+|  |  |- YIELD {1}
+OPT-SYNC-DAG buffer.id=1 resourceKey=0 groups=0 (initial-empty=0 singleton=0 ready-fanout=0 done-fanin=0 linear-chain=0)
+|- func region @_p_matmul_NNT_fp8e4nvxfp8e4nvxmxfp4_128x256x128x1_dequantize_mxfp8
+|  |- scf.for (WS, tag=0) {1}
+|  |  |- ENTER {1}
+|  |  |- W  m0  ttng.tmem_alloc  {1}
+|  |  |- R  m0  ttng.tc_gen5_mma_scaled  {1}
+|  |  |- YIELD {1}
+RELEASED-SEMAPHORES buffer.id=1 resourceKey=0 seeded=no count=0
+NVWS-SEMA-DAG buffer.id=2 memory=local
+  members: m0(offset=0,extent=128,resourceKey=0)
+ACCESS-DAG
+|- scf.for (WS, tag=0)
+|  |- W  m0  nvws.descriptor_gather {2}
+|  |- R  m0  ttng.tc_gen5_mma_scaled {1}
+OWNERSHIP-DAG buffer.id=2 resourceKey=0 members: m0
+|- func region @_p_matmul_NNT_fp8e4nvxfp8e4nvxmxfp4_128x256x128x1_dequantize_mxfp8
+|  |- scf.for (WS, tag=0) {2}
+|  |  |- ENTER {2}
+|  |  |- W  m0  nvws.descriptor_gather  use {2}
+|  |  |- R  m0  ttng.tc_gen5_mma_scaled  use {1}
+|  |  |- YIELD {2}
+RAW-SYNC-DAG buffer.id=2 resourceKey=0 edges=2
+|  semaphore-classes: {S1=SEED}
+|- func region @_p_matmul_NNT_fp8e4nvxfp8e4nvxmxfp4_128x256x128x1_dequantize_mxfp8
+|  |- a  S1  acquire  root
+|  |- scf.for (WS, tag=0) {2}
+|  |  |- ENTER {2}
+|  |  |- W  m0  nvws.descriptor_gather  {2}
+|  |  |- r  S0  release  {2} -> {1}
+|  |  |- a  S0  acquire  {1}
+|  |  |- R  m0  ttng.tc_gen5_mma_scaled  {1}
+|  |  |- r  S1  release  {1} -> {2}
+|  |  |- a  S1  acquire  {2}
+|  |  |- YIELD {2}
+OPT-SYNC-DAG buffer.id=2 resourceKey=0 groups=2 (initial-empty=1 singleton=0 ready-fanout=0 done-fanin=0 linear-chain=1)
+|- func region @_p_matmul_NNT_fp8e4nvxfp8e4nvxmxfp4_128x256x128x1_dequantize_mxfp8
+|  |- a  S1  acquire  root
+|  |- scf.for (WS, tag=0) {2}
+|  |  |- ENTER {2}
+|  |  |- W  m0  nvws.descriptor_gather  {2}
+|  |  |- r  S0  release  {2} -> {1}
+|  |  |- a  S0  acquire  {1}
+|  |  |- R  m0  ttng.tc_gen5_mma_scaled  {1}
+|  |  |- r  S1  release  {1} -> {2}
+|  |  |- a  S1  acquire  {2}
+|  |  |- YIELD {2}
+RELEASED-SEMAPHORES buffer.id=2 resourceKey=0 seeded=yes count=1
+  seed: group=0 (S_g0, kind=0) acquirer={p2,ws0}
+NVWS-SEMA-DAG buffer.id=3 memory=local
+  members: m0(offset=0,extent=256,resourceKey=0)
+ACCESS-DAG
+|- scf.for (WS, tag=0)
+|  |- W  m0  nvws.descriptor_load {2}
+|  |- R  m0  ttng.tc_gen5_mma_scaled {1}
+OWNERSHIP-DAG buffer.id=3 resourceKey=0 members: m0
+|- func region @_p_matmul_NNT_fp8e4nvxfp8e4nvxmxfp4_128x256x128x1_dequantize_mxfp8
+|  |- scf.for (WS, tag=0) {2}
+|  |  |- ENTER {2}
+|  |  |- W  m0  nvws.descriptor_load  use {2}
+|  |  |- R  m0  ttng.tc_gen5_mma_scaled  use {1}
+|  |  |- YIELD {2}
+RAW-SYNC-DAG buffer.id=3 resourceKey=0 edges=2
+|  semaphore-classes: {S1=SEED}
+|- func region @_p_matmul_NNT_fp8e4nvxfp8e4nvxmxfp4_128x256x128x1_dequantize_mxfp8
+|  |- a  S1  acquire  root
+|  |- scf.for (WS, tag=0) {2}
+|  |  |- ENTER {2}
+|  |  |- W  m0  nvws.descriptor_load  {2}
+|  |  |- r  S0  release  {2} -> {1}
+|  |  |- a  S0  acquire  {1}
+|  |  |- R  m0  ttng.tc_gen5_mma_scaled  {1}
+|  |  |- r  S1  release  {1} -> {2}
+|  |  |- a  S1  acquire  {2}
+|  |  |- YIELD {2}
+OPT-SYNC-DAG buffer.id=3 resourceKey=0 groups=2 (initial-empty=1 singleton=0 ready-fanout=0 done-fanin=0 linear-chain=1)
+|- func region @_p_matmul_NNT_fp8e4nvxfp8e4nvxmxfp4_128x256x128x1_dequantize_mxfp8
+|  |- a  S1  acquire  root
+|  |- scf.for (WS, tag=0) {2}
+|  |  |- ENTER {2}
+|  |  |- W  m0  nvws.descriptor_load  {2}
+|  |  |- r  S0  release  {2} -> {1}
+|  |  |- a  S0  acquire  {1}
+|  |  |- R  m0  ttng.tc_gen5_mma_scaled  {1}
+|  |  |- r  S1  release  {1} -> {2}
+|  |  |- a  S1  acquire  {2}
+|  |  |- YIELD {2}
+RELEASED-SEMAPHORES buffer.id=3 resourceKey=0 seeded=yes count=1
+  seed: group=0 (S_g0, kind=0) acquirer={p2,ws0}
+NVWS-SEMA-DAG buffer.id=4 memory=local
+  members: m0(offset=0,extent=1,resourceKey=0)
+ACCESS-DAG
+|- scf.for (WS, tag=0)
+|  |- W  m0  nvws.descriptor_load {2}
+|  |- R  m0  ttng.tc_gen5_mma_scaled {1}
+OWNERSHIP-DAG buffer.id=4 resourceKey=0 members: m0
+|- func region @_p_matmul_NNT_fp8e4nvxfp8e4nvxmxfp4_128x256x128x1_dequantize_mxfp8
+|  |- scf.for (WS, tag=0) {2}
+|  |  |- ENTER {2}
+|  |  |- W  m0  nvws.descriptor_load  use {2}
+|  |  |- R  m0  ttng.tc_gen5_mma_scaled  use {1}
+|  |  |- YIELD {2}
+RAW-SYNC-DAG buffer.id=4 resourceKey=0 edges=2
+|  semaphore-classes: {S1=SEED}
+|- func region @_p_matmul_NNT_fp8e4nvxfp8e4nvxmxfp4_128x256x128x1_dequantize_mxfp8
+|  |- a  S1  acquire  root
+|  |- scf.for (WS, tag=0) {2}
+|  |  |- ENTER {2}
+|  |  |- W  m0  nvws.descriptor_load  {2}
+|  |  |- r  S0  release  {2} -> {1}
+|  |  |- a  S0  acquire  {1}
+|  |  |- R  m0  ttng.tc_gen5_mma_scaled  {1}
+|  |  |- r  S1  release  {1} -> {2}
+|  |  |- a  S1  acquire  {2}
+|  |  |- YIELD {2}
+OPT-SYNC-DAG buffer.id=4 resourceKey=0 groups=2 (initial-empty=1 singleton=0 ready-fanout=0 done-fanin=0 linear-chain=1)
+|- func region @_p_matmul_NNT_fp8e4nvxfp8e4nvxmxfp4_128x256x128x1_dequantize_mxfp8
+|  |- a  S1  acquire  root
+|  |- scf.for (WS, tag=0) {2}
+|  |  |- ENTER {2}
+|  |  |- W  m0  nvws.descriptor_load  {2}
+|  |  |- r  S0  release  {2} -> {1}
+|  |  |- a  S0  acquire  {1}
+|  |  |- R  m0  ttng.tc_gen5_mma_scaled  {1}
+|  |  |- r  S1  release  {1} -> {2}
+|  |  |- a  S1  acquire  {2}
+|  |  |- YIELD {2}
+RELEASED-SEMAPHORES buffer.id=4 resourceKey=0 seeded=yes count=1
+  seed: group=0 (S_g0, kind=0) acquirer={p2,ws0}
+

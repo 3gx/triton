@@ -1,0 +1,4 @@
+test/NVWS/insert_semas_local_errors.mlir:16:15: error: nvws-insert-semas: unsupported memdesc alias use test.memdesc_view
+      %view = "test.memdesc_view"(%alloc) {ttg.partition = array<i32: 1>} : (!ttg.memdesc<1xi32, #shared, #smem, mutable>) -> !ttg.memdesc<1xi32, #shared, #smem>
+              ^
+test/NVWS/insert_semas_local_errors.mlir:16:15: note: see current operation: %2 = "test.memdesc_view"(%0) {ttg.partition = array<i32: 1>} : (!ttg.memdesc<1xi32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>) -> !ttg.memdesc<1xi32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory>

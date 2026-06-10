@@ -7,6 +7,9 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
+#include "triton/Dialect/TritonGPU/Transforms/PartitionBuilder.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -42,6 +45,7 @@ namespace nvws = triton::nvws;
 #include "InsertSemasAccessDag.h"
 #include "InsertSemasOwnerDag.h"
 #include "InsertSemasSyncDag.h"
+#include "InsertSemasEmitIR.h"
 
 // ---------------------------------------------------------------------------
 // Dispatcher. Commit 1 of the plan: stage 1 (ACCESS-DAG) only — pure
@@ -82,8 +86,8 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner) {
       return failure();
 
   if (shouldDumpDag()) {
-    llvm::errs() << "==== NVWS InsertSemas (commit 3: ACCESS-DAG + "
-                    "OWNER-DAG + SYNC-DAG) ====\n";
+    llvm::errs() << "==== NVWS InsertSemas (commit 4: ACCESS-DAG + "
+                    "OWNER-DAG + SYNC-DAG + EMIT) ====\n";
     llvm::errs() << "function: @" << funcOp.getName() << "\n";
     llvm::errs() << "groups: " << groups.size() << "\n";
     for (GroupDag &g : groups) {
@@ -92,7 +96,9 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner) {
       dumpGroupSyncDag(g, funcOp);
     }
   }
-  return success();
+
+  // Stage 4: EMIT-IR (the only mutating stage).
+  return emitIR(funcOp, groups);
 }
 
 } // namespace
