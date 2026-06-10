@@ -84,6 +84,13 @@ the evidence.
    loop-scheduler workaround — both sanctioned by ground rule 5; nothing
    else may move or rewrite emitted sync. Inexpressible cases get a hard
    diagnostic naming the DAG node — never a workaround.
+8. **`AGENTS.md` applies throughout**: build first, then lit (commands in
+   §4a are the canonical forms); no pytest beyond the single user-sanctioned
+   §5 gate-2 case; no guessing, no theorizing, no overreach beyond what this
+   plan explicitly permits; re-read the plan at every commit. Anything that
+   executes a kernel (the §5 runtime gates, any GPU repro) **requires the
+   GPU and must run outside the sandbox**; build, lit, and dump capture are
+   CPU-only and sandbox-safe.
 
 ## 1. Files and build
 
@@ -523,10 +530,23 @@ examples (§4.1 E1–E6, §5.3, §5.5 — ENTER/EXIT rows, `R`/`W` access rows,
 reference (that code is deleted), and the archived commit logs become the
 reference corpus. The user can independently dump any stage at any commit:
 
+Build and lit commands follow `AGENTS.md` (canonical; its rules apply:
+**first build, then run lit**; no pytest unless explicitly sanctioned —
+the §5 gate 2 case is user-sanctioned):
+
 ```bash
-# from the repo root — test/NVWS/*.mlir and logs/ are repo-root-relative
+# BUILD (AGENTS.md): always first
+cd /home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/build/cmake.linux-x86_64-cpython-3.12/ \
+  && ninja triton triton-opt
+
+# LIT (AGENTS.md): from that same build folder
+/home/egaburov/work/oai-triton/triton-src/llvm-project.git/build/bin/llvm-lit -v test
+#   (single suite/file: append its path under test/, e.g.
+#    .../llvm-lit -v test/TritonGPU/automatic-warp-specialization.mlir)
+
+# DUMP capture: from the repo root — test/NVWS/*.mlir and logs/ are
+# repo-root-relative (build + lit run CPU-only and work inside the sandbox)
 cd /home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git
-ninja -C build/cmake.linux-x86_64-cpython-3.12 triton triton-opt
 mkdir -p logs/new-insert-semas/commit<N>
 NVWS_INSERT_SEMA_DUMP_DAG=1 build/cmake.linux-x86_64-cpython-3.12/bin/triton-opt \
   test/NVWS/<f>.mlir -split-input-file -allow-unregistered-dialect \
@@ -785,9 +805,14 @@ must still error throughout.
 `test/NVWS/insert_semas*` lit tests **may fail** — golden regeneration is
 deferred to the next stage, after this plan is completed. The gates for this
 plan are exactly the following (`third_party/tlx/killgpu.sh` on any hang).
-Gate 1 runs from `build/cmake.linux-x86_64-cpython-3.12`; gates 2–3 run from
-the **repo root** — `run_nvws*.sh` and the pytest path are repo-root-relative
-and fail from the build dir:
+**Always build first** (AGENTS.md): `cd build/cmake.linux-x86_64-cpython-3.12/
+&& ninja triton triton-opt`. Gate 1 (lit) is CPU-only and runs from the
+build dir, sandbox fine. **Gates 2–3 execute kernels on the GPU and MUST be
+run outside the sandbox** (sandboxed shells have no GPU access — a sandboxed
+run fails or silently tests nothing; disable sandboxing for these commands
+or have the user run them); they run from the **repo root** —
+`run_nvws*.sh` and the pytest path are repo-root-relative and fail from the
+build dir:
 
 1. **`test/TritonGPU/automatic-warp-specialization.mlir` must pass,
    unmodified.** AutoWS runs insert-semas internally; the
