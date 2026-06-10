@@ -894,7 +894,13 @@ static void computeBackingPlan(GroupDag &g, triton::FuncOp funcOp,
   // owners, the walk, edges/semaphores, entry acquires, crossings, or
   // placement.
   g.backingPlan.numStages = 1;
-  if (g.isTmem() && !useMetaPartitioner && isMultiStagedGroup(g, numTmemBlocks))
+  // Zero-semaphore groups are untouched at emission (contract H): no stage
+  // assignment, no capacity charge — phantom charges from groups that will
+  // never be materialized are order-dependent and can push a later REAL
+  // accumulator below capacity (plan contract B).
+  bool untouched = g.semaTable.semas.empty();
+  if (g.isTmem() && !untouched && !useMetaPartitioner &&
+      isMultiStagedGroup(g, numTmemBlocks))
     g.backingPlan.numStages = 2;
   // Hoist anchor: before the first WS-tagged loop (function scope).
   Operation *anchor = nullptr;
@@ -904,7 +910,7 @@ static void computeBackingPlan(GroupDag &g, triton::FuncOp funcOp,
     return anchor ? WalkResult::interrupt() : WalkResult::advance();
   });
   g.backingPlan.hoistAnchor = anchor ? anchor : &funcOp.getBody().front().front();
-  if (g.isTmem())
+  if (g.isTmem() && !untouched)
     for (const Member &m : g.pieceTable.members) {
       auto shape = m.type.getShape();
       if (shape.size() >= 2)
@@ -1215,6 +1221,10 @@ static void dumpGroupSyncDag(GroupDag &g, triton::FuncOp funcOp) {
     }
     if (any)
       os << "  SEMAS c" << comp << ": " << ls.str() << "\n";
+  }
+  if (g.semaTable.semas.empty()) {
+    os << "  BACKING: untouched (no semaphores)\n";
+    return;
   }
   os << "  BACKING: numStages=" << g.backingPlan.numStages << " anchor=";
   if (auto forOp = dyn_cast_or_null<scf::ForOp>(g.backingPlan.hoistAnchor))

@@ -111,9 +111,10 @@ diffed against spec §6 and plan commit-4. Produced by a background explorer,
 A. **`@nested_loop_no_double_buffer` numStages=2 vs golden 1x.** The verbatim
    veto-chain ruling (pattern gate dropped) double-buffers a shape the old
    pass single-buffered ONLY via the dropped gate (consumer-side in-loop
-   store). The in-tree golden pins `1x128x128`. At commit 4 either the
-   regenerated golden accepts 2x (more TMEM for this shape) or the ruling
-   gains a nuance.
+   store). The in-tree golden pins `1x128x128`. **RULED (user): 2x is
+   CORRECT** — the dropped gate was a condition InsertTmemSemaphore needed
+   for its own pipeline, not something this pass requires; the golden
+   regenerates to 2x at commit 4.
 B. **Sync-free TMEM groups inflate the capacity budget.** The veto chain
    evaluates a scales group against its MMA's ACCUMULATOR shape with
    cumulative numTmemBlocks, so identical immutable, semaphore-less scales

@@ -467,7 +467,11 @@ InsertTmemSemaphore.cpp:1431/:1596) ; `useMetaPartitioner` ⇒ 1
 (meta_fa_fwd is all 1x). Implemented as `computeBackingStages(group,
 numTmemBlocks&)` in **stage 3** output (BackingPlan), modeled on
 the :1408-1425 veto chain per the user ruling (pattern gate dropped) —
-never at emit time.
+never at emit time. **Zero-semaphore groups are exempt**: a group with no
+semaphores is untouched at emission (contract H), so it gets NO stage
+assignment and NO capacity charge — its BACKING line reports `untouched`.
+Without this, phantom 2x charges from never-materialized groups are
+order-dependent and can push a later REAL accumulator below capacity.
 
 **C. Backing dedup and reuse views — emission per member, coalescing as a
 post-process.** The final-IR shape in the goldens: members with identical
@@ -502,15 +506,26 @@ placement is realized downstream from the attrs.
 (`tmem-buffer-reuse-semas.mlir` :22–:25; meta_fa_fwd :302 → :306–:309 —
 in-inner-loop sourceful alloc stores into view member #4 and releases
 `<none>`); `ttg.local_alloc %src` → `ttg.local_store` into the view
-(`insert_semas_local_buffer_reuse.mlir` :32–:41).
+(`insert_semas_local_buffer_reuse.mlir` :32–:41). The synthesized store
+(and its `arith.constant true` / splat) inherits the ORIGINAL alloc's
+owner and stage/cluster (mining gap 8). A SCALAR `%src`
+(float/int) first materializes via `triton::SplatOp`, owner+stage
+stamped, then the local_store (mining gap 7). **OPEN DECISION (mining
+gap 6, user ruling pending):** a managed `ttg.local_alloc %src` whose
+source is a `tt.descriptor_load/gather` — old pass converted it to
+`nvws.descriptor_load/gather` writing the view directly (no register
+round-trip); contract D as written would store through registers. No
+corpus input exercises it; stage 1 must DETECT the shape and surface a
+named diagnostic until ruled.
 
 **E. ALL original TMEM tokens are nuked — as a pre-process, before any
 semaphore IR is emitted.** Design rule: nuke *all* TMEM async-token plumbing
 of every semaphore-managed group, then thread *all* semaphore tokens fresh.
 The nuke is a dedicated pre-pass at the top of commit-4 emission: create
 **one function-level `ub.poison : !ttg.async.token`** (InsertTmemSemaphore's
-`replToken` pattern — one value for the whole function; never poison ops
-inside loops), then clear dep/token operands of the groups' access ops
+`replToken` pattern — one value for the whole function; THIS PRE-PROCESS
+never creates poison ops inside loops — the step-7 workaround's in-loop
+poison is a sanctioned exception), then clear dep/token operands of the groups' access ops
 (empty `[]` brackets — `insert_semas.mlir` :600–:608; meta_fa_fwd
 :322/:329) and RAUW their token results and dead token iter_arg slots —
 init and yield — with that single value
@@ -564,7 +579,13 @@ pass behave):
   live above the pipelined region.
 - `nvws.semaphore.acquire` anchored before a real access op: stage/cluster
   read off that access op (`getStageCluster(dstOp)`).
-- `nvws.semaphore.buffer`: identical to the acquire that produced its token.
+- `nvws.semaphore.buffer`: stamped with the CONSUMING ACCESS's owner and
+  stage/cluster, NOT the acquire's (mining gap 3) — views are materialized
+  LAZILY at the requesting access, per region: the view cache is cleared
+  at every acquire AND at every region entry/exit, so a carried token gets
+  a fresh view in each region that uses it. One buffer op yields ALL
+  member views of a multi-member semaphore at once (`TypeRange` of member
+  view types), cached until the next acquire or region boundary.
 - `nvws.semaphore.release` anchored after a real access op: stage/cluster of
   that source access op.
 - Sync ops anchored on virtual rows (`Enter`/`Exit`/super-node — no real
@@ -914,7 +935,9 @@ Strict order — pre-process, apply frozen plans, render, post-process:
    equal exit carrier owner (no reconcile-toggling; inequality = verifier
    failure), set both yields per the Crossing facts (each branch := its
    `finals[]` entry's token, or the incoming carrier when null — SSA
-   pass-through; yield partition attrs := `slotOwner`), carrier := if
+   pass-through; yield partition attrs are UNION-EXTENDED with `slotOwner` — start from
+   the yield's existing `ttg.partition` ids and add the token owners,
+   never overwrite (mining gap 5)), carrier := if
    result; no-crossing regions
    balance locally (cf. :964–977). Access nodes: retarget memdesc operands
    through the recorded alias chain onto the member's view; sourceful
@@ -926,7 +949,18 @@ Strict order — pre-process, apply frozen plans, render, post-process:
    with the condition/bounds availability to each added partition verified
    (spec §6) — note `--tritongpu-partition-loops` does **not** rematerialize
    condition chains into a partition's stream; if the condition's defining
-   ops do not already carry `P`, that is a hard diagnostic, not a fixup. Erase fully-retargeted originals.
+   ops do not already carry `P`, that is a hard diagnostic, not a fixup.
+   **View types (mining gap 4):** a local member's view type = the access
+   site's own memdesc type after walking leading `memdesc_index` alias
+   steps, mutability forced `true`; alias-chain replay SKIPS
+   `memdesc_index` steps whose result type already equals the current view
+   type, and forces each cloned view op's result mutability to its
+   source's; TMEM views retain the allocShape suffix.
+   **RAUW discipline (mining gap 9):** replace only uses DOMINATED by the
+   view; exclude the synthesized store and `SemaphoreCreateOp` users;
+   track rewritten values so later retargeting matches the original OR
+   the already-rewritten value. Erase fully-retargeted originals (alias
+   ops in reverse order before allocs — uses before defs).
 5. **Post-emit verifier**: emitted-op ↔ node bijection; every view token
    traces to a DAG acquire; tokens cross boundaries only via planned slots.
 6. **Post-process: coalesce TMEM backings into views** (contract C): per
@@ -937,7 +971,23 @@ Strict order — pre-process, apply frozen plans, render, post-process:
    accepted the emitted semaphore IR. Local backings exempt.
 7. **Post-process: loop-scheduler workaround, last** — a second, separate
    post-processor: the `scf.if` acquire/release split reimplemented from
-   `workaroundForLoopScheduler` (InsertTmemSemaphore.cpp:1640–). It reshapes
+   the OLD PASS's `splitSemaphoreIfForLoopScheduler`
+   (`git show 5cfe0ac6e7^:.../InsertSemasEmitter.h` :2793–:2999) — NOT from
+   `InsertTmemSemaphore.cpp:1640`, whose simplified variant hard-codes
+   partitions 1/0 and only matches release-first/acquire-last then-blocks
+   (mining report gap 1). The full rule set to reimplement: the candidate
+   release need not be the branch's first op (skip ConstantLike and alias
+   ops); ELSE-branch splits; RELEASE-ONLY splits (TMEM semaphore with a
+   later acquire in the same branch -> exit-if only); the
+   acquire-first-then-block pattern with a release immediately preceding
+   the if; full-split REFUSAL when the TMEM semaphore has multiple member
+   base types; exit-if stage = the release's stage with
+   `inferPrecedingMmaStage(ifOp)` fallback; enter/exit partitions = the
+   UNION of the release's and acquire's owners (owner-derived, never
+   hard-coded); middle-if partitions = original minus the enter/exit ids
+   with per-result outputs; `setPartitionOutputs(exitIf, {})`. The
+   workaround legitimately creates ONE `ub.poison` inside the loop body
+   (feeding the middle if's dead slot) — exempt from the step-1 rule. It reshapes
    `scf.if` token plumbing so the downstream loop scheduler can pipeline
    release and acquire into different stages. **This step is critical for
    `test/TritonGPU/automatic-warp-specialization.mlir` to pass** — AutoWS
@@ -981,6 +1031,11 @@ build dir:
    /home/egaburov/work/oai-triton/triton-src/llvm-project.git/build/bin/llvm-lit \
        -v test/TritonGPU/automatic-warp-specialization.mlir
    ```
+
+**Gate ordering is strict (mining gap 10): no pytest runs until gate 1
+passes UNMODIFIED. A timeout at any gate is a hang CAUSED BY THE CURRENT
+CHANGE — stop and root-cause it; never retry, never broaden the test
+selection.**
 
 2. **One pytest case, 60s timeout — DO NOT run the entire pytest suite:**
 

@@ -806,7 +806,7 @@ the terminator) holds by construction:
 |---|---|
 | `Func`/`For`/`If` | recurse; thread the live carrier tokens through `iter_args` / if-results — one slot per live component; the slot's owner and its final-carrier row are **stage-3 ThreadingPlan facts** (then/body yields the recorded final carrier's token; else/skip yields the incoming carrier unchanged — an SSA pass-through, which is why bare else brackets need no record) |
 | `Enter`/`Exit` | insertion-point markers only |
-| `Acquire` | emit `nvws.semaphore.acquire`; its token becomes the owner's carrier; emit/cache the `nvws.semaphore.buffer` view |
+| `Acquire` | emit `nvws.semaphore.acquire`; its token becomes the owner's carrier. Buffer VIEWS are NOT emitted here: `nvws.semaphore.buffer` is materialized lazily at each consuming access, in that access's region, stamped with that access's owner and stage/cluster; the view cache clears at every acquire and at every region boundary (a carried token gets a fresh view per region); one buffer op yields all member views of a multi-member semaphore |
 | `Access` | retarget the op's memdesc operands onto the view (via the recorded alias chain); erase its original async-token plumbing |
 | `Release` | emit `nvws.semaphore.release` with the node's recorded payload, consuming the owner's carrier token |
 
