@@ -261,6 +261,18 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SyncCtx &ctx,
         WaveSt &w = wave[compOf(p)];
         bool force = w.valid && n->owner.has_value() &&
                      w.owner.has_value() && !sameOwner(w.owner, n->owner);
+        // NOTE (TOKEN RETENTION — deliberately NOT implemented, spec
+        // Addendum A): when this toucher held the carrier earlier in the
+        // SAME chain and every conflicting holder is already
+        // transitively synchronized behind it, this forced edge creates
+        // a semaphore that can never block (same source completion, same
+        // acquiring partition, later in its program order — meta-FA
+        // S2/S6 class). Eliding it here (force stands down; the touch
+        // rides the partition's retained token) was implemented and
+        // gate-green in commit 844bf8fa63, but cost ~5% FA performance:
+        // the always-satisfied wait doubles as a runtime pacing point
+        // (without it the merged store issues into the mma's operand-
+        // streaming window). Keep the "redundant" semaphore on purpose.
         applyTouch(st, p, n->owner, e, n, pay, ctx, /*wsAdopt=*/false,
                    force, w.lastRow, w.owner, w.pay);
         if (n->owner.has_value()) {

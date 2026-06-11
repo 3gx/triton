@@ -1141,3 +1141,17 @@ selection.**
   (automatic-warp-specialization.mlir unmodified, the single pytest case,
   both FA scripts); `insert_semas*` golden regeneration explicitly deferred
   to the next stage.
+
+---
+
+ADDENDUM (11jun26): TOKEN RETENTION — evaluated, NOT implemented. The
+same-source/same-acquirer/later-in-program-order semaphores (meta-FA
+S2/S6 class) are provably non-blocking, and a full elision
+implementation (spec Addendum A) passed all gates with meta-FA stats
+groups at 7 semaphores instead of 9 — but cost ~5% FA performance
+(bisect-confirmed; the waits act as runtime pacing points: without
+them the merged stores issue into the mma's operand-streaming window).
+Implementation preserved in commit 844bf8fa63 on branch
+egx/meta/sema10a-meta-new-sema-fresh-v5-fable; landing site marked by
+a placeholder comment at the wave-locality force in walkChain
+(InsertSemasSyncDag.h). Keep the "redundant" semaphores on purpose.

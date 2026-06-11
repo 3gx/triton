@@ -1036,3 +1036,61 @@ meanwhile. Expected eventual churn (intended): per-destination fan-out
 semaphores, entry acquires rendered before loops, finer piece granularity
 decoupling partially-overlapping members, tail acquires before `scf.yield`,
 appended-only token slots.
+
+---
+
+## Addendum A — TOKEN RETENTION (evaluated, NOT implemented: perf regression)
+
+**The redundancy.** A semaphore whose release and acquire satisfy all of:
+released by the same completion event as another semaphore, acquired by
+the SAME partition, and acquired LATER in that partition's program order,
+can never block — by the time the partition reaches the wait, the permit
+was granted long ago (the partition already waited on the same event at
+its earlier acquire). Example: the meta-FA stats group, where the qk mma
+releases both S0 (acquired by the softmax partition before `read qk_0`)
+and S2 (acquired by the same partition later, before `store p`); S2
+transfers no information. Same shape one level up for the l/m stats
+stores (S5/S6).
+
+**The elision rule (where it would land).** Stage 3, the wave-locality
+`force` site in `walkChain` (see the placeholder comment in
+`InsertSemasSyncDag.h`): the force may stand down — the touch riding the
+partition's RETAINED token from its earlier wave, with no new acquire
+and no semaphore — iff (a) the toucher held the carrier earlier in the
+SAME chain (its token is live partition-local SSA), and (b) zero edges
+are needed (every conflicting holder is already transitively
+synchronized behind the toucher; an intervening conflicting touch
+becomes a holder demanding a real edge, blocking the merge
+automatically). Companion pieces: cross-game `syncedBehind` marking
+(one release event covers every piece pending at that row), the chain
+verifier accepting retained owners, an emitter retained
+(component, partition) -> token map, and an owner-keyed view cache.
+
+**It was implemented and measured** — full implementation, dedicated lit
+test (`insert_semas_token_retention.mlir`, merge-fires + conflict-blocks
+cases), and regenerated corpus live in commit `844bf8fa63`
+("[InsertSemas rewrite 4.10/4]", branch
+`egx/meta/sema10a-meta-new-sema-fresh-v5-fable`). Meta-FA stats groups
+dropped 9 -> 7 semaphores; all gates green. **But it costs ~5% FA
+performance** (user-measured; bisect-confirmed against `8642940bd1`).
+
+**Root-cause findings (IR-level, from the 4.4 vs 4.5 corpus diff +
+AssignStagePhase comparison):** every surviving op keeps byte-identical
+`loop.stage`/`loop.cluster` — the software-pipeline schedule is
+unchanged, so "the removed acquire perturbed the pipeliner" is ruled
+out. The only real deltas are at runtime: two fewer mbarrier objects,
+one fewer `tc5mma` arrive per mma, two fewer (always-satisfied) waits
+per iteration — and, the surviving hypothesis: the merged stores now
+ISSUE EARLIER in their partition's instruction stream (no wait
+sequence before them), moving their TMEM writes from the post-commit
+window into the mma's operand-streaming window — a contention-window
+shift, plausibly the ~5%. Unproven at the IR level; confirming needs
+profiles (TMEM/SMEM port stalls, mbarrier stall cycles).
+
+**Status: NOT implemented, by user ruling (11jun26).** The "redundant"
+semaphore is kept deliberately — it doubles as a runtime pacing point.
+If ever revisited: the refinement suggested by the evidence is to merge
+only when the riding touch lands in the SAME `loop.stage`/`loop.cluster`
+as the retained acquire (the epilogue stats merges keep their benefit;
+the cross-stage in-loop merge — the suspect — keeps its semaphore), and
+to gate the whole feature behind an env knob for perf A/B.
