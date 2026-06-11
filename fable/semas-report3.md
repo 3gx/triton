@@ -738,11 +738,16 @@ Rules that produce and govern this shape:
   across the whole corpus: root for root-seeded accumulators, the producer
   partition for operand buffers, and the in-loop first toucher for
   branch-local buffers (whose placement chain's ENTER owner is root — the
-  ENTER owner is NOT the inherit fact). Emission stamps the entry-acquire
-  op with it
-  (`ttg.partition`+tag for a partition, no attrs for root; this is exactly
-  what the previous pass emitted: operand entries stamped `{p2, tag 0}`,
-  the root-seeded accumulator entry attr-less).
+  ENTER owner is NOT the inherit fact). **Emission (USER RULING 10jun26 — root-outside rule, PARKED: see
+  fable/attr-less-acquire-release-handoff.md; current emission still
+  stamps inheritStamp): entry acquires are emitted ATTR-LESS, always.** They
+  execute in the root block (partition-loops leaves unannotated ops in
+  place); the one-time wait passes off the initial permit, so no phase
+  needs communicating — an entry acquire is a phase SOURCE (a static
+  constant), never a consumer. `inheritStamp` remains a recorded analysis
+  fact (the component's first access owner, printed in SEMAS), but it is
+  no longer an emission stamp. This supersedes the earlier
+  replicate-the-previous-pass stamping ({p2, tag 0} on operand entries).
   **M3 acquirer-class criterion (verifier, hard error):** for every
   semaphore, the set of acquiring owners may contain **at most one
   concrete partition**; `root` is additionally allowed (the inherit case).
@@ -881,10 +886,20 @@ the terminator) holds by construction:
 | *(post-nuke)* | the token nuke leaves dead token-typed **signature slots** (a `scf.for` iter_arg whose region arg and result are both unused; a `scf.if` result that is unused); these are erased to a fixpoint before any semaphore IR is emitted — dropping the matching init/yield operands and `ttg.partition.outputs` entries. Gate-1 evidence (automatic-warp-specialization.mlir): surviving poison-husk slots change region signatures and break the downstream loop scheduler |
 | `Release` | emit `nvws.semaphore.release` with the node's recorded payload, consuming the owner's carrier token |
 
-Plus the mechanical stamping rules: every sync op carries its node's owner
-partition; a sync op owned by `{P}` but emitted outside the WS loop also
-carries the loop's `ttg.warp_specialize.tag` (required for
-`--tritongpu-partition-loops` routing and isolated-region co-location);
+Plus the mechanical stamping rules: INSIDE the WS loop every sync op
+carries exactly its node's owner partition (mandatory — partition-loops
+routes child ops by it). OUTSIDE the WS loop (USER RULING 10jun26 — root-outside rule, PARKED
+pending LowerAref tolerance, see
+fable/attr-less-acquire-release-handoff.md; current emission stamps
+{P}+tag for every concrete owner): the default is ROOT, attr-less. Annotation `{P}` +
+`ttg.warp_specialize.tag` is emitted only when P is NON-ZERO — i.e. the
+op consumes a token/phase from a non-zero partition's chain and must be
+routed into that warp-group region so its stage/phase SSA chain stays
+local (unannotated it would force the phase to be exported into
+partition 0 — a cross-warpgroup cost). Partition 0 and root are the same
+cost domain (the default warpgroup executes the root block), so a
+partition-0 owner outside the loop emits attr-less; entry acquires are
+always attr-less (phase sources, see the inherit rule);
 stage/cluster is read off the anchor access op, with the per-partition
 last-seen cache for all virtual-row anchors (`Enter`/`Exit`/super-node);
 `nvws.semaphore.create` ops (one per semaphore, `true` iff entry — §5.3 IR

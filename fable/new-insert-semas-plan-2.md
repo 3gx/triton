@@ -863,6 +863,10 @@ applies only while the toucher still holds the carrier; a cross-partition
 touch on a moved carrier always materializes an edge, and two hard-error
 verifiers (stage-3 chain carrier locality; emitter post-emit token/view
 locality) pin the class — see the spec's WAVE LOCALITY section; the
+ROOT-OUTSIDE rule (10jun26): outside tt.ws sync ops default to root
+attr-less; `{P}`+tag only for non-zero P (phase-chain locality; p0 ==
+root cost domain; entry acquires always root) — see spec stamping rules;
+the
 TRANSITIVE REDUCTION post-pass (spec section; ruled 10jun26) drops
 implied same-chain edges with a witness obligation, guarded by the
 independent closure verifier (every dropped edge must be covered by the

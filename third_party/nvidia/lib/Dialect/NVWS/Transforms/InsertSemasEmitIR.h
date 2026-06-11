@@ -58,6 +58,9 @@ static OpT emitInto(OpBuilder &b, Location loc, const Owner &owner,
       forOp = forOp->template getParentOfType<scf::ForOp>();
     if (!forOp)
       gpu::setWarpSpecializeTag(op, owner->second);
+    // ROOT-OUTSIDE rule: PARKED (user ruling 10jun26) — blocked by
+    // LowerAref's stamped-acquire assumptions; see
+    // fable/attr-less-acquire-release-handoff.md for the exact change.
   }
   return op;
 }
@@ -316,7 +319,10 @@ static void emitEntryAcquires(EmitCtx &ctx, GroupDag &g,
                                         .getTerminator()
                                   : &ctx.func.getBody().front().back());
         // Carrier-inherit stamp (spec 5.3): the op carries inheritStamp,
-        // not root, matching the previous pass's emitted IR.
+        // NOT the node's root owner — the one sanctioned DAG/IR stamp
+        // divergence. The attr-less ROOT-OUTSIDE form (emission matching
+        // the DAG) is PARKED pending LowerAref tolerance —
+        // fable/attr-less-acquire-release-handoff.md.
         const Sema &s = g.semaTable.semas[n->sema];
         gpu::StageCluster sc = {};
         auto acq = emitInto<nvws::SemaphoreAcquireOp>(
