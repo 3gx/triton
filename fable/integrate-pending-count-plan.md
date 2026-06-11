@@ -103,20 +103,21 @@ matches the pass ethos (hard diagnostic, never a silent repair).
      semaphore with asymmetric source counts) so the PASS ITSELF emits
      `release ... arrive_count(2)` — pin it, and feed the same case
      through `--nvws-insert-semas --nvws-lower-semaphore` to pin the
-     lowered `arrive_barrier ..., 2`. EXPLORATION OUTCOME (11jun26):
-     no current input reaches the scaling path — the whole corpus emits
-     arrive_count = 1 everywhere (214 releases), and a constructed
-     asymmetric-wave probe (fanout store + 2 readers + regain store +
-     single second reader) was resolved by the pass with SEPARATE
-     semaphores (in-body fan-in count-2 + count-1 exit), every wave
-     symmetric. The SyncDag adoption path (For-row group adopting the
-     regain group's semaphore with fewer sources) demands a shape not
-     yet identified. TODO: revisit when a real asymmetric-wave kernel
-     appears; the hand-written lower-level coverage
-     (lower_semaphore_arrive_count.mlir) pins the count>1 lowering
-     contract meanwhile. Probe preserved at /tmp/asym_probe.mlir
-     pattern in this plan's history; do not fake the shape with
-     hand-mutated metadata (feedback-partition-metadata-semantics).
+     lowered `arrive_barrier ..., 2`. RESOLVED (11jun26, second pass):
+     the triggering shape already existed in-tree —
+     insert_semas_release_count.mlir (rewrite commit 3.1/4) drives the
+     SyncDag For-row adoption with a 1-source outer group adopting a
+     2-source regain (its DAG dump pins `r S0(2)`); it was missed
+     because its RUN piped to /dev/null, so no emitted-IR golden carried
+     arrive_count. The test now has EMIT and LOWER check prefixes
+     pinning `pending_count = 2` / `arrive_count = 2` in emitted IR and
+     `init_barrier/arrive_barrier ..., 2` after lowering — end-to-end
+     coverage from a real pass-produced shape. (Hand-built probes that
+     do NOT trigger the path, for the record: an in-body asymmetric
+     second reader resolves to separate symmetric semaphores via an
+     EXIT-close group, and a pre-loop toucher resolves via entry-permit
+     semantics; the adoption specifically needs an outer For-row edge
+     whose acquirer's LAST in-body group has more sources.)
 - **Negative tests** (4): create missing pending_count at lowering;
   release missing arrive_count at lowering; pending_count != analysis;
   `arrive_count > 1` with an async kind (expects the lowering

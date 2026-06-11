@@ -1,4 +1,15 @@
 // RUN: env NVWS_INSERT_SEMA_DUMP_DAG=1 triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas -o /dev/null 2>&1 | FileCheck %s
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas -cse | FileCheck %s --check-prefix=EMIT
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas --nvws-lower-semaphore -cse | FileCheck %s --check-prefix=LOWER
+//
+// EMIT/LOWER pin the first-class count contract end to end on THIS
+// pass-produced shape (fable/integrate-pending-count-plan.md): the
+// scaled release carries arrive_count = 2 in emitted IR, and the
+// lowering transcribes both counts into the mbarrier init/arrive.
+// EMIT: nvws.semaphore.create {{.*}} {pending_count = 2 : i32}
+// EMIT: nvws.semaphore.release {{.*}} {arrive_count = 2 : i32, ttg.partition = array<i32: 3>}
+// LOWER: ttng.init_barrier {{.*}}, 2
+// LOWER: ttng.arrive_barrier {{.*}}, 2
 
 // Release arrive-multiplicity (spec section 5.2, uniform pending count):
 // a semaphore's pending count is a per-semaphore constant — every acquire
