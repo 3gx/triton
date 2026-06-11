@@ -467,6 +467,32 @@ Rows are visited in chain order; the complete rule set:
    of the view's partition; root-stamped entry acquires are the one
    sanctioned seed exemption).
 
+   **TOKEN RETENTION (same-owner wave merge — USER RULING 11jun26,
+   pay-for-play).** The wave-locality MUST above has one sound
+   exception: a token is partition-local SSA, so it stays usable by its
+   own partition after the carrier moves on. A touch by Q while the
+   carrier belongs to P != Q rides Q's RETAINED token — no fresh edge,
+   no semaphore — iff BOTH hold: (a) Q already held the carrier earlier
+   in the SAME chain (Q has a live token: an earlier acquire by Q, or
+   the chain's ENTER-carried owner is Q), and (b) the elision rules
+   prove ZERO edges would be needed (every conflicting holder is
+   already transitively synchronized behind Q). Condition (b) makes the
+   intervening-conflict check automatic: any foreign touch on the same
+   pieces since Q's wave becomes a holder that demands a real edge,
+   which blocks the merge and the touch opens a wave normally. The
+   merged touch's releases consume the retained token (same partition —
+   token locality holds by construction). Evidence: meta-FA stats
+   group, S2 — released by the same mma completion as S0 and acquired
+   by the same partition later in its program order; the wait can never
+   block and transfers nothing (and S6 identically, one level up).
+   Verifier extensions: the stage-3 chain verifier accepts an
+   Access/Release row whose owner holds a retained token (an earlier
+   Acquire row of that owner in the chain) in place of the current
+   carrier; the post-emit token-locality subpass needs no change (the
+   retained token's acquire IS the op's own partition). The emitter
+   keeps a retained (component, partition) -> token map beside the
+   carrier, scoped like the chain: never across region boundaries.
+
    **FORWARD REGAIN PLACEMENT (USER RULING 10jun26, second instance of
    the class):** only ONE token is carried into the following traversal
    through the iter_args slot — the chain's first wave owner's (the

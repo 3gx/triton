@@ -1,0 +1,14 @@
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 1, colStride = 1>
+#tmem1 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @tmem_reuse_views_end_of_insert_semas() {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %result = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 42 : i32, buffer.offset = 64 : i32} : () -> !ttg.memdesc<1x128x1xf32, #tmem, #ttng.tensor_memory, mutable>
+    %result_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 42 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32, #tmem1, #ttng.tensor_memory, mutable>
+    %result_1 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 42 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf16, #tmem1, #ttng.tensor_memory, mutable>
+    "use"(%result, %result_0, %result_1) : (!ttg.memdesc<1x128x1xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x128x128xf32, #tmem1, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x128x128xf16, #tmem1, #ttng.tensor_memory, mutable>) -> ()
+    tt.return
+  }
+}
+

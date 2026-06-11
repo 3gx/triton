@@ -917,6 +917,18 @@ their loop, counts on grouped acquires). Eyeball against
 `insert_semas.mlir::local_smem_fanout`, `insert_semas_per_edge_tmem.mlir`,
 `insert_semas_local_cfg.mlir`, and the meta_fa_fwd keystone chain.
 
+TOKEN RETENTION (same-owner wave merge, spec wave-locality section,
+user ruling 11jun26): the wave-locality force stands down when the
+toucher held the carrier earlier in the same chain AND zero edges are
+needed (all conflicting holders transitively synchronized behind it) --
+the touch rides the partition's retained token instead of opening a new
+wave; no semaphore is created for it. Kills the redundant
+same-source/same-acquirer/later-in-program-order semaphores (meta-FA
+S2/S6 class). Chain verifier accepts retained owners; emitter carries a
+(component, partition) retained-token map beside the carrier, region
+scoped. Dedicated lit: merge fires (3 semas not 4) + conflicting
+intervening write blocks the merge.
+
 ### Commit 4 — EMIT-IR (creates `InsertSemasEmitIR.h`)
 Strict order — pre-process, apply frozen plans, render, post-process:
 

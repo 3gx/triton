@@ -1,0 +1,180 @@
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @tmem_mixed_overlap_spanning_member
+groups: 1
+GROUP buffer.id=520 memory=tmem members=5
+  members: m0[64,65) m1[66,67) m2[65,66) m3[0,128) m4[0,64)
+  pieces: P0=[0,64){m3,m4}c0 P1=[64,65){m0,m3}c0 P2=[65,66){m2,m3}c0 P3=[66,67){m1,m3}c0 P4=[67,128){m3}c0
+  footprints: m0={P1} m1={P3} m2={P2} m3={P0,P1,P2,P3,P4} m4={P0}
+ACCESS-DAG
+|- func @tmem_mixed_overlap_spanning_member
+|  |- scf.for (WS, tag=0) effects{P0:W,P1:W,P2:W,P3:W,P4:W}
+|  |  |- W  m0  ttng.tmem_store {1}
+|  |  |- R  m0  ttng.tmem_load {2}
+|  |  |- W  m1  ttng.tmem_store {1}
+|  |  |- R  m1  ttng.tmem_load {2}
+|  |  |- W  m2  ttng.tmem_store {1}
+|  |  |- R  m2  ttng.tmem_load {2}
+|  |  |- W  m3  ttng.tmem_store {2}
+|  |  |- R  m3  ttng.tmem_load {0}
+|  |  |- W  m4  ttng.tmem_store {0}
+|  |  |- R  m4  ttng.tmem_load {1}
+OWNER-DAG
+|- func @tmem_mixed_overlap_spanning_member
+|  |- scf.for (WS, tag=0) pieces{P0:W:{2},P1:W:{1},P2:W:{1},P3:W:{1},P4:W:{2}}
+|  |  |- ENTER pieces{P0:W:{2},P1:W:{1},P2:W:{1},P3:W:{1},P4:W:{2}}
+|  |  |- W  m0  ttng.tmem_store {1}
+|  |  |- R  m0  ttng.tmem_load {2}
+|  |  |- W  m1  ttng.tmem_store {1}
+|  |  |- R  m1  ttng.tmem_load {2}
+|  |  |- W  m2  ttng.tmem_store {1}
+|  |  |- R  m2  ttng.tmem_load {2}
+|  |  |- W  m3  ttng.tmem_store {2}
+|  |  |- R  m3  ttng.tmem_load {0}
+|  |  |- W  m4  ttng.tmem_store {0}
+|  |  |- R  m4  ttng.tmem_load {1}
+|  |  |- EXIT pieces{P0:W:{2},P1:W:{1},P2:W:{1},P3:W:{1},P4:W:{2}}
+SYNC-DAG
+|- func @tmem_mixed_overlap_spanning_member
+|  |- a  S5(2)  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{2},P1:W:{1},P2:W:{1},P3:W:{1},P4:W:{2}} parts{0,1,2} thread{c0:{1}}
+|  |  |- ENTER pieces{P0:W:{2},P1:W:{1},P2:W:{1},P3:W:{1},P4:W:{2}}
+|  |  |- W m0  ttng.tmem_store {1}
+|  |  |- r  S0  {1} [none]
+|  |  |- a  S0  {2}
+|  |  |- R m0  ttng.tmem_load {2}
+|  |  |- W m1  ttng.tmem_store {1}
+|  |  |- r  S1  {1} [none]
+|  |  |- a  S1  {2}
+|  |  |- R m1  ttng.tmem_load {2}
+|  |  |- W m2  ttng.tmem_store {1}
+|  |  |- r  S2  {1} [none]
+|  |  |- a  S2  {2}
+|  |  |- R m2  ttng.tmem_load {2}
+|  |  |- W m3  ttng.tmem_store {2}
+|  |  |- r  S3  {2} [none]
+|  |  |- r  S5  {2} [none]
+|  |  |- a  S3  {0}
+|  |  |- R m3  ttng.tmem_load {0}
+|  |  |- r  S5  {0} [none]
+|  |  |- W m4  ttng.tmem_store {0}
+|  |  |- r  S4  {0} [none]
+|  |  |- a  S4  {1}
+|  |  |- R m4  ttng.tmem_load {1}
+|  |  |- a  S5(2)  {1}
+|  |  |- EXIT pieces{P0:W:{2},P1:W:{1},P2:W:{1},P3:W:{1},P4:W:{2}} yield{c0: a S5}
+  SEMAS c0: S0{count=1} S1{count=1} S2{count=1} S3{count=1} S4{count=1} S5{count=2 entry inherit={@0.1}}
+  BACKING: numStages=2 anchor=before scf.for(tag=0)
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @tmem_disjoint_slivers_cross_partition
+groups: 1
+GROUP buffer.id=521 memory=tmem members=4
+  members: m0[64,65) m1[66,67) m2[65,66) m3[0,64)
+  pieces: P0=[0,64){m3}c0 P1=[64,65){m0}c1 P2=[65,66){m2}c2 P3=[66,67){m1}c3
+  footprints: m0={P1} m1={P3} m2={P2} m3={P0}
+ACCESS-DAG
+|- func @tmem_disjoint_slivers_cross_partition
+|  |- scf.for (WS, tag=1) effects{P0:W,P1:W,P2:W,P3:W}
+|  |  |- W  m0  ttng.tmem_store {1}
+|  |  |- R  m0  ttng.tmem_load {2}
+|  |  |- W  m1  ttng.tmem_store {1}
+|  |  |- R  m1  ttng.tmem_load {2}
+|  |  |- W  m2  ttng.tmem_store {1}
+|  |  |- R  m2  ttng.tmem_load {2}
+|  |  |- W  m3  ttng.tmem_store {0}
+|  |  |- R  m3  ttng.tmem_load {1}
+OWNER-DAG
+|- func @tmem_disjoint_slivers_cross_partition
+|  |- scf.for (WS, tag=1) pieces{P0:W:{0},P1:W:{1},P2:W:{1},P3:W:{1}}
+|  |  |- ENTER pieces{P0:W:{0},P1:W:{1},P2:W:{1},P3:W:{1}}
+|  |  |- W  m0  ttng.tmem_store {1}
+|  |  |- R  m0  ttng.tmem_load {2}
+|  |  |- W  m1  ttng.tmem_store {1}
+|  |  |- R  m1  ttng.tmem_load {2}
+|  |  |- W  m2  ttng.tmem_store {1}
+|  |  |- R  m2  ttng.tmem_load {2}
+|  |  |- W  m3  ttng.tmem_store {0}
+|  |  |- R  m3  ttng.tmem_load {1}
+|  |  |- EXIT pieces{P0:W:{0},P1:W:{1},P2:W:{1},P3:W:{1}}
+SYNC-DAG
+|- func @tmem_disjoint_slivers_cross_partition
+|  |- a  S3  root  ; entry
+|  |- a  S5  root  ; entry
+|  |- a  S6  root  ; entry
+|  |- a  S7  root  ; entry
+|  |- scf.for (WS, tag=1) pieces{P0:W:{0},P1:W:{1},P2:W:{1},P3:W:{1}} parts{0,1,2} thread{c0:{1},c1:{1},c2:{1},c3:{1}}
+|  |  |- ENTER pieces{P0:W:{0},P1:W:{1},P2:W:{1},P3:W:{1}}
+|  |  |- W m0  ttng.tmem_store {1}
+|  |  |- r  S0  {1} [none]
+|  |  |- a  S0  {2}
+|  |  |- R m0  ttng.tmem_load {2}
+|  |  |- r  S5  {2} [none]
+|  |  |- W m1  ttng.tmem_store {1}
+|  |  |- r  S1  {1} [none]
+|  |  |- a  S1  {2}
+|  |  |- R m1  ttng.tmem_load {2}
+|  |  |- r  S7  {2} [none]
+|  |  |- W m2  ttng.tmem_store {1}
+|  |  |- r  S2  {1} [none]
+|  |  |- a  S2  {2}
+|  |  |- R m2  ttng.tmem_load {2}
+|  |  |- r  S6  {2} [none]
+|  |  |- a  S4  {0}
+|  |  |- W m3  ttng.tmem_store {0}
+|  |  |- r  S3  {0} [none]
+|  |  |- a  S3  {1}
+|  |  |- R m3  ttng.tmem_load {1}
+|  |  |- r  S4  {1} [none]
+|  |  |- a  S5  {1}
+|  |  |- a  S6  {1}
+|  |  |- a  S7  {1}
+|  |  |- EXIT pieces{P0:W:{0},P1:W:{1},P2:W:{1},P3:W:{1}} yield{c0: a S3,c1: a S5,c2: a S6,c3: a S7}
+  SEMAS c0: S3{count=1 entry inherit={@1.0}} S4{count=1 entry inherit={@1.0}}
+  SEMAS c1: S0{count=1} S5{count=1 entry inherit={@1.1}}
+  SEMAS c2: S2{count=1} S6{count=1 entry inherit={@1.1}}
+  SEMAS c3: S1{count=1} S7{count=1 entry inherit={@1.1}}
+  BACKING: numStages=2 anchor=before scf.for(tag=1)
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @tmem_disjoint_slivers_same_owner
+groups: 1
+GROUP buffer.id=522 memory=tmem members=4
+  members: m0[64,65) m1[66,67) m2[65,66) m3[0,64)
+  pieces: P0=[0,64){m3}c0 P1=[64,65){m0}c1 P2=[65,66){m2}c2 P3=[66,67){m1}c3
+  footprints: m0={P1} m1={P3} m2={P2} m3={P0}
+ACCESS-DAG
+|- func @tmem_disjoint_slivers_same_owner
+|  |- scf.for (WS, tag=2) effects{P0:W,P1:W,P2:W,P3:W}
+|  |  |- W  m0  ttng.tmem_store {1}
+|  |  |- R  m0  ttng.tmem_load {1}
+|  |  |- W  m1  ttng.tmem_store {1}
+|  |  |- R  m1  ttng.tmem_load {1}
+|  |  |- W  m2  ttng.tmem_store {1}
+|  |  |- R  m2  ttng.tmem_load {1}
+|  |  |- W  m3  ttng.tmem_store {0}
+|  |  |- R  m3  ttng.tmem_load {0}
+OWNER-DAG
+|- func @tmem_disjoint_slivers_same_owner
+|  |- scf.for (WS, tag=2) pieces{P0:W:{0},P1:W:{1},P2:W:{1},P3:W:{1}}
+|  |  |- ENTER pieces{P0:W:{0},P1:W:{1},P2:W:{1},P3:W:{1}}
+|  |  |- W  m0  ttng.tmem_store {1}
+|  |  |- R  m0  ttng.tmem_load {1}
+|  |  |- W  m1  ttng.tmem_store {1}
+|  |  |- R  m1  ttng.tmem_load {1}
+|  |  |- W  m2  ttng.tmem_store {1}
+|  |  |- R  m2  ttng.tmem_load {1}
+|  |  |- W  m3  ttng.tmem_store {0}
+|  |  |- R  m3  ttng.tmem_load {0}
+|  |  |- EXIT pieces{P0:W:{0},P1:W:{1},P2:W:{1},P3:W:{1}}
+SYNC-DAG
+|- func @tmem_disjoint_slivers_same_owner
+|  |- scf.for (WS, tag=2) pieces{P0:W:{0},P1:W:{1},P2:W:{1},P3:W:{1}} parts{0,1}
+|  |  |- ENTER pieces{P0:W:{0},P1:W:{1},P2:W:{1},P3:W:{1}}
+|  |  |- W m0  ttng.tmem_store {1}
+|  |  |- R m0  ttng.tmem_load {1}
+|  |  |- W m1  ttng.tmem_store {1}
+|  |  |- R m1  ttng.tmem_load {1}
+|  |  |- W m2  ttng.tmem_store {1}
+|  |  |- R m2  ttng.tmem_load {1}
+|  |  |- W m3  ttng.tmem_store {0}
+|  |  |- R m3  ttng.tmem_load {0}
+|  |  |- EXIT pieces{P0:W:{0},P1:W:{1},P2:W:{1},P3:W:{1}}
+  BACKING: untouched (no semaphores)

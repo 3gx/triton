@@ -1,0 +1,404 @@
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @for_outer_if_inner_access
+groups: 1
+GROUP buffer.id=800 memory=local members=1
+  members: m0[0,1)
+  pieces: P0=[0,1){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @for_outer_if_inner_access
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- scf.if effects{P0:W}
+|  |  |  |- then
+|  |  |  |  |- W  m0  ttg.local_store {1}
+OWNER-DAG
+|- func @for_outer_if_inner_access
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- scf.if pieces{P0:W:{1}}
+|  |  |  |- then
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- W  m0  ttg.local_store {1}
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- else (virtual)
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT
+|  |  |- EXIT pieces{P0:W:{1}}
+SYNC-DAG
+|- func @for_outer_if_inner_access
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}} parts{1}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- scf.if pieces{P0:W:{1}} parts{1}
+|  |  |  |- then
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- W m0  ttg.local_store {1}
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- else (virtual)
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT
+|  |  |- EXIT pieces{P0:W:{1}}
+  BACKING: untouched (no semaphores)
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @if_outer_for_inner_access
+groups: 1
+GROUP buffer.id=801 memory=local members=1
+  members: m0[0,1)
+  pieces: P0=[0,1){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @if_outer_for_inner_access
+|  |- scf.if effects{P0:W}
+|  |  |- then
+|  |  |  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |  |  |- W  m0  ttg.local_store {1}
+OWNER-DAG
+|- func @if_outer_for_inner_access
+|  |- scf.if pieces{P0:W:root}
+|  |  |- then
+|  |  |  |- ENTER pieces{P0:W:root}
+|  |  |  |- scf.for (WS, tag=0) pieces{P0:W:{1}}
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- W  m0  ttg.local_store {1}
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- EXIT pieces{P0:W:root}
+|  |  |- else (virtual)
+|  |  |  |- ENTER
+|  |  |  |- EXIT
+SYNC-DAG
+|- func @if_outer_for_inner_access
+|  |- scf.if pieces{P0:W:root} parts{1}
+|  |  |- then
+|  |  |  |- ENTER pieces{P0:W:root}
+|  |  |  |- scf.for (WS, tag=0) pieces{P0:W:{1}} parts{1}
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- W m0  ttg.local_store {1}
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- EXIT pieces{P0:W:root}
+|  |  |- else (virtual)
+|  |  |  |- ENTER
+|  |  |  |- EXIT
+  BACKING: untouched (no semaphores)
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @if_outer_if_inner_access
+groups: 1
+GROUP buffer.id=802 memory=local members=1
+  members: m0[0,1)
+  pieces: P0=[0,1){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @if_outer_if_inner_access
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- scf.if effects{P0:W}
+|  |  |  |- then
+|  |  |  |  |- scf.if effects{P0:W}
+|  |  |  |  |  |- then
+|  |  |  |  |  |  |- W  m0  ttg.local_store {1}
+OWNER-DAG
+|- func @if_outer_if_inner_access
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- scf.if pieces{P0:W:{1}}
+|  |  |  |- then
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- scf.if pieces{P0:W:{1}}
+|  |  |  |  |  |- then
+|  |  |  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |  |  |- W  m0  ttg.local_store {1}
+|  |  |  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |  |  |- else (virtual)
+|  |  |  |  |  |  |- ENTER
+|  |  |  |  |  |  |- EXIT
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- else (virtual)
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT
+|  |  |- EXIT pieces{P0:W:{1}}
+SYNC-DAG
+|- func @if_outer_if_inner_access
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}} parts{1}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- scf.if pieces{P0:W:{1}} parts{1}
+|  |  |  |- then
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- scf.if pieces{P0:W:{1}} parts{1}
+|  |  |  |  |  |- then
+|  |  |  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |  |  |- W m0  ttg.local_store {1}
+|  |  |  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |  |  |- else (virtual)
+|  |  |  |  |  |  |- ENTER
+|  |  |  |  |  |  |- EXIT
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- else (virtual)
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT
+|  |  |- EXIT pieces{P0:W:{1}}
+  BACKING: untouched (no semaphores)
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @for_outer_for_inner_access
+groups: 1
+GROUP buffer.id=803 memory=local members=1
+  members: m0[0,1)
+  pieces: P0=[0,1){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @for_outer_for_inner_access
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- scf.for effects{P0:W}
+|  |  |  |- W  m0  ttg.local_store {1}
+OWNER-DAG
+|- func @for_outer_for_inner_access
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- scf.for pieces{P0:W:{1}}
+|  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |- W  m0  ttg.local_store {1}
+|  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |- EXIT pieces{P0:W:{1}}
+SYNC-DAG
+|- func @for_outer_for_inner_access
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}} parts{1}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- scf.for pieces{P0:W:{1}} parts{1}
+|  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |- W m0  ttg.local_store {1}
+|  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |- EXIT pieces{P0:W:{1}}
+  BACKING: untouched (no semaphores)
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @triple_for_if_for_access
+groups: 1
+GROUP buffer.id=804 memory=local members=1
+  members: m0[0,1)
+  pieces: P0=[0,1){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @triple_for_if_for_access
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- scf.if effects{P0:W}
+|  |  |  |- then
+|  |  |  |  |- scf.for effects{P0:W}
+|  |  |  |  |  |- W  m0  ttg.local_store {1}
+OWNER-DAG
+|- func @triple_for_if_for_access
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- scf.if pieces{P0:W:{1}}
+|  |  |  |- then
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- scf.for pieces{P0:W:{1}}
+|  |  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |  |- W  m0  ttg.local_store {1}
+|  |  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- else (virtual)
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT
+|  |  |- EXIT pieces{P0:W:{1}}
+SYNC-DAG
+|- func @triple_for_if_for_access
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}} parts{1}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- scf.if pieces{P0:W:{1}} parts{1}
+|  |  |  |- then
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- scf.for pieces{P0:W:{1}} parts{1}
+|  |  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |  |- W m0  ttg.local_store {1}
+|  |  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- else (virtual)
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT
+|  |  |- EXIT pieces{P0:W:{1}}
+  BACKING: untouched (no semaphores)
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @triple_if_for_if_access
+groups: 1
+GROUP buffer.id=805 memory=local members=1
+  members: m0[0,1)
+  pieces: P0=[0,1){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @triple_if_for_if_access
+|  |- scf.if effects{P0:W}
+|  |  |- then
+|  |  |  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |  |  |- scf.if effects{P0:W}
+|  |  |  |  |  |- then
+|  |  |  |  |  |  |- W  m0  ttg.local_store {1}
+OWNER-DAG
+|- func @triple_if_for_if_access
+|  |- scf.if pieces{P0:W:root}
+|  |  |- then
+|  |  |  |- ENTER pieces{P0:W:root}
+|  |  |  |- scf.for (WS, tag=0) pieces{P0:W:{1}}
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- scf.if pieces{P0:W:{1}}
+|  |  |  |  |  |- then
+|  |  |  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |  |  |- W  m0  ttg.local_store {1}
+|  |  |  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |  |  |- else (virtual)
+|  |  |  |  |  |  |- ENTER
+|  |  |  |  |  |  |- EXIT
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- EXIT pieces{P0:W:root}
+|  |  |- else (virtual)
+|  |  |  |- ENTER
+|  |  |  |- EXIT
+SYNC-DAG
+|- func @triple_if_for_if_access
+|  |- scf.if pieces{P0:W:root} parts{1}
+|  |  |- then
+|  |  |  |- ENTER pieces{P0:W:root}
+|  |  |  |- scf.for (WS, tag=0) pieces{P0:W:{1}} parts{1}
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- scf.if pieces{P0:W:{1}} parts{1}
+|  |  |  |  |  |- then
+|  |  |  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |  |  |- W m0  ttg.local_store {1}
+|  |  |  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |  |  |- else (virtual)
+|  |  |  |  |  |  |- ENTER
+|  |  |  |  |  |  |- EXIT
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- EXIT pieces{P0:W:root}
+|  |  |- else (virtual)
+|  |  |  |- ENTER
+|  |  |  |- EXIT
+  BACKING: untouched (no semaphores)
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @quad_for_if_for_if_access
+groups: 1
+GROUP buffer.id=806 memory=local members=1
+  members: m0[0,1)
+  pieces: P0=[0,1){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @quad_for_if_for_if_access
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- scf.if effects{P0:W}
+|  |  |  |- then
+|  |  |  |  |- scf.for effects{P0:W}
+|  |  |  |  |  |- scf.if effects{P0:W}
+|  |  |  |  |  |  |- then
+|  |  |  |  |  |  |  |- W  m0  ttg.local_store {1}
+OWNER-DAG
+|- func @quad_for_if_for_if_access
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- scf.if pieces{P0:W:{1}}
+|  |  |  |- then
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- scf.for pieces{P0:W:{1}}
+|  |  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |  |- scf.if pieces{P0:W:{1}}
+|  |  |  |  |  |  |- then
+|  |  |  |  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |  |  |  |- W  m0  ttg.local_store {1}
+|  |  |  |  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |  |  |  |- else (virtual)
+|  |  |  |  |  |  |  |- ENTER
+|  |  |  |  |  |  |  |- EXIT
+|  |  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- else (virtual)
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT
+|  |  |- EXIT pieces{P0:W:{1}}
+SYNC-DAG
+|- func @quad_for_if_for_if_access
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}} parts{1}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- scf.if pieces{P0:W:{1}} parts{1}
+|  |  |  |- then
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- scf.for pieces{P0:W:{1}} parts{1}
+|  |  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |  |- scf.if pieces{P0:W:{1}} parts{1}
+|  |  |  |  |  |  |- then
+|  |  |  |  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |  |  |  |- W m0  ttg.local_store {1}
+|  |  |  |  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |  |  |  |- else (virtual)
+|  |  |  |  |  |  |  |- ENTER
+|  |  |  |  |  |  |  |- EXIT
+|  |  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- else (virtual)
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT
+|  |  |- EXIT pieces{P0:W:{1}}
+  BACKING: untouched (no semaphores)
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @sibling_if_only_one_with_access
+groups: 1
+GROUP buffer.id=807 memory=local members=1
+  members: m0[0,1)
+  pieces: P0=[0,1){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @sibling_if_only_one_with_access
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- scf.if effects{P0:W}
+|  |  |  |- then
+|  |  |  |  |- W  m0  ttg.local_store {1}
+OWNER-DAG
+|- func @sibling_if_only_one_with_access
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- scf.if pieces{P0:W:{1}}
+|  |  |  |- then
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- W  m0  ttg.local_store {1}
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- else (virtual)
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT
+|  |  |- EXIT pieces{P0:W:{1}}
+SYNC-DAG
+|- func @sibling_if_only_one_with_access
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}} parts{1}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- scf.if pieces{P0:W:{1}} parts{1}
+|  |  |  |- then
+|  |  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |  |- W m0  ttg.local_store {1}
+|  |  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |  |- else (virtual)
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT
+|  |  |- EXIT pieces{P0:W:{1}}
+  BACKING: untouched (no semaphores)
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @sibling_for_only_one_with_access
+groups: 1
+GROUP buffer.id=808 memory=local members=1
+  members: m0[0,1)
+  pieces: P0=[0,1){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @sibling_for_only_one_with_access
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- scf.for effects{P0:W}
+|  |  |  |- W  m0  ttg.local_store {1}
+OWNER-DAG
+|- func @sibling_for_only_one_with_access
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- scf.for pieces{P0:W:{1}}
+|  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |- W  m0  ttg.local_store {1}
+|  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |- EXIT pieces{P0:W:{1}}
+SYNC-DAG
+|- func @sibling_for_only_one_with_access
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1}} parts{1}
+|  |  |- ENTER pieces{P0:W:{1}}
+|  |  |- scf.for pieces{P0:W:{1}} parts{1}
+|  |  |  |- ENTER pieces{P0:W:{1}}
+|  |  |  |- W m0  ttg.local_store {1}
+|  |  |  |- EXIT pieces{P0:W:{1}}
+|  |  |- EXIT pieces{P0:W:{1}}
+  BACKING: untouched (no semaphores)
