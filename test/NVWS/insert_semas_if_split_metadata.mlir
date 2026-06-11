@@ -61,4 +61,49 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // After loop: no drain; there is no post-loop TMEM access.
     tt.return
   }
+
+  // REGRESSION (1fd82a2814): the middle if's content union must route
+  // yield-consumed survivors through the loop's AUTHORED
+  // partition.outputs entry - NOT the yield op's {0,1,2} union
+  // annotation. The bug stamped the middle if {0,1,2}; partition 2's
+  // clone then kept an empty husk using a condition it didn't have
+  // (PartitionLoops: 'operation destroyed but still has uses').
+  // CHECK-LABEL: @if_split_yield_routing_three_partitions
+  tt.func @if_split_yield_routing_three_partitions(%lhs: !ttg.memdesc<128x64xf16, #shared, #smem>, %rhs: !ttg.memdesc<64x128xf16, #shared, #smem>) {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c32_i32 = arith.constant 32 : i32
+    %true = arith.constant true
+    %false = arith.constant false
+
+    %acc, %acc_tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+
+    %loop:3 = scf.for %iv = %c0_i32 to %c32_i32 step %c1_i32 iter_args(%use_acc = %false, %tok = %acc_tok, %carry = %c0_i32) -> (i1, !ttg.async.token, i32) : i32 {
+      %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%tok], %use_acc, %true {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %aux = "p2_work"(%iv) {ttg.partition = array<i32: 2>} : (i32) -> i32
+      "p2_sink"(%aux) {ttg.partition = array<i32: 2>} : (i32) -> ()
+      %cond = arith.cmpi eq, %iv, %c0_i32 {ttg.partition = array<i32: 0, 1>} : i32
+
+      // The middle if must NOT pick up partition 2: its survivors are
+      // routed by the LOOP's authored outputs ({1} and {0}), and the
+      // {0,1,2} annotation on the loop yield is an over-approximation
+      // (regression: an {0,1,2} middle if leaves partition 2's clone an
+      // empty husk using a condition that clone does not have).
+      // CHECK: } {ttg.partition = array<i32: 1>}
+      // CHECK: scf.if
+      // CHECK: } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0>, array<i32: 0>]}
+      // CHECK: scf.if
+      // CHECK: } {ttg.partition = array<i32: 1>, ttg.partition.outputs = [array<i32: 1>]}
+      %epilogue:3 = scf.if %cond -> (i32, !ttg.async.token, i1) {
+        %value, %load_tok = ttng.tmem_load %acc[%mma] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+        "acc_user"(%value) {ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> ()
+        scf.yield {ttg.partition = array<i32: 0, 1, 2>} %iv, %load_tok, %true : i32, !ttg.async.token, i1
+      } else {
+        scf.yield {ttg.partition = array<i32: 0, 1, 2>} %carry, %mma, %use_acc : i32, !ttg.async.token, i1
+      } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0>, array<i32: 1>, array<i32: 0>]}
+      %next = arith.addi %epilogue#0, %c1_i32 {ttg.partition = array<i32: 0, 1>} : i32
+      scf.yield {ttg.partition = array<i32: 0, 1, 2>} %epilogue#2, %epilogue#1, %next : i1, !ttg.async.token, i32
+    } {tt.num_stages = 2 : i32, tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.outputs = [array<i32: 1>, array<i32: 1>, array<i32: 0>], ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 1 : i32}
+    tt.return
+  }
 }
