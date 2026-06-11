@@ -1175,30 +1175,39 @@ static LogicalResult workaroundLoopScheduler(EmitCtx &ctx) {
       SmallVector<SetVector<int>, 1> enterOutputs{enterExitIds};
       gpu::setPartitionOutputs(enterIf, enterOutputs);
     }
-    // Step 6 — middle-if partition recomputation.
+    // Step 6 — middle-if partition metadata: PRESERVED, not re-derived
+    // (user ruling 11jun26, refining the upstream-9860c26c port). The
+    // authored ttg.partition/ttg.partition.outputs stay verbatim: a
+    // multi-result middle if still carries replicated scalar
+    // pass-throughs that every original partition's clone must keep
+    // computing (tightening to the consumer partition deletes them —
+    // caught by the partition-outputs verifier). The token slot needs no
+    // outputs entry at all: it is dead after the reroute and the
+    // post-split eraseDeadTokenSlots sweep drops it, filtering the
+    // surviving slots' authored outputs through filterPartitionOutputs.
+    // The PARTITION attr is the one thing the split invalidates (the
+    // body was peeled), recomputed as the CONTENT UNION: the remainder
+    // (original ids minus enter/exit ids) plus the consumers of every
+    // surviving result — a multi-result middle if is a replicated
+    // scalar mux each consuming partition's clone must keep (use_acc
+    // feeding next iteration's mma); with no surviving results it
+    // collapses to the body's partition.
+    SetVector<int> originalIds = partitionIdsOfFwd(ifOp);
     SetVector<int> middleIds;
-    if (gpu::hasPartition(ifOp)) {
-      for (int p : partitionIdsOfFwd(ifOp))
-        if (!enterExitIds.contains(p))
+    for (int p : originalIds)
+      if (!enterExitIds.contains(p))
+        middleIds.insert(p);
+    if (middleIds.empty())
+      middleIds = originalIds;
+    for (auto [i, res] : llvm::enumerate(ifOp.getResults())) {
+      if (i == c.tokenResultIdx)
+        continue;
+      for (Operation *user : res.getUsers())
+        for (int p : partitionIdsOfFwd(user))
           middleIds.insert(p);
     }
-    if (middleIds.empty() && ifOp.getNumResults() > 0)
-      middleIds = partitionSetForValue(ifOp.getResult(0));
-    if (!middleIds.empty()) {
-      SetVector<int> ifIds = middleIds;
-      SmallVector<SetVector<int>, 4> outputs;
-      outputs.reserve(ifOp.getNumResults());
-      for (Value result : ifOp.getResults()) {
-        SetVector<int> resultIds = partitionSetForValue(result);
-        if (resultIds.empty())
-          resultIds = middleIds;
-        for (int p : resultIds)
-          ifIds.insert(p);
-        outputs.push_back(resultIds);
-      }
-      gpu::setPartition(ifOp, ifIds.getArrayRef());
-      gpu::setPartitionOutputs(ifOp, outputs);
-    }
+    if (!middleIds.empty())
+      gpu::setPartition(ifOp, middleIds.getArrayRef());
   }
   return success();
 }
@@ -1206,6 +1215,76 @@ static LogicalResult workaroundLoopScheduler(EmitCtx &ctx) {
 // ---------------------------------------------------------------------------
 // Driver.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// POST-EMIT PARTITION-OUTPUTS VERIFIER (hard error; user ruling 11jun26):
+// ttg.partition.outputs is AUTHORED routing metadata — PartitionLoops
+// wires each region result from the partition clone the attribute
+// names. For every For/If carrying the attribute, each result slot
+// whose yielded value has a determinate producing partition must name
+// one of those producers. Indeterminate producers (block args, poison,
+// constants, attr-less defs) are skipped — never guessed.
+// ---------------------------------------------------------------------------
+static LogicalResult verifyPartitionOutputs(triton::FuncOp func) {
+  constexpr llvm::StringLiteral kOutputs = "ttg.partition.outputs";
+  // Producing partitions of a yielded value (one region-op level deep).
+  auto producerIds = [&](Value v) -> SetVector<int> {
+    Operation *def = v.getDefiningOp();
+    if (!def || isa<ub::PoisonOp>(def) ||
+        def->hasTrait<OpTrait::ConstantLike>())
+      return {};
+    // Nested region results: the value is AVAILABLE in every partition
+    // the inner op runs in (its ttg.partition ids) — the inner op's own
+    // outputs entry is a routing CHOICE, not the availability set, and
+    // nesting levels may legitimately choose different routings for a
+    // replicated scalar.
+    if (!gpu::hasPartition(def))
+      return {};
+    return gpu::getPartitionIds(def);
+  };
+  LogicalResult result = success();
+  func.walk([&](Operation *op) {
+    if (!isa<scf::ForOp, scf::IfOp>(op) || !op->hasAttr(kOutputs) ||
+        failed(result))
+      return;
+    auto outputs = gpu::getPartitionOutputs(op);
+    if (outputs.size() != op->getNumResults()) {
+      result = op->emitError("nvws-insert-semas: partition-outputs "
+                             "verifier: attribute has ")
+               << outputs.size() << " entries for " << op->getNumResults()
+               << " results";
+      return;
+    }
+    SmallVector<Operation *, 2> terms;
+    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      terms.push_back(forOp.getBody()->getTerminator());
+    } else {
+      auto ifOp = cast<scf::IfOp>(op);
+      terms.push_back(ifOp.thenYield());
+      if (!ifOp.getElseRegion().empty())
+        terms.push_back(ifOp.elseYield());
+    }
+    for (auto [i, outSet] : llvm::enumerate(outputs))
+      for (Operation *term : terms) {
+        SetVector<int> prod = producerIds(term->getOperand(i));
+        if (prod.empty())
+          continue; // indeterminate producer: out of scope, never guessed
+        if (llvm::none_of(prod,
+                          [&](int p) { return outSet.contains(p); })) {
+          std::string have;
+          llvm::raw_string_ostream os(have);
+          for (int p : prod)
+            os << p << " ";
+          result = op->emitError("nvws-insert-semas: partition-outputs "
+                                 "verifier: result ")
+                   << i << " is produced by partition(s) " << os.str()
+                   << "but ttg.partition.outputs names none of them";
+          return;
+        }
+      }
+  });
+  return result;
+}
 
 // ---------------------------------------------------------------------------
 // POST-EMIT TOKEN/VIEW LOCALITY VERIFIER (hard error; user ruling
@@ -1360,8 +1439,17 @@ LogicalResult emitIR(triton::FuncOp funcOp,
   for (GroupDag &g : groups)
     coalesceBackings(g);
   // Step 7.
-  if (failed(workaroundLoopScheduler(ctx)))
-    return failure();
+  {
+    if (failed(workaroundLoopScheduler(ctx)))
+      return failure();
+    // The split reroutes the middle if's token result to the enter-if and
+    // leaves a dead poison slot behind; a result slot is metadata nobody
+    // reads (user ruling 11jun26: drop it rather than label it). The same
+    // keep-mask rebuild as step 1b carries the surviving slots' AUTHORED
+    // partition.outputs through filterPartitionOutputs.
+    while (eraseDeadTokenSlots(ctx, groups)) {
+    }
+  }
   // Erase dead alias-view chains (fixpoint, leaf-first): retargeting left
   // the original memdesc view ops dead, and they pin the original allocs
   // (and carry stale partition stamps that partition-loops rejects as
@@ -1396,6 +1484,8 @@ LogicalResult emitIR(triton::FuncOp funcOp,
   if (ctx.poison.use_empty())
     ctx.poison.getDefiningOp()->erase();
   // Post-emit token/view locality subpass (user ruling 10jun26).
+  if (failed(verifyPartitionOutputs(funcOp)))
+    return failure();
   if (failed(verifyTokenLocality(funcOp)))
     return failure();
   return success();
