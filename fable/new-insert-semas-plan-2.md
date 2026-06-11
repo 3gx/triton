@@ -1144,6 +1144,19 @@ selection.**
 
 ---
 
+ADDENDUM (11jun26, post-closure refactor — supersedes the §1
+single-TU/no-CMakeLists decisions): after plan closure (4.12 audit
+PASS), the layout converts to conventional .h/.cpp pairs — each stage's
+implementation moves to InsertSemas{AccessDag,OwnerDag,SyncDag,
+EmitIR}.cpp, headers shrink to the cross-stage contract (types + stage
+entry points), headers become self-contained (clangd-analyzable), and
+CMakeLists gains the four .cpp files. The single-TU rule was a bring-up
+convenience for the commit ladder, not a correctness property. Step 1 =
+purely mechanical move verified by byte-identical corpus output + full
+gate battery; step 2 = deduplication/cleanup with the goal of reducing
+non-comment LoC. One-header-per-stage mapping and the four-stage
+architecture are unchanged.
+
 ADDENDUM (11jun26): TOKEN RETENTION — evaluated, NOT implemented. The
 same-source/same-acquirer/later-in-program-order semaphores (meta-FA
 S2/S6 class) are provably non-blocking, and a full elision

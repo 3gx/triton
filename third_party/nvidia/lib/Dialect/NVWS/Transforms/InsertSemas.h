@@ -1,12 +1,47 @@
 #ifndef NVWS_TRANSFORMS_INSERT_SEMAS_H_
 #define NVWS_TRANSFORMS_INSERT_SEMAS_H_
 
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
+#include "triton/Analysis/BufferRegion.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
+#include "triton/Dialect/TritonGPU/Transforms/PartitionBuilder.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <cstdlib>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+
+namespace mlir {
+namespace triton {
+namespace nvws_semas {
+
+using namespace mlir;
+using triton::nvws::AsyncOp;
+namespace gpu = triton::gpu;
+namespace nvidia_gpu = triton::nvidia_gpu;
+namespace nvws = triton::nvws;
+
 // Shared data model and helpers for the nvws-insert-semas pass.
 // Spec: fable/semas-report3.md (section 2 — the Node model);
 // plan: fable/new-insert-semas-plan-2.md (section 2 — every type defined).
 //
-// This header is included only by InsertSemas.cpp, inside its anonymous
-// namespace (single translation unit; plan section 1). All identifiers are
+// Self-contained shared header for the per-stage translation units
+// (plan section 1 addendum, post-closure refactor). All identifiers are
 // indices into per-group tables, allocated in program/discovery order —
 // never hash order (plan ground rule 6: hash containers are lookup-only).
 
@@ -24,6 +59,13 @@ using CompId = unsigned;   // connected component of pieces = one token game
 // ---------------------------------------------------------------------------
 using PartitionId = std::pair<int /*ttg.partition*/, int /*ws tag*/>;
 using Owner = std::optional<PartitionId>;
+
+inline int64_t ownerKey(const Owner &o) {
+  if (!o)
+    return -1;
+  return (static_cast<int64_t>(o->second) << 32) |
+         static_cast<uint32_t>(o->first);
+}
 
 inline bool sameOwner(const Owner &a, const Owner &b) {
   if (!a && !b)
@@ -338,5 +380,9 @@ inline bool shouldDumpDag() {
   const char *env = ::getenv("NVWS_INSERT_SEMA_DUMP_DAG");
   return env && StringRef(env) == "1";
 }
+
+} // namespace nvws_semas
+} // namespace triton
+} // namespace mlir
 
 #endif // NVWS_TRANSFORMS_INSERT_SEMAS_H_

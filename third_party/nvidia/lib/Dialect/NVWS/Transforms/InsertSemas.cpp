@@ -1,3 +1,7 @@
+#include "InsertSemasAccessDag.h"
+#include "InsertSemasEmitIR.h"
+#include "InsertSemasOwnerDag.h"
+#include "InsertSemasSyncDag.h"
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/Pass.h"
@@ -39,13 +43,10 @@ namespace gpu = triton::gpu;
 namespace nvidia_gpu = triton::nvidia_gpu;
 namespace nvws = triton::nvws;
 
-// Stage implementations (single translation unit; one header per stage —
-// fable/new-insert-semas-plan-2.md section 1).
-#include "InsertSemas.h"
-#include "InsertSemasAccessDag.h"
-#include "InsertSemasOwnerDag.h"
-#include "InsertSemasSyncDag.h"
-#include "InsertSemasEmitIR.h"
+// Stage implementations live in their own translation units (plan
+// section 1 addendum, post-closure refactor); this file is the
+// dispatcher only.
+using namespace nvws_semas;
 
 // ---------------------------------------------------------------------------
 // Dispatcher. Commit 1 of the plan: stage 1 (ACCESS-DAG) only — pure

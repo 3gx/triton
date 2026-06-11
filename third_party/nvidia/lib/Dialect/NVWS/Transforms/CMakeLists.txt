@@ -7,6 +7,10 @@ add_triton_library(NVWSTransforms
   Utilities.cpp
   InsertTmemSemaphore.cpp
   InsertSemas.cpp
+  InsertSemasAccessDag.cpp
+  InsertSemasEmitIR.cpp
+  InsertSemasOwnerDag.cpp
+  InsertSemasSyncDag.cpp
   HoistTmemStore.cpp
   WSUtility.cpp
   WSDataPartition.cpp
