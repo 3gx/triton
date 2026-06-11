@@ -91,7 +91,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // empty husk using a condition that clone does not have).
       // CHECK: } {ttg.partition = array<i32: 1>}
       // CHECK: scf.if
-      // CHECK: } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0>, array<i32: 0>]}
+      // CHECK: } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0, 1>, array<i32: 1>]}
       // CHECK: scf.if
       // CHECK: } {ttg.partition = array<i32: 1>, ttg.partition.outputs = [array<i32: 1>]}
       %epilogue:3 = scf.if %cond -> (i32, !ttg.async.token, i1) {

@@ -1199,9 +1199,10 @@ static LogicalResult workaroundLoopScheduler(EmitCtx &ctx) {
         middleIds.insert(p);
     if (middleIds.empty())
       middleIds = originalIds;
+    SmallVector<SetVector<int>, 4> newOutputs(ifOp.getNumResults());
     for (auto [i, res] : llvm::enumerate(ifOp.getResults())) {
       if (i == c.tokenResultIdx)
-        continue;
+        continue; // dead after the reroute; dropped by the post-split sweep
       for (OpOperand &use : res.getUses()) {
         Operation *user = use.getOwner();
         SetVector<int> ids;
@@ -1218,12 +1219,24 @@ static LogicalResult workaroundLoopScheduler(EmitCtx &ctx) {
         }
         if (ids.empty())
           ids = partitionIdsOfFwd(user);
-        for (int p : ids)
+        for (int p : ids) {
           middleIds.insert(p);
+          newOutputs[i].insert(p);
+        }
       }
     }
-    if (!middleIds.empty())
+    if (!middleIds.empty()) {
       gpu::setPartition(ifOp, middleIds.getArrayRef());
+      // INVARIANT (user ruling 11jun26): every partition member is
+      // justified by a body op or an outputs entry — the outputs ARE
+      // the consumer-derived producer sets that justified middleIds,
+      // never the (possibly inconsistent) authored entries. The dead
+      // token slot's entry is filtered out with the slot itself.
+      for (auto [i, o] : llvm::enumerate(newOutputs))
+        if (o.empty())
+          newOutputs[i] = middleIds; // token slot placeholder
+      gpu::setPartitionOutputs(ifOp, newOutputs);
+    }
   }
   return success();
 }
