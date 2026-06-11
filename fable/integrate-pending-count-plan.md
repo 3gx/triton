@@ -103,11 +103,19 @@ matches the pass ethos (hard diagnostic, never a silent repair).
      semaphore with asymmetric source counts) so the PASS ITSELF emits
      `release ... arrive_count(2)` — pin it, and feed the same case
      through `--nvws-insert-semas --nvws-lower-semaphore` to pin the
-     lowered `arrive_barrier ..., 2`. EXPLORATION TASK: construct the
-     triggering input (candidate source: the asymmetric-wave FA shapes
-     referenced by the retired EmitIR:105 ruling); if no current input
-     reaches the path, say so explicitly and ship the hand-written
-     lower-level case plus a TODO — do not fake the shape with
+     lowered `arrive_barrier ..., 2`. EXPLORATION OUTCOME (11jun26):
+     no current input reaches the scaling path — the whole corpus emits
+     arrive_count = 1 everywhere (214 releases), and a constructed
+     asymmetric-wave probe (fanout store + 2 readers + regain store +
+     single second reader) was resolved by the pass with SEPARATE
+     semaphores (in-body fan-in count-2 + count-1 exit), every wave
+     symmetric. The SyncDag adoption path (For-row group adopting the
+     regain group's semaphore with fewer sources) demands a shape not
+     yet identified. TODO: revisit when a real asymmetric-wave kernel
+     appears; the hand-written lower-level coverage
+     (lower_semaphore_arrive_count.mlir) pins the count>1 lowering
+     contract meanwhile. Probe preserved at /tmp/asym_probe.mlir
+     pattern in this plan's history; do not fake the shape with
      hand-mutated metadata (feedback-partition-metadata-semantics).
 - **Negative tests** (4): create missing pending_count at lowering;
   release missing arrive_count at lowering; pending_count != analysis;
