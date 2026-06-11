@@ -34,17 +34,17 @@ multiplicity, so no `>=` relaxation is ever needed.
   AutomaticWarpSpecialization.cpp:122-123, and never lowered in-tree);
   they are NOT stamped (user stance: no scope creep).
 
-## RULING (user-approved, 11jun26)
+## RULING (user-approved, 11jun26; revised same day)
 
-`arrive_count > 1` is directly lowerable only for sync kinds
-(`none`/`wgmma` -> ArriveBarrierOp count). `tc5mma`/`tmem_copy` lower
-to TCGen5CommitOp (no count); `tma_load` arrives via hardware (no op).
-RULING: no use cases exist for multiplicity on async kinds — the
-lowering switch uses `llvm::report_fatal_error` (llvm_unreachable
-style) when it sees `arrive_count > 1` with a `tc5mma`/`tmem_copy`/
-`tma_load` kind. No verifier machinery, no lit-testable diagnostic; if
-a real asymmetric kernel ever hits it, the crash message names this
-plan and the semantics question gets answered then.
+`tc5mma`/`tmem_copy`/`tma_load` remain fully valid async kinds with
+`arrive_count = 1` — nothing changes for them. ONLY the combination
+`arrive_count > 1` AND an async kind is rejected: those kinds lower to
+TCGen5CommitOp / hardware-completed TMA, which cannot arrive N times.
+Multiplicity > 1 is supported exactly for `[none]`/`[wgmma]`
+(ArriveBarrierOp takes a count). REJECTION MECHANISM (user-revised):
+a proper DIAGNOSTIC — `emitError` on the release op and pass failure
+in the lowering — NOT report_fatal_error; it is lit-testable and
+matches the pass ethos (hard diagnostic, never a silent repair).
 
 ## Code changes
 
@@ -56,7 +56,7 @@ plan and the semantics question gets answered then.
 | `InsertSemasEmitIR.cpp:293` | create: set `pending_count = s.count`; delete dag_pending_count setAttr |
 | `InsertSemasEmitIR.cpp:869` | release: set `arrive_count = n->count` (currently ignored); retire the EmitIR:105 deferral comment |
 | `LowerAref.cpp:131` | getPendingCount: require field, verify vs analysis, diagnostics not asserts |
-| `LowerAref.cpp:271/318` | rewriteRelease: require field, pass to ArriveBarrierOp; fatal-error on count>1 with async kind |
+| `LowerAref.cpp:271/318` | rewriteRelease: require field, pass to ArriveBarrierOp; emitError + fail on count>1 with async kind |
 
 ## Gate sequencing (USER-MANDATED — do not deviate)
 
@@ -109,10 +109,10 @@ plan and the semantics question gets answered then.
      reaches the path, say so explicitly and ship the hand-written
      lower-level case plus a TODO — do not fake the shape with
      hand-mutated metadata (feedback-partition-metadata-semantics).
-- **Negative tests** (3): create missing pending_count at lowering;
-  release missing arrive_count at lowering; pending_count != analysis.
-  (count>1-with-async-kind is a fatal-error path per the ruling — not
-  lit-testable, intentionally.)
+- **Negative tests** (4): create missing pending_count at lowering;
+  release missing arrive_count at lowering; pending_count != analysis;
+  `arrive_count > 1` with an async kind (expects the lowering
+  diagnostic).
 - Old-pass lit tests (6 files using nvws-insert-semaphore /
   nvws-insert-tmem-semaphore): untouched, they never lower.
 
