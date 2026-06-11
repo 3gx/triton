@@ -855,7 +855,11 @@ walk order pinned; WS-For root
 adoption — contract H; the virtual else carries no sync rows; the
 transitive-sync skip: per holder, partitions that already took an edge
 from it since its lastRow are recorded (syncedBehind) and never re-edged —
-rules 1/2/4; EXIT closes additionally only when load-bearing — under a
+rules 1/2/4 — GATED BY WAVE LOCALITY (user ruling 10jun26): every elision
+applies only while the toucher still holds the carrier; a cross-partition
+touch on a moved carrier always materializes an edge, and two hard-error
+verifiers (stage-3 chain carrier locality; emitter post-emit token/view
+locality) pin the class — see the spec's WAVE LOCALITY section; EXIT closes additionally only when load-bearing — under a
 loop or with a later touch in an ancestor chain — never as drains); dedupe
 (incl. the same-owner second collapse: same dst + same source owner +
 different rows -> latest row, payload union — multi-piece games require it);

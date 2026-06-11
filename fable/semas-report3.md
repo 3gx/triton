@@ -444,6 +444,28 @@ Rows are visited in chain order; the complete rule set:
    parent's state was never touched by the body. The consumer is guaranteed
    (the carried owner's continuation) whenever a close IS emitted, so no
    "release into void" case exists.
+
+   **WAVE LOCALITY (USER RULING 10jun26 — run_nvws root cause).** The
+   carrier token is partition-local: an acquire, the buffer views drawn
+   from its token, and the releases consuming that token are ALWAYS one
+   partition; a chain decomposes into bracketed waves (acquire by Q,
+   accesses by Q, releases by Q). ALL edge-elision rules above (the
+   transitive-sync skip, same-owner no-edge, reader-rejoin no-edge) are
+   valid only while the toucher's wave is OPEN — the toucher still holds
+   the carrier. A touch by Q while the carrier belongs to P != Q MUST
+   take an edge (a fresh acquire by Q) even when Q is a co-holder or
+   transitively synchronized: ordering soundness is not sufficient — the
+   emitted single-token protocol cannot express a touch without a held
+   token (meta-FA p-write after the alpha handoff: ordering-sound,
+   token-unsound, destroyed-view crash in partition-loops). Enforced by
+   two hard-error verifiers: the stage-3 chain verifier (every
+   Access/Release row's owner equals its component's current carrier
+   owner, tracked through Acquire rows and region seeds) and the emitter
+   post-emit subpass (every `nvws.semaphore.buffer`/`release` token
+   operand traces — through loop iter_args and if-results — to acquires
+   of the op's own partition; a buffer's views are consumed only by ops
+   of the view's partition; root-stamped entry acquires are the one
+   sanctioned seed exemption).
 5. **ENTER row — seeds the region's local game.** Every region body walks
    a **fresh local state**, per piece in the **chain's own footprint** (a
    branch that does not touch a piece has no game for it — nothing seeded,

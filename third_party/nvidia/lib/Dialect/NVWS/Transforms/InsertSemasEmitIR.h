@@ -1215,6 +1215,103 @@ static LogicalResult workaroundLoopScheduler(EmitCtx &ctx) {
 // ---------------------------------------------------------------------------
 // Driver.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// POST-EMIT TOKEN/VIEW LOCALITY VERIFIER (hard error; user ruling
+// 10jun26): every token consumed by semaphore.buffer/release must trace
+// (through loop iter_args and if-results) to acquires of the op's own
+// partition — cross-partition tokens are invalid. A buffer's views may
+// only be consumed by ops of the view's partition. Attr-less acquires
+// (root entry seeds) are the one sanctioned exemption.
+// ---------------------------------------------------------------------------
+static LogicalResult verifyTokenLocality(triton::FuncOp func) {
+  auto idsOf = [](Operation *op) -> std::optional<SmallVector<int, 2>> {
+    if (!gpu::hasPartition(op))
+      return std::nullopt;
+    auto set = gpu::getPartitionIds(op);
+    SmallVector<int, 2> v(set.begin(), set.end());
+    llvm::sort(v);
+    return v;
+  };
+  std::function<LogicalResult(Operation *, Value, DenseSet<Value> &)> trace =
+      [&](Operation *consumer, Value tok,
+          DenseSet<Value> &seen) -> LogicalResult {
+    if (!seen.insert(tok).second)
+      return success();
+    if (auto ba = dyn_cast<BlockArgument>(tok)) {
+      if (auto forOp =
+              dyn_cast<scf::ForOp>(ba.getOwner()->getParentOp())) {
+        unsigned idx = ba.getArgNumber() - 1; // skip induction var
+        if (failed(trace(consumer, forOp.getInits()[idx], seen)))
+          return failure();
+        auto *yield = forOp.getBody()->getTerminator();
+        return trace(consumer, yield->getOperand(idx), seen);
+      }
+      return success(); // other block args: out of scope
+    }
+    Operation *def = tok.getDefiningOp();
+    if (!def || isa<ub::PoisonOp>(def))
+      return success();
+    if (auto acq = dyn_cast<nvws::SemaphoreAcquireOp>(def)) {
+      auto ap = idsOf(acq), cp = idsOf(consumer);
+      if (!ap)
+        return success(); // root entry seed exemption
+      if (cp && *ap != *cp)
+        return consumer->emitError(
+                   "nvws-insert-semas: token-locality violation: token "
+                   "acquired in partition set differs from consumer's")
+                   .attachNote(acq.getLoc())
+               << "acquired here";
+      return success();
+    }
+    if (auto ifOp = dyn_cast<scf::IfOp>(def)) {
+      unsigned idx = cast<OpResult>(tok).getResultNumber();
+      if (failed(trace(consumer, ifOp.thenYield().getOperand(idx), seen)))
+        return failure();
+      if (!ifOp.getElseRegion().empty())
+        return trace(consumer, ifOp.elseYield().getOperand(idx), seen);
+      return success();
+    }
+    if (auto forOp = dyn_cast<scf::ForOp>(def)) {
+      unsigned idx = cast<OpResult>(tok).getResultNumber();
+      if (failed(trace(consumer, forOp.getInits()[idx], seen)))
+        return failure();
+      auto *yield = forOp.getBody()->getTerminator();
+      return trace(consumer, yield->getOperand(idx), seen);
+    }
+    return success();
+  };
+  LogicalResult result = success();
+  func.walk([&](Operation *op) {
+    Value tok;
+    if (auto rel = dyn_cast<nvws::SemaphoreReleaseOp>(op))
+      tok = rel.getToken();
+    else if (auto buf = dyn_cast<nvws::SemaphoreBufferOp>(op))
+      tok = buf.getToken();
+    else
+      return;
+    DenseSet<Value> seen;
+    if (failed(trace(op, tok, seen)))
+      result = failure();
+    if (auto buf = dyn_cast<nvws::SemaphoreBufferOp>(op)) {
+      auto bp = idsOf(op);
+      if (bp)
+        for (Value view : buf->getResults())
+          for (Operation *user : view.getUsers()) {
+            auto up = idsOf(user);
+            if (up && *up != *bp) {
+              user->emitError("nvws-insert-semas: view-locality violation: "
+                              "view consumed outside its partition")
+                  .attachNote(op->getLoc())
+                  << "view materialized here";
+              result = failure();
+            }
+          }
+    }
+  });
+  return result;
+}
+
 static LogicalResult emitIR(triton::FuncOp funcOp,
                             MutableArrayRef<GroupDag> groups) {
   EmitCtx ctx;
@@ -1314,6 +1411,9 @@ static LogicalResult emitIR(triton::FuncOp funcOp,
   // Poison cleanup: if unused, drop it.
   if (ctx.poison.use_empty())
     ctx.poison.getDefiningOp()->erase();
+  // Post-emit token/view locality subpass (user ruling 10jun26).
+  if (failed(verifyTokenLocality(funcOp)))
+    return failure();
   return success();
 }
 

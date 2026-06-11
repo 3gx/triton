@@ -1,0 +1,245 @@
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @_attn_fwd
+groups: 6
+GROUP buffer.id=4 memory=tmem members=3
+  members: m0[0,128) m1[64,65) m2[0,64)
+  pieces: P0=[0,64){m0,m2}c0 P1=[64,65){m0,m1}c0 P2=[65,128){m0}c0
+  footprints: m0={P0,P1,P2} m1={P1} m2={P0}
+ACCESS-DAG
+|- func @_attn_fwd
+|  |- scf.for (WS, tag=0) effects{P0:W,P1:W,P2:W}
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |- R  m0  ttng.tmem_load {5}
+|  |  |- W  m1  ttng.tmem_store {5}
+|  |  |- R  m1  ttng.tmem_load {0}
+|  |  |- W  m2  ttng.tmem_alloc {5}
+|  |  |- R  m2  ttng.tc_gen5_mma {1}
+OWNER-DAG
+|- func @_attn_fwd
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1},P1:W:{1},P2:W:{1}}
+|  |  |- ENTER pieces{P0:W:{1},P1:W:{1},P2:W:{1}}
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |- R  m0  ttng.tmem_load {5}
+|  |  |- W  m1  ttng.tmem_store {5}
+|  |  |- R  m1  ttng.tmem_load {0}
+|  |  |- W  m2  ttng.tmem_alloc {5}
+|  |  |- R  m2  ttng.tc_gen5_mma {1}
+|  |  |- EXIT pieces{P0:W:{1},P1:W:{1},P2:W:{1}}
+SYNC-DAG
+|- func @_attn_fwd
+|  |- a  S3(2)  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1},P1:W:{1},P2:W:{1}} parts{0,1,5} thread{c0:{1}}
+|  |  |- ENTER pieces{P0:W:{1},P1:W:{1},P2:W:{1}}
+|  |  |- W m0  ttng.tc_gen5_mma {1}
+|  |  |- r  S0  {1} [tc5mma]
+|  |  |- a  S0  {5}
+|  |  |- R m0  ttng.tmem_load {5}
+|  |  |- W m1  ttng.tmem_store {5}
+|  |  |- r  S1  {5} [none]
+|  |  |- r  S3  {5} [none]
+|  |  |- a  S1  {0}
+|  |  |- R m1  ttng.tmem_load {0}
+|  |  |- r  S3  {0} [none]
+|  |  |- W m2  ttng.tmem_alloc {5}
+|  |  |- r  S2  {5} [none]
+|  |  |- a  S2  {1}
+|  |  |- R m2  ttng.tc_gen5_mma {1}
+|  |  |- a  S3(2)  {1}
+|  |  |- EXIT pieces{P0:W:{1},P1:W:{1},P2:W:{1}} yield{c0: a S3}
+  SEMAS c0: S0{count=1} S1{count=1} S2{count=1} S3{count=2 entry inherit={@0.1}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+GROUP buffer.id=5 memory=tmem members=3
+  members: m0[0,128) m1[64,65) m2[0,64)
+  pieces: P0=[0,64){m0,m2}c0 P1=[64,65){m0,m1}c0 P2=[65,128){m0}c0
+  footprints: m0={P0,P1,P2} m1={P1} m2={P0}
+ACCESS-DAG
+|- func @_attn_fwd
+|  |- scf.for (WS, tag=0) effects{P0:W,P1:W,P2:W}
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |- R  m0  ttng.tmem_load {4}
+|  |  |- W  m1  ttng.tmem_store {4}
+|  |  |- R  m1  ttng.tmem_load {0}
+|  |  |- W  m2  ttng.tmem_alloc {4}
+|  |  |- R  m2  ttng.tc_gen5_mma {1}
+OWNER-DAG
+|- func @_attn_fwd
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1},P1:W:{1},P2:W:{1}}
+|  |  |- ENTER pieces{P0:W:{1},P1:W:{1},P2:W:{1}}
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |- R  m0  ttng.tmem_load {4}
+|  |  |- W  m1  ttng.tmem_store {4}
+|  |  |- R  m1  ttng.tmem_load {0}
+|  |  |- W  m2  ttng.tmem_alloc {4}
+|  |  |- R  m2  ttng.tc_gen5_mma {1}
+|  |  |- EXIT pieces{P0:W:{1},P1:W:{1},P2:W:{1}}
+SYNC-DAG
+|- func @_attn_fwd
+|  |- a  S3(2)  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{1},P1:W:{1},P2:W:{1}} parts{0,1,4} thread{c0:{1}}
+|  |  |- ENTER pieces{P0:W:{1},P1:W:{1},P2:W:{1}}
+|  |  |- W m0  ttng.tc_gen5_mma {1}
+|  |  |- r  S0  {1} [tc5mma]
+|  |  |- a  S0  {4}
+|  |  |- R m0  ttng.tmem_load {4}
+|  |  |- W m1  ttng.tmem_store {4}
+|  |  |- r  S1  {4} [none]
+|  |  |- r  S3  {4} [none]
+|  |  |- a  S1  {0}
+|  |  |- R m1  ttng.tmem_load {0}
+|  |  |- r  S3  {0} [none]
+|  |  |- W m2  ttng.tmem_alloc {4}
+|  |  |- r  S2  {4} [none]
+|  |  |- a  S2  {1}
+|  |  |- R m2  ttng.tc_gen5_mma {1}
+|  |  |- a  S3(2)  {1}
+|  |  |- EXIT pieces{P0:W:{1},P1:W:{1},P2:W:{1}} yield{c0: a S3}
+  SEMAS c0: S0{count=1} S1{count=1} S2{count=1} S3{count=2 entry inherit={@0.1}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+GROUP buffer.id=2 memory=tmem members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @_attn_fwd
+|  |- W  m0  ttng.tmem_store root
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- R  m0  ttng.tmem_load {0}
+|  |  |- W  m0  ttng.tmem_store {0}
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |- R  m0  ttng.tmem_load root
+OWNER-DAG
+|- func @_attn_fwd
+|  |- W  m0  ttng.tmem_store root
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- R  m0  ttng.tmem_load {0}
+|  |  |- W  m0  ttng.tmem_store {0}
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |- EXIT pieces{P0:W:{0}}
+|  |- R  m0  ttng.tmem_load root
+SYNC-DAG
+|- func @_attn_fwd
+|  |- a  S1  root  ; entry
+|  |- W m0  ttng.tmem_store root
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}} parts{0,1} thread{c0:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- R m0  ttng.tmem_load {0}
+|  |  |- W m0  ttng.tmem_store {0}
+|  |  |- r  S0  {0} [none]
+|  |  |- a  S0  {1}
+|  |  |- W m0  ttng.tc_gen5_mma {1}
+|  |  |- r  S1  {1} [tc5mma]
+|  |  |- a  S1  {0}
+|  |  |- EXIT pieces{P0:W:{0}} yield{c0: a S1}
+|  |- r  S2  {@0.0} [none]
+|  |- a  S2  root
+|  |- R m0  ttng.tmem_load root
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit=root} S2{count=1}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+GROUP buffer.id=3 memory=tmem members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @_attn_fwd
+|  |- W  m0  ttng.tmem_store root
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- R  m0  ttng.tmem_load {0}
+|  |  |- W  m0  ttng.tmem_store {0}
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |- R  m0  ttng.tmem_load root
+OWNER-DAG
+|- func @_attn_fwd
+|  |- W  m0  ttng.tmem_store root
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- R  m0  ttng.tmem_load {0}
+|  |  |- W  m0  ttng.tmem_store {0}
+|  |  |- W  m0  ttng.tc_gen5_mma {1}
+|  |  |- EXIT pieces{P0:W:{0}}
+|  |- R  m0  ttng.tmem_load root
+SYNC-DAG
+|- func @_attn_fwd
+|  |- a  S1  root  ; entry
+|  |- W m0  ttng.tmem_store root
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}} parts{0,1} thread{c0:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- R m0  ttng.tmem_load {0}
+|  |  |- W m0  ttng.tmem_store {0}
+|  |  |- r  S0  {0} [none]
+|  |  |- a  S0  {1}
+|  |  |- W m0  ttng.tc_gen5_mma {1}
+|  |  |- r  S1  {1} [tc5mma]
+|  |  |- a  S1  {0}
+|  |  |- EXIT pieces{P0:W:{0}} yield{c0: a S1}
+|  |- r  S2  {@0.0} [none]
+|  |- a  S2  root
+|  |- R m0  ttng.tmem_load root
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit=root} S2{count=1}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+GROUP buffer.id=none#1 memory=local members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @_attn_fwd
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  nvws.descriptor_load {3}
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+OWNER-DAG
+|- func @_attn_fwd
+|  |- scf.for (WS, tag=0) pieces{P0:W:{3}}
+|  |  |- ENTER pieces{P0:W:{3}}
+|  |  |- W  m0  nvws.descriptor_load {3}
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+|  |  |- EXIT pieces{P0:W:{3}}
+SYNC-DAG
+|- func @_attn_fwd
+|  |- a  S1  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{3}} parts{1,3} thread{c0:{3}}
+|  |  |- ENTER pieces{P0:W:{3}}
+|  |  |- W m0  nvws.descriptor_load {3}
+|  |  |- r  S0  {3} [tma_load]
+|  |  |- a  S0  {1}
+|  |  |- R m0  ttng.tc_gen5_mma {1}
+|  |  |- R m0  ttng.tc_gen5_mma {1}
+|  |  |- r  S1  {1} [tc5mma]
+|  |  |- a  S1  {3}
+|  |  |- EXIT pieces{P0:W:{3}} yield{c0: a S1}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.3}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+GROUP buffer.id=none#2 memory=local members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @_attn_fwd
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  nvws.descriptor_load {3}
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+OWNER-DAG
+|- func @_attn_fwd
+|  |- scf.for (WS, tag=0) pieces{P0:W:{3}}
+|  |  |- ENTER pieces{P0:W:{3}}
+|  |  |- W  m0  nvws.descriptor_load {3}
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+|  |  |- R  m0  ttng.tc_gen5_mma {1}
+|  |  |- EXIT pieces{P0:W:{3}}
+SYNC-DAG
+|- func @_attn_fwd
+|  |- a  S1  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{3}} parts{1,3} thread{c0:{3}}
+|  |  |- ENTER pieces{P0:W:{3}}
+|  |  |- W m0  nvws.descriptor_load {3}
+|  |  |- r  S0  {3} [tma_load]
+|  |  |- a  S0  {1}
+|  |  |- R m0  ttng.tc_gen5_mma {1}
+|  |  |- R m0  ttng.tc_gen5_mma {1}
+|  |  |- r  S1  {1} [tc5mma]
+|  |  |- a  S1  {3}
+|  |  |- EXIT pieces{P0:W:{3}} yield{c0: a S1}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.3}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
