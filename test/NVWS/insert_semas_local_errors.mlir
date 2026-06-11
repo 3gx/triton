@@ -12,7 +12,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
       %v = "producer"() {ttg.partition = array<i32: 0>} : () -> !ty
       ttg.local_store %v, %alloc {ttg.partition = array<i32: 0>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
 
-      // CHECK: local semaphore: unsupported SMEM memdesc alias use test.memdesc_view
+      // CHECK: nvws-insert-semas: unsupported memdesc alias use test.memdesc_view
       %view = "test.memdesc_view"(%alloc) {ttg.partition = array<i32: 1>} : (!ttg.memdesc<1xi32, #shared, #smem, mutable>) -> !ttg.memdesc<1xi32, #shared, #smem>
       %l = ttg.local_load %view {ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi32, #shared, #smem> -> !ty
       "use"(%l) {ttg.partition = array<i32: 1>} : (!ty) -> ()
