@@ -555,7 +555,7 @@ static LogicalResult sweepChain(GroupDag &g, Node *head, ChainIndex &ci,
       if (ci.chainOf.lookup(e.src) != head)
         continue;
       if (e.dst->kind == Node::Exit)
-        continue; // back-edge closes are re-verified by sweepTraversalClosure
+        continue; // EXIT closes are re-verified by sweepTraversalClosure
       if (!covers(behind[ownerKey(e.dstOwner)], ownerKey(e.srcOwner),
                   ci.idx.lookup(e.src)))
         return (e.dst->op ? e.dst->op : g.root->op)
