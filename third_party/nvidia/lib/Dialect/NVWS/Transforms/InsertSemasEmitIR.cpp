@@ -1202,9 +1202,25 @@ static LogicalResult workaroundLoopScheduler(EmitCtx &ctx) {
     for (auto [i, res] : llvm::enumerate(ifOp.getResults())) {
       if (i == c.tokenResultIdx)
         continue;
-      for (Operation *user : res.getUsers())
-        for (int p : partitionIdsOfFwd(user))
+      for (OpOperand &use : res.getUses()) {
+        Operation *user = use.getOwner();
+        SetVector<int> ids;
+        // A yield's op-level annotation unions ALL its operands'
+        // partitions; the consumers of THIS value are the parent's
+        // authored partition.outputs entry for this operand (else the
+        // union drags in partitions with no content here, leaving
+        // PartitionLoops an empty husk that still uses the condition).
+        if (isa<scf::YieldOp>(user)) {
+          auto outs = gpu::getPartitionOutputs(user->getParentOp());
+          unsigned idx = use.getOperandNumber();
+          if (idx < outs.size())
+            ids = outs[idx];
+        }
+        if (ids.empty())
+          ids = partitionIdsOfFwd(user);
+        for (int p : ids)
           middleIds.insert(p);
+      }
     }
     if (!middleIds.empty())
       gpu::setPartition(ifOp, middleIds.getArrayRef());
