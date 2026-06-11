@@ -91,16 +91,16 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // empty husk using a condition that clone does not have).
       // CHECK: } {ttg.partition = array<i32: 1>}
       // CHECK: scf.if
-      // CHECK: } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0, 1>, array<i32: 1>]}
+      // CHECK: } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0>, array<i32: 0, 1>]}
       // CHECK: scf.if
       // CHECK: } {ttg.partition = array<i32: 1>, ttg.partition.outputs = [array<i32: 1>]}
       %epilogue:3 = scf.if %cond -> (i32, !ttg.async.token, i1) {
         %value, %load_tok = ttng.tmem_load %acc[%mma] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
         "acc_user"(%value) {ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> ()
-        scf.yield {ttg.partition = array<i32: 0, 1, 2>} %iv, %load_tok, %true : i32, !ttg.async.token, i1
+        scf.yield {ttg.partition = array<i32: 0, 1>} %iv, %load_tok, %true : i32, !ttg.async.token, i1
       } else {
-        scf.yield {ttg.partition = array<i32: 0, 1, 2>} %carry, %mma, %use_acc : i32, !ttg.async.token, i1
-      } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0>, array<i32: 1>, array<i32: 0>]}
+        scf.yield {ttg.partition = array<i32: 0, 1>} %carry, %mma, %use_acc : i32, !ttg.async.token, i1
+      } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0>, array<i32: 1>, array<i32: 0, 1>]}
       %next = arith.addi %epilogue#0, %c1_i32 {ttg.partition = array<i32: 0, 1>} : i32
       scf.yield {ttg.partition = array<i32: 0, 1, 2>} %epilogue#2, %epilogue#1, %next : i1, !ttg.async.token, i32
     } {tt.num_stages = 2 : i32, tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.outputs = [array<i32: 1>, array<i32: 1>, array<i32: 0>], ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 1 : i32}

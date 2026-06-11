@@ -1192,51 +1192,38 @@ static LogicalResult workaroundLoopScheduler(EmitCtx &ctx) {
     // scalar mux each consuming partition's clone must keep (use_acc
     // feeding next iteration's mma); with no surviving results it
     // collapses to the body's partition.
-    SetVector<int> originalIds = partitionIdsOfFwd(ifOp);
+    // PRODUCERS ARE INVARIANT UNDER THE SPLIT (user ruling 11jun26):
+    // outputs stay the AUTHORED entries — the split cannot make a
+    // partition start producing a value it never produced. The dead
+    // token slot's entry leaves with the slot (post-split sweep +
+    // filterPartitionOutputs). The partition attr is then exactly what
+    // the metadata justifies: body-op owners plus the union of the
+    // surviving authored outputs (a replicated select slot authored
+    // {0,1} is what legitimately keeps a body-less partition in the
+    // set — never a fabricated entry).
     SetVector<int> middleIds;
-    for (int p : originalIds)
-      if (!enterExitIds.contains(p))
+    for (Operation &op : ifOp.getThenRegion().front()) {
+      if (isa<scf::YieldOp>(op))
+        continue; // yields mirror the region op; they are not evidence
+      for (int p : partitionIdsOfFwd(&op))
         middleIds.insert(p);
-    if (middleIds.empty())
-      middleIds = originalIds;
-    SmallVector<SetVector<int>, 4> newOutputs(ifOp.getNumResults());
-    for (auto [i, res] : llvm::enumerate(ifOp.getResults())) {
-      if (i == c.tokenResultIdx)
-        continue; // dead after the reroute; dropped by the post-split sweep
-      for (OpOperand &use : res.getUses()) {
-        Operation *user = use.getOwner();
-        SetVector<int> ids;
-        // A yield's op-level annotation unions ALL its operands'
-        // partitions; the consumers of THIS value are the parent's
-        // authored partition.outputs entry for this operand (else the
-        // union drags in partitions with no content here, leaving
-        // PartitionLoops an empty husk that still uses the condition).
-        if (isa<scf::YieldOp>(user)) {
-          auto outs = gpu::getPartitionOutputs(user->getParentOp());
-          unsigned idx = use.getOperandNumber();
-          if (idx < outs.size())
-            ids = outs[idx];
-        }
-        if (ids.empty())
-          ids = partitionIdsOfFwd(user);
-        for (int p : ids) {
+    }
+    if (!ifOp.getElseRegion().empty())
+      for (Operation &op : ifOp.getElseRegion().front()) {
+        if (isa<scf::YieldOp>(op))
+          continue;
+        for (int p : partitionIdsOfFwd(&op))
           middleIds.insert(p);
-          newOutputs[i].insert(p);
-        }
       }
+    auto authored = gpu::getPartitionOutputs(ifOp);
+    for (auto [i, o] : llvm::enumerate(authored)) {
+      if (i == c.tokenResultIdx)
+        continue; // dead after the reroute; dropped by the sweep
+      for (int p : o)
+        middleIds.insert(p);
     }
-    if (!middleIds.empty()) {
+    if (!middleIds.empty())
       gpu::setPartition(ifOp, middleIds.getArrayRef());
-      // INVARIANT (user ruling 11jun26): every partition member is
-      // justified by a body op or an outputs entry — the outputs ARE
-      // the consumer-derived producer sets that justified middleIds,
-      // never the (possibly inconsistent) authored entries. The dead
-      // token slot's entry is filtered out with the slot itself.
-      for (auto [i, o] : llvm::enumerate(newOutputs))
-        if (o.empty())
-          newOutputs[i] = middleIds; // token slot placeholder
-      gpu::setPartitionOutputs(ifOp, newOutputs);
-    }
   }
   return success();
 }
