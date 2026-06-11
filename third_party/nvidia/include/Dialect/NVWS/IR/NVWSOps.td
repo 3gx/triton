@@ -47,11 +47,18 @@ def NVWS_SemaphoreCreateOp : NVWS_Op<"semaphore.create", [
                          "::llvm::cast<SemaphoreType>($_self).getBaseType()">]> {
   let summary = "Create a semaphore guarding a multi-buffered allocation.";
   let arguments = (ins Variadic<TTG_MemDescType>:$buffers,
-                       I1Attr:$is_released);
+                       I1Attr:$is_released,
+                       OptionalAttr<I32Attr>:$pending_count);
   let results = (outs NVWS_SemaphoreType:$result);
   let assemblyFormat = [{
     $buffers $is_released attr-dict `:` type($result)
   }];
+  let builders = [
+    OpBuilder<(ins "Type":$result, "ValueRange":$buffers, "bool":$is_released), [{
+      build($_builder, $_state, result, buffers, is_released,
+            /*pending_count=*/IntegerAttr());
+    }]>
+  ];
   let hasVerifier = 1;
 }
 
@@ -80,14 +87,16 @@ def NVWS_SemaphoreReleaseOp : NVWS_Op<"semaphore.release", [
   let arguments = (ins NVWS_SemaphoreType:$semaphore,
                        TTG_AsyncToken:$token,
                        Optional<I32>:$stage,
-                       NVWS_AsyncOpArrayAttr:$async_ops);
+                       NVWS_AsyncOpArrayAttr:$async_ops,
+                       OptionalAttr<I32Attr>:$arrive_count);
   let assemblyFormat = [{
     $semaphore (`[` $stage^ `]`)? `,` $token $async_ops attr-dict
     `:` type($semaphore) `,` type($token)
   }];
   let builders = [
     OpBuilder<(ins "Value":$semaphore, "Value":$token, "ArrayAttr":$async_ops), [{
-      build($_builder, $_state, semaphore, token, Value(), async_ops);
+      build($_builder, $_state, semaphore, token, Value(), async_ops,
+            /*arrive_count=*/IntegerAttr());
     }]>
   ];
   let hasVerifier = 1;

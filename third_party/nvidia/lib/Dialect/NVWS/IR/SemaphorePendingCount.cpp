@@ -129,6 +129,11 @@ analyzeSemaphorePendingCount(SemaphoreCreateOp op) {
       analysis.unsupportedAsyncOp = unsupportedAsyncOp;
       return analysis;
     }
+    // First-class arrive multiplicity (absent = 1 for legacy producers):
+    // with this folded in, the analysis sees exactly what the lowering
+    // emits and pending-count verification is exact equality.
+    if (auto countAttr = releaseOp.getArriveCountAttr())
+      *contribution *= countAttr.getInt();
 
     int partitionId = partitionIds.front();
     auto [globalIt, globalInserted] =

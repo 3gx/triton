@@ -605,10 +605,11 @@ createSemaphoreProducer(OpBuilder &builder, CommunicationBuffer &sema,
 
   if (sema.hasSemaphores()) {
     // Cross-release: producer releases full semaphore.
-    createInto<SemaphoreReleaseOp>(
+    auto rel = createInto<SemaphoreReleaseOp>(
         builder, loc, producerPartitions, stageCluster, wsTag, sema.full, token,
         builder.getArrayAttr(SmallVector<Attribute>{
             AsyncOpAttr::get(builder.getContext(), producerKind)}));
+    rel.setArriveCountAttr(builder.getI32IntegerAttr(1));
   }
 
   return staleOps;
@@ -898,10 +899,11 @@ void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
   builder.setInsertionPointAfter(exitInsertPointAfter);
 
   // Cross-release: consumer releases empty semaphore
-  createInto<SemaphoreReleaseOp>(
+  auto rel = createInto<SemaphoreReleaseOp>(
       builder, loc, consumerPartitions, stageClusterExit, wsTag, sema.empty,
       token,
       builder.getArrayAttr(asyncKinds));
+  rel.setArriveCountAttr(builder.getI32IntegerAttr(1));
 }
 
 Operation *getEarliestUserInBlock(Block *block, ArrayRef<OpOperand *> uses) {

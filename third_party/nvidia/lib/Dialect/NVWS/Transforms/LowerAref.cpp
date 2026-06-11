@@ -128,20 +128,40 @@ void setIsAsync(triton::nvidia_gpu::MMAv5OpInterface mmaOp,
   mmaOp.setIsAsync(isAsync);
 }
 
-int getPendingCount(SemaphoreCreateOp op) {
+// CONTRACT (fable/integrate-pending-count-plan.md): pending_count is
+// AUTHORED by the producing pass (insert-semas, insert-allocas, or the
+// combine phase below) and REQUIRED here; the analysis re-derives it from
+// the IR purely as a verifier — exact equality, never a fallback.
+FailureOr<int> getPendingCount(SemaphoreCreateOp op) {
+  auto authored = op.getPendingCountAttr();
+  if (!authored)
+    return op.emitError(
+        "semaphore.create reached nvws-lower-semaphore without a "
+        "pending_count; the producing pass must author it");
   auto analysis = analyzeSemaphorePendingCount(op);
-  assert(!analysis.invalidPartitionArity &&
-         "partitioned semaphore.release must have exactly one partition id");
-  assert(!analysis.unsupportedAsyncOp &&
-         "unsupported async kind in semaphore.release pending-count analysis");
-  assert(!analysis.inconsistentPartitionId &&
-         "inconsistent per-partition pending-count contribution");
+  if (analysis.invalidPartitionArity)
+    return op.emitError("partitioned semaphore.release must have exactly one "
+                        "partition id for pending-count analysis");
+  if (analysis.unsupportedAsyncOp)
+    return op.emitError(
+        "unsupported async kind in semaphore.release pending-count analysis");
+  if (analysis.inconsistentPartitionId)
+    return op.emitError(
+        "inconsistent per-partition pending-count contribution");
+  if (authored.getInt() != analysis.pendingCount)
+    return op.emitError("authored pending_count ")
+           << authored.getInt() << " disagrees with pending-count analysis "
+           << analysis.pendingCount;
   return analysis.pendingCount;
 }
 
-Value createAndInitMbar(SemaphoreCreateOp op, PatternRewriter &rewriter) {
+FailureOr<Value> createAndInitMbar(SemaphoreCreateOp op,
+                                   PatternRewriter &rewriter) {
   int numStages = op.getType().getNumStages();
-  int pendingCount = getPendingCount(op);
+  auto pendingCountOr = getPendingCount(op);
+  if (failed(pendingCountOr))
+    return failure();
+  int pendingCount = *pendingCountOr;
 
   rewriter.setInsertionPoint(op);
   ImplicitLocOpBuilder b(op.getLoc(), rewriter);
@@ -268,11 +288,18 @@ void rewriteAcquire(SemaphoreAcquireOp op, PatternRewriter &rewriter,
   assignStageCluster(waitOp, partitionWsTagIds, stageCluster, rewriter);
 }
 
-void rewriteRelease(
+LogicalResult rewriteRelease(
     SemaphoreCreateOp semaOp, SemaphoreReleaseOp op, PatternRewriter &rewriter,
     Value mbars, const llvm::DenseMap<Operation *, bool> &hasAsyncPeerBySema) {
   auto loc = op.getLoc();
   auto asyncKinds = castAsyncOpAttrs(op.getAsyncOps());
+  // CONTRACT: arrive_count is authored by the producing pass and required.
+  auto countAttr = op.getArriveCountAttr();
+  if (!countAttr)
+    return op.emitError(
+        "semaphore.release reached nvws-lower-semaphore without an "
+        "arrive_count; the producing pass must author it");
+  int arriveCount = countAttr.getInt();
   rewriter.setInsertionPointAfter(op);
   auto partitionWsTagIds = getPartitionWsTagIds(op);
   auto stageCluster = getStageCluster(op);
@@ -315,13 +342,18 @@ void rewriteRelease(
     switch (asyncKind) {
     case AsyncOp::NONE:
     case AsyncOp::WGMMA:
-      arriveOp = ArriveBarrierOp::create(rewriter, loc, mbar, 1);
+      arriveOp = ArriveBarrierOp::create(rewriter, loc, mbar, arriveCount);
       break;
     case AsyncOp::TC5MMA:
     case AsyncOp::TMEMCopy:
-      arriveOp = TCGen5CommitOp::create(rewriter, loc, mbar, Value(), false);
-      break;
     case AsyncOp::TMALoad:
+      // Commit/TMA-completed arrivals cannot arrive N times (user ruling,
+      // fable/integrate-pending-count-plan.md).
+      if (arriveCount > 1)
+        return op.emitError("arrive_count > 1 is only lowerable for "
+                            "none/wgmma async kinds");
+      if (asyncKind != AsyncOp::TMALoad)
+        arriveOp = TCGen5CommitOp::create(rewriter, loc, mbar, Value(), false);
       break;
     case AsyncOp::CpAsync:
     default:
@@ -330,6 +362,7 @@ void rewriteRelease(
     if (arriveOp)
       assignStageCluster(arriveOp, partitionWsTagIds, stageCluster, rewriter);
   }
+  return success();
 }
 
 static MemDescType getAsMutable(MemDescType type) {
@@ -444,7 +477,10 @@ public:
       }
     }
 
-    auto mbars = createAndInitMbar(op, rewriter);
+    auto mbarsOr = createAndInitMbar(op, rewriter);
+    if (failed(mbarsOr))
+      return failure();
+    Value mbars = *mbarsOr;
     SmallVector<Value> buffers(op.getBuffers().begin(), op.getBuffers().end());
 
     // Load TMA loads before erasing/rewriting semaphore users.
@@ -482,7 +518,9 @@ public:
       if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(userOp)) {
         rewriteAcquire(acquireOp, rewriter, mbars);
       } else if (auto releaseOp = dyn_cast<SemaphoreReleaseOp>(userOp)) {
-        rewriteRelease(op, releaseOp, rewriter, mbars, hasAsyncPeerBySema);
+        if (failed(rewriteRelease(op, releaseOp, rewriter, mbars,
+                                  hasAsyncPeerBySema)))
+          return failure();
       } else if (auto bufferOp = dyn_cast<SemaphoreBufferOp>(userOp)) {
         rewriteBuffer(bufferOp, rewriter, buffers);
       } else {
@@ -660,6 +698,7 @@ void createCombinedSemaphoreOps(ArrayRef<SemaphoreAcquireOp> acquireOps,
       builder, lastRelease.getLoc(), releaseSema, combinedAcquire.getToken(),
       builder.getArrayAttr(
           SmallVector<Attribute>(asyncOpsSet.begin(), asyncOpsSet.end())));
+  combinedRelease.setArriveCountAttr(builder.getI32IntegerAttr(1));
   assignStageCluster(combinedRelease, getPartitionWsTagIds(lastRelease),
                      getStageCluster(lastRelease), builder);
 }
@@ -920,6 +959,14 @@ void combineSemaphores(scf::ForOp loop) {
     combineConsumerSide(acquireGroup, groupInfo, combinedPair, builder);
     combineProducerSide(groupInfo, combinedPair, builder);
     eraseSemaToCombineGroup(acquireGroup, groupInfo);
+    // The combiner is the author of the combined semaphores: stamp their
+    // pending counts from the now-complete combined protocol (the create
+    // verifier and getPendingCount both re-check via the analysis).
+    for (auto sema : {combinedPair.empty, combinedPair.full}) {
+      auto a = analyzeSemaphorePendingCount(sema);
+      sema.setPendingCountAttr(
+          builder.getI32IntegerAttr(a.pendingCount));
+    }
   }
 }
 

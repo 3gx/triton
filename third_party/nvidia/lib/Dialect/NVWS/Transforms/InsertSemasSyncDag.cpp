@@ -1196,6 +1196,7 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
                        ? terminal->owner
                        : sortedPieceInfo(terminal).front().second.owner;
       rel->sema = sid;
+      rel->count = 1; // arrive multiplicity (terminal permit return)
       rel->payloads.push_back(AsyncOp::NONE);
       // Place after any releases already trailing the terminal row.
       Node *anchor = terminal;

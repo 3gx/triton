@@ -100,6 +100,9 @@ verifySharedBufferPeerTupleInvariant(SemaphoreCreateOp semaphoreCreate) {
 }
 
 LogicalResult SemaphoreReleaseOp::verify() {
+  if (auto count = getArriveCountAttr())
+    if (count.getInt() < 1)
+      return emitError("arrive_count must be >= 1, got ") << count.getInt();
   return verifyNoDuplicateAsyncOps(getOperation(), getAsyncOps());
 }
 
@@ -163,6 +166,15 @@ LogicalResult SemaphoreCreateOp::verify() {
            << pendingCountAnalysis.inconsistentPartitionId.value()
            << ": expected " << pendingCountAnalysis.expectedContribution
            << ", got " << pendingCountAnalysis.actualContribution;
+  }
+  // First-class pending count (authored by the producing pass) must agree
+  // exactly with the analysis — the analysis folds arrive_count in, so any
+  // disagreement is authored-metadata corruption, never a convention gap.
+  if (auto authored = getPendingCountAttr()) {
+    if (authored.getInt() != pendingCountAnalysis.pendingCount)
+      return emitError("pending_count ") << authored.getInt()
+             << " disagrees with pending-count analysis "
+             << pendingCountAnalysis.pendingCount;
   }
 
   return success();

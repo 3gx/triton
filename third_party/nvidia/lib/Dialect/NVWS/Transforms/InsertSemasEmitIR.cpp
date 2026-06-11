@@ -98,13 +98,10 @@ static SetVector<int> partitionIdsOfFwd(Operation *op) {
   return s;
 }
 
-// USER RULING (2026-06-10): the DAG's arrive multiplicity (r S(n)) is NOT
-// expressible in async_ops today — the op verifier rejects duplicate
-// kinds, and SemaphorePendingCount counts a partition once per wave. The
-// payload union is emitted ONCE; the DAG count is preserved on the create
-// (nvws.dag_pending_count) for the planned lowering extension. Until it
-// lands, kernels relying on asymmetric-wave counts (run_nvws gates) are
-// deferred; gate 1 and the sanctioned pytest are unaffected.
+// Arrive multiplicity (r S(n)) is first-class: the payload union is
+// emitted once per release with arrive_count = the DAG count, and the
+// lowering passes it to the mbarrier arrive (count > 1 valid for
+// none/wgmma kinds only; see fable/integrate-pending-count-plan.md).
 static ArrayAttr asyncOpsAttr(MLIRContext *ctx, const Node *rel) {
   SmallVector<Attribute, 2> elems;
   for (AsyncOp p : rel->payloads)
@@ -287,12 +284,9 @@ static LogicalResult emitBackingsAndCreates(EmitCtx &ctx, GroupDag &g) {
     Sema &s = *sp;
     auto create = nvws::SemaphoreCreateOp::create(
         b, loc, semaTy, g.backingPlan.backing, s.isEntry);
-    // Pending count is a DAG fact the current lowering re-derives from
-    // release waves; record it for the planned lowering extension (see
-    // asyncOpsAttr note — multiplicities > 1 are not yet expressible).
-    create->setAttr("nvws.dag_pending_count",
-                    IntegerAttr::get(IntegerType::get(b.getContext(), 32),
-                                     s.count));
+    // First-class pending count: the DAG fan-in, transcribed (and
+    // verified against the pending-count analysis) by the lowering.
+    create.setPendingCountAttr(b.getI32IntegerAttr(s.count));
     s.create = create.getResult();
   }
   return success();
@@ -870,6 +864,9 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
           b, lastReal ? lastReal->getLoc() : ctx.func.getLoc(), n->owner,
           stageFor(rs, n->owner, nullptr), g.semaTable.semas[n->sema].create,
           tok, asyncOpsAttr(b.getContext(), n));
+      // First-class arrive multiplicity: transcribe the DAG fact (r S(n));
+      // the lowering passes it to the mbarrier arrive.
+      rel.setArriveCountAttr(b.getI32IntegerAttr(n->count));
       emitted[n] = Value();
       lastReal = rel;
       break;
