@@ -108,15 +108,28 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // buffer.id=402 but live at non-overlapping offsets (0 and 256, both
   // extent 128). They are physically distinct (different resourceKey),
   // each touched by only one owner, so no semaphores are needed.
+  // The pass must leave this function untouched: no semaphores, no
+  // buffer views, both streams keep their original alloc/load rows.
+  // (Regression guard: wave locality is scoped per component; the two
+  // independent streams must not be cross-serialized.)
   // CHECK-LABEL: @local_non_overlapping_aliased_buffers
   tt.func @local_non_overlapping_aliased_buffers(%lb: i32, %ub: i32, %step: i32) {
     %c0 = arith.constant 0 : i32
     %cst0 = arith.constant dense<0.000000e+00> : tensor<128x128xf16, #blocked>
     %cst1 = arith.constant dense<1.000000e+00> : tensor<128x128xf16, #blocked>
     %r = scf.for %iv = %lb to %ub step %step iter_args(%i = %c0) -> (i32) : i32 {
+      // CHECK-NOT: nvws.semaphore
+      // CHECK: [[A:%.*]] = ttg.local_alloc %{{[-A-Za-z0-9_.$#]+}} {buffer.id = 402 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      // CHECK-NOT: nvws.semaphore
+      // CHECK: ttg.local_load [[A]] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #blocked>
       %a = ttg.local_alloc %cst0 {buffer.id = 402 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       %av = ttg.local_load %a {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #blocked>
       "use_a"(%av) {ttg.partition = array<i32: 0>} : (tensor<128x128xf16, #blocked>) -> ()
+      // CHECK-NOT: nvws.semaphore
+      // CHECK: [[B:%.*]] = ttg.local_alloc %{{[-A-Za-z0-9_.$#]+}} {buffer.id = 402 : i32, buffer.offset = 256 : i32, ttg.partition = array<i32: 1>} : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      // CHECK-NOT: nvws.semaphore
+      // CHECK: ttg.local_load [[B]] {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #blocked>
+      // CHECK-NOT: nvws.semaphore
       %b = ttg.local_alloc %cst1 {buffer.id = 402 : i32, buffer.offset = 256 : i32, ttg.partition = array<i32: 1>} : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       %bv = ttg.local_load %b {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #blocked>
       "use_b"(%bv) {ttg.partition = array<i32: 1>} : (tensor<128x128xf16, #blocked>) -> ()

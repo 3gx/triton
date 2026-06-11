@@ -214,6 +214,11 @@ def apply_to_test(test, gen):
         for anchor, text in gen[m.group(1)]:
             by.setdefault(anchor, []).append(text)
         out.append(ln); i += 1
+        # multi-line signature: pass continuation lines through verbatim
+        # so the body walk starts after the '{' opener (else this walk
+        # runs long and swallows the NEXT function, stripping its checks).
+        while i < n and not out[-1].rstrip().endswith('{'):
+            out.append(lines[i]); i += 1
         depth = 0
         acc_k = for_k = yield_k = 0
         stack = []
