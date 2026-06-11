@@ -33,15 +33,13 @@ SYNC-DAG
 |  |  |- r  S1  {1} [none]
 |  |  |- r  S3  {1} [none]
 |  |  |- a  S1  {2}
-|  |  |- a  S4  {2}
 |  |  |- W m1  ttg.local_alloc {2}
 |  |  |- r  S2  {2} [none]
 |  |  |- a  S2  {0}
 |  |  |- R m1  ttg.local_load {0}
-|  |  |- r  S4  {0} [none]
 |  |  |- a  S3  {0}
 |  |  |- EXIT pieces{P0:W:{0},P1:W:{0},P2:W:{2}} yield{c0: a S3}
-  SEMAS c0: S0{count=1} S1{count=1} S2{count=1} S3{count=1 entry inherit={@0.0}} S4{count=1 entry inherit={@0.2}}
+  SEMAS c0: S0{count=1} S1{count=1} S2{count=1} S3{count=1 entry inherit={@0.0}}
   BACKING: numStages=1 anchor=before scf.for(tag=0)
 ==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
 function: @fanout_not_reduced

@@ -467,21 +467,24 @@ Rows are visited in chain order; the complete rule set:
    of the view's partition; root-stamped entry acquires are the one
    sanctioned seed exemption).
 
-   **Back-edge placement (USER RULING 10jun26, second instance of the
-   class):** only ONE token wraps a loop's back edge — the chain's first
-   wave owner's (the yielded carrier; its pre-loop entry + trailing regain
-   are the section 5.3 canonical structure). Every OTHER carried owner's
-   EXIT-close regain anchors at the START of its own wave inside the body
-   (immediately before that partition's first touch row); its
-   cross-iteration wait travels through the semaphore's mbarrier phase,
-   not through an SSA token; iteration 0 is satisfied by the semaphore's
-   initial permit (created released, no pre-loop entry instance, no
-   iter_arg slot). Single-owner bodies reduce to the canonical structure
-   unchanged. Evidence: local_buffer_reuse's three-partition cycle yielded
-   only the LAST trailing regain's token ({2}) while the next iteration's
-   first wave ({0}) consumed it — caught by the post-emit verifier; the
-   stage-3 verifier additionally checks, for every loop-body chain, that
-   the final carrier owner equals the first wave owner.
+   **FORWARD REGAIN PLACEMENT (USER RULING 10jun26, second instance of
+   the class):** only ONE token is carried into the following traversal
+   through the iter_args slot — the chain's first wave owner's (the
+   yielded carrier; its pre-loop entry + trailing regain are the section
+   5.3 canonical structure). Every OTHER carried owner's EXIT-close
+   regain anchors at the START of its own wave inside the body
+   (immediately before that partition's first touch row). This is the
+   spec's own initial-permit rule: the semaphore's first chain event is
+   then an acquire, so it is created with an initial permit (released
+   state) and each release forward-satisfies the NEXT acquire occurrence
+   in chain order — no pre-loop entry instance, no iter_arg slot, no
+   token threading. Single-owner bodies reduce to the canonical
+   structure unchanged. Evidence: local_buffer_reuse's three-partition
+   serialized chain yielded only the LAST trailing regain's token ({2})
+   while the following traversal's first wave ({0}) consumed it — caught
+   by the post-emit verifier; the stage-3 verifier additionally checks,
+   for every loop-body chain, that the final carrier owner equals the
+   first wave owner (the carried token's consumer).
 
    **TRANSITIVE REDUCTION (USER RULING 10jun26 — pay-for-play).** After
    the walk, before dedupe/grouping, a per-chain reduction drops edges
@@ -492,13 +495,25 @@ Rows are visited in chain order; the complete rule set:
    dropped only when Q's vector at d already covers s. Scope: both
    endpoints in the same chain (If bodies are separate chains, so the
    historical conditional-scope hang class stays direct-only); region-row
-   endpoints are never dropped; within-iteration only (back-edge closure
-   is a separate, later phase). Semantics are unchanged by construction —
+   endpoints are never dropped; single-traversal facts only (traversal
+   closure is a separate, later phase). Semantics are unchanged by construction —
    every drop has a witness chain of kept hard waits plus program order.
    **Closure verifier (hard error):** independently re-derives the
    happens-before closure from the FINAL edge set and re-checks EVERY
    originally generated edge, dropped or kept; an uncovered dropped edge
    fails analysis naming both rows. Under-synchronization cannot ship.
+   **Phase B — traversal closure:** for loop-body chains the sweep
+   continues over a SECOND TRAVERSAL of the chain — strictly forward:
+   each partition's program order is sequential through repeated
+   traversals, so its sync vector carries from the end of one traversal
+   into the next, and kept forward satisfactions re-apply at their rows.
+   An EXIT-close edge P@s -> Q drops iff, at Q's first touch of each
+   closed piece in the following traversal, (a) coverage of s holds and
+   (b) Q's wave is already opened there by a kept in-body acquire. The
+   carrier close (acquirer = first wave owner, the yielded final) is
+   NEVER dropped. The closure verifier re-checks all Phase-B drops under
+   the same forward two-traversal propagation. The serialized chain then
+   lands at its minimal form (local_n_owner: four semaphores).
 5. **ENTER row — seeds the region's local game.** Every region body walks
    a **fresh local state**, per piece in the **chain's own footprint** (a
    branch that does not touch a piece has no game for it — nothing seeded,
@@ -632,7 +647,7 @@ acquire is the ordering witness).
   silent repair. Verifier: all acquire sites of one semaphore have equal
   counts; per group the multiplicities sum to the count. **For-row destinations unify with
   the loop's regain**: an edge whose destination row is a `For` row is the
-  *entry instance of that loop's regain* (the back-edge-as-permit rule
+  *entry instance of that loop's regain* (the edge-into-For-row-as-permit rule
   applied at the nested loop) — iteration 0 is fed by the outside release,
   iterations 1..N by the in-loop release; same acquirer class, M3-clean.
   Grouping therefore merges a For-row destination group into the loop's

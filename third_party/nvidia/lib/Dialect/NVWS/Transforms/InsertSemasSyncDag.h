@@ -542,6 +542,8 @@ static LogicalResult sweepChain(GroupDag &g, Node *head, ChainIndex &ci,
       EdgeRec &e = edges[ei];
       if (ci.chainOf.lookup(e.src) != head)
         continue;
+      if (e.dst->kind == Node::Exit)
+        continue; // back-edge closes are re-verified by sweepTraversalClosure
       if (!covers(behind[ownerKey(e.dstOwner)], ownerKey(e.srcOwner),
                   ci.idx.lookup(e.src)))
         return (e.dst->op ? e.dst->op : g.root->op)
@@ -550,6 +552,136 @@ static LogicalResult sweepChain(GroupDag &g, Node *head, ChainIndex &ci,
                         "final edge set");
     }
   return success();
+}
+
+
+// Phase B: traversal-closure for one loop-body chain (spec). Sweeps the
+// forward — the sweep continues over a SECOND TRAVERSAL; per-partition
+// program order is sequential through repeated traversals so vectors
+// carry forward. An EXIT-close edge drops iff at the closing owner's
+// first touch of each closed piece in the following traversal the source
+// is covered AND the wave is already open via a kept in-body acquire.
+// The carrier close (acquirer == first wave owner, the yielded final)
+// never drops. `reduce` toggles reduction vs re-verification.
+static LogicalResult sweepTraversalClosure(GroupDag &g, Node *head, ChainIndex &ci,
+                                   SmallVector<EdgeRec> &edges,
+                                   std::vector<bool> &drop, bool reduce,
+                                   ArrayRef<unsigned> checkIdxs) {
+  // First wave owner (the protected carrier close's acquirer).
+  Owner firstWaveOwner;
+  for (Node *n = head; n && !firstWaveOwner; n = n->next)
+    if (n->kind == Node::Access && n->owner)
+      firstWaveOwner = n->owner;
+  if (!firstWaveOwner)
+    return success();
+  constexpr unsigned kPass2 = 1u << 20;
+  // In-body kept edges by destination row; EXIT closes listed separately.
+  DenseMap<Node *, SmallVector<unsigned, 2>> atDst;
+  SmallVector<unsigned, 4> closes;
+  for (auto [i, e] : llvm::enumerate(edges)) {
+    if (drop[i] || ci.chainOf.lookup(e.src) != head ||
+        ci.chainOf.lookup(e.dst) != head)
+      continue;
+    if (e.dst->kind == Node::Exit && e.src->kind == Node::Access &&
+        e.srcOwner && e.dstOwner)
+      closes.push_back(i);
+    else
+      atDst[e.dst].push_back(i);
+  }
+  if (closes.empty())
+    return success();
+  for (auto &[d, v] : atDst)
+    llvm::stable_sort(v, [&](unsigned a, unsigned b) {
+      return ci.idx.lookup(edges[a].src) > ci.idx.lookup(edges[b].src);
+    });
+  // First pass-2 touch row per (owner, piece) for the close checks.
+  auto firstTouch = [&](const Owner &q, PieceId pc) -> Node * {
+    for (Node *n = head; n; n = n->next)
+      if (n->kind == Node::Access && n->owner && sameOwner(n->owner, q))
+        for (const Touch &t : n->touches)
+          for (PieceId fp : g.pieceTable.footprint[t.member])
+            if (fp == pc)
+              return n;
+    return nullptr;
+  };
+  std::map<int64_t, SyncVec> behind;
+  DenseMap<Node *, SyncVec> snap1, snap2;
+  std::map<int64_t, unsigned> waveOpenAt; // ownerKey -> pass-2 open row
+  auto applyKept = [&](EdgeRec &e, unsigned srcIdx,
+                       DenseMap<Node *, SyncVec> &snaps) {
+    SyncVec &dv = behind[ownerKey(e.dstOwner)];
+    auto sn = snaps.find(e.src);
+    if (sn != snaps.end())
+      for (auto &[k, v] : sn->second)
+        dv[k] = std::max(dv[k], v);
+    int64_t sk = ownerKey(e.srcOwner);
+    dv[sk] = std::max(dv[sk], srcIdx);
+  };
+  // Pass 1.
+  for (Node *n = head; n; n = n->next) {
+    auto it = atDst.find(n);
+    if (it != atDst.end())
+      for (unsigned ei : it->second)
+        applyKept(edges[ei], ci.idx.lookup(edges[ei].src), snap1);
+    if (n->owner && n->kind == Node::Access) {
+      behind[ownerKey(n->owner)][ownerKey(n->owner)] = ci.idx.lookup(n);
+      snap1[n] = behind[ownerKey(n->owner)];
+    }
+  }
+  // Second traversal (indices offset by kPass2); kept closes apply at
+  // their true destinations (closing owner's first touches), in order.
+  DenseMap<Node *, SmallVector<unsigned, 2>> closeAt;
+  for (unsigned ei : closes) {
+    EdgeRec &e = edges[ei];
+    Node *latest = nullptr;
+    for (PieceId pc : e.pieces)
+      if (Node *ft = firstTouch(e.dstOwner, pc))
+        if (!latest || ci.idx.lookup(ft) > ci.idx.lookup(latest))
+          latest = ft;
+    if (latest)
+      closeAt[latest].push_back(ei);
+  }
+  LogicalResult result = success();
+  for (Node *n = head; n; n = n->next) {
+    auto it = atDst.find(n);
+    if (it != atDst.end())
+      for (unsigned ei : it->second) {
+        if (drop[ei])
+          continue;
+        applyKept(edges[ei], kPass2 + ci.idx.lookup(edges[ei].src), snap2);
+        waveOpenAt.try_emplace(ownerKey(edges[ei].dstOwner),
+                               kPass2 + ci.idx.lookup(n));
+      }
+    auto ct = closeAt.find(n);
+    if (ct != closeAt.end())
+      for (unsigned ei : ct->second) {
+        EdgeRec &e = edges[ei];
+        int64_t dk = ownerKey(e.dstOwner);
+        bool covered = covers(behind[dk], ownerKey(e.srcOwner),
+                              ci.idx.lookup(e.src));
+        bool open = waveOpenAt.count(dk);
+        bool isCarrierClose = sameOwner(e.dstOwner, firstWaveOwner);
+        if (reduce) {
+          if (!drop[ei] && covered && open && !isCarrierClose)
+            drop[ei] = true;
+          if (!drop[ei]) // kept close: provides its ordering at dst
+            applyKept(e, ci.idx.lookup(e.src), snap1);
+        } else if (!drop[ei]) {
+          applyKept(e, ci.idx.lookup(e.src), snap1);
+        } else if (llvm::is_contained(checkIdxs, ei) &&
+                   !(covered && open)) {
+          result = (e.src->op ? e.src->op : g.root->op)
+                       ->emitError("nvws-insert-semas: traversal-closure "
+                                   "violation: dropped close not implied");
+        }
+      }
+    if (n->owner && n->kind == Node::Access) {
+      behind[ownerKey(n->owner)][ownerKey(n->owner)] =
+          kPass2 + ci.idx.lookup(n);
+      snap2[n] = behind[ownerKey(n->owner)];
+    }
+  }
+  return result;
 }
 
 static LogicalResult reduceEdges(GroupDag &g, SyncCtx &ctx) {
@@ -569,6 +701,12 @@ static LogicalResult reduceEdges(GroupDag &g, SyncCtx &ctx) {
   for (Node *h : heads)
     if (failed(sweepChain(g, h, ci, ctx.edges, drop, /*reduce=*/true, {})))
       return failure();
+  // Phase B: traversal-closure on loop-body chains.
+  for (Node *h : heads)
+    if (h->parent && h->parent->kind == Node::For)
+      if (failed(sweepTraversalClosure(g, h, ci, ctx.edges, drop, /*reduce=*/true,
+                               {})))
+        return failure();
   SmallVector<unsigned, 8> dropped;
   for (auto [i, d] : llvm::enumerate(drop))
     if (d)
@@ -581,6 +719,11 @@ static LogicalResult reduceEdges(GroupDag &g, SyncCtx &ctx) {
     if (failed(sweepChain(g, h, ci, ctx.edges, drop, /*reduce=*/false,
                           dropped)))
       return failure();
+  for (Node *h : heads)
+    if (h->parent && h->parent->kind == Node::For)
+      if (failed(sweepTraversalClosure(g, h, ci, ctx.edges, drop, /*reduce=*/false,
+                               dropped)))
+        return failure();
   if (std::getenv("NVWS_EDGE_DEBUG"))
     llvm::errs() << "[reduce] dropped " << dropped.size() << " of "
                  << ctx.edges.size() << " edges\n";
@@ -817,23 +960,23 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SyncCtx &ctx) {
     // regain whose acquirer is NOT the chain's first wave owner anchors
     // at the start of its own wave (before its partition's first touch);
     // iteration 0 is satisfied by the initial permit (isEntry), and no
-    // token for it wraps the back edge.
+    // token threads through iter_args for it.
     Node *dstAnchor = grp.dst;
     if (grp.dst->kind == Node::Exit && acq->owner) {
       Node *head = grp.dst;
       while (head->prev)
         head = head->prev;
-      Owner wrap;
+      Owner firstWaveOwner;
       Node *firstTouch = nullptr;
       for (Node *r = head; r; r = r->next) {
         if (r->kind != Node::Access || !r->owner)
           continue;
-        if (!wrap)
-          wrap = r->owner;
+        if (!firstWaveOwner)
+          firstWaveOwner = r->owner;
         if (!firstTouch && sameOwner(r->owner, acq->owner))
           firstTouch = r;
       }
-      if (wrap && !sameOwner(wrap, acq->owner) && firstTouch) {
+      if (firstWaveOwner && !sameOwner(firstWaveOwner, acq->owner) && firstTouch) {
         dstAnchor = firstTouch;
         s.isEntry = true; // initial permit; no pre-loop entry instance
         s.inheritStamp = acq->owner;
@@ -1352,9 +1495,9 @@ static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
       break;
     }
   }
-  // Back-edge locality (spec wave-locality section): under a loop, the
-  // chain's final carrier owner must equal its first wave owner — only
-  // that token wraps the back edge.
+  // Traversal-boundary locality (spec wave-locality section): under a
+  // loop the chain's final carrier owner must equal its first wave
+  // owner — only that token is carried into the following traversal.
   if (head->parent && head->parent->kind == Node::For) {
     // First wave = the first carrier consumer next iteration; a leading
     // region row consumes it in ITS body top — descend.
@@ -1378,7 +1521,7 @@ static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
         finalCarrier = n->owner;
     if (firstWave && finalCarrier && !sameOwner(firstWave, finalCarrier))
       return (g.root->op ? g.root->op : head->parent->op)
-                 ->emitError("nvws-insert-semas: back-edge wave-locality "
+                 ->emitError("nvws-insert-semas: traversal-boundary wave-locality "
                              "violation: loop body's final carrier owner ")
              << finalCarrier->first << " differs from its first wave owner "
              << firstWave->first;

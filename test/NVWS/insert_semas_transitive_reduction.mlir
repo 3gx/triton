@@ -24,10 +24,11 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
     // Overlapping pair (offset 0 and 64 of one buffer.id): {0} writes a,
     // {1} reads a, {2} writes b (overlaps a), {0} reads b. The W-after-R
     // edge {0}->{2} for the overlap piece is implied via {0}->{1}->{2}.
-    // Exactly ONE release into {2}'s wave survives — five releases total
-    // (three handoffs + the {0} wrap regain + the {2} permit regain); the
-    // sixth (the implied {0}->{2} arm) is dropped by the reduction:
-    // CHECK-COUNT-5: nvws.semaphore.release
+    // The minimal serialized chain survives: three handoffs plus the
+    // carrier close — four releases. The implied {0}->{2} fan-in arm
+    // (phase A) and the {2} regain whose ordering the following
+    // traversal already implies (phase B, traversal closure) are gone:
+    // CHECK-COUNT-4: nvws.semaphore.release
     // CHECK-NOT: nvws.semaphore.release
     %r = scf.for %iv = %lb to %ub step %step iter_args(%i = %c0) -> (i32) : i32 {
       %a = ttg.local_alloc %cst0 {buffer.id = 500 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>

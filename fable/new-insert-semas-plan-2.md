@@ -89,7 +89,10 @@ the evidence.
    passes, payload or owner override chains, op-pattern-matched special
    cases, drain/loop-close synthesis, re-planning against mutated IR,
    RAW-vs-OPT DAG split, "back edge" framing. Named exceptions (the only
-   ones): the §4 step-6 backing-view post-process and the step-7
+   ones): the TRANSITIVE REDUCTION post-pass with its closure verifier
+   (user-ruled 10jun26; edge DELETION with witness obligation, expressed
+   strictly in forward/traversal terms — never cyclic framing),
+   the §4 step-6 backing-view post-process and the step-7
    loop-scheduler workaround — both sanctioned by ground rule 5; nothing
    else may move or rewrite emitted sync. Inexpressible cases get a hard
    diagnostic naming the DAG node — never a workaround.
