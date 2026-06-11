@@ -632,8 +632,14 @@ static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs,
     auto buf = emitInto<nvws::SemaphoreBufferOp>(
         b, accessOp->getLoc(), owner, gpu::getStageCluster(accessOp), semaVal,
         TypeRange(types), tok);
+    // Cache only the views of THIS component's members: the buffer op
+    // yields views for every group member, but a view is bound to the
+    // carrier token (and partition) it was minted under — serving another
+    // component's member from this row would cross token games (the
+    // post-emit view-locality verifier rejects exactly that).
     for (auto [mi, v] : llvm::enumerate(buf.getBuffers()))
-      rs.view[static_cast<MemberId>(mi)] = v;
+      if (compOfMember(g, static_cast<MemberId>(mi)) == comp)
+        rs.view[static_cast<MemberId>(mi)] = v;
     base = rs.view[t.member];
   }
   // Replay the alias chain (old emitter :763-788): skip memdesc_index

@@ -1,0 +1,193 @@
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @local_if_conditional_only
+groups: 1
+GROUP buffer.id=200 memory=local members=1
+  members: m0[0,1)
+  pieces: P0=[0,1){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @local_if_conditional_only
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  ttg.local_store {0}
+|  |  |- scf.if effects{P0:R}
+|  |  |  |- then
+|  |  |  |  |- R  m0  ttg.local_load {1}
+|  |  |  |- else
+|  |  |- W  m0  ttg.local_store {0}
+OWNER-DAG
+|- func @local_if_conditional_only
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W  m0  ttg.local_store {0}
+|  |  |- scf.if pieces{P0:R:{0}}
+|  |  |  |- then
+|  |  |  |  |- ENTER pieces{P0:R:{0}}
+|  |  |  |  |- R  m0  ttg.local_load {1}
+|  |  |  |  |- EXIT pieces{P0:R:{0}}
+|  |  |  |- else
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT
+|  |  |- W  m0  ttg.local_store {0}
+|  |  |- EXIT pieces{P0:W:{0}}
+SYNC-DAG
+|- func @local_if_conditional_only
+|  |- a  S1  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}} parts{0,1} thread{c0:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W m0  ttg.local_store {0}
+|  |  |- scf.if pieces{P0:R:{0}} parts{0,1} thread{c0:{0}}
+|  |  |  |- then
+|  |  |  |  |- ENTER pieces{P0:R:{0}}
+|  |  |  |  |- r  S0  {0} [none]
+|  |  |  |  |- a  S0  {1}
+|  |  |  |  |- R m0  ttg.local_load {1}
+|  |  |  |  |- r  S1  {1} [none]
+|  |  |  |  |- a  S1  {0}
+|  |  |  |  |- EXIT pieces{P0:R:{0}} yield{c0: a S1}
+|  |  |  |- else
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT yield{c0: pass}
+|  |  |- W m0  ttg.local_store {0}
+|  |  |- EXIT pieces{P0:W:{0}} yield{c0: scf.if}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.0}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @local_if_conditional_only_else
+groups: 1
+GROUP buffer.id=203 memory=local members=1
+  members: m0[0,1)
+  pieces: P0=[0,1){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @local_if_conditional_only_else
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  ttg.local_store {0}
+|  |  |- scf.if effects{P0:R}
+|  |  |  |- then
+|  |  |  |- else
+|  |  |  |  |- R  m0  ttg.local_load {1}
+|  |  |- W  m0  ttg.local_store {0}
+OWNER-DAG
+|- func @local_if_conditional_only_else
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W  m0  ttg.local_store {0}
+|  |  |- scf.if pieces{P0:R:{0}}
+|  |  |  |- then
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT
+|  |  |  |- else
+|  |  |  |  |- ENTER pieces{P0:R:{0}}
+|  |  |  |  |- R  m0  ttg.local_load {1}
+|  |  |  |  |- EXIT pieces{P0:R:{0}}
+|  |  |- W  m0  ttg.local_store {0}
+|  |  |- EXIT pieces{P0:W:{0}}
+SYNC-DAG
+|- func @local_if_conditional_only_else
+|  |- a  S1  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}} parts{0,1} thread{c0:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W m0  ttg.local_store {0}
+|  |  |- scf.if pieces{P0:R:{0}} parts{0,1} thread{c0:{0}}
+|  |  |  |- then
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT yield{c0: pass}
+|  |  |  |- else
+|  |  |  |  |- ENTER pieces{P0:R:{0}}
+|  |  |  |  |- r  S0  {0} [none]
+|  |  |  |  |- a  S0  {1}
+|  |  |  |  |- R m0  ttg.local_load {1}
+|  |  |  |  |- r  S1  {1} [none]
+|  |  |  |  |- a  S1  {0}
+|  |  |  |  |- EXIT pieces{P0:R:{0}} yield{c0: a S1}
+|  |  |- W m0  ttg.local_store {0}
+|  |  |- EXIT pieces{P0:W:{0}} yield{c0: scf.if}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.0}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @local_if_consumption_continues_after_join
+groups: 1
+GROUP buffer.id=201 memory=local members=1
+  members: m0[0,1)
+  pieces: P0=[0,1){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @local_if_consumption_continues_after_join
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  ttg.local_store {0}
+|  |  |- scf.if effects{P0:R}
+|  |  |  |- then
+|  |  |  |  |- R  m0  ttg.local_load {1}
+|  |  |  |- else
+|  |  |- R  m0  ttg.local_load {1}
+|  |  |- W  m0  ttg.local_store {0}
+OWNER-DAG
+|- func @local_if_consumption_continues_after_join
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W  m0  ttg.local_store {0}
+|  |  |- scf.if pieces{P0:R:{0}}
+|  |  |  |- then
+|  |  |  |  |- ENTER pieces{P0:R:{0}}
+|  |  |  |  |- R  m0  ttg.local_load {1}
+|  |  |  |  |- EXIT pieces{P0:R:{0}}
+|  |  |  |- else
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT
+|  |  |- R  m0  ttg.local_load {1}
+|  |  |- W  m0  ttg.local_store {0}
+|  |  |- EXIT pieces{P0:W:{0}}
+SYNC-DAG
+|- func @local_if_consumption_continues_after_join
+|  |- a  S3  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}} parts{0,1} thread{c0:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W m0  ttg.local_store {0}
+|  |  |- scf.if pieces{P0:R:{0}} parts{0,1} thread{c0:{0}}
+|  |  |  |- then
+|  |  |  |  |- ENTER pieces{P0:R:{0}}
+|  |  |  |  |- r  S0  {0} [none]
+|  |  |  |  |- a  S0  {1}
+|  |  |  |  |- R m0  ttg.local_load {1}
+|  |  |  |  |- r  S1  {1} [none]
+|  |  |  |  |- a  S1  {0}
+|  |  |  |  |- EXIT pieces{P0:R:{0}} yield{c0: a S1}
+|  |  |  |- else
+|  |  |  |  |- ENTER
+|  |  |  |  |- EXIT yield{c0: pass}
+|  |  |- r  S2  {0} [none]
+|  |  |- a  S2  {1}
+|  |  |- R m0  ttg.local_load {1}
+|  |  |- r  S3  {1} [none]
+|  |  |- a  S3  {0}
+|  |  |- W m0  ttg.local_store {0}
+|  |  |- EXIT pieces{P0:W:{0}} yield{c0: a S3}
+  SEMAS c0: S0{count=1} S1{count=1} S2{count=1} S3{count=1 entry inherit={@0.0}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @local_root_external_distinct_from_ws_tag_zero
+groups: 1
+GROUP buffer.id=202 memory=local members=1
+  members: m0[0,1)
+  pieces: P0=[0,1){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @local_root_external_distinct_from_ws_tag_zero
+|  |- W  m0  ttg.local_store root
+|  |- scf.for (WS, tag=0) effects{P0:R}
+|  |  |- R  m0  ttg.local_load {0}
+OWNER-DAG
+|- func @local_root_external_distinct_from_ws_tag_zero
+|  |- W  m0  ttg.local_store root
+|  |- scf.for (WS, tag=0) pieces{P0:R:{0}}
+|  |  |- ENTER pieces{P0:R:{0}}
+|  |  |- R  m0  ttg.local_load {0}
+|  |  |- EXIT pieces{P0:R:{0}}
+SYNC-DAG
+|- func @local_root_external_distinct_from_ws_tag_zero
+|  |- W m0  ttg.local_store root
+|  |- scf.for (WS, tag=0) pieces{P0:R:{0}} parts{0}
+|  |  |- ENTER pieces{P0:R:{0}}
+|  |  |- R m0  ttg.local_load {0}
+|  |  |- EXIT pieces{P0:R:{0}}
+  BACKING: untouched (no semaphores)

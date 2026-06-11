@@ -771,11 +771,21 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SyncCtx &ctx) {
   // closure verifier re-checks every drop against the kept set.
   if (failed(reduceEdges(g, ctx)))
     return failure();
-  // Dedupe by (src, dst, srcOwner) with payload + piece union.
+  // Components are independent (spec): no merge layer below may join
+  // pieces of different components — one semaphore would otherwise span
+  // components (the createSema guard refuses that). Every merge key
+  // therefore carries the edge's component. Edges are born per chain
+  // walk, i.e. per component, so the first piece determines it.
+  auto edgeComp = [&](const EdgeRec &e) -> CompId {
+    return g.pieceTable.pieceComp[e.pieces.front()];
+  };
+  // Dedupe by (src, dst, srcOwner, component) with payload + piece union.
   SmallVector<EdgeRec> deduped;
-  DenseMap<std::tuple<Node *, Node *, int64_t>, unsigned> index; // lookup
+  DenseMap<std::tuple<Node *, Node *, int64_t, CompId>, unsigned>
+      index; // lookup
   for (EdgeRec &e : ctx.edges) {
-    auto key = std::make_tuple(e.src, e.dst, ownerKey(e.srcOwner));
+    auto key = std::make_tuple(e.src, e.dst, ownerKey(e.srcOwner),
+                               edgeComp(e));
     auto it = index.find(key);
     if (it == index.end()) {
       index.try_emplace(key, deduped.size());
@@ -808,9 +818,9 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SyncCtx &ctx) {
     return false;
   };
   SmallVector<EdgeRec> collapsed;
-  DenseMap<std::pair<Node *, int64_t>, unsigned> cidx; // lookup
+  DenseMap<std::tuple<Node *, int64_t, CompId>, unsigned> cidx; // lookup
   for (EdgeRec &e : deduped) {
-    auto key = std::make_pair(e.dst, ownerKey(e.srcOwner));
+    auto key = std::make_tuple(e.dst, ownerKey(e.srcOwner), edgeComp(e));
     auto it = cidx.find(key);
     if (it == cidx.end()) {
       cidx.try_emplace(key, collapsed.size());
@@ -837,13 +847,16 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SyncCtx &ctx) {
     SmallVector<unsigned, 2> idxs;
     int sema = -1;
   };
-  // Key = (destination row, destination OWNER): an EXIT row of a
-  // multi-piece chain can close pieces with different carried owners, and
+  // Key = (destination row, destination OWNER, component): an EXIT row of
+  // a multi-piece chain can close pieces with different carried owners, and
   // each owner class is its own phase-tracked waiter (old M3 identity).
-  llvm::MapVector<std::pair<Node *, int64_t>, unsigned> dstIndex;
+  // The component keeps independent token games apart even when their
+  // regains share a destination row and acquirer (e.g. disjoint slivers
+  // written by one partition: same For row, same owner, separate games).
+  llvm::MapVector<std::tuple<Node *, int64_t, CompId>, unsigned> dstIndex;
   SmallVector<DstGroup> groups;
   for (auto [i, e] : llvm::enumerate(collapsed)) {
-    auto key = std::make_pair(e.dst, ownerKey(e.dstOwner));
+    auto key = std::make_tuple(e.dst, ownerKey(e.dstOwner), edgeComp(e));
     auto it = dstIndex.find(key);
     if (it == dstIndex.end()) {
       dstIndex.try_emplace(key, groups.size());
@@ -865,7 +878,7 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SyncCtx &ctx) {
                              CompId comp) -> int {
     int best = -1;
     for (Node *m = forRow->children[0]; m; m = m->next) {
-      auto it = dstIndex.find(std::make_pair(m, ownerKey(acq)));
+      auto it = dstIndex.find(std::make_tuple(m, ownerKey(acq), comp));
       if (it == dstIndex.end())
         continue;
       DstGroup &cand = groups[it->second];
