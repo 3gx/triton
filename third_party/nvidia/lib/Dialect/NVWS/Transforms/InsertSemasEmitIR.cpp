@@ -149,17 +149,10 @@ static void nukeGroupTokens(EmitCtx &ctx, GroupDag &g) {
   };
   for (const Member &m : g.pieceTable.members)
     nukeOp(m.allocOp);
-  std::function<void(Node *)> walk = [&](Node *head) {
-    for (Node *n = head; n; n = n->next) {
-      if (n->kind == Node::Access)
-        nukeOp(n->op);
-      if (n->kind == Node::For || n->kind == Node::If)
-        for (Node *child : n->children)
-          walk(child);
-    }
-  };
-  if (!g.root->children.empty())
-    walk(g.root->children[0]);
+  forEachNode(g, [&](Node *n) {
+    if (n->kind == Node::Access)
+      nukeOp(n->op);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -309,8 +302,8 @@ static LogicalResult emitBackingsAndCreates(EmitCtx &ctx, GroupDag &g) {
 // entry semaphores). Step 3 needs their tokens as init values.
 static void emitEntryAcquires(EmitCtx &ctx, GroupDag &g,
                               DenseMap<Node *, Value> &emitted) {
-  std::function<void(Node *)> walk = [&](Node *head) {
-    for (Node *n = head; n; n = n->next) {
+  forEachNode(g, [&](Node *n) {
+    {
       if (n->kind == Node::Acquire && !n->owner.has_value() &&
           g.semaTable.semas[n->sema].isEntry && !emitted.count(n)) {
         Operation *before = nextRealOp(n->next);
@@ -334,13 +327,8 @@ static void emitEntryAcquires(EmitCtx &ctx, GroupDag &g,
             sc, s.create, ctx.tokenType);
         emitted[n] = acq.getToken();
       }
-      if (n->kind == Node::For || n->kind == Node::If)
-        for (Node *child : n->children)
-          walk(child);
     }
-  };
-  if (!g.root->children.empty())
-    walk(g.root->children[0]);
+  });
 }
 
 
@@ -352,17 +340,10 @@ static void emitEntryAcquires(EmitCtx &ctx, GroupDag &g,
 static void fixupAnchors(MutableArrayRef<GroupDag> groups, Operation *oldOp,
                          Operation *newOp) {
   for (GroupDag &g : groups) {
-    std::function<void(Node *)> walk = [&](Node *head) {
-      for (Node *n = head; n; n = n->next) {
-        if (n->op == oldOp)
-          n->op = newOp;
-        if (n->kind == Node::For || n->kind == Node::If)
-          for (Node *child : n->children)
-            walk(child);
-      }
-    };
-    if (!g.root->children.empty())
-      walk(g.root->children[0]);
+    forEachNode(g, [&](Node *n) {
+      if (n->op == oldOp)
+        n->op = newOp;
+    });
     if (g.backingPlan.hoistAnchor == oldOp)
       g.backingPlan.hoistAnchor = newOp;
   }
@@ -487,17 +468,11 @@ static LogicalResult rewriteSignatures(EmitCtx &ctx,
   };
   llvm::MapVector<Operation *, SmallVector<Want, 2>> wanted;
   for (GroupDag &g : groups) {
-    std::function<void(Node *)> walk = [&](Node *head) {
-      for (Node *n = head; n; n = n->next)
-        if (n->kind == Node::For || n->kind == Node::If) {
-          for (const Crossing &c : n->crossings)
-            wanted[n->op].push_back(Want{&g, c.comp, c.slotOwner});
-          for (Node *child : n->children)
-            walk(child);
-        }
-    };
-    if (!g.root->children.empty())
-      walk(g.root->children[0]);
+    forEachNode(g, [&](Node *n) {
+      if (n->kind == Node::For || n->kind == Node::If)
+        for (const Crossing &c : n->crossings)
+          wanted[n->op].push_back(Want{&g, c.comp, c.slotOwner});
+    });
   }
   // Outside-in: stable sort by nesting depth.
   SmallVector<Operation *> ops;
@@ -1342,17 +1317,10 @@ LogicalResult emitIR(triton::FuncOp funcOp,
   for (GroupDag &g : groups)
     if (!g.semaTable.semas.empty()) {
       nukeGroupTokens(ctx, g);
-      std::function<void(Node *)> collect = [&](Node *head) {
-        for (Node *n = head; n; n = n->next) {
-          if (n->kind == Node::Access && n->op)
-            g.accessRowOps.insert(n->op);
-          if (n->kind == Node::For || n->kind == Node::If)
-            for (Node *child : n->children)
-              collect(child);
-        }
-      };
-      if (!g.root->children.empty())
-        collect(g.root->children[0]);
+      forEachNode(g, [&](Node *n) {
+        if (n->kind == Node::Access && n->op)
+          g.accessRowOps.insert(n->op);
+      });
     }
   // Step 1b: erase the dead token slots the nuke leaves behind (fixpoint).
   while (eraseDeadTokenSlots(ctx, groups)) {

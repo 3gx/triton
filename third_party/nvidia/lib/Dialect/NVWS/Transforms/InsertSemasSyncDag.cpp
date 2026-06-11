@@ -790,6 +790,14 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SyncCtx &ctx) {
     return g.pieceTable.pieceComp[e.pieces.front()];
   };
   // Dedupe by (src, dst, srcOwner, component) with payload + piece union.
+  // Union e's payloads and pieces into the kept edge (both merge layers).
+  auto absorbEdge = [](EdgeRec &d, const EdgeRec &e) {
+    unionPayloads(d.payloads, e.payloads);
+    for (PieceId p : e.pieces)
+      if (!llvm::is_contained(d.pieces, p))
+        d.pieces.push_back(p);
+    llvm::sort(d.pieces);
+  };
   SmallVector<EdgeRec> deduped;
   DenseMap<std::tuple<Node *, Node *, int64_t, CompId>, unsigned>
       index; // lookup
@@ -806,12 +814,7 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SyncCtx &ctx) {
       deduped.push_back(e);
       continue;
     }
-    EdgeRec &d = deduped[it->second];
-    unionPayloads(d.payloads, e.payloads);
-    for (PieceId p : e.pieces)
-      if (!llvm::is_contained(d.pieces, p))
-        d.pieces.push_back(p);
-    llvm::sort(d.pieces);
+    absorbEdge(deduped[it->second], e);
   }
 
   // Second collapse — same destination, same source OWNER, different
@@ -840,11 +843,7 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SyncCtx &ctx) {
     EdgeRec &d = collapsed[it->second];
     if (isLaterInChain(e.src, d.src))
       d.src = e.src;
-    unionPayloads(d.payloads, e.payloads);
-    for (PieceId p : e.pieces)
-      if (!llvm::is_contained(d.pieces, p))
-        d.pieces.push_back(p);
-    llvm::sort(d.pieces);
+    absorbEdge(d, e);
   }
 
   // Group by destination, first-seen order: one semaphore per destination —

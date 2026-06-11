@@ -381,6 +381,24 @@ inline bool shouldDumpDag() {
   return env && StringRef(env) == "1";
 }
 
+// Pre-order walk over every node of a chain, descending into For/If
+// region children — the one traversal shape shared by the stages.
+template <typename Fn>
+inline void forEachNode(Node *head, Fn &&fn) {
+  for (Node *n = head; n; n = n->next) {
+    fn(n);
+    if (n->kind == Node::For || n->kind == Node::If)
+      for (Node *child : n->children)
+        forEachNode(child, fn);
+  }
+}
+
+template <typename Fn>
+inline void forEachNode(GroupDag &g, Fn &&fn) {
+  if (!g.root->children.empty())
+    forEachNode(g.root->children[0], std::forward<Fn>(fn));
+}
+
 } // namespace nvws_semas
 } // namespace triton
 } // namespace mlir
