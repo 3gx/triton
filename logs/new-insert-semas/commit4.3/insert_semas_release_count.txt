@@ -1,0 +1,56 @@
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @release_multiplicity_unified_fanin_regain
+groups: 1
+GROUP buffer.id=700 memory=local members=1
+  members: m0[0,1)
+  pieces: P0=[0,1){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @release_multiplicity_unified_fanin_regain
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  ttg.local_store {3}
+|  |  |- scf.for effects{P0:W}
+|  |  |  |- R  m0  ttg.local_load {2}
+|  |  |  |- R  m0  ttg.local_load {1}
+|  |  |  |- W  m0  ttg.local_store {1}
+|  |  |  |- R  m0  ttg.local_load {0}
+OWNER-DAG
+|- func @release_multiplicity_unified_fanin_regain
+|  |- scf.for (WS, tag=0) pieces{P0:W:{3}}
+|  |  |- ENTER pieces{P0:W:{3}}
+|  |  |- W  m0  ttg.local_store {3}
+|  |  |- scf.for pieces{P0:W:{2}}
+|  |  |  |- ENTER pieces{P0:W:{2}}
+|  |  |  |- R  m0  ttg.local_load {2}
+|  |  |  |- R  m0  ttg.local_load {1}
+|  |  |  |- W  m0  ttg.local_store {1}
+|  |  |  |- R  m0  ttg.local_load {0}
+|  |  |  |- EXIT pieces{P0:W:{2}}
+|  |  |- EXIT pieces{P0:W:{3}}
+SYNC-DAG
+|- func @release_multiplicity_unified_fanin_regain
+|  |- a  S3  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{3}} parts{0,1,2,3} thread{c0:{3}}
+|  |  |- ENTER pieces{P0:W:{3}}
+|  |  |- W m0  ttg.local_store {3}
+|  |  |- r  S0(2)  {3} [none]
+|  |  |- a  S0(2)  {2}
+|  |  |- scf.for pieces{P0:W:{2}} parts{0,1,2} thread{c0:{2}}
+|  |  |  |- ENTER pieces{P0:W:{2}}
+|  |  |  |- R m0  ttg.local_load {2}
+|  |  |  |- r  S1  {2} [none]
+|  |  |  |- a  S1  {1}
+|  |  |  |- R m0  ttg.local_load {1}
+|  |  |  |- W m0  ttg.local_store {1}
+|  |  |  |- r  S2  {1} [none]
+|  |  |  |- r  S0  {1} [none]
+|  |  |  |- a  S2  {0}
+|  |  |  |- R m0  ttg.local_load {0}
+|  |  |  |- r  S0  {0} [none]
+|  |  |  |- a  S0(2)  {2}
+|  |  |  |- EXIT pieces{P0:W:{2}} yield{c0: a S0}
+|  |  |- r  S3  {2} [none]
+|  |  |- a  S3  {3}
+|  |  |- EXIT pieces{P0:W:{3}} yield{c0: a S3}
+  SEMAS c0: S0{count=2} S1{count=1} S2{count=1} S3{count=1 entry inherit={@0.3}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)

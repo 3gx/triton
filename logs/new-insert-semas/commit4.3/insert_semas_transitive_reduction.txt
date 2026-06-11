@@ -1,0 +1,89 @@
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @serialized_ring_reduces
+groups: 1
+GROUP buffer.id=500 memory=local members=2
+  members: m0[0,128) m1[64,192)
+  pieces: P0=[0,64){m0}c0 P1=[64,128){m0,m1}c0 P2=[128,192){m1}c0
+  footprints: m0={P0,P1} m1={P1,P2}
+ACCESS-DAG
+|- func @serialized_ring_reduces
+|  |- scf.for (WS, tag=0) effects{P0:W,P1:W,P2:W}
+|  |  |- W  m0  ttg.local_alloc {0}
+|  |  |- R  m0  ttg.local_load {1}
+|  |  |- W  m1  ttg.local_alloc {2}
+|  |  |- R  m1  ttg.local_load {0}
+OWNER-DAG
+|- func @serialized_ring_reduces
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0},P1:W:{0},P2:W:{2}}
+|  |  |- ENTER pieces{P0:W:{0},P1:W:{0},P2:W:{2}}
+|  |  |- W  m0  ttg.local_alloc {0}
+|  |  |- R  m0  ttg.local_load {1}
+|  |  |- W  m1  ttg.local_alloc {2}
+|  |  |- R  m1  ttg.local_load {0}
+|  |  |- EXIT pieces{P0:W:{0},P1:W:{0},P2:W:{2}}
+SYNC-DAG
+|- func @serialized_ring_reduces
+|  |- a  S3  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0},P1:W:{0},P2:W:{2}} parts{0,1,2} thread{c0:{0}}
+|  |  |- ENTER pieces{P0:W:{0},P1:W:{0},P2:W:{2}}
+|  |  |- W m0  ttg.local_alloc {0}
+|  |  |- r  S0  {0} [none]
+|  |  |- a  S0  {1}
+|  |  |- R m0  ttg.local_load {1}
+|  |  |- r  S1  {1} [none]
+|  |  |- r  S3  {1} [none]
+|  |  |- a  S1  {2}
+|  |  |- a  S4  {2}
+|  |  |- W m1  ttg.local_alloc {2}
+|  |  |- r  S2  {2} [none]
+|  |  |- a  S2  {0}
+|  |  |- R m1  ttg.local_load {0}
+|  |  |- r  S4  {0} [none]
+|  |  |- a  S3  {0}
+|  |  |- EXIT pieces{P0:W:{0},P1:W:{0},P2:W:{2}} yield{c0: a S3}
+  SEMAS c0: S0{count=1} S1{count=1} S2{count=1} S3{count=1 entry inherit={@0.0}} S4{count=1 entry inherit={@0.2}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @fanout_not_reduced
+groups: 1
+GROUP buffer.id=501 memory=local members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @fanout_not_reduced
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  ttg.local_alloc {0}
+|  |  |- R  m0  ttg.local_load {1}
+|  |  |- R  m0  ttg.local_load {2}
+|  |  |- R  m0  ttg.local_load {0}
+OWNER-DAG
+|- func @fanout_not_reduced
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W  m0  ttg.local_alloc {0}
+|  |  |- R  m0  ttg.local_load {1}
+|  |  |- R  m0  ttg.local_load {2}
+|  |  |- R  m0  ttg.local_load {0}
+|  |  |- EXIT pieces{P0:W:{0}}
+SYNC-DAG
+|- func @fanout_not_reduced
+|  |- a  S3(2)  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}} parts{0,1,2} thread{c0:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W m0  ttg.local_alloc {0}
+|  |  |- r  S0  {0} [none]
+|  |  |- r  S1  {0} [none]
+|  |  |- a  S0  {1}
+|  |  |- R m0  ttg.local_load {1}
+|  |  |- r  S3  {1} [none]
+|  |  |- a  S1  {2}
+|  |  |- R m0  ttg.local_load {2}
+|  |  |- r  S2  {2} [none]
+|  |  |- r  S3  {2} [none]
+|  |  |- a  S2  {0}
+|  |  |- R m0  ttg.local_load {0}
+|  |  |- a  S3(2)  {0}
+|  |  |- EXIT pieces{P0:W:{0}} yield{c0: a S3}
+  SEMAS c0: S0{count=1} S1{count=1} S2{count=1} S3{count=2 entry inherit={@0.0}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)

@@ -1,0 +1,33 @@
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @tmem_reinterpret_alias
+groups: 1
+GROUP buffer.id=none#1 memory=tmem members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @tmem_reinterpret_alias
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  ttng.tmem_store {0}
+|  |  |- R  m0  ttng.tmem_load {1}
+OWNER-DAG
+|- func @tmem_reinterpret_alias
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W  m0  ttng.tmem_store {0}
+|  |  |- R  m0  ttng.tmem_load {1}
+|  |  |- EXIT pieces{P0:W:{0}}
+SYNC-DAG
+|- func @tmem_reinterpret_alias
+|  |- a  S1  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{0}} parts{0,1} thread{c0:{0}}
+|  |  |- ENTER pieces{P0:W:{0}}
+|  |  |- W m0  ttng.tmem_store {0}
+|  |  |- r  S0  {0} [none]
+|  |  |- a  S0  {1}
+|  |  |- R m0  ttng.tmem_load {1}
+|  |  |- r  S1  {1} [none]
+|  |  |- a  S1  {0}
+|  |  |- EXIT pieces{P0:W:{0}} yield{c0: a S1}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.0}}
+  BACKING: numStages=2 anchor=before scf.for(tag=0)

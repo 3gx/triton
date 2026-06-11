@@ -438,6 +438,161 @@ static void spliceAfter(Node *node, Node *after) {
   after->next = node;
 }
 
+
+// ---------------------------------------------------------------------------
+// TRANSITIVE REDUCTION (spec section; user ruling 10jun26) + closure
+// verifier. Pay-for-play: drop same-chain Access-row edges whose ordering
+// is already implied by kept hard waits plus per-partition program order.
+// ---------------------------------------------------------------------------
+namespace {
+using SyncVec = std::map<int64_t, unsigned>; // partitionKey -> row index
+
+struct ChainIndex {
+  DenseMap<Node *, unsigned> idx; // row -> position within its chain
+  DenseMap<Node *, Node *> chainOf; // row -> chain head
+};
+
+static void indexChains(Node *head, ChainIndex &ci) {
+  unsigned i = 0;
+  for (Node *n = head; n; n = n->next) {
+    ci.idx[n] = i++;
+    ci.chainOf[n] = head;
+    if (n->kind == Node::For || n->kind == Node::If)
+      for (Node *child : n->children)
+        indexChains(child, ci);
+  }
+}
+
+static bool covers(const SyncVec &v, int64_t key, unsigned srcIdx) {
+  auto it = v.find(key);
+  return it != v.end() && it->second >= srcIdx;
+}
+
+// One sweep over a chain with the given edge set (drop[i] marks edges to
+// ignore). When `reduce` is set, fills drop[] for newly-implied edges;
+// otherwise verifies that every edge in `check` is covered.
+static LogicalResult sweepChain(GroupDag &g, Node *head, ChainIndex &ci,
+                                SmallVector<EdgeRec> &edges,
+                                std::vector<bool> &drop, bool reduce,
+                                ArrayRef<unsigned> checkIdxs) {
+  // Edges grouped by destination row, original order preserved.
+  DenseMap<Node *, SmallVector<unsigned, 2>> atDst;
+  for (auto [i, e] : llvm::enumerate(edges))
+    if (ci.chainOf.lookup(e.src) == head && ci.chainOf.lookup(e.dst) == head)
+      atDst[e.dst].push_back(i);
+  // Latest source first: its inherited snapshot subsumes earlier ones, so
+  // earlier-source edges at the same destination become provably implied.
+  for (auto &[d, v] : atDst)
+    llvm::stable_sort(v, [&](unsigned a, unsigned b) {
+      return ci.idx.lookup(edges[a].src) > ci.idx.lookup(edges[b].src);
+    });
+  std::map<int64_t, SyncVec> behind;
+  DenseMap<Node *, SyncVec> snapAtRow; // source snapshots
+  // WAVE GUARD: ordering-implied is not token-allowed — an edge may be
+  // dropped only when the destination's wave is already open (carrier
+  // with Q via a kept acquire). Track the wave owner per component.
+  std::map<CompId, int64_t> waveOf;
+  if (head->kind == Node::Enter)
+    for (auto &[pc, pi] : sortedPieceInfo(head))
+      if (pi.owner)
+        waveOf[g.pieceTable.pieceComp[pc]] = ownerKey(pi.owner);
+  auto compOfEdge = [&](const EdgeRec &e) {
+    return g.pieceTable.pieceComp[e.pieces.front()];
+  };
+  auto ownerOfRow = [&](Node *n) -> Owner {
+    return n->kind == Node::Exit ? Owner() : n->owner;
+  };
+  for (Node *n = head; n; n = n->next) {
+    auto it = atDst.find(n);
+    if (it != atDst.end())
+      for (unsigned ei : it->second) {
+        EdgeRec &e = edges[ei];
+        if (!e.srcOwner || !e.dstOwner || e.src->kind != Node::Access)
+          continue; // region/root endpoints: never reduced
+        int64_t sk = ownerKey(e.srcOwner), dk = ownerKey(e.dstOwner);
+        unsigned srcIdx = ci.idx.lookup(e.src);
+        bool implied = covers(behind[dk], sk, srcIdx);
+        bool waveOpen = waveOf.count(compOfEdge(e)) &&
+                        waveOf[compOfEdge(e)] == dk;
+        if (reduce && !drop[ei] && implied && waveOpen &&
+            e.dst->kind == Node::Access) {
+          drop[ei] = true;
+          continue;
+        }
+        if (drop[ei])
+          continue;
+        waveOf[compOfEdge(e)] = dk; // kept acquire opens Q's wave
+        // Kept acquire: dst inherits the source's snapshot + the edge.
+        SyncVec &dv = behind[dk];
+        auto snap = snapAtRow.find(e.src);
+        if (snap != snapAtRow.end())
+          for (auto &[k, v] : snap->second)
+            if (!covers(dv, k, v))
+              dv[k] = std::max(dv[k], v);
+        dv[sk] = std::max(dv[sk], srcIdx);
+      }
+    if (Owner o = ownerOfRow(n)) {
+      behind[ownerKey(o)][ownerKey(o)] = ci.idx.lookup(n);
+      snapAtRow[n] = behind[ownerKey(o)];
+    }
+  }
+  // Verification mode: every checked (dropped) edge must now be implied.
+  if (!reduce)
+    for (unsigned ei : checkIdxs) {
+      EdgeRec &e = edges[ei];
+      if (ci.chainOf.lookup(e.src) != head)
+        continue;
+      if (!covers(behind[ownerKey(e.dstOwner)], ownerKey(e.srcOwner),
+                  ci.idx.lookup(e.src)))
+        return (e.dst->op ? e.dst->op : g.root->op)
+            ->emitError("nvws-insert-semas: transitive-reduction closure "
+                        "violation: dropped edge is not implied by the "
+                        "final edge set");
+    }
+  return success();
+}
+
+static LogicalResult reduceEdges(GroupDag &g, SyncCtx &ctx) {
+  if (g.root->children.empty() || ctx.edges.empty())
+    return success();
+  ChainIndex ci;
+  indexChains(g.root->children[0], ci);
+  std::vector<bool> drop(ctx.edges.size(), false);
+  SmallVector<Node *, 8> heads;
+  DenseSet<Node *> seen;
+  for (auto &[row, h] : ci.chainOf)
+    if (seen.insert(h).second)
+      heads.push_back(h);
+  llvm::sort(heads, [&](Node *a, Node *b) {
+    return ci.idx.lookup(a) < ci.idx.lookup(b);
+  });
+  for (Node *h : heads)
+    if (failed(sweepChain(g, h, ci, ctx.edges, drop, /*reduce=*/true, {})))
+      return failure();
+  SmallVector<unsigned, 8> dropped;
+  for (auto [i, d] : llvm::enumerate(drop))
+    if (d)
+      dropped.push_back(i);
+  if (dropped.empty())
+    return success();
+  // CLOSURE VERIFIER: re-derive coverage from the kept set only and
+  // re-check every dropped edge (hard error on under-synchronization).
+  for (Node *h : heads)
+    if (failed(sweepChain(g, h, ci, ctx.edges, drop, /*reduce=*/false,
+                          dropped)))
+      return failure();
+  if (std::getenv("NVWS_EDGE_DEBUG"))
+    llvm::errs() << "[reduce] dropped " << dropped.size() << " of "
+                 << ctx.edges.size() << " edges\n";
+  SmallVector<EdgeRec> kept;
+  for (auto [i, e] : llvm::enumerate(ctx.edges))
+    if (!drop[i])
+      kept.push_back(e);
+  ctx.edges = std::move(kept);
+  return success();
+}
+} // namespace
+
 // ---------------------------------------------------------------------------
 // Edge dedupe + fan-in grouping + node injection (spec section 5.2).
 // ---------------------------------------------------------------------------
@@ -469,6 +624,10 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SyncCtx &ctx) {
       llvm::errs() << "]\n";
     }
   }
+  // Transitive reduction (spec section) — drops implied edges, then the
+  // closure verifier re-checks every drop against the kept set.
+  if (failed(reduceEdges(g, ctx)))
+    return failure();
   // Dedupe by (src, dst, srcOwner) with payload + piece union.
   SmallVector<EdgeRec> deduped;
   DenseMap<std::tuple<Node *, Node *, int64_t>, unsigned> index; // lookup

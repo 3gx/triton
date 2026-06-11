@@ -1,0 +1,21 @@
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @tmem_reuse_views_end_of_insert_semas
+groups: 1
+GROUP buffer.id=42 memory=tmem members=3
+  members: m0[64,65) m1[0,128) m2[0,64)
+  pieces: P0=[0,64){m1,m2}c0 P1=[64,65){m0,m1}c0 P2=[65,128){m1}c0
+  footprints: m0={P1} m1={P0,P1,P2} m2={P0}
+ACCESS-DAG
+|- func @tmem_reuse_views_end_of_insert_semas
+|  |- W  m0  use root
+|  |- W  m1  use root
+|  |- W  m2  use root
+OWNER-DAG
+|- func @tmem_reuse_views_end_of_insert_semas
+|  |- W  m0  use root
+|  |- W  m1  use root
+|  |- W  m2  use root
+SYNC-DAG
+|- func @tmem_reuse_views_end_of_insert_semas
+|  |- W m0,W m1,W m2  use root
+  BACKING: untouched (no semaphores)

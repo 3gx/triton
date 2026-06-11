@@ -482,6 +482,23 @@ Rows are visited in chain order; the complete rule set:
    first wave ({0}) consumed it — caught by the post-emit verifier; the
    stage-3 verifier additionally checks, for every loop-body chain, that
    the final carrier owner equals the first wave owner.
+
+   **TRANSITIVE REDUCTION (USER RULING 10jun26 — pay-for-play).** After
+   the walk, before dedupe/grouping, a per-chain reduction drops edges
+   whose ordering is already implied: sweep rows in order keeping a sync
+   vector per partition (advanced by its own program order, and on every
+   KEPT acquire inheriting the source partition's vector AS OF the release
+   row — snapshots, not current state); an Access-row edge P@s -> Q@d is
+   dropped only when Q's vector at d already covers s. Scope: both
+   endpoints in the same chain (If bodies are separate chains, so the
+   historical conditional-scope hang class stays direct-only); region-row
+   endpoints are never dropped; within-iteration only (back-edge closure
+   is a separate, later phase). Semantics are unchanged by construction —
+   every drop has a witness chain of kept hard waits plus program order.
+   **Closure verifier (hard error):** independently re-derives the
+   happens-before closure from the FINAL edge set and re-checks EVERY
+   originally generated edge, dropped or kept; an uncovered dropped edge
+   fails analysis naming both rows. Under-synchronization cannot ship.
 5. **ENTER row — seeds the region's local game.** Every region body walks
    a **fresh local state**, per piece in the **chain's own footprint** (a
    branch that does not touch a piece has no game for it — nothing seeded,

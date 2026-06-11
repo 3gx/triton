@@ -1,0 +1,40 @@
+==== NVWS InsertSemas (commit 4: ACCESS-DAG + OWNER-DAG + SYNC-DAG + EMIT) ====
+function: @outer_produced_inner_consumed
+groups: 1
+GROUP buffer.id=200 memory=local members=1
+  members: m0[0,128)
+  pieces: P0=[0,128){m0}c0
+  footprints: m0={P0}
+ACCESS-DAG
+|- func @outer_produced_inner_consumed
+|  |- scf.for (WS, tag=0) effects{P0:W}
+|  |  |- W  m0  ttg.local_store {2}
+|  |  |- scf.for effects{P0:R}
+|  |  |  |- R  m0  ttg.local_load {1}
+OWNER-DAG
+|- func @outer_produced_inner_consumed
+|  |- scf.for (WS, tag=0) pieces{P0:W:{2}}
+|  |  |- ENTER pieces{P0:W:{2}}
+|  |  |- W  m0  ttg.local_store {2}
+|  |  |- scf.for pieces{P0:R:{1}}
+|  |  |  |- ENTER pieces{P0:R:{1}}
+|  |  |  |- R  m0  ttg.local_load {1}
+|  |  |  |- EXIT pieces{P0:R:{1}}
+|  |  |- EXIT pieces{P0:W:{2}}
+SYNC-DAG
+|- func @outer_produced_inner_consumed
+|  |- a  S1  root  ; entry
+|  |- scf.for (WS, tag=0) pieces{P0:W:{2}} parts{1,2} thread{c0:{2}}
+|  |  |- ENTER pieces{P0:W:{2}}
+|  |  |- W m0  ttg.local_store {2}
+|  |  |- r  S0  {2} [none]
+|  |  |- a  S0  {1}
+|  |  |- scf.for pieces{P0:R:{1}} parts{1}
+|  |  |  |- ENTER pieces{P0:R:{1}}
+|  |  |  |- R m0  ttg.local_load {1}
+|  |  |  |- EXIT pieces{P0:R:{1}}
+|  |  |- r  S1  {1} [none]
+|  |  |- a  S1  {2}
+|  |  |- EXIT pieces{P0:W:{2}} yield{c0: a S1}
+  SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.2}}
+  BACKING: numStages=1 anchor=before scf.for(tag=0)

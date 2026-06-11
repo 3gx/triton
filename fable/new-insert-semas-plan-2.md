@@ -859,7 +859,11 @@ rules 1/2/4 — GATED BY WAVE LOCALITY (user ruling 10jun26): every elision
 applies only while the toucher still holds the carrier; a cross-partition
 touch on a moved carrier always materializes an edge, and two hard-error
 verifiers (stage-3 chain carrier locality; emitter post-emit token/view
-locality) pin the class — see the spec's WAVE LOCALITY section; EXIT closes additionally only when load-bearing — under a
+locality) pin the class — see the spec's WAVE LOCALITY section; the
+TRANSITIVE REDUCTION post-pass (spec section; ruled 10jun26) drops
+implied same-chain edges with a witness obligation, guarded by the
+independent closure verifier (every dropped edge must be covered by the
+final edge set — under-sync is a hard error); EXIT closes additionally only when load-bearing — under a
 loop or with a later touch in an ancestor chain — never as drains); dedupe
 (incl. the same-owner second collapse: same dst + same source owner +
 different rows -> latest row, payload union — multi-piece games require it);
