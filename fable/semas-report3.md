@@ -466,6 +466,22 @@ Rows are visited in chain order; the complete rule set:
    of the op's own partition; a buffer's views are consumed only by ops
    of the view's partition; root-stamped entry acquires are the one
    sanctioned seed exemption).
+
+   **Back-edge placement (USER RULING 10jun26, second instance of the
+   class):** only ONE token wraps a loop's back edge — the chain's first
+   wave owner's (the yielded carrier; its pre-loop entry + trailing regain
+   are the section 5.3 canonical structure). Every OTHER carried owner's
+   EXIT-close regain anchors at the START of its own wave inside the body
+   (immediately before that partition's first touch row); its
+   cross-iteration wait travels through the semaphore's mbarrier phase,
+   not through an SSA token; iteration 0 is satisfied by the semaphore's
+   initial permit (created released, no pre-loop entry instance, no
+   iter_arg slot). Single-owner bodies reduce to the canonical structure
+   unchanged. Evidence: local_buffer_reuse's three-partition cycle yielded
+   only the LAST trailing regain's token ({2}) while the next iteration's
+   first wave ({0}) consumed it — caught by the post-emit verifier; the
+   stage-3 verifier additionally checks, for every loop-body chain, that
+   the final carrier owner equals the first wave owner.
 5. **ENTER row — seeds the region's local game.** Every region body walks
    a **fresh local state**, per piece in the **chain's own footprint** (a
    branch that does not touch a piece has no game for it — nothing seeded,

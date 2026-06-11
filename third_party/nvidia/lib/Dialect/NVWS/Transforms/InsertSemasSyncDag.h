@@ -212,27 +212,29 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SyncCtx &ctx,
     for (auto &[p, pi] : sortedPieceInfo(head))
       carried[p] = pi.owner;
 
-  // WAVE LOCALITY state (spec rule): the chain-level carrier owner. Set
-  // from the uniform ENTER seed; updated after every row. waveValid=false
-  // means "no constraint yet" (chain start / mixed region owners).
-  Owner waveOwner;
-  bool waveValid = false;
-  Node *waveLastRow = nullptr;
-  SmallVector<AsyncOp, 1> waveLastPay;
-  if (head->kind == Node::Enter) {
-    bool uniform = true;
-    bool first = true;
+  // WAVE LOCALITY state (spec rule): the carrier owner PER COMPONENT —
+  // the carrier/token is per component (stage-1 pieceComp), so two
+  // disjoint buffer streams in one group track independent waves.
+  // valid=false means "no constraint yet" (chain start / mixed owners).
+  struct WaveSt {
+    Owner owner;
+    bool valid = false;
+    Node *lastRow = nullptr;
+    SmallVector<AsyncOp, 1> pay;
+  };
+  std::map<CompId, WaveSt> wave;
+  auto compOf = [&](PieceId p) { return g.pieceTable.pieceComp[p]; };
+  if (head->kind == Node::Enter)
     for (auto &[p, pi] : sortedPieceInfo(head)) {
-      if (first) {
-        waveOwner = pi.owner;
-        first = false;
-      } else if (!sameOwner(waveOwner, pi.owner))
-        uniform = false;
+      WaveSt &w = wave[compOf(p)];
+      if (!w.lastRow) {
+        w.owner = pi.owner;
+        w.valid = true;
+        w.lastRow = head;
+        w.pay.assign(1, AsyncOp::NONE);
+      } else if (!sameOwner(w.owner, pi.owner))
+        w.valid = false;
     }
-    waveValid = !first && uniform;
-    waveLastRow = head;
-    waveLastPay.push_back(AsyncOp::NONE);
-  }
 
   for (Node *n = head; n; n = n->next) {
     switch (n->kind) {
@@ -256,18 +258,17 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SyncCtx &ctx,
         // through the same table (spec section 1.2).
         SmallVector<AsyncOp, 1> pay;
         pay.push_back(asyncPayloadOf(n->op));
-        bool force = waveValid && n->owner.has_value() &&
-                     waveOwner.has_value() &&
-                     !sameOwner(waveOwner, n->owner);
+        WaveSt &w = wave[compOf(p)];
+        bool force = w.valid && n->owner.has_value() &&
+                     w.owner.has_value() && !sameOwner(w.owner, n->owner);
         applyTouch(st, p, n->owner, e, n, pay, ctx, /*wsAdopt=*/false,
-                   force, waveLastRow, waveOwner, waveLastPay);
-      }
-      if (n->owner.has_value()) {
-        waveOwner = n->owner;
-        waveValid = true;
-        waveLastRow = n;
-        waveLastPay.clear();
-        waveLastPay.push_back(asyncPayloadOf(n->op));
+                   force, w.lastRow, w.owner, w.pay);
+        if (n->owner.has_value()) {
+          w.owner = n->owner;
+          w.valid = true;
+          w.lastRow = n;
+          w.pay.assign(1, asyncPayloadOf(n->op));
+        }
       }
       break;
     }
@@ -331,26 +332,27 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SyncCtx &ctx,
             h->lastPayloads = it->second;
         }
       }
-      // WAVE LOCALITY: after the region the carrier is back with the
-      // carried owner (the EXIT regain). Mixed owners reset the wave.
+      // WAVE LOCALITY: after the region each component's carrier is back
+      // with its carried owner (the EXIT regain). Mixed owners per
+      // component reset that component's wave.
       {
-        bool uniform = true, first = true;
-        Owner ro;
+        std::map<CompId, std::pair<Owner, bool>> ro; // owner, uniform
         for (auto &[p, pi] : infos) {
-          if (first) {
-            ro = pi.owner;
-            first = false;
-          } else if (!sameOwner(ro, pi.owner))
-            uniform = false;
+          auto [it, fresh] =
+              ro.try_emplace(compOf(p), std::make_pair(pi.owner, true));
+          if (!fresh && !sameOwner(it->second.first, pi.owner))
+            it->second.second = false;
         }
-        if (!first && uniform && ro.has_value()) {
-          waveOwner = ro;
-          waveValid = true;
-          waveLastRow = n;
-          waveLastPay.clear();
-          waveLastPay.push_back(AsyncOp::NONE);
-        } else {
-          waveValid = false;
+        for (auto &[c, ou] : ro) {
+          WaveSt &w = wave[c];
+          if (ou.second && ou.first.has_value()) {
+            w.owner = ou.first;
+            w.valid = true;
+            w.lastRow = n;
+            w.pay.assign(1, AsyncOp::NONE);
+          } else {
+            w.valid = false;
+          }
         }
       }
       break;
@@ -652,7 +654,33 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SyncCtx &ctx) {
     acq->owner = groupAcquirer(grp);
     acq->sema = static_cast<SemaId>(grp.sema);
     acq->count = s.count;
-    spliceBefore(acq, grp.dst);
+    // BACK-EDGE PLACEMENT (spec wave-locality section): an EXIT-close
+    // regain whose acquirer is NOT the chain's first wave owner anchors
+    // at the start of its own wave (before its partition's first touch);
+    // iteration 0 is satisfied by the initial permit (isEntry), and no
+    // token for it wraps the back edge.
+    Node *dstAnchor = grp.dst;
+    if (grp.dst->kind == Node::Exit && acq->owner) {
+      Node *head = grp.dst;
+      while (head->prev)
+        head = head->prev;
+      Owner wrap;
+      Node *firstTouch = nullptr;
+      for (Node *r = head; r; r = r->next) {
+        if (r->kind != Node::Access || !r->owner)
+          continue;
+        if (!wrap)
+          wrap = r->owner;
+        if (!firstTouch && sameOwner(r->owner, acq->owner))
+          firstTouch = r;
+      }
+      if (wrap && !sameOwner(wrap, acq->owner) && firstTouch) {
+        dstAnchor = firstTouch;
+        s.isEntry = true; // initial permit; no pre-loop entry instance
+        s.inheritStamp = acq->owner;
+      }
+    }
+    spliceBefore(acq, dstAnchor);
     s.expectedReleases += m * relCount;
     for (unsigned idx : grp.idxs) {
       EdgeRec &e = collapsed[idx];
@@ -1165,6 +1193,37 @@ static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
       break;
     }
   }
+  // Back-edge locality (spec wave-locality section): under a loop, the
+  // chain's final carrier owner must equal its first wave owner — only
+  // that token wraps the back edge.
+  if (head->parent && head->parent->kind == Node::For) {
+    // First wave = the first carrier consumer next iteration; a leading
+    // region row consumes it in ITS body top — descend.
+    std::function<Owner(Node *)> firstWaveOf = [&](Node *h) -> Owner {
+      for (Node *n = h; n; n = n->next) {
+        if (n->kind == Node::Access && n->owner)
+          return n->owner;
+        if (n->kind == Node::Acquire && n->owner)
+          return n->owner; // a leading in-body acquire opens the wave
+        if ((n->kind == Node::For || n->kind == Node::If) &&
+            !n->children.empty())
+          if (Owner o = firstWaveOf(n->children[0]))
+            return o;
+      }
+      return std::nullopt;
+    };
+    Owner firstWave = firstWaveOf(head);
+    Owner finalCarrier;
+    for (Node *n = head; n; n = n->next)
+      if (n->kind == Node::Acquire && n->owner)
+        finalCarrier = n->owner;
+    if (firstWave && finalCarrier && !sameOwner(firstWave, finalCarrier))
+      return (g.root->op ? g.root->op : head->parent->op)
+                 ->emitError("nvws-insert-semas: back-edge wave-locality "
+                             "violation: loop body's final carrier owner ")
+             << finalCarrier->first << " differs from its first wave owner "
+             << firstWave->first;
+  }
   return success();
 }
 
@@ -1191,7 +1250,7 @@ static LogicalResult verifySyncDag(GroupDag &g) {
           for (Node *m = n->next; m; m = m->next)
             if (m == n->sat)
               forward = true;
-          if (!forward)
+          if (!forward && !g.semaTable.semas[n->sema].isEntry)
             return g.root->op->emitError(
                 "nvws-insert-semas: release does not precede its acquire");
         }
