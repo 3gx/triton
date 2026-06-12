@@ -66,10 +66,8 @@ static OpT emitInto(OpBuilder &b, Location loc, const Owner &owner,
     // loop, p0 == root cost domain emits attr-less; a non-zero partition
     // keeps {P} + tag so its stage/phase SSA chain stays inside that
     // warp-group region.
-    // ABSORBER_IN_ROOT_ALL (plan M4.1) widens the rule to every partition:
-    // ownership-only change — the op keeps its position and operands.
     if (!forOp) {
-      if (owner->first == 0 || absorberInRootAll())
+      if (owner->first == 0)
         op->removeAttr(gpu::kPartitionAttrName);
       else
         gpu::setWarpSpecializeTag(op, owner->second);

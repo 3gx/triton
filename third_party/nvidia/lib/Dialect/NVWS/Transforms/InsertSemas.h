@@ -393,15 +393,6 @@ inline bool shouldDumpDag() {
   return env && StringRef(env) == "1";
 }
 
-// ABSORBER_IN_ROOT_ALL experiment (plan M4.1): widen the ROOT-OUTSIDE
-// stamping rule from p0 to every partition — ops the pass emits outside a
-// WS-tagged loop keep their position and operands but emit attr-less
-// (root) instead of {P}+tag. Default off = emission unchanged.
-inline bool absorberInRootAll() {
-  const char *env = ::getenv("ABSORBER_IN_ROOT_ALL");
-  return env && StringRef(env) == "1";
-}
-
 // Pre-order walk over every node of a chain, descending into For/If
 // region children — the one traversal shape shared by the stages.
 template <typename Fn>
