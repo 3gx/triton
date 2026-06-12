@@ -1431,26 +1431,63 @@ static void rewriteCarriedTokensToPointOfUse(EmitCtx &ctx) {
           yieldOp.getOperand(idx).getDefiningOp<nvws::SemaphoreAcquireOp>();
       if (!bottomAcq || bottomAcq->getBlock() != loop.getBody())
         continue;
+      // The yielded acquire must be a PURE next-iteration re-acquire: its
+      // token's only use is the yield. If the token also feeds in-loop
+      // ops, the acquire is a mid-loop protocol participant — e.g. the
+      // acc pattern's commit-wait acquire, whose token guards the
+      // epilogue read of the MMA result. Moving such an acquire above
+      // the producer store strips the wait off that read (12jun26 moe
+      // mxfp4 regression: races/hangs).
+      if (!bottomAcq.getToken().hasOneUse())
+        continue;
       auto entryAcq =
           loop.getInits()[idx].getDefiningOp<nvws::SemaphoreAcquireOp>();
       if (!entryAcq || entryAcq.getSemaphore() != bottomAcq.getSemaphore())
         continue;
       if (!entryAcq.getToken().hasOneUse())
         continue;
-      Operation *firstUser = nullptr;
+      // The loop's token result must be dead: the rewrite poisons the
+      // yield slot, so a post-loop consumer would receive poison.
+      if (!loop.getResult(idx).use_empty())
+        continue;
+      // SOUNDNESS: convert only the exactly-one-round shape — ONE buffer
+      // followed by ONE release. A token with more users encodes
+      // in-iteration SEQUENTIAL REUSE (e.g. the acc pattern: buffer for
+      // the init store, release of the full partner, then a second
+      // buffer reading the MMA result). AssignStagePhase places the
+      // mid-loop wait for that reuse from the rotated carried-token
+      // protocol; collapsing it to a single point-of-use acquire loses
+      // the wait guarding the reuse (12jun26 moe mxfp4 regression:
+      // unsynchronized tmem_load of the MMA accumulator).
+      nvws::SemaphoreBufferOp bufUser;
+      nvws::SemaphoreReleaseOp relUser;
       bool convertible = true;
       for (Operation *user : arg.getUsers()) {
-        if (user->getBlock() != loop.getBody() ||
-            !isa<nvws::SemaphoreBufferOp, nvws::SemaphoreReleaseOp>(user)) {
+        if (user->getBlock() != loop.getBody()) {
           convertible = false;
           break;
         }
-        if (!firstUser || user->isBeforeInBlock(firstUser))
-          firstUser = user;
+        if (auto buf = dyn_cast<nvws::SemaphoreBufferOp>(user)) {
+          if (bufUser) {
+            convertible = false;
+            break;
+          }
+          bufUser = buf;
+        } else if (auto rel = dyn_cast<nvws::SemaphoreReleaseOp>(user)) {
+          if (relUser) {
+            convertible = false;
+            break;
+          }
+          relUser = rel;
+        } else {
+          convertible = false;
+          break;
+        }
       }
-      if (!convertible || !firstUser)
+      if (!convertible || !bufUser || !relUser ||
+          !bufUser->isBeforeInBlock(relUser))
         continue;
-      bottomAcq->moveBefore(firstUser);
+      bottomAcq->moveBefore(bufUser);
       arg.replaceAllUsesWith(bottomAcq.getToken());
       loop.getInitsMutable()[idx].assign(ctx.poison);
       yieldOp->setOperand(idx, ctx.poison);
