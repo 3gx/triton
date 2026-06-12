@@ -60,11 +60,18 @@ static OpT emitInto(OpBuilder &b, Location loc, const Owner &owner,
     auto forOp = op->template getParentOfType<scf::ForOp>();
     while (forOp && !gpu::hasWarpSpecializeTag(forOp))
       forOp = forOp->template getParentOfType<scf::ForOp>();
-    if (!forOp)
-      gpu::setWarpSpecializeTag(op, owner->second);
-    // ROOT-OUTSIDE rule: PARKED (user ruling 10jun26) — blocked by
-    // LowerAref's stamped-acquire assumptions; see
-    // fable/attr-less-acquire-release-handoff.md for the exact change.
+    // ROOT-OUTSIDE rule (enabled 12jun26 — semaphore combine is disabled,
+    // which removes LowerAref's stamped-acquire assumptions; see
+    // fable/attr-less-acquire-release-handoff.md): outside any WS-tagged
+    // loop, p0 == root cost domain emits attr-less; a non-zero partition
+    // keeps {P} + tag so its stage/phase SSA chain stays inside that
+    // warp-group region.
+    if (!forOp) {
+      if (owner->first == 0)
+        op->removeAttr(gpu::kPartitionAttrName);
+      else
+        gpu::setWarpSpecializeTag(op, owner->second);
+    }
   }
   return op;
 }
@@ -309,15 +316,15 @@ static void emitEntryAcquires(EmitCtx &ctx, GroupDag &g,
                                   ? n->parent->op->getRegion(0).front()
                                         .getTerminator()
                                   : &ctx.func.getBody().front().back());
-        // Carrier-inherit stamp (spec 5.3): the op carries inheritStamp,
-        // NOT the node's root owner — the one sanctioned DAG/IR stamp
-        // divergence. The attr-less ROOT-OUTSIDE form (emission matching
-        // the DAG) is PARKED pending LowerAref tolerance —
+        // ROOT-OUTSIDE rule (enabled 12jun26): entry acquires are phase
+        // SOURCES — emitted attr-less so they stay in the root block
+        // (matching the DAG's `root ; entry` rows); the token reaches the
+        // partitioned loop clones by plain SSA capture. See
         // fable/attr-less-acquire-release-handoff.md.
         const Sema &s = g.semaTable.semas[n->sema];
         gpu::StageCluster sc = {};
         auto acq = emitInto<nvws::SemaphoreAcquireOp>(
-            b, before ? before->getLoc() : ctx.func.getLoc(), s.inheritStamp,
+            b, before ? before->getLoc() : ctx.func.getLoc(), Owner(),
             sc, s.create, ctx.tokenType);
         emitted[n] = acq.getToken();
       }

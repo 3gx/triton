@@ -11,7 +11,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     // CHECK: [[V1:%.*]] = nvws.semaphore.create %{{[-A-Za-z0-9_.$#]+}} true {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[V2:%.*]] = nvws.semaphore.create %{{[-A-Za-z0-9_.$#]+}} false {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
-    // CHECK: [[V3:%.*]] = nvws.semaphore.acquire [[V1]] {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+    // CHECK: [[V3:%.*]] = nvws.semaphore.acquire [[V1]] : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
     // CHECK: [[V5:%.*]] = scf.for %{{[-A-Za-z0-9_.$#]+}} = %{{[-A-Za-z0-9_.$#]+}} to %{{[-A-Za-z0-9_.$#]+}} step %{{[-A-Za-z0-9_.$#]+}} iter_args([[V4:%.*]] = [[V3]]) -> (!ttg.async.token)  : i32 {
     scf.for %i = %lb to %ub step %step : i32 {
       %v = "producer"() {ttg.partition = array<i32: 0>} : () -> !ty
