@@ -1,9 +1,13 @@
 # THE HOLD RULE — native emission implementation plan
 
-Status: APPROVED (user GO, 12jun26). M0-M2 IMPLEMENTED AND COMMITTED
-(47a3e1653f): native emission live, fixup deleted, NVWS lit 92/92, compile
-hard gate green with the test file unmodified. M3 runtime gates in
-progress (user running their runtime set first; plan sequence after).
+Status: COMPLETE (12jun26). M0-M2 committed (47a3e1653f); M3 runtime
+gates PASSED in order: 4x warp-spec pytests, 2x moe block-128, run_nvws.sh
+(no hang), 06-fa.py PARITY by same-session A/B — native 623/627/611 vs
+fixup-era binary 625/610 TFLOPS back-to-back on the same GPU (the recorded
+657-668 band is stale for that day's GPU state; the fixup-era binary does
+not reach it either). Fingerprint: holdrule on the real 06-fa kernel = acc
+gated(entry-consumed), qk/p/m_i/m_ij/k/v pointofuse — the validated
+partition. M4 follow-ups (absorber flags first) remain queued.
 
 Scope: **solid-01 only** (this repo, branch
 `egx/meta/sema10a-meta-new-sema-fresh-v5-fable-perf-1`). triton-03.git is
