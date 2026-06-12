@@ -1402,6 +1402,63 @@ static LogicalResult verifyTokenLocality(triton::FuncOp func) {
   return result;
 }
 
+// POINT-OF-USE in-loop acquires (enabled 12jun26, ported from the
+// egx/nvws-semaphore-insert-semas experiment branch): rewrite the rotated
+// carried-token protocol (entry acquire -> iter_arg -> in-loop uses ->
+// bottom re-acquire -> yield) to the old InsertSemaphore pass's
+// point-of-use shape: the in-loop acquire moves to immediately before the
+// token's first in-loop user, the in-loop uses take its token directly,
+// and the entry acquire is deleted — iteration 0's in-loop acquire
+// consumes the initial permit supplied by the initially-released create.
+// The iter_arg goes dead (init AND yield slots poisoned: the token must
+// DIE inside the body, since a yielded acquire token would re-enter
+// AssignStagePhase's stage-propagation walk, which only knows tokens it
+// threaded itself; the partition-outputs verifier exempts poison
+// producers). Semaphores whose entry token has uses beyond the loop init
+// (e.g. the acc init-store chain) are left rotated — matching the old
+// pass, where qk/acc remain rotated. This placement was the dominant term
+// of the FA fwd WS regression (~47 TFLOPS); see
+// fable/fa-perf-study-regressions-analysis.md sections 13-14.
+static void rewriteCarriedTokensToPointOfUse(EmitCtx &ctx) {
+  ctx.func.walk([&](scf::ForOp loop) {
+    if (!gpu::hasWarpSpecializeTag(loop))
+      return;
+    auto yieldOp = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    for (auto [idx, arg] : llvm::enumerate(loop.getRegionIterArgs())) {
+      if (!isa<gpu::AsyncTokenType>(arg.getType()))
+        continue;
+      auto bottomAcq =
+          yieldOp.getOperand(idx).getDefiningOp<nvws::SemaphoreAcquireOp>();
+      if (!bottomAcq || bottomAcq->getBlock() != loop.getBody())
+        continue;
+      auto entryAcq =
+          loop.getInits()[idx].getDefiningOp<nvws::SemaphoreAcquireOp>();
+      if (!entryAcq || entryAcq.getSemaphore() != bottomAcq.getSemaphore())
+        continue;
+      if (!entryAcq.getToken().hasOneUse())
+        continue;
+      Operation *firstUser = nullptr;
+      bool convertible = true;
+      for (Operation *user : arg.getUsers()) {
+        if (user->getBlock() != loop.getBody() ||
+            !isa<nvws::SemaphoreBufferOp, nvws::SemaphoreReleaseOp>(user)) {
+          convertible = false;
+          break;
+        }
+        if (!firstUser || user->isBeforeInBlock(firstUser))
+          firstUser = user;
+      }
+      if (!convertible || !firstUser)
+        continue;
+      bottomAcq->moveBefore(firstUser);
+      arg.replaceAllUsesWith(bottomAcq.getToken());
+      loop.getInitsMutable()[idx].assign(ctx.poison);
+      yieldOp->setOperand(idx, ctx.poison);
+      entryAcq.erase();
+    }
+  });
+}
+
 LogicalResult emitIR(triton::FuncOp funcOp,
                             MutableArrayRef<GroupDag> groups) {
   EmitCtx ctx;
@@ -1500,6 +1557,8 @@ LogicalResult emitIR(triton::FuncOp funcOp,
       if (m.allocOp && m.allocOp->getBlock() && m.allocOp->use_empty())
         m.allocOp->erase();
   }
+  // Point-of-use in-loop acquires (see rewriteCarriedTokensToPointOfUse).
+  rewriteCarriedTokensToPointOfUse(ctx);
   // Poison cleanup: if unused, drop it.
   if (ctx.poison.use_empty())
     ctx.poison.getDefiningOp()->erase();
