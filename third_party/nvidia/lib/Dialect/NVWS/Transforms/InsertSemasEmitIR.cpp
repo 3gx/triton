@@ -471,8 +471,13 @@ static LogicalResult rewriteSignatures(EmitCtx &ctx,
   for (GroupDag &g : groups) {
     forEachNode(g, [&](Node *n) {
       if (n->kind == Node::For || n->kind == Node::If)
-        for (const Crossing &c : n->crossings)
+        for (const Crossing &c : n->crossings) {
+          // Native point-of-use crossings (plan M2) materialize no slot:
+          // the token is born and dies inside the body.
+          if (n->kind == Node::For && !c.holdGated)
+            continue;
           wanted[n->op].push_back(Want{&g, c.comp, c.slotOwner});
+        }
     });
   }
   // Outside-in: stable sort by nesting depth.
@@ -580,7 +585,6 @@ static unsigned slotIndexFor(EmitCtx &ctx, Operation *op, GroupDag *g,
       return s.index;
   llvm_unreachable("missing slot");
 }
-
 
 // Materialize (or fetch) the view of `member`, replaying the access's alias
 // chain (mining gap 4 rules).
@@ -727,6 +731,8 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
                                   DenseMap<Node *, Value> &emitted) {
   // Set this op's slot inits / record incoming carriers.
   for (const Crossing &c : n->crossings) {
+    if (n->kind == Node::For && !c.holdGated)
+      continue; // native point-of-use: no slot (plan M2)
     unsigned idx = slotIndexFor(ctx, n->op, &g, c.comp);
     Value incoming = rs.carrier.lookup(c.comp);
     if (!incoming)
@@ -753,6 +759,13 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
     RenderState body = rs; // stage cache flows in; views do not
     body.view.clear();
     for (const Crossing &c : n->crossings) {
+      if (!c.holdGated) {
+        // Native point-of-use (plan M2): no incoming carrier — the moved
+        // wrap acquire renders before the hold's first toucher and births
+        // the body-local token there.
+        body.carrier.erase(c.comp);
+        continue;
+      }
       unsigned idx = slotIndexFor(ctx, n->op, &g, c.comp);
       body.carrier[c.comp] = forOp.getRegionIterArg(idx);
     }
@@ -761,6 +774,10 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
     // Yield wiring: body-final carrier per slot (terminator looked up now).
     auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
     for (const Crossing &c : n->crossings) {
+      if (!c.holdGated) {
+        rs.carrier.erase(c.comp); // token died in the body; nothing flows out
+        continue;
+      }
       unsigned idx = slotIndexFor(ctx, n->op, &g, c.comp);
       yield->setOperand(idx, body.carrier.lookup(c.comp));
       rs.carrier[c.comp] = forOp.getResult(idx);
@@ -1402,174 +1419,115 @@ static LogicalResult verifyTokenLocality(triton::FuncOp func) {
   return result;
 }
 
-// Ride detection (12jun26): a token "rides" when it has a buffer use
-// AFTER a release use, or more than one buffer use — a second read on a
-// held token after the partner release. Such protocols lean on the
-// ROTATED bottom re-acquire's program-order position for ordering (the
-// writer's next-iteration acquire sits after the rider's chain), so
-// converting any slot of a ride-bearing component to point-of-use breaks
-// it (found via the TOKEN RETENTION re-evaluation: meta-FA run_nvws
-// deadlock, 12jun26; retention itself was re-parked, but the guard is
-// kept — the hazard is a property of the protocol shape, not of who
-// emits it).
-static bool tokenRides(Value tok, Block *body) {
-  bool sawRelease = false;
-  int bufs = 0;
-  SmallVector<Operation *> users;
-  for (Operation *u : tok.getUsers())
-    if (u->getBlock() == body)
-      users.push_back(u);
-  llvm::sort(users,
-             [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
-  for (Operation *u : users) {
-    if (isa<nvws::SemaphoreReleaseOp>(u))
-      sawRelease = true;
-    else if (isa<nvws::SemaphoreBufferOp>(u)) {
-      ++bufs;
-      if (sawRelease || bufs > 1)
-        return true;
+// Emission constraints recorded for the hold-rule work (plan M0.3):
+//  - protocol ops (semaphore acquire/release/buffer) must never be emitted
+//    inside a PARTITION-LESS scf.if: AssignStagePhase's assignStateInIfOp
+//    requires partition metadata and aborts on root conditional pre/post-WS
+//    code containing protocol ops;
+//  - root-side anchors HOIST ABOVE predicates rather than render under
+//    them (the entry acquire above a conditional init is what makes the
+//    adopted token dominate) — current emitter behavior, load-bearing.
+
+// Verifier (plan M0.2b; spec Addendum B.3(b)): no token may have a buffer
+// view AFTER a release in the same block — such an access sits outside its
+// hold's span and rides on incidental program order (Addendum A's hazard
+// class). Natively emitted protocols cannot contain the shape, so its
+// appearance is a hard error, never repaired.
+static LogicalResult verifyNoUseAfterRelease(triton::FuncOp funcOp) {
+  auto checkToken = [](Value tok) -> LogicalResult {
+    llvm::SmallDenseMap<Block *, SmallVector<Operation *, 4>> byBlock;
+    for (Operation *u : tok.getUsers())
+      byBlock[u->getBlock()].push_back(u);
+    for (auto &[block, users] : byBlock) {
+      llvm::sort(users, [](Operation *a, Operation *b) {
+        return a->isBeforeInBlock(b);
+      });
+      bool sawRelease = false;
+      for (Operation *u : users) {
+        if (isa<nvws::SemaphoreReleaseOp>(u))
+          sawRelease = true;
+        else if (sawRelease && isa<nvws::SemaphoreBufferOp>(u))
+          return u->emitError(
+              "nvws-insert-semas: token has a buffer view after its release "
+              "(use-after-release; spec fable/semas-report3.md Addendum "
+              "B.3(b))");
+      }
     }
-  }
-  return false;
-}
-
-static bool componentHasRides(nvws::SemaphoreCreateOp candidate,
-                              scf::ForOp loop) {
-  // Component = every semaphore sharing a backing buffer with the
-  // candidate. Check every token operating on it inside the loop —
-  // in-loop acquire results and loop-carried token block args alike.
-  llvm::SmallPtrSet<Value, 8> bufs(candidate.getBuffers().begin(),
-                                   candidate.getBuffers().end());
-  auto sameComponent = [&](Value sema) {
-    auto create = sema.getDefiningOp<nvws::SemaphoreCreateOp>();
-    if (!create)
-      return false;
-    return llvm::any_of(create.getBuffers(),
-                        [&](Value b) { return bufs.contains(b); });
+    return success();
   };
-  Block *body = loop.getBody();
-  for (Operation &op : *body)
-    if (auto acq = dyn_cast<nvws::SemaphoreAcquireOp>(&op))
-      if (sameComponent(acq.getSemaphore()) &&
-          tokenRides(acq.getToken(), body))
-        return true;
-  for (BlockArgument arg : loop.getRegionIterArgs()) {
-    if (!isa<gpu::AsyncTokenType>(arg.getType()))
-      continue;
-    bool onComponent = llvm::any_of(arg.getUsers(), [&](Operation *u) {
-      if (u->getBlock() != body)
-        return false;
-      if (auto b = dyn_cast<nvws::SemaphoreBufferOp>(u))
-        return sameComponent(b.getSemaphore());
-      if (auto r = dyn_cast<nvws::SemaphoreReleaseOp>(u))
-        return sameComponent(r.getSemaphore());
-      return false;
-    });
-    if (onComponent && tokenRides(arg, body))
-      return true;
-  }
-  return false;
+  auto res = funcOp.walk([&](Operation *op) -> WalkResult {
+    if (auto acq = dyn_cast<nvws::SemaphoreAcquireOp>(op))
+      if (failed(checkToken(acq.getToken())))
+        return WalkResult::interrupt();
+    if (auto forOp = dyn_cast<scf::ForOp>(op))
+      for (BlockArgument arg : forOp.getRegionIterArgs())
+        if (isa<gpu::AsyncTokenType>(arg.getType()) &&
+            failed(checkToken(arg)))
+          return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  return failure(res.wasInterrupted());
 }
 
-// POINT-OF-USE in-loop acquires (enabled 12jun26, ported from the
-// egx/nvws-semaphore-insert-semas experiment branch): rewrite the rotated
-// carried-token protocol (entry acquire -> iter_arg -> in-loop uses ->
-// bottom re-acquire -> yield) to the old InsertSemaphore pass's
-// point-of-use shape: the in-loop acquire moves to immediately before the
-// token's first in-loop user, the in-loop uses take its token directly,
-// and the entry acquire is deleted — iteration 0's in-loop acquire
-// consumes the initial permit supplied by the initially-released create.
-// The iter_arg goes dead (init AND yield slots poisoned: the token must
-// DIE inside the body, since a yielded acquire token would re-enter
-// AssignStagePhase's stage-propagation walk, which only knows tokens it
-// threaded itself; the partition-outputs verifier exempts poison
-// producers). Semaphores whose entry token has uses beyond the loop init
-// (e.g. the acc init-store chain) are left rotated — matching the old
-// pass, where qk/acc remain rotated. This placement was the dominant term
-// of the FA fwd WS regression (~47 TFLOPS); see
-// fable/fa-perf-study-regressions-analysis.md sections 13-14.
-static void rewriteCarriedTokensToPointOfUse(EmitCtx &ctx) {
-  ctx.func.walk([&](scf::ForOp loop) {
-    if (!gpu::hasWarpSpecializeTag(loop))
-      return;
-    auto yieldOp = cast<scf::YieldOp>(loop.getBody()->getTerminator());
-    for (auto [idx, arg] : llvm::enumerate(loop.getRegionIterArgs())) {
+// Resolve the acquire feeding a value, looking through scf.if results (the
+// conditional re-acquire shape yields the token out of a branch). Bounded
+// fuel: the chain descends nested ifs only.
+static nvws::SemaphoreAcquireOp resolveAcquireThroughIfs(Value v) {
+  for (int fuel = 0; fuel < 8; ++fuel) {
+    if (auto acq = v.getDefiningOp<nvws::SemaphoreAcquireOp>())
+      return acq;
+    auto ifOp = v.getDefiningOp<scf::IfOp>();
+    if (!ifOp)
+      return nullptr;
+    unsigned idx = cast<OpResult>(v).getResultNumber();
+    Value t = ifOp.thenYield()->getOperand(idx);
+    if (auto acq = t.getDefiningOp<nvws::SemaphoreAcquireOp>())
+      return acq;
+    if (ifOp.elseBlock()) {
+      Value e = ifOp.elseYield()->getOperand(idx);
+      if (auto acq = e.getDefiningOp<nvws::SemaphoreAcquireOp>())
+        return acq;
+    }
+    v = t;
+  }
+  return nullptr;
+}
+
+// Verifier (plan M0.2a; spec Addendum B.3(a)): at most ONE carrier token
+// slot per semaphore group per loop. AssignStagePhase scopes its stage
+// threading by backing buffer; a second loop-carried slot of one group
+// crashes propagateStage (DenseMap::at on an unthreaded key). Assert here,
+// where the offending loop and backing are nameable.
+static LogicalResult verifySingleCarrierPerGroup(triton::FuncOp funcOp) {
+  auto res = funcOp.walk([&](scf::ForOp forOp) -> WalkResult {
+    llvm::SmallDenseMap<Value, unsigned> slotsPerBacking;
+    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+    for (BlockArgument arg : forOp.getRegionIterArgs()) {
       if (!isa<gpu::AsyncTokenType>(arg.getType()))
         continue;
-      auto bottomAcq =
-          yieldOp.getOperand(idx).getDefiningOp<nvws::SemaphoreAcquireOp>();
-      if (!bottomAcq || bottomAcq->getBlock() != loop.getBody())
+      unsigned idx = arg.getArgNumber() - 1; // skip induction variable
+      // The live carrier definition is the yielded value; dead/converted
+      // slots yield poison and resolve to nothing.
+      nvws::SemaphoreAcquireOp acq =
+          resolveAcquireThroughIfs(yieldOp.getOperand(idx));
+      if (!acq)
         continue;
-      // The yielded acquire must be a PURE next-iteration re-acquire: its
-      // token's only use is the yield. If the token also feeds in-loop
-      // ops, the acquire is a mid-loop protocol participant — e.g. the
-      // acc pattern's commit-wait acquire, whose token guards the
-      // epilogue read of the MMA result. Moving such an acquire above
-      // the producer store strips the wait off that read (12jun26 moe
-      // mxfp4 regression: races/hangs).
-      if (!bottomAcq.getToken().hasOneUse())
+      auto create =
+          acq.getSemaphore().getDefiningOp<nvws::SemaphoreCreateOp>();
+      if (!create || create.getBuffers().empty())
         continue;
-      auto entryAcq =
-          loop.getInits()[idx].getDefiningOp<nvws::SemaphoreAcquireOp>();
-      if (!entryAcq || entryAcq.getSemaphore() != bottomAcq.getSemaphore())
-        continue;
-      if (!entryAcq.getToken().hasOneUse())
-        continue;
-      // The loop's token result must be dead: the rewrite poisons the
-      // yield slot, so a post-loop consumer would receive poison.
-      if (!loop.getResult(idx).use_empty())
-        continue;
-      // SOUNDNESS: convert only the exactly-one-round shape — ONE buffer
-      // followed by ONE release. A token with more users encodes
-      // in-iteration SEQUENTIAL REUSE (e.g. the acc pattern: buffer for
-      // the init store, release of the full partner, then a second
-      // buffer reading the MMA result). AssignStagePhase places the
-      // mid-loop wait for that reuse from the rotated carried-token
-      // protocol; collapsing it to a single point-of-use acquire loses
-      // the wait guarding the reuse (12jun26 moe mxfp4 regression:
-      // unsynchronized tmem_load of the MMA accumulator).
-      nvws::SemaphoreBufferOp bufUser;
-      nvws::SemaphoreReleaseOp relUser;
-      bool convertible = true;
-      for (Operation *user : arg.getUsers()) {
-        if (user->getBlock() != loop.getBody()) {
-          convertible = false;
-          break;
-        }
-        if (auto buf = dyn_cast<nvws::SemaphoreBufferOp>(user)) {
-          if (bufUser) {
-            convertible = false;
-            break;
-          }
-          bufUser = buf;
-        } else if (auto rel = dyn_cast<nvws::SemaphoreReleaseOp>(user)) {
-          if (relUser) {
-            convertible = false;
-            break;
-          }
-          relUser = rel;
-        } else {
-          convertible = false;
-          break;
-        }
+      Value backing = create.getBuffers().front();
+      if (++slotsPerBacking[backing] > 1) {
+        forOp.emitError(
+            "nvws-insert-semas: two carrier token slots for one semaphore "
+            "group in a single loop (spec fable/semas-report3.md Addendum "
+            "B.3(a)); AssignStagePhase cannot thread this");
+        return WalkResult::interrupt();
       }
-      if (!convertible || !bufUser || !relUser ||
-          !bufUser->isBeforeInBlock(relUser))
-        continue;
-      // Never convert a slot of a ride-bearing component (see
-      // componentHasRides).
-      if (componentHasRides(
-              cast<nvws::SemaphoreCreateOp>(
-                  entryAcq.getSemaphore().getDefiningOp()),
-              loop))
-        continue;
-      bottomAcq->moveBefore(bufUser);
-      arg.replaceAllUsesWith(bottomAcq.getToken());
-      loop.getInitsMutable()[idx].assign(ctx.poison);
-      yieldOp->setOperand(idx, ctx.poison);
-      entryAcq.erase();
     }
+    return WalkResult::advance();
   });
+  return failure(res.wasInterrupted());
 }
 
 LogicalResult emitIR(triton::FuncOp funcOp,
@@ -1670,8 +1628,11 @@ LogicalResult emitIR(triton::FuncOp funcOp,
       if (m.allocOp && m.allocOp->getBlock() && m.allocOp->use_empty())
         m.allocOp->erase();
   }
-  // Point-of-use in-loop acquires (see rewriteCarriedTokensToPointOfUse).
-  rewriteCarriedTokensToPointOfUse(ctx);
+  // Point-of-use placement is NATIVE as of plan M2 (spec Addendum B.2.2):
+  // the SYNC-DAG anchors ungated wrap acquires at the hold's first toucher
+  // (applyHoldRulePlacement) and materializes no slot for them. The former
+  // post-emission rewrite (rewriteCarriedTokensToPointOfUse) and its M1
+  // oracle cross-check are deleted.
   // Poison cleanup: if unused, drop it.
   if (ctx.poison.use_empty())
     ctx.poison.getDefiningOp()->erase();
@@ -1679,6 +1640,11 @@ LogicalResult emitIR(triton::FuncOp funcOp,
   if (failed(verifyPartitionOutputs(funcOp)))
     return failure();
   if (failed(verifyTokenLocality(funcOp)))
+    return failure();
+  // Hold-rule seatbelts (plan M0.2; spec Addendum B.3).
+  if (failed(verifyNoUseAfterRelease(funcOp)))
+    return failure();
+  if (failed(verifySingleCarrierPerGroup(funcOp)))
     return failure();
   return success();
 }

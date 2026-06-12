@@ -1340,6 +1340,185 @@ static void collectParts(Node *head, SmallVector<int, 4> &parts) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// HOLD-RULE boundary-device gate (plan M1; spec Addendum B.2.1) — SIDE-BAND.
+// Per (For row, crossing): does the loop boundary need the rotated device
+// (GATED), or does the component anchor point-of-use (UNGATED, with the
+// predicted target row)? The conditions are the DAG-level derivation of the
+// in-tree fixup's guards — the fixup is the M1 oracle; emission cross-checks
+// agreement on every input (crossCheckHoldRule in InsertSemasEmitIR.cpp).
+// Vocabulary: a crossing's component is GATED when its protocol genuinely
+// spans the loop boundary (entry token consumed by pre-loop accesses, loop
+// result consumed after the loop, carrier with trailing in-body uses, or a
+// non-trivial prefix pattern); otherwise the carried hold closes inside the
+// body and the acquire belongs at the first toucher.
+// ---------------------------------------------------------------------------
+static bool crossesComp(const Node *n, CompId comp) {
+  return llvm::any_of(n->crossings,
+                      [&](const Crossing &x) { return x.comp == comp; });
+}
+
+static void gateCrossing(GroupDag &g, Node *F, Crossing &c) {
+  c.holdGated = true;
+  c.holdFirstToucher = nullptr;
+  auto gated = [&](const char *r) { c.holdGateReason = r; };
+  if (!F->op || !gpu::hasWarpSpecializeTag(F->op))
+    return gated("non-ws-loop");
+  CompId comp = c.comp;
+  // (a) the body chain's final carrier must be a top-level bottom
+  // re-acquire (a nested-region final means the yielded token is a region
+  // result — a mid-loop protocol participant).
+  Node *regain = c.finals.empty() ? nullptr : c.finals[0];
+  if (!regain || regain->kind != Node::Acquire)
+    return gated(regain ? "nested-final" : "no-final");
+  // (b) trailing in-body uses of the regain token: any component event
+  // after the regain (access, release, or a region row threading the
+  // carrier) makes the regain a mid-loop participant.
+  for (Node *m = regain->next; m; m = m->next) {
+    if (m->kind == Node::Access && nodeInvolvesComp(g, m, comp))
+      return gated("trailing-use");
+    if ((m->kind == Node::For || m->kind == Node::If) && crossesComp(m, comp))
+      return gated("trailing-use");
+    if (m->kind == Node::Release &&
+        g.semaTable.semas[m->sema].component == comp)
+      return gated("trailing-use");
+  }
+  // (c) the slot's feeding acquire: scan backwards in F's own chain. The
+  // first component event must be an Acquire of the regain's semaphore
+  // with nothing consuming its token before F.
+  Node *feed = nullptr;
+  for (Node *m = F->prev; m; m = m->prev) {
+    if (m->kind == Node::Acquire &&
+        g.semaTable.semas[m->sema].component == comp) {
+      feed = m;
+      break;
+    }
+    if (m->kind == Node::Access && nodeInvolvesComp(g, m, comp))
+      return gated("entry-consumed");
+    if ((m->kind == Node::For || m->kind == Node::If) && crossesComp(m, comp))
+      return gated("region-feed");
+    if (m->kind == Node::Release &&
+        g.semaTable.semas[m->sema].component == comp)
+      return gated("release-feed");
+  }
+  if (!feed)
+    return gated("no-entry-acquire");
+  if (feed->sema != regain->sema)
+    return gated("entry-sema-mismatch");
+  c.holdFeedAcquire = feed;
+  // (d) the loop result must be dead: forward from F, the first component
+  // event must be a superseding Acquire (or nothing) — an access, a
+  // release (the seam shape), or a carrier-threading region row consumes
+  // the result. A parent crossing whose final is F yields it onward.
+  for (Node *m = F->next; m; m = m->next) {
+    if (m->kind == Node::Acquire &&
+        g.semaTable.semas[m->sema].component == comp)
+      break;
+    if (m->kind == Node::Release &&
+        g.semaTable.semas[m->sema].component == comp)
+      return gated("result-consumed");
+    if (m->kind == Node::Access && nodeInvolvesComp(g, m, comp))
+      return gated("result-consumed");
+    if ((m->kind == Node::For || m->kind == Node::If) && crossesComp(m, comp))
+      return gated("result-consumed");
+  }
+  if (Node *p = F->parent;
+      p && (p->kind == Node::For || p->kind == Node::If)) {
+    for (const Crossing &x : p->crossings)
+      if (x.comp == comp &&
+          llvm::any_of(x.finals, [&](Node *f) { return f == F; }))
+        return gated("result-consumed");
+  }
+  // (e) the incoming carrier's body prefix (rows before the component's
+  // first in-body acquire) must be the exactly-one-round shape mirrored at
+  // the EMISSION level: the carrier token's users are ONE buffer-view op
+  // (the view cache makes any run of prefix access rows share a single
+  // view, materialized at the FIRST access row) followed by ONE release.
+  // Anything else — a region-threaded carrier, several releases, a view
+  // after the release — encodes a wider protocol.
+  Node *bufRow = nullptr; // first access row = where the one view is made
+  unsigned accessRows = 0, rels = 0;
+  bool relBeforeBuf = false;
+  for (Node *m = F->children[0]; m; m = m->next) {
+    if (m->kind == Node::Acquire &&
+        g.semaTable.semas[m->sema].component == comp)
+      break;
+    if ((m->kind == Node::For || m->kind == Node::If) && crossesComp(m, comp))
+      return gated("region-crossing");
+    if (m->kind == Node::Access && nodeInvolvesComp(g, m, comp)) {
+      ++accessRows;
+      if (!bufRow) {
+        bufRow = m;
+        if (rels)
+          relBeforeBuf = true; // the one view would sit after the release
+      }
+    }
+    if (m->kind == Node::Release &&
+        g.semaTable.semas[m->sema].component == comp)
+      ++rels;
+  }
+  if (!bufRow || rels != 1 || relBeforeBuf)
+    return gated(!bufRow      ? "no-buf"
+                 : rels != 1  ? "rel-count"
+                              : "rel-before-buf");
+  c.holdGated = false;
+  c.holdGateReason = "";
+  c.holdFirstToucher = bufRow;
+}
+
+static void computeHoldRuleGates(GroupDag &g, Node *head) {
+  for (Node *n = head; n; n = n->next) {
+    for (Node *child : n->children)
+      if (child)
+        computeHoldRuleGates(g, child);
+    if (n->kind == Node::For)
+      for (Crossing &c : n->crossings)
+        gateCrossing(g, n, c);
+  }
+}
+
+// Detach a node from its chain, fixing the owning head pointer when the
+// node is a chain head.
+static void unlinkFromChain(Node *n) {
+  if (n->prev)
+    n->prev->next = n->next;
+  else if (n->parent)
+    for (Node *&child : n->parent->children)
+      if (child == n)
+        child = n->next;
+  if (n->next)
+    n->next->prev = n->prev;
+  n->prev = n->next = nullptr;
+}
+
+// HOLD-RULE native placement (plan M2; spec Addendum B.2.2): for UNGATED
+// crossings, move the wrap acquire (the regain) from the chain end to
+// immediately before the hold's first toucher, and unlink the feeding
+// entry-instance acquire — iteration 1 pairs with the initial permit (the
+// create stays is_released=true via the sema's isEntry fact). The crossing
+// record is kept (dump + requiredParts) but no slot/yield materializes:
+// the token is born and dies inside the body. verifySyncDag accepts the
+// shape as-is: the wrap release's backward sat link is the existing
+// entry-sema exemption (satisfaction crosses the bracket pairing forward
+// in time — Addendum B.2.3).
+static void applyHoldRulePlacement(GroupDag &g, Node *head) {
+  for (Node *n = head; n; n = n->next) {
+    for (Node *child : n->children)
+      if (child)
+        applyHoldRulePlacement(g, child);
+    if (n->kind != Node::For)
+      continue;
+    for (Crossing &c : n->crossings) {
+      if (c.holdGated)
+        continue;
+      Node *regain = c.finals[0];
+      unlinkFromChain(regain);
+      spliceBefore(regain, c.holdFirstToucher);
+      unlinkFromChain(c.holdFeedAcquire);
+    }
+  }
+}
+
 static void computeRequiredParts(Node *head) {
   for (Node *n = head; n; n = n->next)
     if (n->kind == Node::For || n->kind == Node::If) {
@@ -1521,14 +1700,60 @@ static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
   // Traversal-boundary locality (spec wave-locality section): under a
   // loop the chain's final carrier owner must equal its first wave
   // owner — only that token is carried into the following traversal.
+  // REVISED (plan M2; spec Addendum B.2.2 / audit S4): the invariant is a
+  // property of the CARRIED token, so it applies to carrier-bearing
+  // (GATED) components only; native point-of-use components thread
+  // nothing across the traversal boundary.
   if (head->parent && head->parent->kind == Node::For) {
+    auto compCarried = [&](CompId comp) {
+      for (const Crossing &c : head->parent->crossings)
+        if (c.comp == comp)
+          return c.holdGated;
+      return false; // no crossing: nothing carried
+    };
+    // The invariant concerns the carried token's CONSUMER, so it is
+    // vacuous for a gated component whose incoming carrier is never
+    // consumed in the body (the dead-slot shape: every in-body event of
+    // the component starts at its own acquire; the threaded slot is
+    // erased post-render). Pre-M2 the chain-level check never examined
+    // such components either.
+    auto carrierConsumed = [&](CompId comp) {
+      for (Node *n = head; n; n = n->next) {
+        if ((n->kind == Node::Acquire || n->kind == Node::Release) &&
+            g.semaTable.semas[n->sema].component == comp)
+          return n->kind == Node::Release; // release pairs with the
+                                           // incoming token; an acquire
+                                           // first means it was never used
+        if (n->kind == Node::Access)
+          for (const Touch &t : n->touches)
+            if (compOfMember(g, t.member) == comp)
+              return true;
+        if ((n->kind == Node::For || n->kind == Node::If))
+          for (const Crossing &c : n->crossings)
+            if (c.comp == comp)
+              return true; // carrier threads into the region
+      }
+      return false;
+    };
+    auto compChecked = [&](CompId comp) {
+      return compCarried(comp) && carrierConsumed(comp);
+    };
+    auto rowCarried = [&](Node *n) {
+      if (n->kind == Node::Acquire || n->kind == Node::Release)
+        return compChecked(g.semaTable.semas[n->sema].component);
+      if (n->kind == Node::Access)
+        for (const Touch &t : n->touches)
+          if (compChecked(compOfMember(g, t.member)))
+            return true;
+      return false;
+    };
     // First wave = the first carrier consumer next iteration; a leading
     // region row consumes it in ITS body top — descend.
     std::function<Owner(Node *)> firstWaveOf = [&](Node *h) -> Owner {
       for (Node *n = h; n; n = n->next) {
-        if (n->kind == Node::Access && n->owner)
+        if (n->kind == Node::Access && n->owner && rowCarried(n))
           return n->owner;
-        if (n->kind == Node::Acquire && n->owner)
+        if (n->kind == Node::Acquire && n->owner && rowCarried(n))
           return n->owner; // a leading in-body acquire opens the wave
         if ((n->kind == Node::For || n->kind == Node::If) &&
             !n->children.empty())
@@ -1540,7 +1765,7 @@ static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
     Owner firstWave = firstWaveOf(head);
     Owner finalCarrier;
     for (Node *n = head; n; n = n->next)
-      if (n->kind == Node::Acquire && n->owner)
+      if (n->kind == Node::Acquire && n->owner && rowCarried(n))
         finalCarrier = n->owner;
     if (firstWave && finalCarrier && !sameOwner(firstWave, finalCarrier))
       return (g.root->op ? g.root->op : head->parent->op)
@@ -1651,6 +1876,8 @@ LogicalResult buildSyncDag(GroupDag &g, triton::FuncOp funcOp,
   if (!g.root->children.empty()) {
     computeCrossings(g, g.root->children[0], numComps);
     pruneDeadIfCrossings(g, g.root->children[0], /*region=*/nullptr);
+    computeHoldRuleGates(g, g.root->children[0]); // the boundary-device gate
+    applyHoldRulePlacement(g, g.root->children[0]); // plan M2: native shape
     computeRequiredParts(g.root->children[0]);
   }
   computeBackingPlan(g, funcOp, useMetaPartitioner, numTmemBlocks);
@@ -1726,6 +1953,28 @@ static void printThreadInfo(llvm::raw_ostream &os, GroupDag &g,
     }
     os << "}";
   }
+  // HOLD-RULE gate (plan M1, side-band): per For-row crossing, the
+  // boundary-device decision and, when ungated, the point-of-use target.
+  if (n->kind == Node::For && !n->crossings.empty()) {
+    os << " holdrule{";
+    bool first = true;
+    for (const Crossing &c : n->crossings) {
+      if (!first)
+        os << ",";
+      first = false;
+      os << "c" << c.comp << ":";
+      if (c.holdGated)
+        os << "gated(" << c.holdGateReason << ")";
+      else {
+        os << "pointofuse->";
+        if (c.holdFirstToucher && c.holdFirstToucher->op)
+          os << c.holdFirstToucher->op->getName().getStringRef();
+        else
+          os << "?";
+      }
+    }
+    os << "}";
+  }
 }
 
 static void printYieldInfo(llvm::raw_ostream &os, GroupDag &g,
@@ -1740,6 +1989,10 @@ static void printYieldInfo(llvm::raw_ostream &os, GroupDag &g,
       os << ",";
     first = false;
     os << "c" << c.comp << ": ";
+    if (!c.holdGated) { // native point-of-use: no slot, nothing yields
+      os << "native";
+      continue;
+    }
     Node *f = chainIdx < c.finals.size() ? c.finals[chainIdx] : nullptr;
     os << (f ? syncRowLabel(g, f) : std::string("pass"));
   }

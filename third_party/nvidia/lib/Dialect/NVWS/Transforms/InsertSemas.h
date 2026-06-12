@@ -140,6 +140,18 @@ struct Crossing {
                        // yield returns — the NEW token. nullptr =
                        // PASS-THROUGH: that chain yields the INCOMING
                        // carrier unchanged (the OLD token).
+  // HOLD-RULE gate facts (plan fable/hold-rule-implementation-plan.md M1,
+  // side-band; spec fable/semas-report3.md Addendum B.2.1). Computed at
+  // stage 3 for For-row crossings, printed in the SYNC dump, and
+  // cross-checked at emission against the in-tree point-of-use fixup (the
+  // M1 oracle). Not acted on until M2.
+  bool holdGated = true;            // true: keep the rotated boundary device
+  const char *holdGateReason = "";  // dump tag; empty when UNGATED
+  Node *holdFirstToucher = nullptr; // UNGATED: the point-of-use target row
+  Node *holdFeedAcquire = nullptr;  // UNGATED: the slot's feeding entry-
+                                    // instance acquire (unlinked at M2 —
+                                    // iteration 1 pairs with the initial
+                                    // permit instead)
 };
 
 struct Node {
