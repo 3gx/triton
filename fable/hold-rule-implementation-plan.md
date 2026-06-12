@@ -233,7 +233,36 @@ In planned order, each as its own ask once M3 is green:
   Reverted tip re-verified: NVWS lit 91/91 + AWS hard gate.
 - M4.2 — Elision peephole in lower-semaphore (root-consumer exit pairs;
   `[none]` absorber elision with needFence residue) — verification doc
-  §7.4 table.
+  §7.4 table. STATUS: IMPLEMENTED, GATED, then **REJECTED AND REVERTED
+  12jun26 (user ruling: too brittle to carry)**. What was built and
+  proven, kept for the record: an early-out in
+  LowerSemaphoreCreate::matchAndRewrite matching a semaphore whose
+  whole protocol is one all-[none] release + one attr-less (root)
+  acquire, both top-level outside any WS-tagged loop, and replacing the
+  rel/aq/buffer-op/create quartet with a direct memdesc_index view
+  (+ fence residue). It passed everything: byte-level corpus A/B (fires
+  only on root_entry_tmem + once in the AWS pipeline; never on FA or
+  any multi-loop shape — the E4 sequential-loops golden has zero diff,
+  shared semaphores add users and fail the match), NVWS lit 91/91, AWS
+  hard gate unmodified, a sensitivity-proven LOWER golden pin, and the
+  full runtime gate set (4 warp-spec pytests, 2 moe, run_nvws.sh,
+  06-fa 621/610 parity). REJECTION RATIONALE (the finding that
+  matters): the elision's soundness rests on four cross-pass structural
+  invariants that NO verifier enforces — (1) attr-less outside-loop op
+  ⇒ partition-loops places it in root post-join; (2) {P}+tag post-loop
+  op ⇒ placed pre-join in that tag's partition region; (3) [none] ⇒
+  arrive-at-op-site survives later lowering; (4) one-rel-one-aq ⇒ no
+  hidden arrive contributor. A future placement change in
+  partition-loops, a new producer shape, or combine re-enable (M4.3)
+  could silently invalidate the match, and the failure mode is a
+  DROPPED SYNCHRONIZATION — race/hang with no compile-time signal.
+  Against that risk the benefit is one epilogue mbarrier
+  alloc/init/inval/dealloc + one arrive + one wait, once per kernel,
+  with no measurable perf effect (06-fa untouched). The §7.4 elision
+  TABLE remains correct as analysis (the device IS join-redundant in
+  these shapes); the mistake would be encoding that analysis as a
+  fragile structural match in lowering. Do not re-propose without a
+  cross-pass verifier for the four invariants.
 - M4.3 — Combine re-enable (separate thread: needs
   `fable/attr-less-acquire-release-handoff.md` §5.1 tolerance guards).
 

@@ -801,8 +801,16 @@ components emit nothing):
 
 Elision table — a **lower-semaphore peephole**, not a rule change (insert-semas
 keeps the uniform emission; lower-semaphore, which owns the `needFence`
-logic at `LowerAref.cpp:307-334`, lowers join-redundant pairs to their
-residue):
+logic, would lower join-redundant pairs to their residue). The TABLE is
+correct as analysis. As an implementation it was built, fully gated, and
+**REJECTED 12jun26 (plan M4.2)**: the structural match (one [none] rel +
+one root aq ⇒ drop the device) is sound only via four unverified
+cross-pass invariants (attr-less ⇒ root placement; {P}+tag post-loop ⇒
+pre-join placement; [none] ⇒ op-site arrive; no hidden arrive
+contributor), and a silent future violation drops a real
+synchronization. Tiny epilogue-only benefit, miscompile-class risk —
+do not re-implement without a verifier for those invariants. Full
+record in the plan's M4.2 entry:
 
 | consumer | final rel kind | lowering of the exit device |
 |---|---|---|
