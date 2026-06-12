@@ -1,6 +1,9 @@
 # THE HOLD RULE — native emission implementation plan
 
-Status: AWAITING USER APPROVAL. No implementation until approved.
+Status: APPROVED (user GO, 12jun26). M0-M2 IMPLEMENTED AND COMMITTED
+(47a3e1653f): native emission live, fixup deleted, NVWS lit 92/92, compile
+hard gate green with the test file unmodified. M3 runtime gates in
+progress (user running their runtime set first; plan sequence after).
 
 Scope: **solid-01 only** (this repo, branch
 `egx/meta/sema10a-meta-new-sema-fresh-v5-fable-perf-1`). triton-03.git is
