@@ -195,16 +195,45 @@ Gate M3: all green in order; perf within band.
 
 In planned order, each as its own ask once M3 is green:
 
-- **M4.1 — `ABSORBER_IN_ROOT_P0=1` / `ABSORBER_IN_ROOT_ALL=1` flags +
-  A/B** (FIRST follow-up; agreed experiment).
+- **M4.1 — `ABSORBER_IN_ROOT_ALL=1` flag** (FIRST follow-up; agreed
+  experiment). STATUS: IMPLEMENTED 12jun26. Ratified semantics
+  (user-corrected from earlier over-built designs — no minted
+  semaphores, no peel, no re-owning): ownership-only change. The flag
+  widens the campaign's ROOT-OUTSIDE stamping rule (emitInto,
+  InsertSemasEmitIR.cpp) from p0 to EVERY partition: protocol ops the
+  pass emits outside a WS-tagged loop (entry acquires before it, exit
+  release / drain acquire / buffer after it) keep position and operands
+  but emit attr-less (root) instead of `{P}+tag`. `_P0` was dropped as a
+  separate flag: p0→root is already today's default (the ported
+  campaign fix), i.e. flag-off IS the P0 leg. Implementation: one
+  condition in emitInto + `absorberInRootAll()` helper (InsertSemas.h,
+  bare `::getenv` like `NVWS_INSERT_SEMA_DUMP_DAG`; NOT in the cache
+  key — A/B runs need `TRITON_ALWAYS_COMPILE=1`). Probes: flag-off
+  NVWS lit 91/91 + AWS hard gate pass; flag-on corpus sweep = stamp-only
+  diffs in 3 files (root_entry, post_ws_read_tag, insert_semas — exit
+  releases `[none]`/`[tc5mma]` of p1/p3 + one drain acquire+buffer
+  pair), no new failures, root_entry/post_ws_read_tag lower clean
+  through partition-loops, full AWS pipeline flag-on exits clean.
+  Noted for the runtime legs: under the flag a `[tc5mma]` exit
+  release's `tc_gen5_commit` is executed by root instead of the
+  MMA-issuing partition — arbitrated by the flag-on correctness gates.
+  PERF A/B (06-fa, 12jun26 evening, 5 interleaved pairs, both legs
+  `TRITON_ALWAYS_COMPILE=1`; pairs 4-5 order-reversed to cancel drift):
+  A=flag-off (= the P0 leg) 627.1/610.2/608.8/603.8/600.5 vs
+  B=ROOT_ALL 617.3/609.1/605.5/607.2/601.9 TF. First-runner won every
+  pair; session declined monotonically 627→600 (machine drift, see
+  fable/perf-residual-handoff.md). Order-balanced paired mean ≈ −1.2 TF,
+  ≈ +0.1 excluding the steep-drift pair 1. VERDICT: perf-neutral within
+  today's noise — no gain, no regression. Caveat: measured on the
+  depressed machine (600-627 vs the 657-668 band); worth one re-check
+  when the machine recovers. CLOSED 12jun26 (user ruling: "doesn't seem
+  ROOT_ALL helps, was worth a try"): implementation committed at
+  108db61c20 and reverted at f88ad4da9e — kept in history, not at tip;
+  recover with `git revert f88ad4da9e` or cherry-pick 108db61c20.
+  Reverted tip re-verified: NVWS lit 91/91 + AWS hard gate.
 - M4.2 — Elision peephole in lower-semaphore (root-consumer exit pairs;
   `[none]` absorber elision with needFence residue) — verification doc
   §7.4 table.
-  M4.1 prerequisites recorded: AssignStagePhase last-pid-wins fix
-  (:1108-1137), Exit-group semaphore adoption path
-  (InsertSemasSyncDag.cpp:900-953), final-iteration peel of the bottom
-  acquire (count ledger: verification doc E2). Both flags into
-  `include/triton/Tools/Sys/GetEnv.hpp`.
 - M4.3 — Combine re-enable (separate thread: needs
   `fable/attr-less-acquire-release-handoff.md` §5.1 tolerance guards).
 

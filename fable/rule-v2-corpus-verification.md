@@ -810,8 +810,27 @@ residue):
 | root | async | the absorber wait only; pair → nothing |
 | partition p3 | any | full device — **mechanically irreducible** (one WaitBarrierOp per acquire; per-iteration phase flips; no trip-count phase arithmetic anywhere; cross-partition SSA rejected at `PartitionLoops.cpp:364-403`) |
 
-Absorber-placement experiment (perf A/B, flags in `GetEnv.hpp`, legs run
-with `TRITON_ALWAYS_COMPILE=1` + per-leg IR fingerprint):
+Absorber-placement experiment — **RATIFIED FORM 12jun26 (supersedes the
+paragraph below)**: the flag is an OWNERSHIP-ONLY change. No peel, no
+yielded phase chains, no adoption path, no minted semaphores — those were
+over-built designs the user rejected. `ABSORBER_IN_ROOT_ALL=1` widens the
+campaign's ROOT-OUTSIDE stamping rule (emitInto,
+`InsertSemasEmitIR.cpp`) from p0 to every partition: protocol ops emitted
+outside a WS-tagged loop (entry acquires before it; exit release / drain
+acquire / buffer after it) keep their position and operands and emit
+attr-less (root) instead of `{P}+tag`. AssignStagePhase then computes
+phase in root locally (verified: root_entry flag-on lowers to root-side
+arrive+wait, both legs clean through partition-loops). A separate `_P0`
+flag was dropped: p0→root is already the flag-off default since the
+campaign port, so flag-off IS the P0 leg. Implemented as one condition +
+one `::getenv` helper (not in the cache key — A/B legs need
+`TRITON_ALWAYS_COMPILE=1`). Flag-on gates passed 12jun26: 4 warp-spec
+pytests + 2 moe. Under the flag a `[tc5mma]` exit release's
+`tc_gen5_commit` executes in root rather than the MMA-issuing partition
+(observed in post_ws_read_tag lowering) — covered by those gates.
+
+SUPERSEDED original framing (kept for the record — this was the
+move-the-wait design, NOT what the flag does):
 
 - default — absorber in its owning partition (today's shape);
 - `ABSORBER_IN_ROOT_P0=1` — p0 absorbers move to root (zero plumbing: p0's
@@ -925,6 +944,12 @@ consumer = p3    :  keep everything            (§6 A1 — no join mid-region)
 ```
 
 #### E2 — ABSORBER_IN_ROOT: the variant and why the peel is mandatory
+
+> **SUPERSEDED 12jun26** — this section analyzes the move-the-wait
+> variant (peel + count ledger). The ratified flag (§7.4 above) is
+> ownership-only: existing boundary ops re-stamped to root, counts
+> untouched, no peel. The ledger below stays correct for what it
+> analyzes; it is just not what `ABSORBER_IN_ROOT_ALL` does.
 
 ```
 for {
