@@ -902,3 +902,31 @@ The FA fwd WS regression is fixed in solid-01. Notably solid reaches
 baseline parity despite its older backend (no FADD2 packing): with the
 stalls removed, the §10 backend deltas do not measurably bite at these
 operating points.
+
+### 14.6 Correctness regression in the point-of-use rewrite, and the fix (12jun26)
+
+The loose convertibility guard of the point-of-use rewrite was unsound
+for **mid-loop protocol acquires**. The moe mxfp4 matmuls (52 failing
+block-128 cases in `fail-moe.log`, plus a machine-dependent
+`run_nvws_1.sh` hang) exposed the acc pattern: the carried token covers
+the init store + full-release; a MID-LOOP acquire then waits for the
+consumer's tc5mma commit and its token guards the epilogue read of the
+MMA result before being yielded. The rewrite took that acquire for the
+bottom re-acquire (it defines the yield operand) and moved it above the
+init store — stripping the `wait_barrier` off the `tmem_load` (verified
+in the lowered IR: rotated form has the wait directly before the load;
+converted form has none). Unsynchronized accumulator read ⇒ wrong
+results or hang depending on timing. The block-16 mxfp4 gate missed it;
+the failures are all block-128 shapes.
+
+Fix (`e51ec62358`): convert only when (a) the yielded acquire's token
+has no use besides the yield, (b) the iter_arg's users are exactly one
+buffer followed by one release, and (c) the loop's token result is
+dead. Verified: 52/52 previously-failing cases pass; FA fwd WS retained
+at 662 TFLOPS (FA's slots all convert under the tightened guard); NVWS
+lit 90/90 (5 goldens re-regenerated); gate battery green.
+
+Methodology note (second occurrence this study): env-var knobs are not
+part of the triton cache key — any knob A/B that shares
+`~/.triton/cache` silently reuses the other leg's kernel. All
+conclusive runs here used per-leg `TRITON_CACHE_DIR`.
