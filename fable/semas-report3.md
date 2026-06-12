@@ -78,7 +78,8 @@ release after the operand-read row must carry `tc5mma` (lowering to a
 completion-gated arrive), or the producer overwrites the operands mid-MMA.
 Synchronous readers (`tmem_load`, `local_load`) map to `none` through the
 same table — never special-case "R rows" to `none`. Tokens that cross a region boundary thread through
-`scf.for` iter_args / `scf.if` results. Buffer groups touched by a single
+`scf.for` iter_args / `scf.if` results *(carrier components only —
+Addendum B.2.4; ungated point-of-use tokens never cross a For boundary)*. Buffer groups touched by a single
 owner produce no edges and are left completely untouched.
 
 ---
@@ -131,7 +132,10 @@ struct Node {
 Traversal is one recursive chain walk (`node = head; while (node) { visit;
 recurse into children; node = node->next; }`). `Release → Acquire`
 satisfaction links (`sat`) are the dependency cross-edges; they always point
-**forward** in traversal order (§5.4). The whole structure is a DAG in the
+**forward** in traversal order (§5.4). *(REVISED — Addendum B.2.3: forward
+in TIME; for ungated components the satisfying release may follow the
+acquire in chain order — sat links are temporal, not chain edges, so
+acyclicity is unaffected.)* The whole structure is a DAG in the
 strict sense — SCF has no back edges, and this design introduces none.
 
 Alongside the DAG, two flat tables: the **member/piece table** (per group:
@@ -197,7 +201,10 @@ renders there as `else (virtual)`).
 ## 4. Stage 2 — OWNER-DAG
 
 Clone the ACCESS-DAG; insert one `Enter` node at the head and one `Exit` node
-at the tail of every **`For`/`If` region chain** (`Exit` sits where the
+at the tail of every **`For`/`If` region chain** *(structural brackets are
+always inserted; their virtual first/last-toucher participation for For
+regions is gated per (region, component) — Addendum B.2.1, see the §4.1
+marker)* (`Exit` sits where the
 region terminator `scf.yield` is; the `Func` chain gets **neither** — no
 carried owner exists at function level, so rules 4–5 never apply there); assign the **owner** half of `pieceInfo` to
 `Enter`/`Exit`/`For`/`If` nodes (the **effect** half was already computed at
@@ -314,6 +321,15 @@ Owner assignment is a deterministic function of access order — no policy:
 
 ### 4.1 ENTER/EXIT are the virtual first and last touchers
 
+> **REVISED 12jun26 — Addendum B.2.1.** For **For regions** the
+> augmentation below is now GATED per (region, component): ENTER/EXIT join
+> the chain only when the loop boundary needs a device (a boundary cut
+> pairing a once-per-run outside end against a per-iteration inside end).
+> Ungated components anchor the handback at the carried owner's next REAL
+> access (point-of-use). scf.if branches are unchanged. E1/E5/E6 are
+> unaffected; for FOR regions, E2/E3/E4 are produced only when the gate
+> fires (E3/E4 in scf.if branches are ungated and unchanged).
+
 The load-bearing identity, per region and piece:
 
 ```
@@ -388,7 +404,9 @@ Rows are visited in chain order; the complete rule set:
 0. **First touch of an unheld piece** (function-level games start empty;
    region games are seeded by rule 5): the toucher initializes
    `Exclusive(toucher)` — **no edge** (there is no prior holder to hand
-   off from; the entry acquire covers the permit).
+   off from; the entry acquire — or, for ungated components, the
+   initial-permit-fed first in-body acquire (Addendum B) — covers the
+   permit).
 
 1. **W by `p` on `r`**: emit one edge `lastRow(h) → thisRow` for every
    co-holder `h ≠ p` — readers AND the producer — **minus holders whose
@@ -429,7 +447,10 @@ Rows are visited in chain order; the complete rule set:
    W wins, rule 1 applies.)
 4. **EXIT row** (carried owner `c`): closes the **region's own game**: for
    every piece whose *in-body* holders ≠ `{c}`, emit `lastRow(h) → EXIT`
-   per in-body cross holder — with two qualifiers:
+   per in-body cross holder *(REVISED — Addendum B.2.1: for ungated For
+   components the close edge re-anchors to the carried owner's next REAL
+   access instead of EXIT; the EXIT destination as written applies to
+   gated components and scf.if branches)* — with two qualifiers:
    - **transitive-sync skip** (§5.2 bullet): a holder whose `syncedBehind`
      already contains `c` is NOT closed — `c`'s own acquire since that
      holder's last row already ordered it behind the holder's work;
@@ -468,7 +489,10 @@ Rows are visited in chain order; the complete rule set:
    sanctioned seed exemption).
 
    **FORWARD REGAIN PLACEMENT (USER RULING 10jun26, second instance of
-   the class):** only ONE token is carried into the following traversal
+   the class)** *(REVISED — Addendum B.2.2: applies to carrier-bearing
+   (gated / merged-wrap) components; ungated components carry no token
+   through iter_args and anchor point-of-use)*: only ONE token is carried
+   into the following traversal
    through the iter_args slot — the chain's first wave owner's (the
    yielded carrier; its pre-loop entry + trailing regain are the section
    5.3 canonical structure). Every OTHER carried owner's EXIT-close
@@ -674,6 +698,14 @@ acquire is the ordering witness).
 
 ### 5.3 The canonical structure — entry acquire and the ownership chain
 
+> **REVISED 12jun26 — Addendum B.2.2.** This shape is demoted from THE
+> required structure to the BOUNDARY-DEVICE realization, emitted exactly
+> when Addendum B's gate fires (acc-class components). Ungated components
+> emit point-of-use per the hold rule (Addendum B.1); merged wrap holds
+> keep the carrier + entry-as-init via C1. The token-genesis, inheritStamp,
+> initial-permit, and M3 rules below remain in force for the shapes that
+> use them.
+
 The required shape of the SYNC-DAG for a loop whose carried owner is `p1`
 (brackets mark rows that may be absent — see E1–E4):
 
@@ -774,6 +806,13 @@ Rules that produce and govern this shape:
 
 ### 5.4 Acyclicity — there is no back edge
 
+> **REVISED 12jun26 — Addendum B.2.3.** Same-iteration satisfaction and the
+> exact `k·(N+1)` balance below hold only for GATED components; ungated
+> components satisfy forward across iterations (initial permits feed
+> iteration 1; the acquire row may precede its satisfying release row in
+> chain order) and run a k-permit surplus at loop exit. Acyclicity is
+> unaffected: satisfaction links are temporal, not chain edges.
+
 Every `Release → Acquire` satisfaction is **forward** in traversal order:
 
 - in-body pairs are adjacent-forward by injection (rule placement);
@@ -794,7 +833,12 @@ SYNC-DAG is acyclic, as the structure of SCF demands.
 
 ### 5.5 Worked examples
 
-**Minimal two-partition loop** (`W m0 {0}; R m0 {1}`) — shape E2:
+**Minimal two-partition loop** (`W m0 {0}; R m0 {1}`) — shape E2
+*(REVISED — Addendum B: this component is UNGATED — no outside end exists —
+so the emitted shape is point-of-use: in-body `a S1` before `W m0` fed by
+the initial permit, `r S1` after `R m0`, no pre-loop entry, no EXIT regain.
+The shape below is the gated boundary-device realization, shown for the
+legacy rule)*:
 
 ```
 a  S1(1) {0}                   ; entry — S1 created with 1 permit
@@ -879,7 +923,7 @@ the terminator) holds by construction:
 
 | node | action |
 |---|---|
-| `Func`/`For`/`If` | recurse; thread the live carrier tokens through `iter_args` / if-results — one slot per live component; the slot's owner and its final-carrier row are **stage-3 ThreadingPlan facts** (then/body yields the recorded final carrier's token; else/skip yields the incoming carrier unchanged — an SSA pass-through, which is why bare else brackets need no record). **Liveness (If rows)**: an If crossing exists only if the carrier is consumed after the If — a later row for the component in the enclosing chain, or the enclosing chain is a For body (recurrence), or, recursively, the enclosing If branch is itself live. A component whose last activity is inside the branch yields nothing (gate-2 evidence 10jun26: threading a dead token through a non-WS guard if trips AssignStagePhase's hasPartition assert). For rows always cross (recurrence) |
+| `Func`/`For`/`If` | recurse; thread the live carrier tokens through `iter_args` / if-results — one slot per live component *(REVISED — Addendum B.2.4: slots exist only for carrier-bearing components — gated boundary devices and merged wrap holds; ungated point-of-use tokens die in the body, so their For rows thread nothing)*; the slot's owner and its final-carrier row are **stage-3 ThreadingPlan facts** (then/body yields the recorded final carrier's token; else/skip yields the incoming carrier unchanged — an SSA pass-through, which is why bare else brackets need no record). **Liveness (If rows)**: an If crossing exists only if the carrier is consumed after the If — a later row for the component in the enclosing chain, or the enclosing chain is a For body (recurrence), or, recursively, the enclosing If branch is itself live. A component whose last activity is inside the branch yields nothing (gate-2 evidence 10jun26: threading a dead token through a non-WS guard if trips AssignStagePhase's hasPartition assert). For rows always cross (recurrence) |
 | `Enter`/`Exit` | insertion-point markers only |
 | `Acquire` | emit `nvws.semaphore.acquire`; its token becomes the owner's carrier. Buffer VIEWS are NOT emitted here: `nvws.semaphore.buffer` is materialized lazily at each consuming access, in that access's region, stamped with that access's owner and stage/cluster; the view cache clears at every acquire and at every region boundary (a carried token gets a fresh view per region); one buffer op yields all member views of a multi-member semaphore |
 | `Access` | retarget the op's memdesc operands onto the view (via the recorded alias chain); erase its original async-token plumbing. **Row independence (gate-2 evidence 10jun26):** a sourceful alloc's replacement RAUW must EXCLUDE the group's other access-row ops — each row retargets itself with its own owner's view (else a reader is left on the writer-partition's view: a cross-partition SSA edge partition-loops rejects); the original alloc's erase is deferred to final cleanup, after every row has retargeted |
@@ -952,7 +996,9 @@ Per stage, checked mechanically before the next stage runs:
   has bare brackets) — owners are never invented for pieces a branch does
   not touch.
 - **SYNC**: every edge connects two rows of the same region chain and points
-  forward; the reader-set invariant holds (`Shared` sets are R-only for the
+  forward *(REVISED — Addendum B.2.3: forward in time; an ungated
+  component's handback edge targets the next-iteration first toucher, which
+  precedes the source in chain order)*; the reader-set invariant holds (`Shared` sets are R-only for the
   current version — rule 2); both if-branch walks exit with identical
   holder states; fan-in
   sources are same-chain siblings of their destination (count is therefore
@@ -967,8 +1013,11 @@ Per stage, checked mechanically before the next stage runs:
   balance:
   within each region execution,
   releases == acquires×count, with entry acquires covered exactly by initial
-  permits; every access is preceded in chain order by an acquire of its
-  component (the carrier exists — guaranteed by the entry acquire); **M3
+  permits *(gated components; ungated components run the Addendum B.2.3
+  surplus — initial permits feed the first in-body acquire and one
+  release's permits go unconsumed at exit)*; every access is preceded in chain order by an acquire of its
+  component (guaranteed by the entry acquire for carrier components, by the
+  hold's own point-of-use acquire otherwise — Addendum B); **M3
   acquirer classes**: per semaphore, the acquiring owners contain at most
   one concrete partition (root additionally allowed — the inherit case).
 - **EMIT**: bijection between emitted `nvws.semaphore.{acquire,release}` ops
@@ -1032,10 +1081,13 @@ invariants plus per-execution balance.
 
 **Golden regeneration of `test/NVWS/insert_semas*` is deferred** to a
 follow-up stage after this bring-up completes; those tests may fail
-meanwhile. Expected eventual churn (intended): per-destination fan-out
+meanwhile. **[DONE — goldens regenerated and in-tree.]** Expected eventual
+churn (intended): per-destination fan-out
 semaphores, entry acquires rendered before loops, finer piece granularity
 decoupling partially-overlapping members, tail acquires before `scf.yield`,
-appended-only token slots.
+appended-only token slots. *(Churn list reflects the pre-Addendum-B rotated
+shape; under Addendum B tail acquires and token slots appear only for
+gated/carrier components.)*
 
 ---
 
@@ -1114,6 +1166,9 @@ Two findings:
    buffer use after a release use, or multiple buffer uses, marks its
    component unconvertible). The guard is KEPT in-tree — the hazard is
    a property of the protocol shape, not of retention specifically.
+   *(Superseded by Addendum B.2.4: the guard is deleted with the fixup;
+   the hazard is owned by B.3(b)'s new verifier — no token buffer use
+   after its release use.)*
 2. **Perf still regresses** (user-measured) even with the placement
    fixes and the guard in place. The pacing-point value of the
    "redundant" semaphore is not an artifact of the old stall-bound
@@ -1121,3 +1176,108 @@ Two findings:
 Ruling: keep the elision OUT; the implementation remains preserved at
 `844bf8fa63` (4.10-era emitter) and, re-ported to the current emitter,
 in the reflog of 12jun26 (never committed).
+
+## Addendum B — THE HOLD RULE revision (12jun26; supersedes §4.1's unconditional augmentation, §5.3's canonical shape, §5.4's same-iteration balance, and the stage-4 fixup)
+
+Provenance: the FA −47 TFLOPS placement regression
+(fable/fa-perf-study-regressions-analysis.md §11–14) was root-caused to the
+EXIT-anchored regain; the replacement rule was derived interactively and
+validated against the full lit corpus, the captured FA kernel, and the
+warp-specialize lowering by four multi-agent workflows. The authoritative
+contract and the evidence live in
+**fable/rule-v2-corpus-verification.md** — §0 (the rule, the realization
+layer, the three constraints, the all-cases behavior table), §6/§7.6
+(pseudo-IR per case), §7 (validation + verified fork-join/async facts).
+This addendum records what changes in THIS spec and what stays in force.
+
+### B.1 The rule
+
+> 1. **Cut** every dependence edge of the ACCESS-DAG whose two accesses
+>    have different execution contexts (owner differs, or the enclosing
+>    predicate set differs).
+> 2. Each maximal un-cut-connected group of accesses is a **hold**.
+> 3. **`aq` immediately before the hold's first access; `rel` immediately
+>    after its last.**
+
+Everything else is realization, governed by three constraints (C1 SSA:
+tokens — find a live acquire or insert one; C2 pairing: one semaphore
+handoff per cut, release at the upstream hold's end, acquire at the
+downstream hold's start; C3 balance: acquire/release executions balance
+per semaphore on every dynamic path). Every device in this spec — entry
+acquire, carrier, adoption, regain, once-flip exit — is the unique
+C1/C2/C3 solution at some cut, never independent rule content.
+
+### B.2 What is superseded
+
+1. **§4.1, the unconditional virtual-toucher identity.** ENTER/EXIT no
+   longer join every region chain as the carried owner's first/last touch.
+   For **For regions** they join per (region, component) **iff the loop
+   boundary needs a device**: some boundary cut pairs a once-per-run
+   outside end against a per-iteration inside end (unequal multiplicity —
+   acc-class pre-loop init / post-loop epilogue, once-readers). An outside
+   end belonging to the same recurring cycle (sequential ws loops sharing
+   the buffer) triggers nothing: the protocol continues on the same
+   semaphores. **scf.if branch brackets are unchanged** (a branch executes
+   at most once; E3/E5 conditional shapes stay as specified).
+   Consequences when the gate does NOT fire: the handback edge's
+   destination is the carried owner's **next real access** (the
+   next-iteration first toucher, via the bracket pairing), not EXIT;
+   shapes E2/E3/E4 of §4.1 are not produced for that component; E1
+   (real first and last access) is unchanged; E5/E6 unchanged.
+2. **§5.3, "the canonical structure".** The entry-acquire + carrier +
+   regain-at-EXIT shape is demoted from THE required shape to **the
+   boundary-device realization**, emitted exactly when B.2.1's gate fires.
+   Otherwise the emitted shape is point-of-use: per-hold `aq` before the
+   hold's first access / `rel` after its last. Merged wrap holds — REAL
+   tail and head accesses of the same context joined by the bracket
+   pairing (§4.1 E1, verification doc E0) — keep the carrier and the
+   entry acquire as its init: that is C1's find-or-insert, not the gate.
+3. **§5.4, balance and satisfaction order.** Satisfaction may cross the
+   bracket pairing forward in time: iteration i's release satisfies
+   iteration i+1's acquire; iteration 1 is fed by the initial permits.
+   In chain order the acquire row may PRECEDE its satisfying release row;
+   the DAG remains acyclic because satisfaction links are temporal
+   (phase-based), not chain edges. Balance for ungated components:
+   provides `k·N + k` (initial), consumes `k·N` — the surplus permit at
+   loop exit is tolerated (verified: semaphore counting tolerates surplus;
+   the in-flight-at-exit hazard is owned by later pipeline stages).
+   Gated components keep the §5.4 arithmetic unchanged.
+4. **Stage 4 / the in-tree fixup.** Native emission of the above replaces
+   the post-emission rewrite: `rewriteCarriedTokensToPointOfUse`, its
+   `hasOneUse` and `componentHasRides` guards, and the poison-slot
+   machinery in InsertSemasEmitIR.cpp are deleted. In-loop point-of-use
+   tokens die in the body by construction (the AssignStagePhase
+   constraint, satisfied structurally).
+
+### B.3 What stays in force, unchanged
+
+- §3 ACCESS-DAG and §4 OWNER-DAG facts (owners, carried owner, pieces,
+  components) — the carried-owner fact still drives merges and the gated
+  boundary devices.
+- §5.1 walk rules and §5.2 in their entirety: edge derivation, dedupe,
+  same-owner collapse, transitive-sync skip, group-by-destination, fan-in
+  counts, uniform pending count + release multiplicity, For-row
+  unification, M3 acquirer-class, initial permits, inheritStamp, the
+  attr-less root emission rule. Fan-in/fan-out derive from the edge
+  substrate under both old and new anchoring (verification doc E3).
+- §7 invariants, plus two NEW verifier obligations: (a) at most one
+  carrier (loop-carried token slot) per semaphore group — guards a latent
+  `propagateStage` crash; (b) no token may have a buffer use after its
+  release use (rides are unconstructible natively; Addendum A's hazard
+  note).
+- Addendum A (token retention parked) — any revival must re-prove against
+  the new anchors.
+
+### B.4 Verified execution-model facts the revision rests on
+
+ttg.warp_specialize is fork-join for root (CTA-wide bar.sync idx 1 at
+entry and exit; WarpSpecializeUtility.cpp:191,196,329-341); partitions
+order against each other mid-region only via semaphores; joins never wait
+for in-flight async (tc5mma/tmem_copy releases lower to TCGen5CommitOp —
+arrive on completion; LowerAref.cpp:347-356) — an exit reader needs the
+ABSORBER wait; synchronous TMEM stores complete at the op site
+(tcgen05.wait::st, TensorMemoryToLLVM.cpp:468). Exit handoffs to ROOT are
+degenerate (elidable in lower-semaphore — the needFence logic owns the
+async-proxy fence residue); exit handoffs to a PARTITION are mechanically
+irreducible (once-flip device). Full table + flags
+(ABSORBER_IN_ROOT_P0/_ALL): verification doc §7.4.
