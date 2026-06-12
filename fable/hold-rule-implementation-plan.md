@@ -2,10 +2,12 @@
 
 Status: COMPLETE (12jun26). M0-M2 committed (47a3e1653f); M3 runtime
 gates PASSED in order: 4x warp-spec pytests, 2x moe block-128, run_nvws.sh
-(no hang), 06-fa.py PARITY by same-session A/B — native 623/627/611 vs
-fixup-era binary 625/610 TFLOPS back-to-back on the same GPU (the recorded
-657-668 band is stale for that day's GPU state; the fixup-era binary does
-not reach it either). Fingerprint: holdrule on the real 06-fa kernel = acc
+(no hang), 06-fa.py PARITY by same-session A/B, verified at the EXACT band commit
+(user-directed, no dir-swap assumption): full checkout of c31a6b7a37
+measures 626/617/610 TFLOPS today — it does not reproduce its own recorded
+657-668 band — vs the hold-rule tip's 623/627/611/611. The band gap is
+therefore outside the code (measured fact, cause not claimed); parity
+native == previous stage holds on paired samples. Fingerprint: holdrule on the real 06-fa kernel = acc
 gated(entry-consumed), qk/p/m_i/m_ij/k/v pointofuse — the validated
 partition. M4 follow-ups (absorber flags first) remain queued.
 
