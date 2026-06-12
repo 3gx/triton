@@ -930,3 +930,19 @@ Methodology note (second occurrence this study): env-var knobs are not
 part of the triton cache key — any knob A/B that shares
 `~/.triton/cache` silently reuses the other leg's kernel. All
 conclusive runs here used per-leg `TRITON_CACHE_DIR`.
+
+### 14.7 Token retention re-evaluated under the new placement (12jun26) — re-parked
+
+With the placement fixes in, the parked TOKEN RETENTION elision
+(semas-report3.md Addendum A, impl `844bf8fa63`) was re-ported and
+re-measured on the theory that the old ~5% regression was an artifact
+of the stall-bound regime. Outcome: (a) it deadlocked `run_nvws_1.sh`
+via an interaction with the point-of-use rewrite — retention's rides
+depend on the rotated bottom re-acquire's program-order position, which
+point-of-use removes; root-caused at IR level and fixed with the
+component-wide ride guard (kept in-tree, commit below); (b) with the
+guard in place and everything green (NVWS 91/91 at the time, 53 mxfp4,
+gates, no hang), perf STILL regressed (user-measured) — the
+pacing-point value of the "redundant" semaphore is real even in the
+stall-free regime. User ruling: retention reverted (re-parked), ride
+guard retained. Full record in semas-report3.md Addendum A.

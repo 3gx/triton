@@ -1402,6 +1402,75 @@ static LogicalResult verifyTokenLocality(triton::FuncOp func) {
   return result;
 }
 
+// Ride detection (12jun26): a token "rides" when it has a buffer use
+// AFTER a release use, or more than one buffer use — a second read on a
+// held token after the partner release. Such protocols lean on the
+// ROTATED bottom re-acquire's program-order position for ordering (the
+// writer's next-iteration acquire sits after the rider's chain), so
+// converting any slot of a ride-bearing component to point-of-use breaks
+// it (found via the TOKEN RETENTION re-evaluation: meta-FA run_nvws
+// deadlock, 12jun26; retention itself was re-parked, but the guard is
+// kept — the hazard is a property of the protocol shape, not of who
+// emits it).
+static bool tokenRides(Value tok, Block *body) {
+  bool sawRelease = false;
+  int bufs = 0;
+  SmallVector<Operation *> users;
+  for (Operation *u : tok.getUsers())
+    if (u->getBlock() == body)
+      users.push_back(u);
+  llvm::sort(users,
+             [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+  for (Operation *u : users) {
+    if (isa<nvws::SemaphoreReleaseOp>(u))
+      sawRelease = true;
+    else if (isa<nvws::SemaphoreBufferOp>(u)) {
+      ++bufs;
+      if (sawRelease || bufs > 1)
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool componentHasRides(nvws::SemaphoreCreateOp candidate,
+                              scf::ForOp loop) {
+  // Component = every semaphore sharing a backing buffer with the
+  // candidate. Check every token operating on it inside the loop —
+  // in-loop acquire results and loop-carried token block args alike.
+  llvm::SmallPtrSet<Value, 8> bufs(candidate.getBuffers().begin(),
+                                   candidate.getBuffers().end());
+  auto sameComponent = [&](Value sema) {
+    auto create = sema.getDefiningOp<nvws::SemaphoreCreateOp>();
+    if (!create)
+      return false;
+    return llvm::any_of(create.getBuffers(),
+                        [&](Value b) { return bufs.contains(b); });
+  };
+  Block *body = loop.getBody();
+  for (Operation &op : *body)
+    if (auto acq = dyn_cast<nvws::SemaphoreAcquireOp>(&op))
+      if (sameComponent(acq.getSemaphore()) &&
+          tokenRides(acq.getToken(), body))
+        return true;
+  for (BlockArgument arg : loop.getRegionIterArgs()) {
+    if (!isa<gpu::AsyncTokenType>(arg.getType()))
+      continue;
+    bool onComponent = llvm::any_of(arg.getUsers(), [&](Operation *u) {
+      if (u->getBlock() != body)
+        return false;
+      if (auto b = dyn_cast<nvws::SemaphoreBufferOp>(u))
+        return sameComponent(b.getSemaphore());
+      if (auto r = dyn_cast<nvws::SemaphoreReleaseOp>(u))
+        return sameComponent(r.getSemaphore());
+      return false;
+    });
+    if (onComponent && tokenRides(arg, body))
+      return true;
+  }
+  return false;
+}
+
 // POINT-OF-USE in-loop acquires (enabled 12jun26, ported from the
 // egx/nvws-semaphore-insert-semas experiment branch): rewrite the rotated
 // carried-token protocol (entry acquire -> iter_arg -> in-loop uses ->
@@ -1486,6 +1555,13 @@ static void rewriteCarriedTokensToPointOfUse(EmitCtx &ctx) {
       }
       if (!convertible || !bufUser || !relUser ||
           !bufUser->isBeforeInBlock(relUser))
+        continue;
+      // Never convert a slot of a ride-bearing component (see
+      // componentHasRides).
+      if (componentHasRides(
+              cast<nvws::SemaphoreCreateOp>(
+                  entryAcq.getSemaphore().getDefiningOp()),
+              loop))
         continue;
       bottomAcq->moveBefore(bufUser);
       arg.replaceAllUsesWith(bottomAcq.getToken());

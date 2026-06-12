@@ -1094,3 +1094,30 @@ only when the riding touch lands in the SAME `loop.stage`/`loop.cluster`
 as the retained acquire (the epilogue stats merges keep their benefit;
 the cross-stage in-loop merge — the suspect — keeps its semaphore), and
 to gate the whole feature behind an env knob for perf A/B.
+
+**Re-evaluated 12jun26 under the point-of-use placement — RE-PARKED.**
+After the acquire-placement fixes (ROOT-OUTSIDE + point-of-use, see
+fable/fa-perf-study-regressions-analysis.md §14) the 4.10
+implementation was re-ported onto the new emitter (lit-faithful:
+identical elision counts to 844bf8fa63 on all four affected tests).
+Two findings:
+1. **Interaction deadlock with point-of-use** (meta-FA `run_nvws_1.sh`
+   hang, machine-reproducible): retention's "the ride needs no edge"
+   proof leans on the ROTATED bottom re-acquire's program-order
+   position — the writer's next-iteration acquire sits after the
+   rider's chain. The post-emission point-of-use rewrite moved that
+   acquire to the top of the body, letting the writer's next MMA fire
+   between the two empty-arrives and the ride read (verified at IR
+   level on the qk_0 group: ride at body line ~245 after its own
+   release of the empty at ~188). Fixed by a component-wide ride guard
+   in the point-of-use rewrite (`componentHasRides`: a token with a
+   buffer use after a release use, or multiple buffer uses, marks its
+   component unconvertible). The guard is KEPT in-tree — the hazard is
+   a property of the protocol shape, not of retention specifically.
+2. **Perf still regresses** (user-measured) even with the placement
+   fixes and the guard in place. The pacing-point value of the
+   "redundant" semaphore is not an artifact of the old stall-bound
+   regime.
+Ruling: keep the elision OUT; the implementation remains preserved at
+`844bf8fa63` (4.10-era emitter) and, re-ported to the current emitter,
+in the reflog of 12jun26 (never committed).
