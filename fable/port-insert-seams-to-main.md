@@ -97,6 +97,13 @@ as part of the port); each fix logged below.
      - `test_warp_specialize_tma_matmul_persistent[True-False-8-2-128-128-128-32-32-32]`
      - `test_warp_specialize_attention_forward[False-4-True-3-128-128-1024-1024]`
      - `test_warp_specialize_attention_persistent_forward[True-8-True-3-128-128-1024-1024]`
+   - **Gate 6 (runtime, mxfp4)** — added 12jun26 (was in the
+     insert-semas battery, initially omitted here):
+     `python/triton_kernels/tests/test_matmul.py::test_op[True-False-False-False-None-16-768-512-1024-ragged-bfloat16-mxfloat4_e2m1-10-1-False-True-None-False-False-False-True-None]`
+     (solid-01 ID); baseline-parametrization equivalent on 03.git:
+     `test_op[None-False-False-False-False-None-16-768-512-1024-ragged-bfloat16-mxfloat4_e2m1-None-10-1-False-False-False-None-False-False-False-True-None]`
+     (the persistent-flag sibling auto-skips at the baseline:
+     "persistent kernel is required" opt_flags conflict).
 5. **Measurement** (after all gates green): 06-fa.py, three legs,
    isolated `TRITON_CACHE_DIR` per leg, back-to-back, per-leg artifact
    fingerprint before reading TFLOPS:
@@ -227,3 +234,8 @@ baseline: ~60 TFLOPS — by elimination now isolated to suspect #2
 (in-loop placement: bottom-of-loop empty-permit re-acquires + wait
 order within gates). Dumps: `logs/fa-11jun26-v3-root/` (passes-03/,
 trace-03root-sema.txt).
+
+**Gate 6 (mxfp4) results** (12jun26): 03.git ported tree (with both
+placement fixes) — baseline-equivalent ID **passed** (12.2s); solid-01
+final tree (all three ported commits) — original ID **passed** (6.1s),
+recorded with the 5-gate battery in the study §14.5.
