@@ -1577,7 +1577,7 @@ for HEAD_DIM in [128]:  #64, 128]:
             configs.append(
                 triton.testing.Benchmark(
                     x_names=["N_CTX"],
-                    x_vals=[2**i for i in range(14, 15)],  #0, 15)],
+                    x_vals=[2**i for i in range(10, 11)],  #0, 15)],
                     line_arg="provider",
                     line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
                     line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
@@ -1597,6 +1597,9 @@ for HEAD_DIM in [128]:  #64, 128]:
 @triton.testing.perf_report(configs)
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider, device=DEVICE):
     assert mode in ["fwd", "bwd"]
+    print(f"BATCH: {BATCH}, H: {H}, N_CTX: {N_CTX}, HEAD_DIM: {HEAD_DIM}, mode: {mode}, baseVariant: {baseVariant}, provider: {provider}, device: {device}")
+    import sys
+    sys.stdout.flush()
     dtype = torch.float16
     if "triton" in provider:
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
@@ -1636,8 +1639,8 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider
 
 if __name__ == "__main__":
     if is_blackwell():
-        print("Test op...")
-        test_op(Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="fwd", baseVariant="ws", provider="triton-fp16", SUBTILING=True, VECT_MUL=1, FADD2_REDUCE=False, bwd_config_idx=0)
+        #print("Test op...")
+        #test_op(Z=8, H=4, N_CTX=16384, HEAD_DIM=128, causal=False, mode="fwd", baseVariant="ws", provider="triton-fp16", SUBTILING=True, VECT_MUL=1, FADD2_REDUCE=False, bwd_config_idx=0)
         print("Running benchmarks...")
         bench_flash_attention.run(print_data=True)
     else:
