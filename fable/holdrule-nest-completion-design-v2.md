@@ -1,284 +1,259 @@
-# HOLD-RULE COMPLETION: boundary classes for arbitrary loop nests
+# Holding regions for arbitrary loop nests (design v2)
 
-Status: DESIGN PROPOSAL, 12jun26 (evening). Nothing implemented; tip is
-green at 5c11da9c87. Authored after the persistent-class finding: the
-point-of-use realization covers FLAT ws loops only, and every nested
-kernel (persistent attention, persistent/grouped matmul, triple nests)
-falls back to the rotated boundary device — the measured −47TF shape.
-This doc is the completion design: same rule, full structural range.
+This is the generic extension of the holding-region construction (THE HOLD
+RULE, `rule-v2-corpus-verification.md` §7.2) from a single loop to an
+arbitrary loop nest — perfect or imperfect, any depth. There are no
+per-kernel cases, no per-depth cases, and no fall-back-to-gated paths: one
+uniform recursive construction places every component.
 
-Companion evidence (this session, all verified on real kernels):
-- persistent attention pytest: 5 of 6 component classes gated
-  (nested-final / non-ws-loop); flat variant: 5 of 6 point-of-use.
-- test_grouped_gemm: triple nest, EVERYTHING gated.
-- test_warp_specialize_tma_matmul_persistent[True-False-8-…]: ws tag on
-  the INNER K-loop → its smem components are point-of-use; placement of
-  the ws tag relative to the nest currently decides emission shape.
-- The gate reasons are not derived from the rule: `non-ws-loop`
-  (InsertSemasSyncDag.cpp:1365) and `nested-final` (:1371) fire BEFORE
-  any shape analysis — inherited verbatim from the deleted fixup's
-  conversion domain.
+Scope of this document: the PLACEMENT construction (where each acquire and
+release goes). Downstream realizability of a placement (stage/phase
+threading, pending-count, TMA arrive locality) is a separate concern and is
+NOT a placement exception — see §6. Performance is taken as given: a
+smaller critical region is the goal; this document does not argue it.
 
-## 0. The contract (unchanged rule, completed realization)
+Verified against `logs/nested-12jun26-v1/`: `grouped_gemm` (3-level nest),
+`attn_persistent` (2-level), `matmul_persistent_flatten0` (2-level,
+flatten=false), plus the persistent-FA captures `insert_semas_meta_fa_fwd`
+and `pfa-before-insert-allocas`.
 
-THE HOLD RULE itself is unchanged (rule-v2-corpus-verification.md §7.2).
-What changes: gateCrossing's binary gated/pointofuse verdict becomes a
-per-(component, loop-boundary) CLASSIFICATION with three outcomes, each
-with its own realization:
+## 1. The holding region (recap)
 
-| class | DAG evidence at this boundary | realization |
-|---|---|---|
-| CONTINUATION | component has NO outside endpoint at this loop, or the outside endpoint belongs to the same recurring cycle | NOTHING at the boundary. In-body point-of-use aq/rel. First-ever acquire pairs with the create's initial credit. No entry acquire op, no carrier, no slot at ANY depth. |
-| DEVICE | unequal multiplicity: an endpoint that executes once per ENTER/EXIT event of this loop pairs against a per-iteration endpoint inside | aq/rel pair rendered in the innermost region containing the cut (outer body): aq before the loop / rel after the loop. Token reaches inner accesses by plain SSA capture — no iter_arg. |
-| MERGE | same-owner hold merged across this loop's bracket pair | carrier iter_arg at EXACTLY this loop; token threading only below it; entry/adoption seeds the init. |
+Per component (a buffer plus its footprint-overlapping aliases;
+single-owner components emit nothing):
 
-Multiplicity reference frame (the spec amendment §6 below makes this
-binding): multiplicity is counted RELATIVE TO THIS BOUNDARY — "once" =
-once per ENTER/EXIT event of this loop, "per-iteration" = once per
-iteration of this loop. Outer-prologue ops are once-per-ENTER of the
-inner loop regardless of how many times the outer loop runs.
+- A **hold** is a maximal run of the component's accesses under one
+  **execution context** — same owner AND same set of enclosing predicates.
+- A **cut** falls where the execution context changes: the owner differs
+  (a producer→consumer handoff), or the enclosing-predicate set differs (a
+  conditional).
+- Each hold is one **critical region**: bracket it with exactly one
+  `acquire` before its first access and one `release` after its last.
 
-## 1. The classes in pseudo-IR
+That is the whole idea, and it does not mention loops. A loop is just a
+region the accesses sit in; the construction below makes loops participate
+without changing the idea.
 
-### 1.1 CONTINUATION — the persistent-kernel core (user's sketch)
+## 2. The generic recursive construction
+
+For one component, over the whole nest:
+
+1. **SEQUENCE.** Walk the component's real accesses in program order across
+   every nest level, each tagged with its owner and its enclosing region
+   chain (which loops/ifs contain it). A loop participates in an enclosing
+   level's sequence as a single **pseudo-access pair** (its ENTER and EXIT)
+   of the owner that carries the component across that loop — present
+   exactly when a hold spans the loop (the component is held across the
+   whole loop by one owner) or when the loop boundary pairs endpoints of
+   unequal multiplicity (a once-per-ENTER/EXIT endpoint outside against a
+   per-iteration endpoint inside). A loop whose every adjacency is the same
+   recurring cycle contributes no pseudo-access — the protocol simply
+   continues across its iterations.
+
+2. **CUT** where the execution context changes (owner or predicate set).
+   Maximal uncut run = one hold. At a loop, the iteration adjacency
+   (last-access-of-iteration → first-access-of-next-iteration) is itself a
+   cut when those two accesses differ in context, and a continuation when
+   they do not.
+
+3. **ANCHOR.** `acquire` immediately before the hold's first element, in
+   that element's region; `release` immediately after the hold's last
+   element, in that element's region; one pair per hold. The acquire and
+   release **need not sit at the same nest level**: a hold whose first
+   access is at an outer level and whose last access is inside an inner
+   loop opens its region at the outer level and closes it inside the inner
+   loop. The phrase "innermost region containing the cut" applies to the
+   **cut point** between two consecutive holds — where an upstream hold's
+   release meets a downstream hold's acquire, that release/acquire sits at
+   the cut, in the lowest region enclosing both sides of it (a plain walk
+   up the region chain to their common ancestor — per cut, never per
+   nest). It is not a claim that one hold's two ends share a region.
+
+Steps 1–3 are applied identically at every level. Nothing in them is
+depth-specific. The placement of a hold is therefore determined by where
+its first and last elements live, not by how deep the kernel nests.
+
+## 3. Where a hold's anchor lands (consequences, not cases)
+
+The placement law in §2.3 yields three shapes. These are **not special
+cases** — each is the same law evaluated for a hold whose elements happen
+to sit at a particular level:
+
+- **Hold entirely inside the innermost loop** → its first and last
+  elements are inside that loop → anchor inside it. The hold recurs across
+  the loop's iterations; the iteration adjacency carries it. No token
+  leaves the loop.
+
+- **Hold spans an inner loop** (one owner holds the buffer across the whole
+  inner loop — e.g. a value produced once in the outer body and read every
+  inner iteration; or an accumulation written every inner iteration and
+  read once after). Then the inner loop's ENTER/EXIT are the hold's
+  first/last pseudo-access at the enclosing level → the pair anchors at the
+  **enclosing level**, before and after the inner loop. The acquire is not
+  placed inside the inner loop. This is the case a single-loop view cannot
+  express: a per-inner-iteration acquire against a once-per-outer-iteration
+  release does not balance (verified on `attn_persistent`'s `q`: produced
+  in the outer body {p2}, read every inner iteration {p1} → one acquire
+  above the inner loop, release after it).
+
+- **Hold spans a loop's iteration bracket with the same owner** → the value
+  threads that loop as a carried iter_arg.
+
+A loop need not be carried by a single owner. When the buffer is handed
+between owners **across** an inner loop — held by one owner at the loop's
+entry, a different owner at its exit (a ping-pong loop) — the carried owner
+**differs at the loop's entry vs its exit**. The construction connects the
+outer prefix to the inner loop's first access and the inner loop's last
+access to the outer suffix: the outer-level holds bracket the inner loop on
+each side, while the in-loop holds ping-pong within it. (Verified on the
+n-level form: an outer same-owner prefix merges with the first
+inner-iteration access of that owner, up to the first owner cut; the inner
+loop then ping-pongs; the outer suffix resumes after the loop's exit-owner
+access.)
+
+One component composes these freely up its nest, each boundary
+independently. Worked example — the accumulator of `grouped_gemm` (3-level:
+ws group-loop ⊃ tile-loop ⊃ k-loop), one op per line, owners in braces:
 
 ```
-S_e = create true ; S_f = create false
-for outer (ws) {
-  for tile {
-    for k {
-      aq  S_e {p2}              // 1st-ever firing: initial credit;
-      descriptor_load {p2}      //  every later firing: previous rel,
-      rel S_f [tma] {p2}        //  across ANY loop boundary — mbarrier
-      aq  S_f {p1}              //  phase just keeps flipping
-      mma {p1}
-      rel S_e [tc5mma] {p1}
-    }
+acc = tmem_alloc init {root}                 // L0 (root), before the ws loop
+for g (ws) {                                  // L0 bracket
+  for tile {                                  // L1
+    for k {                                   // L2
+      mma acc {p1}                            //   written every k-iteration
+    }                                         // L2 EXIT
+    read acc {p0}                             // L1: read once per tile, after k
   }
 }
 ```
-Ledger: aq S_e fires N_total times; credits = 1 init + (N_total−1) rels.
-Tokens are body-local; nothing crosses any boundary. Zero-trip safe by
-construction (aq and rel co-located: 0 trips = 0 waits AND 0 arrives;
-partitions execute CLONED nests, so producer and consumer skip
-together).
+- L0 (ws bracket): root init → first use is the mma {p1}, cross-owner from
+  root → **adoption** (the init value seeds the carried iter_arg; the fork
+  orders root before the partitions, so no pair).
+- L1 (tile bracket): acc cycles per tile with the same owner → **carried**
+  iter_arg across the tile bracket.
+- L2 (k boundary): the mma-write hold ({p1}, spanning the whole k-loop)
+  ends at k-EXIT; the reader {p0} is in the tile body, once per tile →
+  cross-owner handoff at unequal multiplicity → the pair anchors in the
+  innermost region containing the cut = the **tile body**: release after
+  the k-loop, acquire before the read. The in-k re-acquire that seeds the
+  next k-iteration is where the final async write is awaited.
 
-### 1.2 DEVICE — imperfect nest, outer prologue (Q-load class)
+`matmul_persistent_flatten0` is the same composition with the tile level
+removed (2-level); `attn_persistent` is the same with the accumulator's
+reader being the per-tile epilogue. The construction is identical; only the
+depth differs.
 
-```
-for outer (ws) {
-  aq  S_b {p3}                  // bracket cut, point of use
-  q_load {p3}                   // once per outer iteration
-  rel S_a {p3}
-  aq  S_a {p1}                  // ← DEVICE pair at the INNER boundary,
-  for inner {                   //    rendered in the OUTER body
-    mma reads q [token of S_a]  //    (per-inner-iteration reads)
-  }
-  rel S_b {p1}                  // after the loop; payload back-filled
-}                               //  from the inner accesses
-```
-The S_a token is captured into the inner region as plain SSA — the
-emitter ALREADY renders this when no in-body acquire exists
-(renderRegion copies carrier maps wholesale, EmitIR:759; corpus proof:
-insert_semas_local_read_lifetime.mlir pins exactly this shape).
+## 3.5 Per buffer; single-loop and perfect nests are the degenerate cases
 
-### 1.3 MERGE — same-owner across the bracket (acc class)
+The construction is **per component** (per buffer): each buffer places on
+its own access set, independently of the others in the kernel.
 
-Unchanged from E0/nested_carrier: merged tail|head hold → carrier at the
-merging loop, nested token threading below. This is today's gated shape
-applied ONLY where the rule actually derives a merge.
+- A buffer whose accesses all sit in one loop places entirely at that loop
+  — the enclosing loops have no access of it, so they contribute no
+  pseudo-access (no outside endpoint) and carry no acquire/release for it.
+  Its emitted sync is identical to a single-loop kernel's. This holds **per
+  buffer**, even inside an otherwise-imperfect kernel (verified:
+  `grouped_gemm`'s A/B tiles are inner-confined → pure in-loop ping-pong,
+  the enclosing tile- and group-loops transparent to them).
+- A **perfect nest** (every buffer confined to the innermost loop) is
+  therefore the case where every buffer emits single-loop-like and the
+  outer loops carry no sync at all.
+- **Single-loop is the depth-1 instance of this same construction — not a
+  special case.** Run §2 on a one-level nest and the recursion has nothing
+  deeper to descend into: one level to sequence, cut, and anchor over. The
+  multi-level work engages **only** for buffers genuinely accessed at more
+  than one level (the imperfect-nest buffers — e.g. an accumulator with an
+  outer-level epilogue). This **inverts** the prior realization, where
+  single-loop was the only handled shape and nested crossings were bailed
+  to the rotated device; here there is one construction and single-loop is
+  its smallest instance.
+- **Single-loop preservation is by construction, not a caveat.** Because §2
+  at depth 1 is the existing single-loop rule and the removed nested
+  short-circuits never fire on a single-loop kernel, flat kernels emit
+  exactly as before. The flat lit goldens staying byte-identical is the
+  *prediction* that confirms the **implementation** faithfully realizes
+  this construction — a churn means a coding bug, not a design change.
+- Plumbing note: an inner-confined buffer that is *allocated* outside the
+  loops still threads its value inward as a carried iter_arg / adoption
+  through the outer brackets — SSA wiring, not a critical-region device; no
+  acquire/release is added at the outer level.
 
-### 1.4 What flips on the persistent attention kernel
+## 4. Boundary realization is SSA, not extra rules
 
-Today: K/V smem, softmax/stat comps = gated(nested-final + non-ws-loop)
-→ rotated. Under classification: all of them = CONTINUATION (accesses
-only inside the kv loop, recurring cycle) → in-body point-of-use, which
-is byte-equivalent to what the FLAT attention kernel already gets. The
-acc = MERGE at the outer loop (init/epilogue same owner across the
-persistent bracket) — keeps its carrier, as it does in the flat kernel
-(gated entry-consumed).
+The brackets above are realized in SSA, the same way at every level:
 
-## 2. Why the realization is small: the model already supports it
+- A component's first hold opens with the **entry acquire** against the
+  semaphore's initial credit; a cross-owner entry from root is realized as
+  **adoption** (the live value seeds the first hold and the carried
+  iter_arg — never a pair; the fork already orders root first).
+- A hold spanning a loop's iteration bracket materializes as a carried
+  iter_arg (init = the adopted value or the entry acquire), with the
+  in-loop re-acquire seeding the next iteration.
+- A cross-owner hold whose last element is a loop EXIT releases after that
+  loop, once, in the carried owner's stream (the in-loop re-acquire awaits
+  the last async write); the downstream hold acquires a fresh
+  statically-phased semaphore. A same-owner continuation through a loop
+  EXIT carries the value directly, no pair.
 
-Verified by code-walk (file:line):
-- Region rows are first-class edge endpoints; Acquire splices BEFORE a
-  For row (:977,:1007), Release AFTER it (:1009-1020) with async
-  payloads back-filled from the inner accesses (:337-344) — the DEVICE
-  shape exists in the node model today.
-- For-row dst groups with no in-body regain get their OWN semaphore
-  (:951) — pure DEVICE pairing exists.
-- Entry-less first-acquire-pairs-with-credit exists: the back-edge
-  placement (:1003) sets isEntry with NO pre-loop instance; the emitter
-  is purely node-driven and tolerates absent entry nodes
-  (emitEntryAcquires EmitIR:304-333, seeding :1571-1582).
-- Slot suppression is nest-depth-agnostic already: the M2 skip
-  (EmitIR:477-479) + renderRegion ungated path (:734-779). The emitter
-  never sees an ungated nested crossing ONLY because gateCrossing
-  blanket-gates them upstream.
-- Stamping inside non-ws inner loops is already correct: emitInto walks
-  up to the ws-tagged ancestor; partition+stage attrs stay (EmitIR:48-77).
-- computeRequiredParts runs after placement and derives clone sets from
-  the rows recursively (:1330-1341) — reclassification updates them for
-  free.
+## 5. The classification is per (component, boundary)
 
-The work concentrates in: the classifier (replacing gateCrossing's
-reason-1–3 short-circuits), applyHoldRulePlacement (a third outcome:
-continuation-without-feed — today it null-derefs, see B5), and the four
-cross-pass blockers below.
+`gateCrossing`'s current binary verdict (point-of-use vs the rotated
+single-loop device) becomes, per (component, loop boundary), the §2
+construction's outcome for that boundary: in-loop hold, spanning-inner-loop
+pair anchored one level out, or carried bracket. The two short-circuits
+that today force the rotated device for any non-ws or nested-region
+crossing (`non-ws-loop`, `nested-final`) are removed: a crossing over an
+inner loop is classified by §2, not bailed out of. The existing
+outside-endpoint scans already compute the facts §2 needs (the multiplicity
+test and the owner/predicate of each endpoint); what is added is applying
+them at every level and anchoring at the innermost region containing each
+hold.
 
-## 3. Blockers the design must carry (red-team verified, file:line)
+## 6. No placement exceptions
 
-**B1 — PIPELINING (the load-bearing discovery).** Inner non-ws loops are
-re-scheduled and pipelined AFTER insert-semas (internal ScheduleLoops at
-AutomaticWarpSpecialization.cpp:126 → compiler.py:442 expander; lowered
-waits/arrives are latency-class ops, ScheduleLoops.cpp:797-801). An
-in-body anchor with NO loop.stage in a scheduled loop either asserts
-(useMetaWS, ScheduleLoops.cpp:810-814) or is silently pushed to the last
-stage (no SSA edge wait→access) → RACE. The gated form dodges this only
-because OUTER loops are never pipelined (ScheduleLoops.cpp:39-41). The
-flat variant is the existence proof that in-body waits survive
-pipelining WHEN stage attrs are inherited. → Design invariant: every
-point-of-use anchor inside a scheduled loop carries stage/cluster
-inherited from its protected access: aq.stage ≤ first-access.stage,
-rel.stage ≥ last-access.stage, per (component, loop). The expander
-already predicates all four protocol ops (PipeliningUtility.cpp:232-282).
+There is no fall-back-to-gated. Every component places by §2. Two items
+that earlier drafts treated as gated fallbacks are not placement
+exceptions:
 
-**B2 — pending_count wave analysis is backedge- and predicate-blind**
-(SemaphorePendingCount.cpp:64-108). A continuation body whose releases
-LEAD the acquire in walk order gets its waves unioned → wrong derived
-count → either authored-vs-analysis hard error (LowerAref.cpp:151-154)
-or, if authored to match the union, a runtime hang (the verified FA-meta
-mechanism). → Design invariant: continuation emission keeps
-acquire-before-releases order per body (natural for point-of-use), and
-the classifier must never emit cross-partition releases split across
-then/else for one semaphore. If a future shape needs leading releases,
-the analysis must become loop-aware first — separate, gated work.
+- A TMA-load producer's accesses (the loads) and the release that publishes
+  them are one hold under one owner; §2 anchors that hold where the loads
+  are, so the release is never separated from its loads. There is nothing
+  to forbid — the construction co-locates them by definition.
+- The one-carried-value-per-semaphore-group requirement of the downstream
+  stage/phase assignment is a property of the REALIZATION, not of the
+  placement. If a placement the construction produces is not directly
+  representable downstream, that is a realization gap to close in the
+  realization (or a hard diagnostic naming the component) — never a reason
+  to widen the critical region back to the rotated form. Per the standing
+  scope, downstream passes (stage/phase, pending-count, pipelining) are out
+  of scope for this document; they do not constrain the placement here.
 
-**B3 — AssignStagePhase carrier bookkeeping** (AssignStagePhase.cpp:
-947-948, :1103, crash :1183). state.token is overwritten by EVERY group
-acquire in lexical order; a MERGE carrier mixed with a later same-group
-point-of-use acquire in one body registers the WRONG token →
-propagateStage DenseMap::at crash. verifySingleCarrierPerGroup
-(EmitIR:1501-1531) rejects two SLOTS but not slot+in-body-same-group. →
-Design invariant: per (semaphore group, loop body), a MERGE carrier and
-point-of-use acquires of the SAME group must not coexist — the
-classifier must verify this and fall back to gated (rotated) for that
-component if it occurs; OR AssignStagePhase registers the yielded token
-explicitly (an AssignStagePhase fix = outside InsertSemas, needs a
-ruling).
+## 7. Verification against the corpus
 
-**B4 — TMALoad payload locality** (LowerAref.cpp:204-264, :241-250,
-:349-356). A [tma_load] release emits NO arrive at the release point —
-the arrival rides the TMA op and the single BarrierExpect is inserted at
-the FIRST LOAD. A DEVICE pair separating loads from their release across
-a loop boundary deadlocks at zero trip and over-expects at N>1. →
-Design invariant: a [tma_load]-payload release must stay in the same
-block as all loads its semaphore covers. CONTINUATION satisfies this
-naturally; the classifier must FORBID the DEVICE class from splitting a
-tma_load producer (fall back to gated).
+Traced in `logs/nested-12jun26-v1/`:
 
-**B5 — applyHoldRulePlacement null-deref** (InsertSemasSyncDag.cpp:1517).
-It unconditionally unlinks holdFeedAcquire; CONTINUATION has no feed by
-definition. The classifier's third outcome must skip the feed unlink and
-instead mark the in-body semaphore isEntry (template: the :1003
-back-edge path).
+- `grouped_gemm` (3-level): A/B smem = in-k holds; acc = adoption(L0) +
+  carried(L1) + spanning-inner-loop handoff(L2 anchored at L1). Places
+  unambiguously.
+- `matmul_persistent_flatten0` (2-level): same acc composition without L1;
+  A/B in-k. Places unambiguously.
+- `attn_persistent` (2-level): K/V/p/qk in-loop holds; `q` =
+  spanning-inner-loop (the single-loop view would not balance); acc =
+  adoption + in-loop + spanning-inner-loop handoff to the epilogue. Places
+  unambiguously.
+- `insert_semas_meta_fa_fwd`, `pfa-before-insert-allocas`: additional
+  persistent-FA bodies for cross-checking the same construction.
 
-Plus three safety rules from the red team:
-- Equal-multiplicity ⇒ CONTINUATION may only be concluded when both
-  endpoints share the SAME region (zero-trip attack: cross-region static
-  equality breaks under dynamic trip counts → over-arrive).
-- Poison-init verifier: a gated/DEVICE slot whose init resolves to
-  ctx.poison is a silent mis-classification today (EmitIR:737-739;
-  verifyTokenLocality deliberately passes poison :1360-1361). Add a
-  verifier: every real slot's init must be a real token.
-- Single-phase eligibility (AssignStagePhase.cpp:137-208) simulates one
-  body pass; new continuation patterns should advance the ring at least
-  once per inner body touching a depth>1 group (verifier, not assumed).
+Every component in the genuine nests places by the single §2 construction,
+at depths 2 and 3, perfect (in-loop ping-pong) and imperfect
+(prologue/epilogue spanning an inner loop). No component required a special
+case or a gated fallback.
 
-## 4. What changes, where
+## 8. References
 
-1. `gateCrossing` → `classifyBoundary` (InsertSemasSyncDag.cpp): delete
-   the `non-ws-loop`/`nested-final` short-circuits; compute the outside-
-   endpoint facts it ALREADY computes (backward scan :1390-1403, forward
-   scan :1413-1431) plus the multiplicity frame; emit class + reason
-   into the dump (`holdrule{c0:continuation}` / `device@<row>` /
-   `merge` / `gated(<fallback reason>)`). Gated stays as the SAFE
-   FALLBACK class for: B3 coexistence, B4 tma-split, prefix-shape
-   reasons (no-buf/rel-count/rel-before-buf), trailing-use.
-2. `applyHoldRulePlacement`: third outcome (B5); DEVICE keeps the
-   already-injected For-row pair; MERGE keeps the slot only at the
-   merge loop (suppress slots below the cut's innermost region).
-3. Emitter: near-zero for slots (skip extends to classified
-   continuation at any depth); anchor stage/cluster inheritance (B1) at
-   render (Acquire/Release rendering, EmitIR:836-896); poison-init
-   verifier (new).
-4. Out-of-InsertSemas items NEEDING A RULING before any edit:
-   AssignStagePhase token registration (B3 alternative), pending-count
-   loop-aware waves (B2 future), ScheduleLoops interplay is observation
-   only (no edit anticipated; B1 is solved inside insert-semas by attr
-   inheritance).
-
-## 5. Validation plan
-
-Goldens (write PINNING CURRENT gated behavior first, then flip with the
-classifier and audit the diff — the M0→M2 pattern):
-1. `insert_semas_nested_continuation.mlir` @perfect_double_nest_pingpong
-   + @triple_nest_reentry — the user's sketch, depths 2 and 3.
-2. `insert_semas_nested_device.mlir` @outer_prologue_device_inner_pingpong
-   (device + in-body point-of-use coexisting — uncovered today) +
-   @inner_exit_epilogue_device (native; @hoisted_alloc pins it gated).
-3. `insert_semas_sequential_inner_loops.mlir` — one buffer, two
-   sequential inner loops inside one ws loop (per-outer-iteration seam).
-4. Reduced persistent-attention golden + reduced grouped-matmul golden
-   (small enough to review per-component classes; meta_fa_fwd stays as
-   the full-capture change-detector).
-5. Zero-trip continuation + predicated inner loop (lower through
-   partition-loops as crash probes; LOWER prefix where shapes allow).
-Existing nested_carrier: cases reclassify (case 2 middle boundary =
-continuation; case 1/3 keep MERGE at the merging level + DEVICE at
-epilogue boundaries) — expected wholesale regeneration, audited line by
-line.
-
-Gates (same ladder as M0–M3, plus the motivating ones):
-- compile: NVWS lit suite; AWS hard gate (WILL change for grouped_gemm
-  if its kernels reclassify — that golden's diff is part of the review,
-  not blindly regenerated);
-- runtime in order: 4 warp-spec pytests, 2 moe, run_nvws.sh, 06-fa
-  parity (flat must be UNCHANGED — fingerprint byte-diff), then the
-  NEW arbiter: persistent attention + persistent matmul + grouped_gemm
-  pytests, and the perf A/B on the persistent FA tutorial kernel
-  (run_nvws.sh kernel) — the number this whole design exists to move.
-
-In-pass oracle (M1 pattern): classifier dual-run — for every corpus
-input, assert classified CONTINUATION ⊆ today's reasons {non-ws-loop,
-nested-final} ∪ {pointofuse}, i.e. the classifier may only RELAX the
-gate, never convert a protocol-shape gate (trailing-use, rel-count, …)
-into point-of-use. Plus the C3 balance verifier and the poison-init
-verifier as permanent seatbelts.
-
-## 6. Spec amendments (rule-v2 + semas-report3)
-
-1. §7.2 rule 1: define the multiplicity reference frame (the corpus
-   agent's finding: "once-per-run" is ambiguous for nests — "once" must
-   read "once per ENTER/EXIT event of THIS loop"). One sentence.
-2. §7.2 rule 4: add the three-class realization table (§0 above) and
-   the B1–B4 invariants as realization constraints alongside C1–C3.
-3. E-series: add E5 (nested continuation, the user's sketch), E6
-   (device-at-inner-boundary with coexisting in-body point-of-use).
-4. semas-report3 Addendum B mirrors.
-
-## 7. Open rulings for the user
-
-1. B3 resolution: classifier fallback (stay inside InsertSemas, some
-   shapes stay rotated) vs AssignStagePhase registration fix (one
-   targeted edit outside InsertSemas, removes the fallback). Default
-   proposal: fallback first, measure, then decide.
-2. AWS golden: grouped_gemm kernels live in the AWS lit file — its
-   CHECK lines will change if classification flips them. The M0-M3 rule
-   was "AWS unmodified"; the completion intentionally changes emission,
-   so the AWS diff becomes a REVIEWED artifact. Confirm.
-3. DEVICE class in v1 or v2: persistent attention/matmul flip needs
-   CONTINUATION (+MERGE unchanged); the q_load DEVICE class is needed
-   for full imperfect-nest coverage but could ship second. Default
-   proposal: v1 = CONTINUATION only (classifier emits device→gated
-   fallback), v2 = DEVICE native. Smaller blast radius per step.
+- Rule: `rule-v2-corpus-verification.md` §7.2 (cut/hold/anchor) and §7.6
+  (the E-series illustrations).
+- Bodies: `logs/nested-12jun26-v1/`.
+- Implementation: `extend-design-to-nested-loops-plan-v2.md` (the plan
+  carries the code touch-points and gates; this document is the
+  construction only).
