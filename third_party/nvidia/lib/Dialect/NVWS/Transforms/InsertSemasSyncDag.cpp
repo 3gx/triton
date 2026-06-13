@@ -1105,6 +1105,21 @@ static Owner firstAccessOwnerOfComp(GroupDag &g, Node *head, CompId comp,
   return std::nullopt;
 }
 
+static Owner firstPlacementOwnerOfComp(GroupDag &g, ArrayRef<Node *> rows,
+                                       CompId comp, bool &found) {
+  if (!rows.empty() && rows.front()->kind == Node::For) {
+    for (auto [p, pi] : sortedPieceInfo(rows.front())) {
+      if (g.pieceTable.pieceComp[p] != comp)
+        continue;
+      found = true;
+      return pi.owner;
+    }
+  }
+  return firstAccessOwnerOfComp(g, g.root->children.empty() ? nullptr
+                                                            : g.root->children[0],
+                                comp, found);
+}
+
 static LogicalResult insertEntryAcquires(GroupDag &g) {
   unsigned numComps = 0;
   for (CompId c : g.pieceTable.pieceComp)
@@ -1159,14 +1174,13 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
       return g.root->op->emitError(
           "nvws-insert-semas: component with sync but no placement rows");
 
-    // Inherit fact = the component's FIRST ACCESS owner, chain order,
-    // recursive (ground truth: matches the old pass's recorded seed
-    // acquirers across the corpus — root for root-seeded accumulators,
-    // the producer partition for operand buffers, the in-loop first
-    // toucher for branch-local buffers).
-    bool fhFound = false;
-    Owner firstHolder = firstAccessOwnerOfComp(g, top, comp, fhFound);
-    if (!fhFound)
+    // Entry inherit comes from the first placement row when that row is
+    // the carrying tt.ws loop; otherwise fall back to the first access
+    // owner. This preserves root for root-first buffers and stamps the
+    // seed with the loop owner for root -> tt.ws handoffs.
+    bool inheritFound = false;
+    Owner inheritOwner = firstPlacementOwnerOfComp(g, rows, comp, inheritFound);
+    if (!inheritFound)
       return g.root->op->emitError(
           "nvws-insert-semas: component has no access rows");
 
@@ -1183,7 +1197,8 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
     if (regain) {
       Sema &s = g.semaTable.semas[regain->sema];
       s.isEntry = true; // first event in chain order is an acquire
-      s.inheritStamp = firstHolder; // carrier inherit: emission stamps this
+      s.inheritStamp = inheritOwner; // emission stamps the root seed with the
+                                     // resolved loop/root handoff owner
       Node *acq = g.newNode(Node::Acquire, nullptr, rows.front()->parent);
       acq->owner = std::nullopt; // ROOT — executes in the root region
       acq->sema = regain->sema;
@@ -1200,7 +1215,8 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
       s.count = 1;
       s.isEntry = true;
       s.expectedReleases = 1; // the terminal release
-      s.inheritStamp = firstHolder; // carrier inherit: emission stamps this
+      s.inheritStamp = inheritOwner; // emission stamps the root seed with the
+                                     // resolved loop/root handoff owner
       Node *acq = g.newNode(Node::Acquire, nullptr, rows.front()->parent);
       acq->owner = std::nullopt; // ROOT — executes in the root region
       acq->sema = sid;

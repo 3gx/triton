@@ -1243,9 +1243,8 @@ public:
       }
     });
 
-    // Disabled for the root-entry-seed experiment: the combiner assumes
-    // partition-stamped consumer acquires and asserts on attr-less root seeds.
-    (void)loops;
+    for (scf::ForOp loop : loops)
+      combineSemaphores(loop);
 
     auto getSemaGroups = [&]() {
       llvm::DenseMap<Value, SmallVector<SemaphoreCreateOp>> semaGroups;

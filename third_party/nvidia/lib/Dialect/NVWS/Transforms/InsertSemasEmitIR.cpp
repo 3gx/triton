@@ -309,13 +309,13 @@ static void emitEntryAcquires(EmitCtx &ctx, GroupDag &g,
                                   ? n->parent->op->getRegion(0).front()
                                         .getTerminator()
                                   : &ctx.func.getBody().front().back());
-        // Keep root entry acquires attr-less: the SyncDag is authoritative
-        // here, and restamping a root seed with inheritStamp can turn an
-        // allowed {root, pX} semaphore into an illegal {pY, pX} one.
+        // Root entry acquires execute before the loop body, but they inherit
+        // the resolved handoff owner so later partitioned passes see the same
+        // owner transition the SyncDag recorded.
         const Sema &s = g.semaTable.semas[n->sema];
         gpu::StageCluster sc = {};
         auto acq = emitInto<nvws::SemaphoreAcquireOp>(
-            b, before ? before->getLoc() : ctx.func.getLoc(), std::nullopt,
+            b, before ? before->getLoc() : ctx.func.getLoc(), s.inheritStamp,
             sc, s.create, ctx.tokenType);
         emitted[n] = acq.getToken();
       }
