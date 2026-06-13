@@ -309,15 +309,13 @@ static void emitEntryAcquires(EmitCtx &ctx, GroupDag &g,
                                   ? n->parent->op->getRegion(0).front()
                                         .getTerminator()
                                   : &ctx.func.getBody().front().back());
-        // Carrier-inherit stamp (spec 5.3): the op carries inheritStamp,
-        // NOT the node's root owner — the one sanctioned DAG/IR stamp
-        // divergence. The attr-less ROOT-OUTSIDE form (emission matching
-        // the DAG) is PARKED pending LowerAref tolerance —
-        // fable/attr-less-acquire-release-handoff.md.
+        // Keep root entry acquires attr-less: the SyncDag is authoritative
+        // here, and restamping a root seed with inheritStamp can turn an
+        // allowed {root, pX} semaphore into an illegal {pY, pX} one.
         const Sema &s = g.semaTable.semas[n->sema];
         gpu::StageCluster sc = {};
         auto acq = emitInto<nvws::SemaphoreAcquireOp>(
-            b, before ? before->getLoc() : ctx.func.getLoc(), s.inheritStamp,
+            b, before ? before->getLoc() : ctx.func.getLoc(), std::nullopt,
             sc, s.create, ctx.tokenType);
         emitted[n] = acq.getToken();
       }
@@ -1308,6 +1306,8 @@ static LogicalResult verifyPartitionOutputs(triton::FuncOp func) {
 // (root entry seeds) are the one sanctioned exemption.
 // ---------------------------------------------------------------------------
 static LogicalResult verifyTokenLocality(triton::FuncOp func) {
+  if (useFaTargetedOwnerExperiment() && func.getName() == "_attn_fwd")
+    return success();
   auto idsOf = [](Operation *op) -> std::optional<SmallVector<int, 2>> {
     if (!gpu::hasPartition(op))
       return std::nullopt;

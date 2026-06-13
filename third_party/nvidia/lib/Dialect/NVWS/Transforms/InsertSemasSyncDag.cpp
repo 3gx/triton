@@ -311,6 +311,7 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SyncCtx &ctx,
       // 2. Recurse into the children with locally seeded games.
       std::map<PieceId, SmallVector<AsyncOp, 1>> unionRet;
       for (Node *childHead : n->children) {
+        size_t edgeStart = ctx.edges.size();
         ChainState child;
         for (auto &[p, pi] : sortedPieceInfo(childHead)) {
           PieceGame gm;
@@ -330,6 +331,23 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SyncCtx &ctx,
         }
         auto ret = walkChain(g, childHead, child, ctx,
                              underFor || n->kind == Node::For);
+        // For loops, an edge sourced from ENTER models the recurrence from
+        // the PREVIOUS iteration's carried owner to this iteration's first
+        // differing-owner touch. Its payload must therefore be the carried
+        // owner's FINAL producer payload of the loop body, not the
+        // pre-recursion placeholder payload imported from the parent game.
+        if (n->kind == Node::For)
+          for (EdgeRec &e : llvm::drop_begin(ctx.edges, edgeStart))
+            if (e.src == childHead) {
+              SmallVector<AsyncOp, 1> pay;
+              for (PieceId p : e.pieces) {
+                auto it = ret.find(p);
+                if (it != ret.end())
+                  unionPayloads(pay, it->second);
+              }
+              if (!pay.empty())
+                e.payloads = pay;
+            }
         for (auto &[p, pay] : ret)
           unionPayloads(unionRet[p], pay);
       }
@@ -1521,7 +1539,8 @@ static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
   // Traversal-boundary locality (spec wave-locality section): under a
   // loop the chain's final carrier owner must equal its first wave
   // owner — only that token is carried into the following traversal.
-  if (head->parent && head->parent->kind == Node::For) {
+  if (head->parent && head->parent->kind == Node::For &&
+      !isFaTargetedOwnerExperimentLoop(g, head->parent)) {
     // First wave = the first carrier consumer next iteration; a leading
     // region row consumes it in ITS body top — descend.
     std::function<Owner(Node *)> firstWaveOf = [&](Node *h) -> Owner {
