@@ -82,13 +82,23 @@ regardless of enclosing nesting (per-buffer reduction), and single-loop is
 the depth-1 instance of this same construction — **so flat kernels emit
 byte-identical** (the verification obligation below).
 
-The two short-circuits `non-ws-loop` (:1365) and `nested-final` (:1371) —
-which fire before any shape analysis and force the rotated form — are
-DELETED. The existing outside-endpoint detectors (`entry-consumed`,
-`result-consumed`, `region-feed`, `release-feed`, `entry-sema-mismatch`,
-`trailing-use`) become evidence for the spanning/carried placement, not a
-blanket gate. The prefix-shape reasons (`no-buf`, `rel-count`,
-`rel-before-buf`) remain only as malformed-input diagnostics.
+`non-ws-loop` (:1365) is DELETED (a crossing over a non-ws loop is
+classified by §2). `nested-final` (:1371) is **relaxed loop-scoped, NOT
+deleted**: it fires whenever the carrier's final producer is in a nested
+region, which is a **For** in a genuine nest (→ relax, classify by §2) but
+an **`scf.if`** in a depth-1 conditional (→ KEEP gated, the
+conditionality-cut emission is correct and must stay byte-identical).
+Verified: `local_cfg`, `if_split_metadata`, `conditional_multi_result` all
+dump `gated(nested-final)` with NO nested loop — deleting `nested-final`
+blindly would regress these depth-1 conditionals. So the relax condition
+is: `nested-final` ⇒ relax IFF the final's enclosing nested region is a
+`scf.for`; otherwise keep. The existing outside-endpoint detectors
+(`entry-consumed`, `result-consumed`, `region-feed`, `release-feed`,
+`entry-sema-mismatch`, `trailing-use`) become evidence for the
+spanning/carried placement. The prefix-shape reasons (`no-buf`,
+`rel-count`, `rel-before-buf`) and `region-crossing` / `no-final` /
+`no-entry-acquire` remain gated (malformed-input or unsupported-shape
+diagnostics) — see the relax-only oracle for the full reason partition.
 
 One real placement fix needed (B5, insert-semas-side):
 `applyHoldRulePlacement` (:1504-1519) unconditionally unlinks
@@ -123,12 +133,21 @@ decision:
 
 ## Verifiers / in-pass seatbelts
 
-- **Relax-only oracle:** every crossing the construction newly places
-  in-loop or spanning (vs the old rotated form) must have carried gate
-  reason `non-ws-loop` or `nested-final`, OR an outside-endpoint reason now
-  used as spanning/carried evidence. It must NEVER turn a malformed-input
-  reason (`no-buf`/`rel-count`/`rel-before-buf`) into emission. Hard error
-  on violation, every input.
+- **Relax-only oracle** (covers ALL gateCrossing reasons; partition is
+  exhaustive so no reason is unclassified):
+  - **may relax** (newly placed in-loop/spanning vs the old rotated form):
+    `non-ws-loop`; `nested-final` ONLY when the nested final is inside a
+    `scf.for`; and the outside-endpoint detectors `entry-consumed`,
+    `result-consumed`, `region-feed`, `release-feed`, `entry-sema-mismatch`,
+    `trailing-use` (used as spanning/carried evidence).
+  - **must stay gated** (the construction must NOT change their emission):
+    `nested-final` when the nested final is inside an `scf.if` (depth-1
+    conditional — byte-identical), and `region-crossing`, `no-final`,
+    `no-entry-acquire`, `no-buf`, `rel-count`, `rel-before-buf`
+    (unsupported-shape / malformed-input diagnostics).
+  Hard error if a crossing in the "must stay gated" set is placed
+  in-loop/spanning, or if any reason falls outside this partition. Run on
+  every input.
 - **`verifySingleCarrierPerGroup`** (EmitIR :1501-1531) — kept, hard; firing
   is a blocker (see above), not a fallback trigger.
 - **`verifyNoUseAfterRelease`** (EmitIR :1436-1470) — kept; an in-loop
@@ -204,10 +223,12 @@ Any hang: `third_party/tlx/killgpu.sh`, capture IR, STOP.
 
 ### M1 — implement the §2 placement (the change)
 Implement together:
-1. `gateCrossing` → `classifyCrossing`: delete `non-ws-loop`/`nested-final`;
-   compute the §2 placement (in-loop / spanning-inner anchored at the
-   enclosing level / carried) from the outside-endpoint scans + the
-   multiplicity test (same-region-only equal); keep malformed-input
+1. `gateCrossing` → `classifyCrossing`: delete `non-ws-loop`; relax
+   `nested-final` ONLY when the final's nested region is a `scf.for` (keep
+   it gated for `scf.if` — depth-1 conditional, byte-identical); compute
+   the §2 placement (in-loop / spanning-inner anchored at the enclosing
+   level / carried) from the outside-endpoint scans + the multiplicity
+   test (same-region-only equal); keep malformed-input
    diagnostics. Emit the placement into the dump.
 2. `applyHoldRulePlacement`: in-loop → point-of-use + feed-less `isEntry`
    (B5); spanning-inner → the off-region acquire/release pair, no slot
@@ -236,13 +257,24 @@ full corpus; placement matches design-v2 §7.
      one semaphore pair; no entry acquire / carrier / bottom re-acquire /
      seam release) — design-v2 §7.4. This is an improvement, not a
      regression; audit it as such.
-   - the AWS file's `@grouped_matmul_tma_kernel`; the M0 change-detectors;
-     any other the dump flips.
+   - the AWS file's `@grouped_matmul_tma_kernel`.
+   - `insert_semas.mlir` — the 5 hidden nested funcs (`@hoisted_alloc`,
+     `@nested_loop_yes/no_double_buffer`, `@nested_loop_yes/no_double_buffer_scaled`)
+     flip (rotated → §2 spanning/in-loop). The other 23 funcs are depth-1
+     and MUST stay byte-identical — incl. the conditional funcs that dump
+     `gated(nested-final)` via an `scf.if`, which the loop-scoped relax
+     keeps unchanged.
+   - `insert_semas_per_edge_tmem.mlir` — `@tmem_nested_linear_chain_no_outer_drain`
+     flips (inner-confined buffer, rotated → in-loop); 4 other funcs
+     byte-identical.
+   - `insert_semas_live_tag_source.mlir` — its acc component flips
+     (carried + spanning-inner), like grouped_gemm's acc.
+   - the M0 change-detectors; any other the dump flips.
    Audit each diff line-by-line: every change is a placement move
    (slot/entry-acquire removal for in-loop, off-region pair for
    spanning-inner, carrier kept for carried) — nothing unexplained. Flat
-   goldens MUST stay byte-identical (design-v2 §3.5 / §7.3); a flat churn
-   is a regression to stop on.
+   goldens (and every depth-1 conditional) MUST stay byte-identical
+   (design-v2 §3.5 / §7.3); a flat churn is a regression to stop on.
 2. Full NVWS lit suite green.
 3. AWS mlir gate GREEN with combine ON (the M0 crash resolved).
 
@@ -277,10 +309,15 @@ pipeliner, or a runtime hang/race — then:
 ## Churn budget
 - New goldens: the two M0 change-detectors (+ any reduced reproducers from
   blockers).
-- Regenerated (per design-v2 §7, all expected): `nested_carrier` ×3,
-  `meta_fa_fwd`, `sequential_ws_loops` (→ symmetric continuation), the AWS
-  file's grouped_matmul kernel, the change-detectors. Every diff audited as
-  a placement move. Flat goldens byte-identical (a flat churn = stop).
+- Regenerated (per design-v2 §7 + the corpus coverage check, all
+  expected): `nested_carrier` ×3, `meta_fa_fwd`,
+  `sequential_ws_loops` (→ symmetric continuation), the AWS file's
+  grouped_matmul kernel, `insert_semas.mlir` (5 hidden nested funcs only),
+  `insert_semas_per_edge_tmem.mlir` (`@tmem_nested_linear_chain_no_outer_drain`
+  only), `insert_semas_live_tag_source.mlir` (acc component), the
+  change-detectors. Every diff audited as a placement move. All other
+  goldens — incl. every depth-1 conditional — byte-identical (a flat/
+  conditional churn = stop).
 
 ## References
 - Design: `fable/holdrule-nest-completion-design-v2.md` (§2 construction,

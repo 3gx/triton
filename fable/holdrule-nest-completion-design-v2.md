@@ -168,11 +168,22 @@ its own access set, independently of the others in the kernel.
   to the rotated device; here there is one construction and single-loop is
   its smallest instance.
 - **Single-loop preservation is by construction, not a caveat.** Because §2
-  at depth 1 is the existing single-loop rule and the removed nested
-  short-circuits never fire on a single-loop kernel, flat kernels emit
-  exactly as before. The flat lit goldens staying byte-identical is the
-  *prediction* that confirms the **implementation** faithfully realizes
-  this construction — a churn means a coding bug, not a design change.
+  at depth 1 is the existing single-loop rule, flat kernels emit exactly as
+  before. NOTE the precise scope of what is relaxed (verified against the
+  corpus, 13jun26): of the two short-circuits, `non-ws-loop` fires only on
+  a crossing over a non-ws *loop*, and `nested-final` fires whenever the
+  carrier's final producer sits in a nested *region* — which is a loop in a
+  genuine nest but an `scf.if` in a **depth-1 conditional** (e.g.
+  `local_cfg`, `if_split_metadata`, `conditional_multi_result` all dump
+  `gated(nested-final)` with no nested loop). So `nested-final` DOES fire on
+  single-loop kernels. The relaxation is therefore **loop-scoped**: relax
+  `nested-final` only when the nested region is a **For** (the spanning
+  case); KEEP it when the region is an `scf.if` (the conditionality cut,
+  emitted exactly as today). With that scope, every depth-1 kernel —
+  including conditionals — stays byte-identical. The flat lit goldens
+  staying byte-identical is the *prediction* that confirms the
+  **implementation** realizes this — a flat churn means a coding bug, not
+  a design change.
 - Plumbing note: an inner-confined buffer that is *allocated* outside the
   loops still threads its value inward as a carried iter_arg / adoption
   through the outer brackets — SSA wiring, not a critical-region device; no
@@ -200,10 +211,13 @@ The brackets above are realized in SSA, the same way at every level:
 `gateCrossing`'s current binary verdict (point-of-use vs the rotated
 single-loop device) becomes, per (component, loop boundary), the §2
 construction's outcome for that boundary: in-loop hold, spanning-inner-loop
-pair anchored one level out, or carried bracket. The two short-circuits
-that today force the rotated device for any non-ws or nested-region
-crossing (`non-ws-loop`, `nested-final`) are removed: a crossing over an
-inner loop is classified by §2, not bailed out of. The existing
+pair anchored one level out, or carried bracket. The short-circuit
+`non-ws-loop` (a crossing over a non-ws loop) is removed; `nested-final` is
+relaxed **only when the nested final is inside a For** (a genuine
+loop-nest) and KEPT when it is inside an `scf.if` (a depth-1 conditional,
+which keeps the conditionality-cut emission unchanged). A crossing over an
+inner loop is classified by §2, not bailed out of; a depth-1 conditional
+is untouched. The existing
 outside-endpoint scans already compute the facts §2 needs (the multiplicity
 test and the owner/predicate of each endpoint); what is added is applying
 them at every level — anchoring each hold's acquire/release at its
