@@ -231,24 +231,79 @@ exceptions:
 
 ## 7. Verification against the corpus
 
-Traced in `logs/nested-12jun26-v1/`:
+Verified 13jun26 against the full corpus: the 6 nested bodies in
+`logs/nested-12jun26-v1/` and all 25 `test/NVWS/insert_semas*.mlir` lit
+files. Every component in every body places by the single §2 construction
+— no special case, no gated fallback. Detail by group:
+
+### 7.1 The nested bodies (`logs/nested-12jun26-v1/`)
 
 - `grouped_gemm` (3-level): A/B smem = in-k holds; acc = adoption(L0) +
-  carried(L1) + spanning-inner-loop handoff(L2 anchored at L1). Places
-  unambiguously.
+  carried(L1) + spanning-inner-loop handoff(L2 anchored at L1).
 - `matmul_persistent_flatten0` (2-level): same acc composition without L1;
-  A/B in-k. Places unambiguously.
+  A/B in-k.
+- `matmul_persistent` (flatten=true): the tile+k loops are fused to one
+  ws-loop under an `scf.if` — genuinely depth-1; A/B in-loop, the
+  conditional epilogue read is a depth-1 predicate cut (§2.2), placed by
+  the existing conditionality cut, no new machinery.
 - `attn_persistent` (2-level): K/V/p/qk in-loop holds; `q` =
   spanning-inner-loop (the single-loop view would not balance); acc =
-  adoption + in-loop + spanning-inner-loop handoff to the epilogue. Places
-  unambiguously.
-- `insert_semas_meta_fa_fwd`, `pfa-before-insert-allocas`: additional
-  persistent-FA bodies for cross-checking the same construction.
+  adoption + in-loop + spanning-inner-loop handoff to the epilogue.
+- `insert_semas_meta_fa_fwd`, `pfa-before-insert-allocas` (persistent FA,
+  depth-2): `q` spanning-inner, K/V in-loop, acc the composite — same
+  construction; the immutable-value form of `pfa` places identically.
 
-Every component in the genuine nests places by the single §2 construction,
-at depths 2 and 3, perfect (in-loop ping-pong) and imperfect
-(prologue/epilogue spanning an inner loop). No component required a special
-case or a gated fallback.
+### 7.2 The deepest composition (`insert_semas_nested_carrier.mlir`)
+
+The depth-3 imperfect case `@three_level_sourceful_alloc_reentry` (init at
+L0, write in L2, epilogue reads at L1 and L0) composes adoption(L0) +
+carried(L1) + **two independent EXIT cuts** — inner→exit anchored at L1,
+middle→exit anchored at L0 — each placed at its own lowest-common-ancestor
+region by the §2.3 per-cut walk-up, no double-count and no ambiguity.
+This is the hardest single-component composition in the corpus and it
+places determinately.
+
+### 7.3 The flat lit set (§3.5 degenerate) + hidden non-flat funcs
+
+The genuinely depth-1 functions across `insert_semas.mlir` (and the
+per-feature lits: branch_local_init, conditional_multi_result,
+if_split_metadata, local_buffer_reuse, local_cfg, mixed_overlap_members,
+post_ws_read_tag, raw_if_token, root_entry_tmem, tmem_alias,
+tmem_container_subviews, tmem_no_loop_exit_drain, tmem_reuse_views,
+transitive_reduction, local_no_buffer_id) are the depth-1 instance of §2,
+preserved by §3.5. `nested_region_access` (9 funcs) are single-owner →
+nothing emitted. Six functions hiding in the "flat" set are actually
+nested — 5 `nested_loop`/`hoisted_alloc` in `insert_semas.mlir` and
+`tmem_nested_linear_chain_no_outer_drain` in `per_edge_tmem` — and all
+place under §2 (spanning-inner, or per-buffer inner-confined per §3.5).
+`local_read_lifetime` (DEVICE read-only inner) and `release_count`
+(fan-in at inner exit) place as spanning-inner anchored at the outer
+level. `live_tag_source` (two sequential inner loops, disjoint buffers)
+places per-buffer per §3.5.
+
+### 7.4 The one emission that improves: E4 seam
+
+`insert_semas_sequential_ws_loops.mlir` (one buffer shared by two
+sequential ws loops) is the only case where §2 prescribes a *different,
+cleaner* emission than the current pinned golden. §2 places it as
+**symmetric continuation**: both loops native point-of-use, loop A's last
+`release` pairing directly with loop B's first `acquire` on the same
+two semaphores — no entry acquire, no carried token, no bottom re-acquire,
+no seam-conversion release. The current golden instead gates loop A (the
+rotated shape + a seam release) — the pre-§2 asymmetric realization. This
+is not a placement gap (§2 resolves it unambiguously, per the E4 ruling
+rule-v2 §7.5.3) but an improvement: when this construction is implemented,
+the E4 golden regenerates to the symmetric form, which requires the
+realization to use one semaphore pair across the seam (exactly what the
+E4 ruling mandates).
+
+### 7.5 Summary
+
+Across depths 1–3, perfect and imperfect, single-owner and ping-pong,
+sequential and nested loops, every component places by the one §2
+construction. No component required a special case or a gated fallback.
+The only emission that changes beyond the persistent/nested kernels is
+E4's, in the improving direction.
 
 ## 8. References
 
