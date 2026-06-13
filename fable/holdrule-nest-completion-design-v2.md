@@ -206,8 +206,9 @@ crossing (`non-ws-loop`, `nested-final`) are removed: a crossing over an
 inner loop is classified by §2, not bailed out of. The existing
 outside-endpoint scans already compute the facts §2 needs (the multiplicity
 test and the owner/predicate of each endpoint); what is added is applying
-them at every level and anchoring at the innermost region containing each
-hold.
+them at every level — anchoring each hold's acquire/release at its
+elements' regions (which may differ in level) and each cut's
+release/acquire at the innermost region containing that cut.
 
 ## 6. No placement exceptions
 
