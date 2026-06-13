@@ -1555,8 +1555,7 @@ static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
   // Traversal-boundary locality (spec wave-locality section): under a
   // loop the chain's final carrier owner must equal its first wave
   // owner — only that token is carried into the following traversal.
-  if (head->parent && head->parent->kind == Node::For &&
-      !isFaTargetedOwnerExperimentLoop(g, head->parent)) {
+  if (head->parent && head->parent->kind == Node::For) {
     // First wave = the first carrier consumer next iteration; a leading
     // region row consumes it in ITS body top — descend.
     std::function<Owner(Node *)> firstWaveOf = [&](Node *h) -> Owner {

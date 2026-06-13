@@ -201,16 +201,6 @@ static LogicalResult assignOwners(GroupDag &g, Node *chainHead) {
         return n->op->emitError(
             "nvws-insert-semas: no toucher resolves the owner for a piece "
             "in this region's summary (stage-1/stage-2 inconsistency)");
-      if (n->kind == Node::For && isFaTargetedOwnerExperimentLoop(g, n)) {
-        Node *second = n->children[0] && n->children[0]->next
-                           ? n->children[0]->next->next
-                           : nullptr;
-        if (!second || !second->owner)
-          return n->op->emitError(
-              "nvws-insert-semas: targeted FA owner experiment could not "
-              "resolve the consumer owner");
-        owner = second->owner;
-      }
       n->pieceInfo[p].owner = owner;
     }
     // Bracket records are RESTRICTIONS, never copies of the union: each

@@ -1306,8 +1306,6 @@ static LogicalResult verifyPartitionOutputs(triton::FuncOp func) {
 // (root entry seeds) are the one sanctioned exemption.
 // ---------------------------------------------------------------------------
 static LogicalResult verifyTokenLocality(triton::FuncOp func) {
-  if (useFaTargetedOwnerExperiment() && func.getName() == "_attn_fwd")
-    return success();
   auto idsOf = [](Operation *op) -> std::optional<SmallVector<int, 2>> {
     if (!gpu::hasPartition(op))
       return std::nullopt;

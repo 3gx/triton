@@ -381,44 +381,6 @@ inline bool shouldDumpDag() {
   return env && StringRef(env) == "1";
 }
 
-inline bool useFaTargetedOwnerExperiment() {
-  const char *env = ::getenv("NVWS_EXPERIMENT_FA_P_OWNER_TO_CONSUMER");
-  return env && StringRef(env) == "1";
-}
-
-inline bool isFaTargetedOwnerExperimentLoop(const GroupDag &g,
-                                            const Node *loop) {
-  if (!useFaTargetedOwnerExperiment() || !g.isTmem() || !loop ||
-      loop->kind != Node::For || !gpu::hasWarpSpecializeTag(loop->op) ||
-      !g.root || !g.root->op ||
-      cast<triton::FuncOp>(g.root->op).getName() != "_attn_fwd" ||
-      g.pieceTable.members.size() != 1 || g.pieceTable.pieces.size() != 1 ||
-      loop->children.size() != 1 || !loop->children[0])
-    return false;
-
-  const Node *first = nullptr;
-  const Node *second = nullptr;
-  unsigned accessCount = 0;
-  for (const Node *n = loop->children[0]; n; n = n->next) {
-    if (n->kind != Node::Access)
-      continue;
-    ++accessCount;
-    if (!first)
-      first = n;
-    else if (!second)
-      second = n;
-  }
-  if (!first || !second || accessCount != 2 || !first->op || !second->op ||
-      first->touches.size() != 1 || second->touches.size() != 1 ||
-      first->touches[0].effect != Effect::W ||
-      second->touches[0].effect != Effect::R || !first->owner ||
-      !second->owner || first->owner->first != 0 || second->owner->first != 2)
-    return false;
-
-  return first->op->getName().getStringRef() == "ttng.tmem_alloc" &&
-         second->op->getName().getStringRef() == "ttng.tc_gen5_mma";
-}
-
 // Pre-order walk over every node of a chain, descending into For/If
 // region children — the one traversal shape shared by the stages.
 template <typename Fn>
