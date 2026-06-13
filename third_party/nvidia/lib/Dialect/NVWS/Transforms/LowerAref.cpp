@@ -1244,16 +1244,13 @@ public:
     });
 
     for (scf::ForOp loop : loops) {
-      // Semaphore combine disabled (12jun26, ported from the
-      // egx/nvws-semaphore-insert-semas experiment branch): verified inert
-      // for the FA fwd WS kernel, and its grouping/protocol analysis holds
-      // the only stamped-acquire assumptions in this pass, which would
-      // crash on the attr-less ROOT-OUTSIDE entry acquires now emitted by
-      // insert-semas. Kept commented for easy re-enable (would need the
-      // attr-less tolerance guards of
-      // fable/attr-less-acquire-release-handoff.md section 5.1).
-      // combineSemaphores(loop);
-      (void)loop;
+      // Semaphore combine RE-ENABLED. Known consequence pre-nested-loop
+      // completion: combine's grouping analysis asserts on the attr-less
+      // ROOT-OUTSIDE entry acquires that GATED nested crossings still
+      // emit (getPartitionIds at analyzeCombinedSemaphoreGroup); resolved
+      // once those components flip to CONTINUATION point-of-use
+      // (fable/extend-design-to-nested-loops-plan.md).
+      combineSemaphores(loop);
     }
 
     auto getSemaGroups = [&]() {
