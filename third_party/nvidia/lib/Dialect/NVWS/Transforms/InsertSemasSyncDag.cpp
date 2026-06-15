@@ -1407,6 +1407,19 @@ static bool regionResultConsumedAfter(GroupDag &g, Node *region, CompId comp) {
   return false;
 }
 
+static bool prefixRowIsSingleBufferView(Node *F, Node *bufRow) {
+  if (!F || !F->op || gpu::hasWarpSpecializeTag(F->op))
+    return true;
+  if (!bufRow || !bufRow->op)
+    return false;
+  // Check (e) is stated at the emission level: the incoming carrier may be used
+  // by one semaphore-buffer view followed by one release. A sourceful TMEM alloc
+  // is rendered as an explicit tmem_store into that view, so it is not the
+  // single-view prefix shape.
+  auto alloc = dyn_cast<nvidia_gpu::TMEMAllocOp>(bufRow->op);
+  return !alloc || !alloc.getSrc();
+}
+
 static void gateCrossing(GroupDag &g, Node *F, Crossing &c) {
   c.holdKind = Crossing::HoldKind::GATED;
   c.holdGated = true;
@@ -1522,6 +1535,8 @@ static void gateCrossing(GroupDag &g, Node *F, Crossing &c) {
     return gated(!bufRow      ? "no-buf"
                  : rels != 1  ? "rel-count"
                               : "rel-before-buf");
+  if (!prefixRowIsSingleBufferView(F, bufRow))
+    return gated("prefix-not-buffer-view");
   c.holdKind = Crossing::HoldKind::POINT_OF_USE;
   c.holdGated = false;
   c.holdGateReason = "";
