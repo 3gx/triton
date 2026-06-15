@@ -129,6 +129,12 @@ struct Node;
 // node (the DAG is the authority; "ThreadingPlan" is only the derived
 // emission-time aggregation across groups).
 struct Crossing {
+  enum class HoldKind {
+    GATED,
+    POINT_OF_USE,
+    PASSTHROUGH_DROP,
+  };
+
   CompId comp = 0;     // which token game (group implicit: the node's DAG)
   Owner slotOwner;     // partition stamped on this slot's
                        // ttg.partition.outputs entry and yield attrs —
@@ -140,11 +146,10 @@ struct Crossing {
                        // yield returns — the NEW token. nullptr =
                        // PASS-THROUGH: that chain yields the INCOMING
                        // carrier unchanged (the OLD token).
-  // HOLD-RULE gate facts (plan fable/hold-rule-implementation-plan.md M1,
-  // side-band; spec fable/semas-report3.md Addendum B.2.1). Computed at
-  // stage 3 for For-row crossings, printed in the SYNC dump, and
-  // cross-checked at emission against the in-tree point-of-use fixup (the
-  // M1 oracle). Not acted on until M2.
+  // HOLD-RULE gate facts. Computed at stage 3 for For-row crossings and
+  // printed in the SYNC dump. holdGated is retained as the emission-facing
+  // boolean: both POINT_OF_USE and PASSTHROUGH_DROP materialize no carrier slot.
+  HoldKind holdKind = HoldKind::GATED;
   bool holdGated = true;            // true: keep the rotated boundary device
   const char *holdGateReason = "";  // dump tag; empty when UNGATED
   Node *holdFirstToucher = nullptr; // UNGATED: the point-of-use target row
@@ -390,6 +395,11 @@ inline std::string treePrefix(unsigned depth) {
 
 inline bool shouldDumpDag() {
   const char *env = ::getenv("NVWS_INSERT_SEMA_DUMP_DAG");
+  return env && StringRef(env) == "1";
+}
+
+inline bool firstTouchForced() {
+  const char *env = ::getenv("NVWS_FIRST_TOUCH");
   return env && StringRef(env) == "1";
 }
 

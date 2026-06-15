@@ -1358,19 +1358,92 @@ static bool crossesComp(const Node *n, CompId comp) {
                       [&](const Crossing &x) { return x.comp == comp; });
 }
 
+static scf::ForOp outerWSLoop(scf::ForOp loop);
+
+static const Crossing *findCrossing(const Node *n, CompId comp) {
+  for (const Crossing &c : n->crossings)
+    if (c.comp == comp)
+      return &c;
+  return nullptr;
+}
+
+static bool allEnclosersCanDrop(const Node *F) {
+  if (F->op && gpu::hasWarpSpecializeTag(F->op))
+    return true;
+  for (const Node *p = F->parent; p; p = p->parent) {
+    if (p->kind == Node::Func)
+      return true;
+    if (p->kind == Node::If)
+      return false;
+    if (p->kind != Node::For)
+      continue;
+    if (p->op && gpu::hasWarpSpecializeTag(p->op))
+      return true;
+  }
+  return true;
+}
+
+static bool regionResultConsumedAfter(GroupDag &g, Node *region, CompId comp) {
+  for (Node *m = region->next; m; m = m->next) {
+    if (m->kind == Node::Acquire &&
+        g.semaTable.semas[m->sema].component == comp)
+      return false;
+    if (m->kind == Node::Release &&
+        g.semaTable.semas[m->sema].component == comp)
+      return true;
+    if (m->kind == Node::Access && nodeInvolvesComp(g, m, comp))
+      return true;
+    if ((m->kind == Node::For || m->kind == Node::If) && crossesComp(m, comp))
+      return true;
+  }
+
+  Node *p = region->parent;
+  if (!p || (p->kind != Node::For && p->kind != Node::If))
+    return false;
+  for (const Crossing &x : p->crossings)
+    if (x.comp == comp &&
+        llvm::any_of(x.finals, [&](Node *f) { return f == region; }))
+      return regionResultConsumedAfter(g, p, comp);
+  return false;
+}
+
 static void gateCrossing(GroupDag &g, Node *F, Crossing &c) {
+  c.holdKind = Crossing::HoldKind::GATED;
   c.holdGated = true;
+  c.holdGateReason = "";
   c.holdFirstToucher = nullptr;
-  auto gated = [&](const char *r) { c.holdGateReason = r; };
-  if (!F->op || !gpu::hasWarpSpecializeTag(F->op))
-    return gated("non-ws-loop");
+  c.holdFeedAcquire = nullptr;
+  auto gated = [&](const char *r) {
+    c.holdKind = Crossing::HoldKind::GATED;
+    c.holdGated = true;
+    c.holdGateReason = r;
+  };
+  if (firstTouchForced())
+    return gated("first-touch-flag");
+  auto forOp = F->op ? dyn_cast<scf::ForOp>(F->op) : scf::ForOp();
+  if (!forOp || !gpu::hasWarpSpecializeTag(outerWSLoop(forOp)))
+    return gated("non-ws-scope");
+  if (!allEnclosersCanDrop(F))
+    return gated("if-encloser");
   CompId comp = c.comp;
   // (a) the body chain's final carrier must be a top-level bottom
   // re-acquire (a nested-region final means the yielded token is a region
   // result — a mid-loop protocol participant).
   Node *regain = c.finals.empty() ? nullptr : c.finals[0];
-  if (!regain || regain->kind != Node::Acquire)
+  if (!regain)
+    return gated("no-final");
+  if (regain->kind == Node::For) {
+    const Crossing *child = findCrossing(regain, comp);
+    if (child && !child->holdGated) {
+      c.holdKind = Crossing::HoldKind::PASSTHROUGH_DROP;
+      c.holdGated = false;
+      c.holdGateReason = "";
+      return;
+    }
     return gated(regain ? "nested-final" : "no-final");
+  }
+  if (regain->kind != Node::Acquire)
+    return gated("nested-final");
   // (b) trailing in-body uses of the regain token: any component event
   // after the regain (access, release, or a region row threading the
   // carrier) makes the regain a mid-loop participant.
@@ -1387,19 +1460,24 @@ static void gateCrossing(GroupDag &g, Node *F, Crossing &c) {
   // first component event must be an Acquire of the regain's semaphore
   // with nothing consuming its token before F.
   Node *feed = nullptr;
-  for (Node *m = F->prev; m; m = m->prev) {
-    if (m->kind == Node::Acquire &&
-        g.semaTable.semas[m->sema].component == comp) {
-      feed = m;
-      break;
+  for (Node *cur = F; !feed; cur = cur->parent) {
+    for (Node *m = cur->prev; m; m = m->prev) {
+      if (m->kind == Node::Acquire &&
+          g.semaTable.semas[m->sema].component == comp) {
+        feed = m;
+        break;
+      }
+      if (m->kind == Node::Access && nodeInvolvesComp(g, m, comp))
+        return gated("entry-consumed");
+      if ((m->kind == Node::For || m->kind == Node::If) && crossesComp(m, comp))
+        return gated("region-feed");
+      if (m->kind == Node::Release &&
+          g.semaTable.semas[m->sema].component == comp)
+        return gated("release-feed");
     }
-    if (m->kind == Node::Access && nodeInvolvesComp(g, m, comp))
-      return gated("entry-consumed");
-    if ((m->kind == Node::For || m->kind == Node::If) && crossesComp(m, comp))
-      return gated("region-feed");
-    if (m->kind == Node::Release &&
-        g.semaTable.semas[m->sema].component == comp)
-      return gated("release-feed");
+    if (!cur->parent || (cur->parent->kind != Node::For &&
+                         cur->parent->kind != Node::If))
+      break;
   }
   if (!feed)
     return gated("no-entry-acquire");
@@ -1410,25 +1488,8 @@ static void gateCrossing(GroupDag &g, Node *F, Crossing &c) {
   // event must be a superseding Acquire (or nothing) — an access, a
   // release (the seam shape), or a carrier-threading region row consumes
   // the result. A parent crossing whose final is F yields it onward.
-  for (Node *m = F->next; m; m = m->next) {
-    if (m->kind == Node::Acquire &&
-        g.semaTable.semas[m->sema].component == comp)
-      break;
-    if (m->kind == Node::Release &&
-        g.semaTable.semas[m->sema].component == comp)
-      return gated("result-consumed");
-    if (m->kind == Node::Access && nodeInvolvesComp(g, m, comp))
-      return gated("result-consumed");
-    if ((m->kind == Node::For || m->kind == Node::If) && crossesComp(m, comp))
-      return gated("result-consumed");
-  }
-  if (Node *p = F->parent;
-      p && (p->kind == Node::For || p->kind == Node::If)) {
-    for (const Crossing &x : p->crossings)
-      if (x.comp == comp &&
-          llvm::any_of(x.finals, [&](Node *f) { return f == F; }))
-        return gated("result-consumed");
-  }
+  if (regionResultConsumedAfter(g, F, comp))
+    return gated("result-consumed");
   // (e) the incoming carrier's body prefix (rows before the component's
   // first in-body acquire) must be the exactly-one-round shape mirrored at
   // the EMISSION level: the carrier token's users are ONE buffer-view op
@@ -1461,6 +1522,7 @@ static void gateCrossing(GroupDag &g, Node *F, Crossing &c) {
     return gated(!bufRow      ? "no-buf"
                  : rels != 1  ? "rel-count"
                               : "rel-before-buf");
+  c.holdKind = Crossing::HoldKind::POINT_OF_USE;
   c.holdGated = false;
   c.holdGateReason = "";
   c.holdFirstToucher = bufRow;
@@ -1509,7 +1571,7 @@ static void applyHoldRulePlacement(GroupDag &g, Node *head) {
     if (n->kind != Node::For)
       continue;
     for (Crossing &c : n->crossings) {
-      if (c.holdGated)
+      if (c.holdKind != Crossing::HoldKind::POINT_OF_USE)
         continue;
       Node *regain = c.finals[0];
       unlinkFromChain(regain);
@@ -1781,6 +1843,86 @@ static LogicalResult verifySyncDag(GroupDag &g) {
   if (!g.semaTable.semas.empty() && !g.root->children.empty())
     if (failed(verifyCarrierLocality(g, g.root->children[0])))
       return failure();
+  // Hold-rule structural invariants: duplicate region slots, malformed native
+  // point-of-use rows, and malformed pass-through drops are bugs in the SYNC-DAG
+  // decision, not emission-time cleanup work.
+  std::function<LogicalResult(Node *)> verifyHoldKinds =
+      [&](Node *head) -> LogicalResult {
+    for (Node *n = head; n; n = n->next) {
+      if (n->kind == Node::For || n->kind == Node::If) {
+        DenseSet<CompId> seen;
+        for (const Crossing &c : n->crossings) {
+          if (!seen.insert(c.comp).second)
+            return n->op->emitError(
+                "nvws-insert-semas: duplicate carrier slot for component ")
+                   << c.comp;
+          bool shouldBeGated = c.holdKind == Crossing::HoldKind::GATED;
+          if (c.holdGated != shouldBeGated)
+            return n->op->emitError(
+                "nvws-insert-semas: inconsistent holdKind/holdGated state");
+          switch (c.holdKind) {
+          case Crossing::HoldKind::GATED:
+            break;
+          case Crossing::HoldKind::POINT_OF_USE:
+            if (c.finals.empty() || !c.finals[0] ||
+                c.finals[0]->kind != Node::Acquire || !c.holdFirstToucher ||
+                !c.holdFeedAcquire)
+              return n->op->emitError(
+                  "nvws-insert-semas: malformed point-of-use hold crossing");
+            break;
+          case Crossing::HoldKind::PASSTHROUGH_DROP: {
+            if (c.finals.empty() || !c.finals[0] ||
+                c.finals[0]->kind != Node::For || c.holdFirstToucher ||
+                c.holdFeedAcquire)
+              return n->op->emitError(
+                  "nvws-insert-semas: malformed pass-through drop crossing");
+            const Crossing *child = findCrossing(c.finals[0], c.comp);
+            if (!child || child->holdGated)
+              return n->op->emitError(
+                  "nvws-insert-semas: pass-through drop without native child");
+            break;
+          }
+          }
+        }
+        for (Node *child : n->children)
+          if (failed(verifyHoldKinds(child)))
+            return failure();
+      }
+    }
+    return success();
+  };
+  if (!g.root->children.empty())
+    if (failed(verifyHoldKinds(g.root->children[0])))
+      return failure();
+  // For native point-of-use crossings, the moved acquire must be the immediate
+  // predecessor of the first buffer user it guards. The SYNC DAG does not encode
+  // which later access will use which emitted semaphore.buffer value, so this
+  // verifier intentionally checks only the lifetime boundary it can prove
+  // exactly: no release can sit between the moved acquire and the first use.
+  std::function<LogicalResult(Node *)> verifyPointOfUsePlacement =
+      [&](Node *head) -> LogicalResult {
+    for (Node *n = head; n; n = n->next) {
+      if (n->kind == Node::For) {
+        for (const Crossing &c : n->crossings) {
+          if (c.holdKind != Crossing::HoldKind::POINT_OF_USE)
+            continue;
+          Node *acq = c.finals[0];
+          if (acq->next != c.holdFirstToucher)
+            return n->op->emitError(
+                "nvws-insert-semas: point-of-use acquire is not adjacent to "
+                "its first buffer use");
+        }
+      }
+      if (n->kind == Node::For || n->kind == Node::If)
+        for (Node *child : n->children)
+          if (failed(verifyPointOfUsePlacement(child)))
+            return failure();
+    }
+    return success();
+  };
+  if (!g.root->children.empty())
+    if (failed(verifyPointOfUsePlacement(g.root->children[0])))
+      return failure();
   // Per sema: #releases == count; release precedes its sat acquire in the
   // same chain; payloads non-empty.
   SmallVector<unsigned> releaseCount(g.semaTable.semas.size(), 0);
@@ -1963,15 +2105,16 @@ static void printThreadInfo(llvm::raw_ostream &os, GroupDag &g,
         os << ",";
       first = false;
       os << "c" << c.comp << ":";
-      if (c.holdGated)
+      if (c.holdKind == Crossing::HoldKind::GATED)
         os << "gated(" << c.holdGateReason << ")";
-      else {
+      else if (c.holdKind == Crossing::HoldKind::POINT_OF_USE) {
         os << "pointofuse->";
         if (c.holdFirstToucher && c.holdFirstToucher->op)
           os << c.holdFirstToucher->op->getName().getStringRef();
         else
           os << "?";
-      }
+      } else
+        os << "passthrough-drop";
     }
     os << "}";
   }
@@ -1989,8 +2132,9 @@ static void printYieldInfo(llvm::raw_ostream &os, GroupDag &g,
       os << ",";
     first = false;
     os << "c" << c.comp << ": ";
-    if (!c.holdGated) { // native point-of-use: no slot, nothing yields
-      os << "native";
+    if (!c.holdGated) { // native/drop: no slot, nothing yields
+      os << (c.holdKind == Crossing::HoldKind::PASSTHROUGH_DROP ? "drop"
+                                                                : "native");
       continue;
     }
     Node *f = chainIdx < c.finals.size() ? c.finals[chainIdx] : nullptr;
