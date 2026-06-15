@@ -157,6 +157,14 @@ struct Crossing {
                                     // instance acquire (unlinked at M2 —
                                     // iteration 1 pairs with the initial
                                     // permit instead)
+  bool holdRegionTail = false;      // POINT_OF_USE: finals[0] is a region row
+  // v5 uniform hold-builder side-band. M1 computes these fields beside the
+  // legacy gate; M2/M3 make them the emission authority.
+  HoldKind uniformHoldKind = HoldKind::GATED;
+  const char *uniformHoldReason = "";
+  Node *uniformFirstToucher = nullptr;
+  Node *uniformFeedAcquire = nullptr;
+  bool uniformRegionTail = false;
 };
 
 struct Node {
@@ -395,11 +403,6 @@ inline std::string treePrefix(unsigned depth) {
 
 inline bool shouldDumpDag() {
   const char *env = ::getenv("NVWS_INSERT_SEMA_DUMP_DAG");
-  return env && StringRef(env) == "1";
-}
-
-inline bool firstTouchForced() {
-  const char *env = ::getenv("NVWS_FIRST_TOUCH");
   return env && StringRef(env) == "1";
 }
 

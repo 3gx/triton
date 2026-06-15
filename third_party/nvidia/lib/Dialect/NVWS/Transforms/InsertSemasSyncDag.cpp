@@ -1341,17 +1341,16 @@ static void collectParts(Node *head, SmallVector<int, 4> &parts) {
 }
 
 // ---------------------------------------------------------------------------
-// HOLD-RULE boundary-device gate (plan M1; spec Addendum B.2.1) — SIDE-BAND.
-// Per (For row, crossing): does the loop boundary need the rotated device
-// (GATED), or does the component anchor point-of-use (UNGATED, with the
-// predicted target row)? The conditions are the DAG-level derivation of the
-// in-tree fixup's guards — the fixup is the M1 oracle; emission cross-checks
-// agreement on every input (crossCheckHoldRule in InsertSemasEmitIR.cpp).
-// Vocabulary: a crossing's component is GATED when its protocol genuinely
-// spans the loop boundary (entry token consumed by pre-loop accesses, loop
-// result consumed after the loop, carrier with trailing in-body uses, or a
-// non-trivial prefix pattern); otherwise the carried hold closes inside the
-// body and the acquire belongs at the first toucher.
+// HOLD-RULE moving-parts census (v5 M0, N_before): WS-scope and
+// allEnclosersCanDrop preconditions; checks (a)-(e) with each bail tag;
+// helpers regionResultConsumedAfter and prefixRowIsSingleBufferView; the
+// 3-valued holdKind state; applyHoldRulePlacement's POINT_OF_USE-only arm;
+// verifyHoldKinds' GATED/POINT_OF_USE/PASSTHROUGH_DROP shape arms; and the
+// separate PASSTHROUGH_DROP child branch.
+//
+// HOLD-RULE boundary-device decision. Per (For row, crossing): does the loop
+// boundary need the rotated device (GATED), or does the component anchor
+// point-of-use (UNGATED, with the predicted target row)?
 // ---------------------------------------------------------------------------
 static bool crossesComp(const Node *n, CompId comp) {
   return llvm::any_of(n->crossings,
@@ -1420,19 +1419,294 @@ static bool prefixRowIsSingleBufferView(Node *F, Node *bufRow) {
   return !alloc || !alloc.getSrc();
 }
 
+static bool isRegionNode(const Node *n) {
+  return n && (n->kind == Node::For || n->kind == Node::If);
+}
+
+static bool regionEntryOwner(GroupDag &g, Node *region, CompId comp,
+                             Owner &owner) {
+  bool found = false;
+  for (auto &[p, pi] : sortedPieceInfo(region)) {
+    if (g.pieceTable.pieceComp[p] != comp)
+      continue;
+    if (!found) {
+      owner = pi.owner;
+      found = true;
+      continue;
+    }
+    if (!sameOwner(owner, pi.owner))
+      return false;
+  }
+  return found;
+}
+
+static bool chainHasCompEvent(GroupDag &g, Node *head, CompId comp) {
+  for (Node *n = head; n; n = n->next) {
+    if (n->kind == Node::Acquire || n->kind == Node::Release) {
+      if (g.semaTable.semas[n->sema].component == comp)
+        return true;
+    } else if (nodeInvolvesComp(g, n, comp)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool noCompEventAfterFinal(GroupDag &g, Node *final, CompId comp) {
+  for (Node *m = final ? final->next : nullptr; m; m = m->next) {
+    if (m->kind == Node::Acquire || m->kind == Node::Release) {
+      if (g.semaTable.semas[m->sema].component == comp)
+        return false;
+    } else if (nodeInvolvesComp(g, m, comp)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static Owner returnedOwnerForFinal(GroupDag &g, Node *final, CompId comp,
+                                   Owner incoming) {
+  if (!final)
+    return incoming;
+  if (final->kind == Node::Acquire)
+    return final->owner;
+  if (isRegionNode(final))
+    if (const Crossing *c = findCrossing(final, comp))
+      return c->slotOwner;
+  return std::nullopt;
+}
+
+static std::optional<SemaId>
+returnedSemaForFinal(GroupDag &g, Node *final, CompId comp, SemaId incoming) {
+  if (!final)
+    return incoming;
+  if (final->kind == Node::Acquire)
+    return final->sema;
+  if (!isRegionNode(final))
+    return std::nullopt;
+  const Crossing *c = findCrossing(final, comp);
+  if (!c)
+    return std::nullopt;
+  std::optional<SemaId> common;
+  if (final->kind == Node::For)
+    common = incoming; // zero-trip path.
+  for (unsigned i = 0, e = final->children.size(); i < e; ++i) {
+    Node *childFinal = i < c->finals.size() ? c->finals[i] : nullptr;
+    std::optional<SemaId> child =
+        returnedSemaForFinal(g, childFinal, comp, incoming);
+    if (!child)
+      return std::nullopt;
+    if (!common)
+      common = child;
+    else if (*common != *child)
+      return std::nullopt;
+  }
+  return common;
+}
+
+static bool isHoldTransparentRegion(GroupDag &g, Node *region, CompId comp,
+                                    Owner holdOwner) {
+  const Crossing *rc = findCrossing(region, comp);
+  if (!rc)
+    return false;
+  Owner entryOwner;
+  if (!regionEntryOwner(g, region, comp, entryOwner) ||
+      !sameOwner(entryOwner, holdOwner))
+    return false;
+  if (rc->finals.size() > region->children.size())
+    return false;
+  for (unsigned i = 0, e = region->children.size(); i < e; ++i) {
+    Node *childFinal = i < rc->finals.size() ? rc->finals[i] : nullptr;
+    if (!childFinal && chainHasCompEvent(g, region->children[i], comp))
+      return false;
+    if (childFinal && !noCompEventAfterFinal(g, childFinal, comp))
+      return false;
+    Owner returned = returnedOwnerForFinal(g, childFinal, comp, entryOwner);
+    if (!sameOwner(returned, holdOwner))
+      return false;
+  }
+  return true;
+}
+
+struct HoldDecision {
+  Crossing::HoldKind kind = Crossing::HoldKind::GATED;
+  const char *reason = "";
+  Node *firstToucher = nullptr;
+  Node *feedAcquire = nullptr;
+  bool regionTail = false;
+};
+
+static HoldDecision gatedHold(const char *reason) {
+  HoldDecision d;
+  d.kind = Crossing::HoldKind::GATED;
+  d.reason = reason;
+  return d;
+}
+
+static HoldDecision childOwnsHold() {
+  HoldDecision d;
+  d.kind = Crossing::HoldKind::PASSTHROUGH_DROP;
+  return d;
+}
+
+static HoldDecision pointOfUseHold(Node *firstToucher, Node *feedAcquire,
+                                   bool regionTail) {
+  HoldDecision d;
+  d.kind = Crossing::HoldKind::POINT_OF_USE;
+  d.firstToucher = firstToucher;
+  d.feedAcquire = feedAcquire;
+  d.regionTail = regionTail;
+  return d;
+}
+
+static bool uniformUngated(const Node *region, CompId comp) {
+  if (const Crossing *child = findCrossing(region, comp))
+    return child->uniformHoldKind != Crossing::HoldKind::GATED;
+  return false;
+}
+
+static HoldDecision buildUniformHold(GroupDag &g, Node *F, const Crossing &c,
+                                     bool enableRegionTail) {
+  auto forOp = F->op ? dyn_cast<scf::ForOp>(F->op) : scf::ForOp();
+  if (!forOp || !gpu::hasWarpSpecializeTag(outerWSLoop(forOp)))
+    return gatedHold("non-ws-scope");
+  if (!allEnclosersCanDrop(F))
+    return gatedHold("if-encloser");
+
+  CompId comp = c.comp;
+  Node *regain = c.finals.empty() ? nullptr : c.finals[0];
+  bool regionTail = false;
+  if (!regain)
+    return gatedHold("no-final");
+  if (regain->kind == Node::For && uniformUngated(regain, comp))
+    return childOwnsHold();
+  if (isRegionNode(regain) && regain->kind != Node::Acquire) {
+    if (!isHoldTransparentRegion(g, regain, comp, c.slotOwner))
+      return gatedHold("nested-final");
+    if (!enableRegionTail)
+      return gatedHold("nested-final");
+    regionTail = true;
+  } else if (regain->kind != Node::Acquire) {
+    return gatedHold("nested-final");
+  }
+
+  for (Node *m = regain->next; m; m = m->next) {
+    if (m->kind == Node::Access && nodeInvolvesComp(g, m, comp))
+      return gatedHold("trailing-use");
+    if ((m->kind == Node::For || m->kind == Node::If) && crossesComp(m, comp))
+      return gatedHold("trailing-use");
+    if (m->kind == Node::Release &&
+        g.semaTable.semas[m->sema].component == comp)
+      return gatedHold("trailing-use");
+  }
+
+  Node *feed = nullptr;
+  for (Node *cur = F; !feed; cur = cur->parent) {
+    for (Node *m = cur->prev; m; m = m->prev) {
+      if (m->kind == Node::Acquire &&
+          g.semaTable.semas[m->sema].component == comp) {
+        feed = m;
+        break;
+      }
+      if (m->kind == Node::Access && nodeInvolvesComp(g, m, comp))
+        return gatedHold("entry-consumed");
+      if ((m->kind == Node::For || m->kind == Node::If) && crossesComp(m, comp))
+        return gatedHold("region-feed");
+      if (m->kind == Node::Release &&
+          g.semaTable.semas[m->sema].component == comp)
+        return gatedHold("release-feed");
+    }
+    if (!cur->parent || (cur->parent->kind != Node::For &&
+                         cur->parent->kind != Node::If))
+      break;
+  }
+  if (!feed)
+    return gatedHold("no-entry-acquire");
+  std::optional<SemaId> regainSema =
+      regionTail ? returnedSemaForFinal(g, regain, comp, feed->sema)
+                 : std::optional<SemaId>(regain->sema);
+  if (!regainSema || feed->sema != *regainSema)
+    return gatedHold("entry-sema-mismatch");
+
+  if (regionResultConsumedAfter(g, F, comp))
+    return gatedHold("result-consumed");
+
+  Node *bufRow = nullptr;
+  unsigned rels = 0;
+  bool relBeforeBuf = false;
+  for (Node *m = F->children[0]; m; m = m->next) {
+    if (regionTail && m == regain)
+      break;
+    if (m->kind == Node::Acquire &&
+        g.semaTable.semas[m->sema].component == comp)
+      break;
+    if ((m->kind == Node::For || m->kind == Node::If) && crossesComp(m, comp)) {
+      if (!bufRow)
+        return gatedHold("region-crossing");
+      if (!isHoldTransparentRegion(g, m, comp, c.slotOwner))
+        return gatedHold("region-crossing");
+      continue;
+    }
+    if (m->kind == Node::Access && nodeInvolvesComp(g, m, comp)) {
+      if (!bufRow) {
+        bufRow = m;
+        if (rels)
+          relBeforeBuf = true;
+      }
+    }
+    if (m->kind == Node::Release &&
+        g.semaTable.semas[m->sema].component == comp)
+      ++rels;
+  }
+  if (!regionTail) {
+    if (!bufRow || rels != 1 || relBeforeBuf)
+      return gatedHold(!bufRow      ? "no-buf"
+                       : rels != 1  ? "rel-count"
+                                    : "rel-before-buf");
+  } else {
+    if (!bufRow || rels != 0 || relBeforeBuf)
+      return gatedHold(!bufRow      ? "no-buf"
+                       : rels != 0  ? "rel-count"
+                                    : "rel-before-buf");
+  }
+  if (!prefixRowIsSingleBufferView(F, bufRow))
+    return gatedHold("prefix-not-buffer-view");
+  return pointOfUseHold(bufRow, feed, regionTail);
+}
+
+static void storeUniformHold(Crossing &c, const HoldDecision &d) {
+  c.uniformHoldKind = d.kind;
+  c.uniformHoldReason = d.reason;
+  c.uniformFirstToucher = d.firstToucher;
+  c.uniformFeedAcquire = d.feedAcquire;
+  c.uniformRegionTail = d.regionTail;
+}
+
+static std::string holdKindDescription(Crossing::HoldKind kind,
+                                       const char *reason) {
+  switch (kind) {
+  case Crossing::HoldKind::GATED:
+    return std::string("gated(") + reason + ")";
+  case Crossing::HoldKind::POINT_OF_USE:
+    return "pointofuse";
+  case Crossing::HoldKind::PASSTHROUGH_DROP:
+    return "passthrough-drop";
+  }
+  llvm_unreachable("unknown hold kind");
+}
+
 static void gateCrossing(GroupDag &g, Node *F, Crossing &c) {
   c.holdKind = Crossing::HoldKind::GATED;
   c.holdGated = true;
   c.holdGateReason = "";
   c.holdFirstToucher = nullptr;
   c.holdFeedAcquire = nullptr;
+  c.holdRegionTail = false;
   auto gated = [&](const char *r) {
     c.holdKind = Crossing::HoldKind::GATED;
     c.holdGated = true;
     c.holdGateReason = r;
   };
-  if (firstTouchForced())
-    return gated("first-touch-flag");
   auto forOp = F->op ? dyn_cast<scf::ForOp>(F->op) : scf::ForOp();
   if (!forOp || !gpu::hasWarpSpecializeTag(outerWSLoop(forOp)))
     return gated("non-ws-scope");
@@ -1451,6 +1725,7 @@ static void gateCrossing(GroupDag &g, Node *F, Crossing &c) {
       c.holdKind = Crossing::HoldKind::PASSTHROUGH_DROP;
       c.holdGated = false;
       c.holdGateReason = "";
+      c.holdRegionTail = false;
       return;
     }
     return gated(regain ? "nested-final" : "no-final");
@@ -1541,16 +1816,66 @@ static void gateCrossing(GroupDag &g, Node *F, Crossing &c) {
   c.holdGated = false;
   c.holdGateReason = "";
   c.holdFirstToucher = bufRow;
+  c.holdRegionTail = false;
 }
 
-static void computeHoldRuleGates(GroupDag &g, Node *head) {
+static LogicalResult verifyUniformHoldOracle(GroupDag &g, Node *F,
+                                             const Crossing &c) {
+  if (c.holdKind == c.uniformHoldKind)
+    return success();
+  if (c.holdKind == Crossing::HoldKind::GATED &&
+      (StringRef(c.holdGateReason) == "region-crossing" ||
+       StringRef(c.holdGateReason) == "nested-final"))
+    return success();
+  return (F->op ? F->op : g.root->op)
+             ->emitError("nvws-insert-semas: uniform hold oracle divergence "
+                         "outside the expected region flip set: legacy=")
+         << holdKindDescription(c.holdKind, c.holdGateReason)
+         << ", uniform="
+         << holdKindDescription(c.uniformHoldKind, c.uniformHoldReason);
+}
+
+static LogicalResult computeHoldRuleGates(GroupDag &g, Node *head) {
   for (Node *n = head; n; n = n->next) {
     for (Node *child : n->children)
       if (child)
-        computeHoldRuleGates(g, child);
+        if (failed(computeHoldRuleGates(g, child)))
+          return failure();
     if (n->kind == Node::For)
-      for (Crossing &c : n->crossings)
+      for (Crossing &c : n->crossings) {
         gateCrossing(g, n, c);
+        HoldDecision uniform =
+            buildUniformHold(g, n, c, /*enableRegionTail=*/true);
+        storeUniformHold(c, uniform);
+        if (failed(verifyUniformHoldOracle(g, n, c)))
+          return failure();
+      }
+  }
+  return success();
+}
+
+static void publishUniformHoldRules(Node *head) {
+  for (Node *n = head; n; n = n->next) {
+    for (Node *child : n->children)
+      if (child)
+        publishUniformHoldRules(child);
+    if (n->kind != Node::For)
+      continue;
+    for (Crossing &c : n->crossings) {
+      if (c.holdKind == Crossing::HoldKind::GATED &&
+          c.uniformHoldKind == Crossing::HoldKind::GATED) {
+        c.holdFirstToucher = nullptr;
+        c.holdFeedAcquire = nullptr;
+        c.holdRegionTail = false;
+        continue;
+      }
+      c.holdKind = c.uniformHoldKind;
+      c.holdGated = c.uniformHoldKind == Crossing::HoldKind::GATED;
+      c.holdGateReason = c.uniformHoldReason;
+      c.holdFirstToucher = c.uniformFirstToucher;
+      c.holdFeedAcquire = c.uniformFeedAcquire;
+      c.holdRegionTail = c.uniformRegionTail;
+    }
   }
 }
 
@@ -1588,6 +1913,24 @@ static void applyHoldRulePlacement(GroupDag &g, Node *head) {
     for (Crossing &c : n->crossings) {
       if (c.holdKind != Crossing::HoldKind::POINT_OF_USE)
         continue;
+      if (c.holdRegionTail) {
+        Node *tail = c.finals[0];
+        Node *pointAcquire = c.holdFeedAcquire;
+        Sema &s = g.semaTable.semas[pointAcquire->sema];
+        pointAcquire->owner = c.slotOwner;
+        unlinkFromChain(pointAcquire);
+        spliceBefore(pointAcquire, c.holdFirstToucher);
+
+        Node *closing = g.newNode(Node::Release, /*op=*/nullptr, tail->parent);
+        closing->owner = c.slotOwner;
+        closing->sema = pointAcquire->sema;
+        closing->count = 1;
+        closing->payloads.push_back(AsyncOp::NONE);
+        closing->sat = pointAcquire;
+        spliceAfter(closing, tail);
+        s.expectedReleases += closing->count;
+        continue;
+      }
       Node *regain = c.finals[0];
       unlinkFromChain(regain);
       spliceBefore(regain, c.holdFirstToucher);
@@ -1854,6 +2197,45 @@ static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
   return success();
 }
 
+static LogicalResult verifyPointOfUseTransparency(GroupDag &g, Node *F,
+                                                  const Crossing &c) {
+  Node *tailRegion = c.holdRegionTail && !c.finals.empty() ? c.finals[0]
+                                                           : nullptr;
+  if (!c.holdRegionTail) {
+    Node *pouAcquire = c.finals.empty() ? nullptr : c.finals[0];
+    for (Node *m = F->children[0]; m && m != pouAcquire; m = m->next) {
+      if (m->kind == Node::Acquire || m->kind == Node::Release) {
+        if (g.semaTable.semas[m->sema].component == c.comp)
+          return (m->op ? m->op : F->op)
+              ->emitError("nvws-insert-semas: carrier use before "
+                          "point-of-use acquire");
+      } else if (m->kind == Node::Access && nodeInvolvesComp(g, m, c.comp)) {
+        return (m->op ? m->op : F->op)
+            ->emitError("nvws-insert-semas: carrier access before "
+                        "point-of-use acquire");
+      } else if (isRegionNode(m) && crossesComp(m, c.comp)) {
+        return (m->op ? m->op : F->op)
+            ->emitError("nvws-insert-semas: carrier region before "
+                        "point-of-use acquire");
+      }
+    }
+  }
+  for (Node *m = F->children[0]; m; m = m->next) {
+    if (m->kind == Node::Acquire &&
+        g.semaTable.semas[m->sema].component == c.comp)
+      break;
+    if (isRegionNode(m) && crossesComp(m, c.comp)) {
+      if (!isHoldTransparentRegion(g, m, c.comp, c.slotOwner))
+        return (m->op ? m->op : F->op)
+            ->emitError("nvws-insert-semas: non-transparent region reached "
+                        "point-of-use hold");
+      if (m == tailRegion)
+        break;
+    }
+  }
+  return success();
+}
+
 static LogicalResult verifySyncDag(GroupDag &g) {
   if (!g.semaTable.semas.empty() && !g.root->children.empty())
     if (failed(verifyCarrierLocality(g, g.root->children[0])))
@@ -1879,11 +2261,19 @@ static LogicalResult verifySyncDag(GroupDag &g) {
           case Crossing::HoldKind::GATED:
             break;
           case Crossing::HoldKind::POINT_OF_USE:
-            if (c.finals.empty() || !c.finals[0] ||
-                c.finals[0]->kind != Node::Acquire || !c.holdFirstToucher ||
+            if (c.finals.empty() || !c.finals[0] || !c.holdFirstToucher ||
                 !c.holdFeedAcquire)
               return n->op->emitError(
                   "nvws-insert-semas: malformed point-of-use hold crossing");
+            if (!c.holdRegionTail && c.finals[0]->kind != Node::Acquire)
+              return n->op->emitError(
+                  "nvws-insert-semas: point-of-use hold without acquire regain");
+            if (c.holdRegionTail && !isRegionNode(c.finals[0]))
+              return n->op->emitError(
+                  "nvws-insert-semas: regionTail point-of-use without region "
+                  "regain");
+            if (failed(verifyPointOfUseTransparency(g, n, c)))
+              return failure();
             break;
           case Crossing::HoldKind::PASSTHROUGH_DROP: {
             if (c.finals.empty() || !c.finals[0] ||
@@ -1921,11 +2311,21 @@ static LogicalResult verifySyncDag(GroupDag &g) {
         for (const Crossing &c : n->crossings) {
           if (c.holdKind != Crossing::HoldKind::POINT_OF_USE)
             continue;
-          Node *acq = c.finals[0];
+          Node *acq = c.holdRegionTail ? c.holdFeedAcquire : c.finals[0];
           if (acq->next != c.holdFirstToucher)
             return n->op->emitError(
                 "nvws-insert-semas: point-of-use acquire is not adjacent to "
                 "its first buffer use");
+          if (c.holdRegionTail) {
+            Node *tail = c.finals[0];
+            Node *closing = tail ? tail->next : nullptr;
+            if (!closing || closing->kind != Node::Release ||
+                g.semaTable.semas[closing->sema].component != c.comp ||
+                closing->sema != c.holdFeedAcquire->sema)
+              return n->op->emitError(
+                  "nvws-insert-semas: regionTail point-of-use lacks closing "
+                  "release after region result");
+          }
         }
       }
       if (n->kind == Node::For || n->kind == Node::If)
@@ -2033,7 +2433,9 @@ LogicalResult buildSyncDag(GroupDag &g, triton::FuncOp funcOp,
   if (!g.root->children.empty()) {
     computeCrossings(g, g.root->children[0], numComps);
     pruneDeadIfCrossings(g, g.root->children[0], /*region=*/nullptr);
-    computeHoldRuleGates(g, g.root->children[0]); // the boundary-device gate
+    if (failed(computeHoldRuleGates(g, g.root->children[0])))
+      return failure();
+    publishUniformHoldRules(g.root->children[0]);
     applyHoldRulePlacement(g, g.root->children[0]); // plan M2: native shape
     computeRequiredParts(g.root->children[0]);
   }
@@ -2132,6 +2534,33 @@ static void printThreadInfo(llvm::raw_ostream &os, GroupDag &g,
         os << "passthrough-drop";
     }
     os << "}";
+    bool anyUniformDiff = llvm::any_of(n->crossings, [](const Crossing &c) {
+      return c.holdKind != c.uniformHoldKind;
+    });
+    if (anyUniformDiff) {
+      os << " uniformhold{";
+      first = true;
+      for (const Crossing &c : n->crossings) {
+        if (!first)
+          os << ",";
+        first = false;
+        os << "c" << c.comp << ":";
+        if (c.uniformHoldKind == Crossing::HoldKind::GATED)
+          os << "gated(" << c.uniformHoldReason << ")";
+        else if (c.uniformHoldKind == Crossing::HoldKind::POINT_OF_USE) {
+          os << "pointofuse->";
+          if (c.uniformFirstToucher && c.uniformFirstToucher->op)
+            os << c.uniformFirstToucher->op->getName().getStringRef();
+          else
+            os << "?";
+        } else {
+          os << "passthrough-drop";
+        }
+        if (c.uniformRegionTail)
+          os << ":regionTail";
+      }
+      os << "}";
+    }
   }
 }
 
