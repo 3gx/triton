@@ -290,10 +290,10 @@ def NVWSStripPartitionAttrsOutsideWS
 }
 
 def NVWSMemoryPlanner : Pass<"nvws-memory-planner", "mlir::ModuleOp"> {
-  let summary = "NVWS TMEM memory planner";
+  let summary = "NVWS SMEM/TMEM memory planner";
 
   let description = [{
-    Computes TMEM memory planning metadata for NVWS. Phase 1 is TMEM-only.
+    Computes SMEM and TMEM memory planning metadata for NVWS.
   }];
 
   let dependentDialects = [
@@ -305,19 +305,16 @@ def NVWSMemoryPlanner : Pass<"nvws-memory-planner", "mlir::ModuleOp"> {
   let options = [
     Option<"numBuffers", "num-buffers",
            "int32_t", /*default*/"0",
-           "starting buffer id for TMEM allocation">,
+           "number of warp-specialization buffers">,
     Option<"smemAllocAlgo", "smem-alloc-algo",
            "int32_t", /*default*/"0",
-           "accepted for Hopper test compatibility; ignored by the TMEM-only "
-           "NVWS phase-1 planner">,
+           "SMEM allocation algorithm">,
     Option<"smemBudget", "smem-budget",
            "int32_t", /*default*/"0",
-           "accepted for Hopper test compatibility; ignored by the TMEM-only "
-           "NVWS phase-1 planner">,
+           "SMEM allocation budget in bytes">,
     Option<"smemCircularReuse", "smem-circular-reuse",
            "bool", /*default*/"false",
-           "accepted for Hopper test compatibility; ignored by the TMEM-only "
-           "NVWS phase-1 planner">
+           "enable SMEM circular reuse in the WSBuffer planner">
   ];
 }
 

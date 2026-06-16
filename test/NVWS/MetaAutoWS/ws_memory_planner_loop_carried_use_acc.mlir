@@ -17,7 +17,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %true = arith.constant true
     %zero = arith.constant dense<0.000000e+00> : tensor<64x128xf32, #linear>
 
-    // CHECK: ttng.tmem_alloc %{{.*}} {buffer.copy = {{[0-9]+}} : i32, buffer.id = 3 : i32, buffer.offset = 0 : i32
+    // CHECK: ttng.tmem_alloc %{{.*}} {buffer.copy = {{[0-9]+}} : i32, buffer.id = 0 : i32, buffer.offset = 0 : i32
     %acc, %tok = ttng.tmem_alloc %zero {ttg.partition = array<i32: 2>} : (tensor<64x128xf32, #linear>) -> (!ttg.memdesc<64x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
 
     // CHECK: scf.for

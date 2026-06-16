@@ -10,8 +10,8 @@
 // B_smem (64x128xf16, swizzle=128): inner dim = 128 × 2B = 256B > swizzle → split needed
 
 // CHECK-LABEL: @tma_split_copy_separate_buffer_id
-// CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x64xf16
-// CHECK: ttg.local_alloc : () -> !ttg.memdesc<64x128xf16
+// CHECK: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[SMEM:[0-9]+]] : i32} : () -> !ttg.memdesc<128x64xf16
+// CHECK: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[SMEM]] : i32} : () -> !ttg.memdesc<64x128xf16
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory

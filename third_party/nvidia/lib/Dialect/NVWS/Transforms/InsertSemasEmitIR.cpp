@@ -920,11 +920,18 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
 }
 
 // ---------------------------------------------------------------------------
-// Step 6 — coalesce TMEM backings (contract C).
+// Step 6 — coalesce planned backings (contract C).
 // ---------------------------------------------------------------------------
+static bool hasPlannedBufferCopy(const GroupDag &g) {
+  return llvm::any_of(g.pieceTable.members, [](const Member &m) {
+    return m.allocOp->hasAttr("buffer.copy");
+  });
+}
+
 static void coalesceBackings(GroupDag &g) {
-  if (!g.isTmem() || g.semaTable.semas.empty() ||
-      g.pieceTable.members.size() < 2)
+  if (g.semaTable.semas.empty() || g.pieceTable.members.size() < 2)
+    return;
+  if (!g.isTmem() && !hasPlannedBufferCopy(g))
     return;
   // Covering member: minimal offset, maximal end.
   unsigned cover = 0;
@@ -942,6 +949,9 @@ static void coalesceBackings(GroupDag &g) {
       continue; // not contained; leave as-is
     Value backing = g.backingPlan.backing[i];
     Operation *alloc = backing.getDefiningOp();
+    if (!g.isTmem() &&
+        (m.offset != cm.offset || backing.getType() != coverBacking.getType()))
+      continue;
     // The covering backing may be defined after this member's backing in
     // member order; insert the replacement view AFTER the cover so it
     // dominates every use (creates and views all come later).

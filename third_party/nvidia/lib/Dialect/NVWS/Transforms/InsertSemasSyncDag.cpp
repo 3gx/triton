@@ -1841,8 +1841,35 @@ static bool isMultiStagedGroup(GroupDag &g, int numTmemBlocks) {
   return isMultiStaged;
 }
 
-void computeBackingPlan(GroupDag &g, triton::FuncOp funcOp,
-                               bool useMetaPartitioner, int &numTmemBlocks) {
+static LogicalResult getPlannedBufferCopy(GroupDag &g,
+                                          std::optional<int> &plannedCopy) {
+  bool sawMissing = false;
+  for (const Member &m : g.pieceTable.members) {
+    auto copyAttr = m.allocOp->getAttrOfType<IntegerAttr>("buffer.copy");
+    if (!copyAttr) {
+      sawMissing = true;
+      continue;
+    }
+    int copy = copyAttr.getInt();
+    if (copy < 1)
+      return m.allocOp->emitError(
+          "nvws-insert-semas: planned buffer.copy must be positive");
+    if (plannedCopy && *plannedCopy != copy)
+      return m.allocOp->emitError(
+          "nvws-insert-semas: allocs in one planned reuse group have "
+          "inconsistent buffer.copy values");
+    plannedCopy = copy;
+  }
+
+  if (plannedCopy && sawMissing)
+    return g.pieceTable.members.front().allocOp->emitError(
+        "nvws-insert-semas: planned reuse group mixes buffer.copy and "
+        "non-buffer.copy allocs");
+  return success();
+}
+
+LogicalResult computeBackingPlan(GroupDag &g, triton::FuncOp funcOp,
+                                 bool useMetaPartitioner, int &numTmemBlocks) {
   // POSTERITY: this is the ONLY decision in the whole pass that consumes
   // useMetaPartitioner (audited against the pre-rewrite pass, which used it
   // identically and nowhere else): the meta partitioner makes its own
@@ -1857,7 +1884,12 @@ void computeBackingPlan(GroupDag &g, triton::FuncOp funcOp,
   // never be materialized are order-dependent and can push a later REAL
   // accumulator below capacity (plan contract B).
   bool untouched = g.semaTable.semas.empty();
-  if (g.isTmem() && !untouched && !useMetaPartitioner &&
+  std::optional<int> plannedBufferCopy;
+  if (failed(getPlannedBufferCopy(g, plannedBufferCopy)))
+    return failure();
+  if (!untouched && plannedBufferCopy) {
+    g.backingPlan.numStages = *plannedBufferCopy;
+  } else if (g.isTmem() && !untouched && !useMetaPartitioner &&
       isMultiStagedGroup(g, numTmemBlocks))
     g.backingPlan.numStages = 2;
   // Hoist anchor: before the first WS-tagged loop (function scope).
@@ -1874,6 +1906,7 @@ void computeBackingPlan(GroupDag &g, triton::FuncOp funcOp,
       if (shape.size() >= 2)
         numTmemBlocks += shape[0] * shape[1] * g.backingPlan.numStages;
     }
+  return success();
 }
 
 // ---------------------------------------------------------------------------
@@ -2253,7 +2286,8 @@ LogicalResult buildSyncDag(GroupDag &g, triton::FuncOp funcOp,
     applyHoldRulePlacement(g, g.root->children[0]); // plan M2: native shape
     computeRequiredParts(g.root->children[0]);
   }
-  computeBackingPlan(g, funcOp, useMetaPartitioner, numTmemBlocks);
+  if (failed(computeBackingPlan(g, funcOp, useMetaPartitioner, numTmemBlocks)))
+    return failure();
   // Pipeline-invariant guard (contract D / mining gap 6): a managed (=
   // synchronized) group must not contain a tt-form descriptor-fed
   // sourceful alloc — nvws-insert-allocas normalizes those upstream.

@@ -579,8 +579,11 @@ void multiBufferSemaphore(
 
     bool eligible = true;
     for (auto opnd : semas.front().getBuffers()) {
-      if (!opnd.getDefiningOp() || isa<TMEMAllocOp>(opnd.getDefiningOp())) {
+      Operation *defOp = opnd.getDefiningOp();
+      auto localAlloc = dyn_cast_or_null<LocalAllocOp>(defOp);
+      if (!localAlloc || localAlloc->hasAttr("buffer.copy")) {
         eligible = false;
+        break;
       }
     }
 

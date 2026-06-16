@@ -25,6 +25,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/Pass.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -37,7 +38,9 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
+#include <tuple>
 
 #define DEBUG_TYPE "nvws-memory-planner"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -56,7 +59,7 @@ namespace ttng = mlir::triton::nvidia_gpu;
 
 using OperationListT = SmallVector<Operation *>;
 
-enum class ChannelKind { TMEMPost };
+enum class ChannelKind { LocalPost, TMEMPost };
 
 struct TmemDataChannelPost {
   int producer;
@@ -94,6 +97,33 @@ struct TmemDataChannelPost {
   void getDstOps(SmallVectorImpl<Operation *> &dsts) const;
 };
 
+struct LocalDataChannelPost {
+  int producer;
+  SmallVector<int> consumers;
+  Operation *allocOp;
+  Operation *explicitSrcOp = nullptr;
+  SmallVector<Operation *> explicitDstOps;
+  unsigned uniqID;
+
+  LocalDataChannelPost(int producer, ArrayRef<int> consumers,
+                       Operation *allocOp, Operation *srcOp,
+                       ArrayRef<Operation *> dstOps, unsigned uniqID)
+      : producer(producer), consumers(consumers.begin(), consumers.end()),
+        allocOp(allocOp), explicitSrcOp(srcOp),
+        explicitDstOps(dstOps.begin(), dstOps.end()), uniqID(uniqID) {}
+
+  Operation *getAllocOp() const { return allocOp; }
+  Operation *getSrcOp() const { return explicitSrcOp; }
+  Operation *getDstOp() const {
+    if (explicitDstOps.empty())
+      return nullptr;
+    return explicitDstOps.back();
+  }
+  void getDstOps(SmallVectorImpl<Operation *> &dsts) const {
+    dsts.append(explicitDstOps.begin(), explicitDstOps.end());
+  }
+};
+
 struct TmemBuffer {
   Operation *owner = nullptr;
   size_t rowSize = 0;
@@ -102,6 +132,28 @@ struct TmemBuffer {
   size_t colOffset = std::numeric_limits<size_t>::max();
   bool isOwnerOfSpace = false;
   TmemBuffer *reuseOwner = nullptr;
+};
+
+enum class SmemBufferPriority {
+  Lowest = 0,
+  HostToDevice = 1,
+  CrossStage = 2,
+  Epilogue = 3,
+};
+
+struct LocalBuffer {
+  ttg::LocalAllocOp alloc;
+  LocalDataChannelPost *channel = nullptr;
+  unsigned bufferId = 0;
+  unsigned numCopies = 1;
+  unsigned offset = 0;
+  unsigned sizeInBytes = 0;
+  bool pinned = false;
+  bool isInnermost = false;
+  bool isTMA = false;
+  bool isCrossStage = false;
+  SmemBufferPriority priority = SmemBufferPriority::Lowest;
+  Interval<size_t> liveness = Interval<size_t>(0, 0);
 };
 
 struct ChannelAnnotation {
@@ -335,7 +387,8 @@ static DenseMap<Operation *, ChannelAnnotation> buildAllocToAnnotationMap(
     if (!allocOp)
       continue;
 
-    if (isa<ttng::TMEMAllocOp>(allocOp) && ann.memType == "tmem")
+    if ((isa<ttng::TMEMAllocOp>(allocOp) && ann.memType == "tmem") ||
+        (isa<ttg::LocalAllocOp>(allocOp) && ann.memType == "smem"))
       result.try_emplace(allocOp, ann);
   }
   return result;
@@ -804,6 +857,13 @@ findChannelForAlloc(Operation *allocOp,
   return nullptr;
 }
 
+static bool isTransparentMemdescViewOp(Operation *op) {
+  StringRef name = op->getName().getStringRef();
+  return name == "ttg.memdesc_index" || name == "ttg.memdesc_subview" ||
+         name == "ttg.memdesc_trans" || name == "ttg.memdesc_reinterpret" ||
+         name == "ttg.memdesc_reshape";
+}
+
 static void collectTransitiveMemdescUsers(Value value,
                                           DenseSet<Operation *> &users) {
   SmallVector<Value> worklist = {value};
@@ -817,12 +877,139 @@ static void collectTransitiveMemdescUsers(Value value,
       if (!actual)
         continue;
       users.insert(actual);
-      if (actual == user && isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-                               ttg::MemDescTransOp>(actual))
+      if (actual == user && isTransparentMemdescViewOp(actual))
         for (Value result : actual->getResults())
           worklist.push_back(result);
     }
   }
+}
+
+static void collectLocalMemdescUsers(Value value,
+                                     DenseSet<Operation *> &users) {
+  SmallVector<Value> worklist = {value};
+  DenseSet<Value> visited;
+  while (!worklist.empty()) {
+    Value current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+
+    for (Operation *user : current.getUsers()) {
+      Operation *actual = skipIdxOp(user);
+      if (!actual)
+        continue;
+      users.insert(actual);
+
+      if (actual == user && isTransparentMemdescViewOp(actual)) {
+        for (Value result : actual->getResults())
+          worklist.push_back(result);
+        continue;
+      }
+
+      if (isa<nvws::DescriptorLoadOp, nvws::DescriptorGatherOp>(actual)) {
+        for (Value result : actual->getResults())
+          if (isa<ttg::MemDescType>(result.getType()))
+            worklist.push_back(result);
+      }
+    }
+  }
+}
+
+static bool isLocalProducer(Operation *op) {
+  return isa<ttg::LocalStoreOp, nvws::DescriptorLoadOp,
+             nvws::DescriptorGatherOp>(op);
+}
+
+static Operation *producerForSourcefulLocalAlloc(ttg::LocalAllocOp alloc) {
+  if (!alloc.getSrc())
+    return nullptr;
+  return alloc.getOperation();
+}
+
+static LogicalResult createLocalChannelPost(
+    ttg::LocalAllocOp alloc,
+    SmallVectorImpl<std::unique_ptr<LocalDataChannelPost>> &channels) {
+  if (!alloc.isSharedMemoryAlloc())
+    return success();
+
+  DenseSet<Operation *> users;
+  collectLocalMemdescUsers(alloc.getResult(), users);
+
+  SmallVector<Operation *> producers;
+  SmallVector<Operation *> consumers;
+  if (Operation *producer = producerForSourcefulLocalAlloc(alloc))
+    producers.push_back(producer);
+
+  for (Operation *user : users) {
+    if (isTransparentMemdescViewOp(user))
+      continue;
+    if (isLocalProducer(user)) {
+      producers.push_back(user);
+      continue;
+    }
+    consumers.push_back(user);
+  }
+
+  if (producers.empty() && consumers.empty())
+    return success();
+
+  Operation *producerOp =
+      producers.empty() ? alloc.getOperation() : producers.front();
+  SmallVector<int> producerIds = getTaskIds(producerOp);
+  int producerId = producerIds.size() == 1 ? producerIds.front() : -1;
+
+  SmallVector<int> consumerTaskIds = getUniqueTaskIds(consumers);
+  if (producerId >= 0)
+    consumerTaskIds.erase(std::remove(consumerTaskIds.begin(),
+                                      consumerTaskIds.end(), producerId),
+                          consumerTaskIds.end());
+
+  channels.push_back(std::make_unique<LocalDataChannelPost>(
+      producerId, consumerTaskIds, alloc.getOperation(), producerOp, consumers,
+      channels.size()));
+  return success();
+}
+
+static LogicalResult collectLocalPostChannels(
+    SmallVectorImpl<std::unique_ptr<LocalDataChannelPost>> &channels,
+    FuncOp funcOp) {
+  WalkResult result = funcOp.walk([&](ttg::LocalAllocOp alloc) {
+    if (failed(createLocalChannelPost(alloc, channels)))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  return failure(result.wasInterrupted());
+}
+
+static LocalDataChannelPost *
+findChannelForAlloc(Operation *allocOp,
+                    ArrayRef<std::unique_ptr<LocalDataChannelPost>> channels) {
+  for (const auto &channel : channels)
+    if (channel->allocOp == allocOp)
+      return channel.get();
+  return nullptr;
+}
+
+static OperationListT
+livenessForLocalAlloc(ttg::LocalAllocOp alloc,
+                      ArrayRef<std::unique_ptr<LocalDataChannelPost>>
+                          channels) {
+  OperationListT liveOps;
+  DenseSet<Operation *> users;
+  if (LocalDataChannelPost *channel =
+          findChannelForAlloc(alloc.getOperation(), channels)) {
+    if (Operation *src = channel->getSrcOp())
+      users.insert(src);
+    SmallVector<Operation *> dsts;
+    channel->getDstOps(dsts);
+    for (Operation *dst : dsts)
+      users.insert(dst);
+  } else {
+    collectLocalMemdescUsers(alloc.getResult(), users);
+  }
+  liveOps.append(users.begin(), users.end());
+  if (liveOps.empty())
+    liveOps.push_back(alloc.getOperation());
+  return liveOps;
 }
 
 static LogicalResult getAllTmemUsers(TmemDataChannelPost *channel,
@@ -899,6 +1086,369 @@ static bool isDataDependent(Operation *srcOp, Operation *dstOp) {
   }
   return false;
 }
+
+static unsigned getLocalAllocSizeBytes(ttg::LocalAllocOp alloc) {
+  auto allocType = alloc.getType();
+  int64_t numElems = 1;
+  if (auto paddedEnc =
+          dyn_cast<ttg::PaddedSharedEncodingAttr>(allocType.getEncoding())) {
+    SmallVector<int64_t> unpaddedShape = ttg::getShapePerCTA(allocType);
+    numElems = paddedEnc.getPaddedSize(unpaddedShape);
+  } else {
+    SmallVector<int64_t> shapePerCTA =
+        ttg::getAllocationShapePerCTA(allocType);
+    for (int64_t dim : shapePerCTA)
+      numElems *= dim;
+  }
+  return static_cast<unsigned>(numElems * allocType.getElementTypeBitWidth() /
+                               8);
+}
+
+static bool hasLoopStage(Operation *op) {
+  if (!op)
+    return false;
+  if (op->getAttrOfType<IntegerAttr>("loop.stage"))
+    return true;
+  if (auto alloc = dyn_cast<ttg::LocalAllocOp>(op))
+    if (Value src = alloc.getSrc())
+      return hasLoopStage(src.getDefiningOp());
+  if (auto store = dyn_cast<ttg::LocalStoreOp>(op))
+    return hasLoopStage(store.getSrc().getDefiningOp());
+  return false;
+}
+
+static bool isDescriptorLoadProducer(Operation *op) {
+  if (!op)
+    return false;
+  if (isa<nvws::DescriptorLoadOp, nvws::DescriptorGatherOp,
+          tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op))
+    return true;
+  if (auto store = dyn_cast<ttg::LocalStoreOp>(op))
+    return isDescriptorLoadProducer(store.getSrc().getDefiningOp());
+  if (auto alloc = dyn_cast<ttg::LocalAllocOp>(op))
+    if (Value src = alloc.getSrc())
+      return isDescriptorLoadProducer(src.getDefiningOp());
+  return false;
+}
+
+static Operation *findOriginalLoadOp(Value value, DenseSet<Value> &visited) {
+  if (!value || !visited.insert(value).second)
+    return nullptr;
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return nullptr;
+  if (isa<ttng::TMEMLoadOp>(def))
+    return def;
+  for (Value operand : def->getOperands()) {
+    if (isa<ttg::MemDescType>(operand.getType()))
+      continue;
+    if (Operation *load = findOriginalLoadOp(operand, visited))
+      return load;
+  }
+  return nullptr;
+}
+
+static Operation *findOriginalLoadOp(Value value) {
+  DenseSet<Value> visited;
+  return findOriginalLoadOp(value, visited);
+}
+
+static Operation *findOriginalLoadOp(LocalDataChannelPost *channel) {
+  if (!channel)
+    return nullptr;
+  Operation *srcOp = channel->getSrcOp();
+  if (auto store = dyn_cast_or_null<ttg::LocalStoreOp>(srcOp))
+    return findOriginalLoadOp(store.getSrc());
+  if (auto alloc = dyn_cast_or_null<ttg::LocalAllocOp>(srcOp))
+    if (Value src = alloc.getSrc())
+      return findOriginalLoadOp(src);
+  return nullptr;
+}
+
+static bool usersInInnermostLoop(LocalDataChannelPost *channel) {
+  if (!channel)
+    return false;
+  SmallVector<Operation *> users;
+  if (Operation *src = channel->getSrcOp())
+    users.push_back(src);
+  channel->getDstOps(users);
+  if (users.empty())
+    return false;
+
+  Operation *first = users.front();
+  for (Operation *user : users)
+    if (user->getBlock() != first->getBlock())
+      return false;
+  auto parentLoop = first->getParentOfType<scf::ForOp>();
+  return parentLoop && isInnermostLoop(parentLoop);
+}
+
+class LocalSmemAllocator {
+public:
+  LocalSmemAllocator(FuncOp funcOp,
+                     SmallVector<std::unique_ptr<LocalDataChannelPost>>
+                         &channels,
+                     unsigned numBuffers, int smemAllocAlgo,
+                     unsigned smemBudget, bool smemCircularReuse)
+      : funcOp(funcOp), channels(channels),
+        numBuffers(std::max(1u, numBuffers)), smemAllocAlgo(smemAllocAlgo),
+        smemBudget(smemBudget), smemCircularReuse(smemCircularReuse) {}
+
+  LogicalResult run(unsigned &nextBufferId) {
+    buildOperationIdMap(funcOp, operationId);
+    collectAllocs();
+    nextBufferId = 0;
+    if (buffers.empty())
+      return success();
+
+    auto annotations = parseChannelAnnotations(funcOp);
+    smemAnnotations = buildAllocToAnnotationMap(annotations);
+
+    if (smemAllocAlgo == 1) {
+      if (smemBudget == 0)
+        return funcOp.emitError("NVWS memory planner requires smem-budget for "
+                                "smem-alloc-algo=1");
+      runWSBufferPlan(nextBufferId);
+    } else {
+      runLegacyPlan(nextBufferId);
+    }
+
+    emitAttrs();
+    return success();
+  }
+
+private:
+  void collectAllocs() {
+    funcOp.walk<WalkOrder::PreOrder>([&](ttg::LocalAllocOp alloc) {
+      if (!alloc.isSharedMemoryAlloc())
+        return;
+      auto buffer = std::make_unique<LocalBuffer>();
+      buffer->alloc = alloc;
+      buffer->channel = findChannelForAlloc(alloc.getOperation(), channels);
+      buffer->sizeInBytes = getLocalAllocSizeBytes(alloc);
+      buffer->isInnermost = usersInInnermostLoop(buffer->channel);
+      buffer->isTMA = isDescriptorLoadProducer(
+          buffer->channel ? buffer->channel->getSrcOp() : alloc.getOperation());
+      buffer->isCrossStage =
+          hasLoopStage(buffer->channel ? buffer->channel->getSrcOp()
+                                       : alloc.getOperation());
+      buffer->liveness =
+          intervalFromOps(livenessForLocalAlloc(alloc, channels), operationId);
+      buffers.push_back(std::move(buffer));
+    });
+  }
+
+  bool isTwoDimensional(ttg::LocalAllocOp alloc) {
+    return alloc.getType().getShape().size() >= 2;
+  }
+
+  void runLegacyPlan(unsigned &nextBufferId) {
+    DenseMap<Type, unsigned> innermostBufferIds;
+    for (auto &bufferPtr : buffers) {
+      LocalBuffer &buffer = *bufferPtr;
+      buffer.pinned = false;
+      buffer.offset = 0;
+
+      auto annIt = smemAnnotations.find(buffer.alloc.getOperation());
+      if (annIt != smemAnnotations.end()) {
+        const ChannelAnnotation &ann = annIt->second;
+        buffer.pinned = true;
+        buffer.bufferId = ann.bufferId;
+        buffer.numCopies = std::max(1u, ann.numCopies);
+        nextBufferId = std::max(nextBufferId, ann.bufferId + 1);
+        continue;
+      }
+
+      if (buffer.isInnermost && isTwoDimensional(buffer.alloc)) {
+        Type elementType = buffer.alloc.getType().getElementType();
+        auto it = innermostBufferIds.find(elementType);
+        if (it == innermostBufferIds.end()) {
+          it = innermostBufferIds.insert({elementType, nextBufferId++}).first;
+        }
+        buffer.bufferId = it->second;
+        buffer.numCopies = numBuffers;
+      } else {
+        buffer.bufferId = nextBufferId++;
+        buffer.numCopies = 1;
+      }
+    }
+
+    enforceMinCopyForSharedIds(/*cyclicOnly=*/false);
+    fuseEpilogueBuffers();
+  }
+
+  void runWSBufferPlan(unsigned &nextBufferId) {
+    for (auto &bufferPtr : buffers) {
+      LocalBuffer &buffer = *bufferPtr;
+      buffer.offset = 0;
+      auto annIt = smemAnnotations.find(buffer.alloc.getOperation());
+      if (annIt != smemAnnotations.end()) {
+        const ChannelAnnotation &ann = annIt->second;
+        buffer.pinned = true;
+        buffer.bufferId = ann.bufferId;
+        buffer.numCopies = std::max(1u, ann.numCopies);
+        nextBufferId = std::max(nextBufferId, ann.bufferId + 1);
+      } else {
+        buffer.pinned = false;
+        buffer.bufferId = nextBufferId++;
+        buffer.numCopies = 1;
+      }
+      buffer.priority = classifyPriority(buffer);
+    }
+
+    fuseEpilogueBuffers();
+
+    for (auto &bufferPtr : buffers) {
+      LocalBuffer &buffer = *bufferPtr;
+      if (buffer.pinned)
+        continue;
+      unsigned targetCopies = buffer.priority == SmemBufferPriority::Lowest
+                                  ? 1
+                                  : numBuffers;
+      growCopiesWithinBudget(buffer, targetCopies);
+    }
+
+    if (smemCircularReuse)
+      coalesceCircularReuseCandidates();
+    enforceMinCopyForSharedIds(/*cyclicOnly=*/true);
+  }
+
+  SmemBufferPriority classifyPriority(const LocalBuffer &buffer) const {
+    if (findOriginalLoadOp(buffer.channel))
+      return SmemBufferPriority::Epilogue;
+    if (buffer.isCrossStage)
+      return SmemBufferPriority::CrossStage;
+    if (buffer.isInnermost || buffer.isTMA)
+      return SmemBufferPriority::HostToDevice;
+    return SmemBufferPriority::Lowest;
+  }
+
+  unsigned computeTotalSmem() const {
+    DenseMap<unsigned, std::pair<unsigned, unsigned>> idInfo;
+    for (const auto &bufferPtr : buffers) {
+      const LocalBuffer &buffer = *bufferPtr;
+      auto it = idInfo.find(buffer.bufferId);
+      if (it == idInfo.end()) {
+        idInfo[buffer.bufferId] = {buffer.sizeInBytes, buffer.numCopies};
+      } else {
+        it->second.first = std::max(it->second.first, buffer.sizeInBytes);
+        it->second.second = std::max(it->second.second, buffer.numCopies);
+      }
+    }
+
+    unsigned total = 0;
+    for (const auto &[id, sizeAndCopies] : idInfo)
+      total += sizeAndCopies.first * sizeAndCopies.second;
+    return total;
+  }
+
+  void growCopiesWithinBudget(LocalBuffer &buffer, unsigned targetCopies) {
+    while (buffer.numCopies < targetCopies) {
+      unsigned oldCopies = buffer.numCopies;
+      ++buffer.numCopies;
+      if (computeTotalSmem() <= smemBudget)
+        continue;
+      buffer.numCopies = oldCopies;
+      break;
+    }
+  }
+
+  void enforceMinCopyForSharedIds(bool cyclicOnly) {
+    DenseMap<unsigned, unsigned> idToCount;
+    for (const auto &bufferPtr : buffers) {
+      const LocalBuffer &buffer = *bufferPtr;
+      if (!cyclicOnly || buffer.isInnermost || buffer.isCrossStage)
+        ++idToCount[buffer.bufferId];
+    }
+
+    for (auto &bufferPtr : buffers) {
+      LocalBuffer &buffer = *bufferPtr;
+      auto it = idToCount.find(buffer.bufferId);
+      if (it == idToCount.end())
+        continue;
+      buffer.numCopies = std::max(buffer.numCopies, it->second);
+    }
+  }
+
+  bool compatibleForReuse(const LocalBuffer &a, const LocalBuffer &b) const {
+    auto aType = cast<ttg::MemDescType>(a.alloc->getResult(0).getType());
+    auto bType = cast<ttg::MemDescType>(b.alloc->getResult(0).getType());
+    return aType.getElementType() == bType.getElementType() &&
+           a.sizeInBytes == b.sizeInBytes;
+  }
+
+  void fuseEpilogueBuffers() {
+    DenseMap<Operation *, LocalBuffer *> originalLoadToOwner;
+    for (auto &bufferPtr : buffers) {
+      LocalBuffer &buffer = *bufferPtr;
+      Operation *originalLoad = findOriginalLoadOp(buffer.channel);
+      if (!originalLoad)
+        continue;
+      auto it = originalLoadToOwner.find(originalLoad);
+      if (it == originalLoadToOwner.end()) {
+        originalLoadToOwner[originalLoad] = &buffer;
+        continue;
+      }
+
+      LocalBuffer *owner = it->second;
+      if (!compatibleForReuse(*owner, buffer))
+        continue;
+      if (owner->liveness.intersects(buffer.liveness))
+        continue;
+      buffer.bufferId = owner->bufferId;
+      buffer.numCopies = std::max(buffer.numCopies, owner->numCopies);
+    }
+  }
+
+  void coalesceCircularReuseCandidates() {
+    for (size_t i = 0; i < buffers.size(); ++i) {
+      LocalBuffer &owner = *buffers[i];
+      if (owner.pinned || owner.priority == SmemBufferPriority::Lowest)
+        continue;
+      for (size_t j = i + 1; j < buffers.size(); ++j) {
+        LocalBuffer &candidate = *buffers[j];
+        if (candidate.pinned || candidate.priority != owner.priority)
+          continue;
+        if (!compatibleForReuse(owner, candidate))
+          continue;
+        if (owner.liveness.intersects(candidate.liveness))
+          continue;
+
+        unsigned oldId = candidate.bufferId;
+        candidate.bufferId = owner.bufferId;
+        unsigned oldCopies = candidate.numCopies;
+        candidate.numCopies = std::max(candidate.numCopies, owner.numCopies);
+        if (computeTotalSmem() <= smemBudget)
+          continue;
+        candidate.bufferId = oldId;
+        candidate.numCopies = oldCopies;
+      }
+    }
+  }
+
+  void emitAttrs() {
+    for (auto &bufferPtr : buffers) {
+      LocalBuffer &buffer = *bufferPtr;
+      eraseAttr(buffer.alloc, "buffer.id");
+      eraseAttr(buffer.alloc, "buffer.copy");
+      eraseAttr(buffer.alloc, "buffer.offset");
+      setI32Attr(buffer.alloc, "buffer.id", buffer.bufferId);
+      setI32Attr(buffer.alloc, "buffer.copy", buffer.numCopies);
+      if (buffer.offset != 0)
+        setI32Attr(buffer.alloc, "buffer.offset", buffer.offset);
+    }
+  }
+
+  FuncOp funcOp;
+  SmallVector<std::unique_ptr<LocalDataChannelPost>> &channels;
+  unsigned numBuffers;
+  int smemAllocAlgo;
+  unsigned smemBudget;
+  bool smemCircularReuse;
+  DenseMap<Operation *, size_t> operationId;
+  DenseMap<Operation *, ChannelAnnotation> smemAnnotations;
+  SmallVector<std::unique_ptr<LocalBuffer>> buffers;
+};
 
 class TmemAllocator {
 public:
@@ -1581,12 +2131,61 @@ private:
   DenseMap<Operation *, TmemDataChannelPost *> allocToChannel;
 };
 
-static LogicalResult doTmemMemoryPlanning(FuncOp funcOp,
-                                          unsigned firstBufferId) {
+struct EffectiveSmemOptions {
+  int allocAlgo = 0;
+  unsigned budget = 0;
+  bool circularReuse = false;
+};
+
+static EffectiveSmemOptions getEffectiveSmemOptions(FuncOp funcOp,
+                                                    int passAllocAlgo,
+                                                    unsigned passBudget,
+                                                    bool passCircularReuse) {
+  EffectiveSmemOptions options{passAllocAlgo, passBudget, passCircularReuse};
+  funcOp.walk([&](scf::ForOp forOp) {
+    if (!forOp->hasAttr("tt.warp_specialize"))
+      return;
+
+    SmallVector<scf::ForOp> loopChain;
+    loopChain.push_back(forOp);
+    for (auto parent = forOp->getParentOfType<scf::ForOp>(); parent;
+         parent = parent->getParentOfType<scf::ForOp>())
+      loopChain.push_back(parent);
+
+    for (auto it = loopChain.rbegin(); it != loopChain.rend(); ++it) {
+      scf::ForOp loop = *it;
+      if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo"))
+        options.allocAlgo = attr.getInt();
+      if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_budget"))
+        options.budget = static_cast<unsigned>(attr.getInt());
+      if (auto attr = loop->getAttrOfType<BoolAttr>("tt.smem_circular_reuse"))
+        options.circularReuse = attr.getValue();
+    }
+  });
+  return options;
+}
+
+static LogicalResult doMemoryPlanning(FuncOp funcOp, unsigned numBuffers,
+                                      int smemAllocAlgo, unsigned smemBudget,
+                                      bool smemCircularReuse) {
+  SmallVector<std::unique_ptr<LocalDataChannelPost>> localChannels;
+  if (failed(collectLocalPostChannels(localChannels, funcOp)))
+    return failure();
+
+  EffectiveSmemOptions effectiveSmemOptions = getEffectiveSmemOptions(
+      funcOp, smemAllocAlgo, smemBudget, smemCircularReuse);
+
+  unsigned firstTmemBufferId = 0;
+  LocalSmemAllocator localAllocator(
+      funcOp, localChannels, numBuffers, effectiveSmemOptions.allocAlgo,
+      effectiveSmemOptions.budget, effectiveSmemOptions.circularReuse);
+  if (failed(localAllocator.run(firstTmemBufferId)))
+    return failure();
+
   SmallVector<std::unique_ptr<TmemDataChannelPost>> channels;
   if (failed(collectTmemPostChannels(channels, funcOp)))
     return failure();
-  TmemAllocator allocator(funcOp, channels, firstBufferId);
+  TmemAllocator allocator(funcOp, channels, firstTmemBufferId);
   return allocator.run();
 }
 
@@ -1597,7 +2196,12 @@ public:
 
   void runOnOperation() override {
     getOperation()->walk([&](FuncOp funcOp) {
-      if (failed(doTmemMemoryPlanning(funcOp, numBuffers)))
+      unsigned effectiveNumBuffers =
+          numBuffers <= 0 ? 1u : static_cast<unsigned>(numBuffers);
+      unsigned effectiveSmemBudget =
+          smemBudget <= 0 ? 0u : static_cast<unsigned>(smemBudget);
+      if (failed(doMemoryPlanning(funcOp, effectiveNumBuffers, smemAllocAlgo,
+                                  effectiveSmemBudget, smemCircularReuse)))
         signalPassFailure();
     });
   }

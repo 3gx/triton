@@ -253,7 +253,8 @@ struct SemaTable {
 };
 
 struct BackingPlan {
-  int numStages = 1;                 // local: always 1; TMEM: 1 or 2
+  // Depth: buffer.copy when present; otherwise local=1 and TMEM=computed 1/2.
+  int numStages = 1;
   Operation *hoistAnchor = nullptr;  // function scope, before outermost WS loop
   SmallVector<Value> backing;        // per member; backpatch slot (emit step 2)
 };

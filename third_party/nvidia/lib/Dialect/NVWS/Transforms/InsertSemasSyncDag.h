@@ -42,8 +42,8 @@ namespace nvws_semas {
 
 CompId compOfMember(GroupDag &g, MemberId m);
 
-void computeBackingPlan(GroupDag &g, triton::FuncOp funcOp,
-                        bool useMetaPartitioner, int &numTmemBlocks);
+LogicalResult computeBackingPlan(GroupDag &g, triton::FuncOp funcOp,
+                                 bool useMetaPartitioner, int &numTmemBlocks);
 
 LogicalResult buildSyncDag(GroupDag &g, triton::FuncOp funcOp,
                            bool useMetaPartitioner, int &numTmemBlocks);
