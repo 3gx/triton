@@ -54,8 +54,8 @@ the same partition and consumed in the same partition:
 ```text
 for {1} {
   ENTRY {1}
-  st k  {1}
-  st v  {1}
+  ld k  {1}
+  ld v  {1}
   use k {2}
   use v {2}
   EXIT {1}
@@ -63,7 +63,7 @@ for {1} {
 ```
 
 there is no owner-DAG reason to force an extra synchronization edge between
-`st k` and `st v`. Therefore circular support cannot be modeled by only
+`ld k` and `ld v`. Therefore circular support cannot be modeled by only
 coalescing K/V into one existing semaphore-buffer tuple. InsertSemas first needs
 logical per-buffer semaphore streams, then it must fold those streams into one
 physical empty semaphore and one physical full semaphore.
@@ -156,6 +156,28 @@ physical-aliasing contract.
 Before InsertSemas finishes, it folds logical semaphore creates with the same
 `semaphore.id` into one actual `nvws.semaphore.create`.
 
+This fold is an explicit post-render IR rewrite inside InsertSemas. The normal
+emitter first emits the logical SyncDag result: independent logical K/V
+acquire/buffer/release streams, logical semaphore creates, and logical backing
+allocations/views. The normal emitter must not directly emit the folded physical
+semaphore creates or the final shared circular backing. The circular
+post-processing rewrite runs after the normal render walk and before InsertSemas
+exits; it rewrites logical creates/backings/uses into the folded physical form
+and authors the circular stage offsets on the already-emitted semaphore ops.
+
+The same post-render rewrite must preserve token semantics. Circular semaphore
+tokens carry permission only. Event-local acquire tokens and loop-carried
+permission tokens may remain distinct after folding, and they are not
+interchangeable merely because their semaphores fold onto one physical backing.
+
+The current `verifySingleCarrierPerGroup` rule is therefore a non-circular
+implementation limitation, not the target circular invariant. For folded
+circular groups, multiple carrier token slots for one folded physical semaphore
+are legal. AssignStagePhase must not derive circular stages from token lineage;
+it threads the shared circular cursor through control flow and computes every
+circular acquire/buffer/release stage from that op's authored offset plus the
+current shared cursor in program order.
+
 For K/V:
 
 ```text
@@ -174,12 +196,12 @@ circular group:
 The folded IR keeps per-event circular placement by writing the existing
 optional semaphore `stage` operand before AssignStagePhase runs. Before
 AssignStagePhase, that operand is a signed circular offset, not a final
-physical stage. For the straight-line order `st k`, `st v`, `use k`, `use v`,
+physical stage. For the straight-line order `ld k`, `ld v`, `use k`, `use v`,
 the offsets are:
 
 ```text
-acq empty[ 0] ; st k ; rel full [ 0]
-acq empty[ 0] ; st v ; rel full [ 0]
+acq empty[ 0] ; ld k ; rel full [ 0]
+acq empty[ 0] ; ld v ; rel full [ 0]
 
 acq full [-1] ; use k ; rel empty[-1]
 acq full [ 0] ; use v ; rel empty[ 0]
@@ -197,13 +219,10 @@ after AssignStagePhase:
 ```
 
 The offset is an event property. AssignStagePhase consumes the offset exactly
-once and overwrites the operand with the final physical stage. Release and
-buffer ops reached from the same acquire token must either carry the same
-authored offset before AssignStagePhase or have no authored stage operand; after
-AssignStagePhase they receive the final stage by token propagation. The stricter
-implementation choice is to require matching authored offsets on acquire,
-buffer, and release for circular events, because that makes malformed IR
-diagnosable before lowering.
+once on each circular semaphore op and overwrites that op's stage operand with
+the final physical stage. For circular ops, `nvws.semaphore.buffer` and
+`nvws.semaphore.release` do not get their stage from the acquire token. Their
+token operand is only the permission proof.
 
 `nvws.semaphore.acquire` must support a stage-only form before
 AssignStagePhase:
@@ -247,15 +266,40 @@ physical stages under one semaphore. A stage-blind verifier over that folded IR
 can overcount arrivals; the validation point is the producing pass before
 folding, not the generic verifier and not LowerAref.
 
-## Example
+## Examples
 
-Input owner-DAG:
+All examples use the same circular event order:
+
+```text
+ld k
+ld v
+use k
+use v
+```
+
+`ld` means the producer operation that fills the local circular buffer. Because
+the event order is the same in all four cases, the circular offsets are also the
+same:
+
+```text
+ld k  -> offset  0
+ld v  -> offset  0
+use k -> offset -1
+use v -> offset  0
+```
+
+The partition assignment changes token ownership and carrier threading; it does
+not change the offset math.
+
+### Example 1
+
+Both producers run in partition `{1}` and both consumers run in partition `{2}`:
 
 ```text
 for {1} {
   ENTRY {1}
-  st k  {1}
-  st v  {1}
+  ld k  {1}
+  ld v  {1}
   use k {2}
   use v {2}
   EXIT {1}
@@ -265,35 +309,151 @@ for {1} {
 Logical InsertSemas placement:
 
 ```text
-acq K_empty ; st k  ; rel K_full
-acq V_empty ; st v  ; rel V_full
-acq K_full  ; use k ; rel K_empty
-acq V_full  ; use v ; rel V_empty
+acq K_empty {1} ; ld k  {1} ; rel K_full  {1}
+acq V_empty {1} ; ld v  {1} ; rel V_full  {1}
+acq K_full  {2} ; use k {2} ; rel K_empty {2}
+acq V_full  {2} ; use v {2} ; rel V_empty {2}
 ```
 
-Logical semaphores carry fold keys:
+After post-render folding:
 
 ```text
-K_empty.id = E
-V_empty.id = E
-K_full.id  = F
-V_full.id  = F
+acq empty[ 0] {1} ; ld k  {1} ; rel full [ 0] {1}
+acq empty[ 0] {1} ; ld v  {1} ; rel full [ 0] {1}
+acq full [-1] {2} ; use k {2} ; rel empty[-1] {2}
+acq full [ 0] {2} ; use v {2} ; rel empty[ 0] {2}
 ```
 
-After folding:
+This is the easiest ownership case because K/V producers share one partition
+and K/V consumers share one partition. It still does not prove that one carried
+token is enough: if loop-carried K and V tokens are both live at the next
+iteration boundary, both permission proofs must remain available.
+
+### Example 2
+
+Every event runs in a different partition:
 
 ```text
-acq empty[ 0] ; st k  ; rel full [ 0]
-acq empty[ 0] ; st v  ; rel full [ 0]
-acq full [-1] ; use k ; rel empty[-1]
-acq full [ 0] ; use v ; rel empty[ 0]
+for {1} {
+  ENTRY {1}
+  ld k  {1}
+  ld v  {2}
+  use k {3}
+  use v {4}
+  EXIT {1}
+}
 ```
 
-After AssignStagePhase with depth 2:
+Logical InsertSemas placement:
 
 ```text
-acq empty [0] ; st k  ; rel full  [0]
-acq empty [1] ; st v  ; rel full  [1]
+acq K_empty {1} ; ld k  {1} ; rel K_full  {1}
+acq V_empty {2} ; ld v  {2} ; rel V_full  {2}
+acq K_full  {3} ; use k {3} ; rel K_empty {3}
+acq V_full  {4} ; use v {4} ; rel V_empty {4}
+```
+
+After post-render folding:
+
+```text
+acq empty[ 0] {1} ; ld k  {1} ; rel full [ 0] {1}
+acq empty[ 0] {2} ; ld v  {2} ; rel full [ 0] {2}
+acq full [-1] {3} ; use k {3} ; rel empty[-1] {3}
+acq full [ 0] {4} ; use v {4} ; rel empty[ 0] {4}
+```
+
+This case exposes why arbitrary carrier-token coalescing is unsound. K and V
+permission tokens can be owned and consumed by different partitions. A single
+surviving token cannot stand in for both if both are live.
+
+### Example 3
+
+Both producers run in partition `{1}`, but consumers run in different
+partitions:
+
+```text
+for {1} {
+  ENTRY {1}
+  ld k  {1}
+  ld v  {1}
+  use k {2}
+  use v {3}
+  EXIT {1}
+}
+```
+
+Logical InsertSemas placement:
+
+```text
+acq K_empty {1} ; ld k  {1} ; rel K_full  {1}
+acq V_empty {1} ; ld v  {1} ; rel V_full  {1}
+acq K_full  {2} ; use k {2} ; rel K_empty {2}
+acq V_full  {3} ; use v {3} ; rel V_empty {3}
+```
+
+After post-render folding:
+
+```text
+acq empty[ 0] {1} ; ld k  {1} ; rel full [ 0] {1}
+acq empty[ 0] {1} ; ld v  {1} ; rel full [ 0] {1}
+acq full [-1] {2} ; use k {2} ; rel empty[-1] {2}
+acq full [ 0] {3} ; use v {3} ; rel empty[ 0] {3}
+```
+
+This case shows that shared producer-side ownership does not make the
+consumer-side permission tokens interchangeable.
+
+### Example 4
+
+Producers run in different partitions, but both consumers run in partition `{3}`:
+
+```text
+for {1} {
+  ENTRY {1}
+  ld k  {1}
+  ld v  {2}
+  use k {3}
+  use v {3}
+  EXIT {1}
+}
+```
+
+Logical InsertSemas placement:
+
+```text
+acq K_empty {1} ; ld k  {1} ; rel K_full  {1}
+acq V_empty {2} ; ld v  {2} ; rel V_full  {2}
+acq K_full  {3} ; use k {3} ; rel K_empty {3}
+acq V_full  {3} ; use v {3} ; rel V_empty {3}
+```
+
+After post-render folding:
+
+```text
+acq empty[ 0] {1} ; ld k  {1} ; rel full [ 0] {1}
+acq empty[ 0] {2} ; ld v  {2} ; rel full [ 0] {2}
+acq full [-1] {3} ; use k {3} ; rel empty[-1] {3}
+acq full [ 0] {3} ; use v {3} ; rel empty[ 0] {3}
+```
+
+This case shows the symmetric producer-side issue: shared consumer ownership
+does not make producer-side permission tokens interchangeable.
+
+### Consequence
+
+The four examples all support the same folded semaphore/backing structure and
+the same circular offsets. They do not support a general rule that folded
+circular K/V must have one loop-carried token. The correct design requirement is
+permission tokens passed as-is, plus one shared circular cursor for stage
+assignment. Circular stages are computed from the current shared cursor and each
+op's own authored offset.
+
+After AssignStagePhase with depth 2, all four examples use the same physical
+slot sequence:
+
+```text
+acq empty [0] ; ld k  ; rel full  [0]
+acq empty [1] ; ld v  ; rel full  [1]
 acq full  [0] ; use k ; rel empty [0]
 acq full  [1] ; use v ; rel empty [1]
 ```
@@ -301,8 +461,8 @@ acq full  [1] ; use v ; rel empty [1]
 For depth 3, the next logical iteration continues:
 
 ```text
-acq empty [2] ; st k  ; rel full  [2]
-acq empty [0] ; st v  ; rel full  [0]
+acq empty [2] ; ld k  ; rel full  [2]
+acq empty [0] ; ld v  ; rel full  [0]
 ```
 
 The wait on `empty[0]` naturally prevents V from overwriting slot 0 until the
@@ -337,8 +497,8 @@ offset = rank[X] - cursor
 For:
 
 ```text
-st k
-st v
+ld k
+ld v
 use k
 use v
 ```
@@ -346,10 +506,10 @@ use v
 the derivation is:
 
 ```text
-st k:
+ld k:
   cursor = 0, rank[K] = 0, offset = 0
 
-st v:
+ld v:
   cursor = 1, rank[V] = 1, offset = 0
 
 use k:
@@ -361,10 +521,10 @@ use v:
 
 ## AssignStagePhase Contract
 
-AssignStagePhase continues to compute the shared stage and phase for a folded
-semaphore group. The required extension is that a preexisting `stage` operand
-on a circular semaphore event is interpreted as a signed offset before
-assignment, then overwritten with the final physical stage.
+AssignStagePhase continues to compute the shared cursor for a folded semaphore
+group. The required extension is that a preexisting `stage` operand on a
+circular semaphore event is interpreted as a signed offset before assignment,
+then overwritten with the final physical stage.
 
 Definitions:
 
@@ -375,32 +535,31 @@ baseStage     = stage computed by the existing stage state machine
 eventStage    = (baseStage + offset) mod depth
 ```
 
-For an acquire:
+For every circular semaphore op in program order:
 
 ```text
-baseStage = state.stage
+if op is acquire:
+  baseStage = state.stage
 
-if acquire is a fresh write:
-  baseStage = (baseStage + 1) % depth
+  if acquire is a fresh write:
+    baseStage = (baseStage + 1) % depth
 
-offset = signed value from acquire.stage if present, otherwise 0
-eventStage = (baseStage + offset) % depth
+  offset = signed value from acquire.stage if present, otherwise 0
+  eventStage = (baseStage + offset) % depth
 
-state.stage = baseStage
-acquire.stage = eventStage
-phase arithmetic uses eventStage
+  state.stage = baseStage
+  acquire.stage = eventStage
+  phase arithmetic uses eventStage
+
+if op is buffer or release:
+  baseStage = state.stage
+  offset = signed value from op.stage if present, otherwise 0
+  eventStage = (baseStage + offset) % depth
+  op.stage = eventStage
 ```
 
-For release and buffer ops reached from the acquire token:
-
-```text
-if op had an authored stage operand before AssignStagePhase:
-  verify authored offset matches the acquire event offset
-
-op.stage = eventStage
-```
-
-AssignStagePhase must not apply the same offset a second time on token users.
+AssignStagePhase must not derive circular buffer/release stages from token
+lineage. Token propagation remains the non-circular mechanism only.
 
 This preserves the existing rule that LowerAref indexes both mbarriers and data
 buffers using the stage operands present on semaphore ops. There is no separate
@@ -445,8 +604,8 @@ the relevant SCF region.
 For a straight-line SCF block:
 
 ```text
-st k
-st v
+ld k
+ld v
 use k
 use v
 ```
@@ -456,9 +615,9 @@ the offsets are static and valid.
 For:
 
 ```text
-st k
+ld k
 scf.if %cond {
-  st v
+  ld v
 }
 use k
 ```
@@ -503,4 +662,6 @@ Add targeted lit coverage in this order:
 - Do not use `buffer.offset` for local circular starts.
 - Do not make LowerAref allocate mbarrier arrays by `semaphore.id`.
 - Do not preserve distinct K/V logical semaphore creates until LowerAref.
-- Do not introduce dynamic circular cursor SSA values in this design.
+- Do not introduce dynamic per-event offset computation for path-nonuniform
+  circular order. AssignStagePhase may still thread its normal shared
+  stage/cursor SSA through loops and `scf.if`.

@@ -428,6 +428,31 @@ Exit gate:
 
 ### C1 - InsertSemas models circular members as logical channels
 
+Implementation shape:
+
+- The normal InsertSemas emitter must first render the logical semaphore IR
+  that comes out of SyncDag. It should emit independent logical K/V
+  acquire/buffer/release streams and their logical semaphore creates.
+- Circular physical sharing is a required post-render IR rewrite inside
+  InsertSemas, after the normal render walk has emitted logical IR and before
+  InsertSemas exits.
+- That post-render circular rewrite is where the pass folds logical
+  `nvws.semaphore.create` operations with the same fold key, rewrites their
+  uses to the folded physical create, replaces/coalesces logical local
+  backings with one shared circular backing, and authors circular stage
+  offsets on the already-emitted acquire/release/buffer operations.
+- The same post-render rewrite must preserve token semantics. Event-local
+  acquire tokens may remain distinct, and live loop-carried permission tokens
+  for logical streams that fold onto one physical backing are not
+  interchangeable. Do not arbitrarily coalesce several live carried tokens to
+  one survivor. For circular semaphores, tokens carry permission only; they do
+  not carry stage.
+- Do not implement circular folding by making the normal emitter directly emit
+  folded physical semaphore creates or special shared circular backings. The
+  normal emitter remains a transcription of the logical SyncDag; circular
+  folding is a separate post-processing step, analogous in placement to the
+  existing post-emit backing rewrites.
+
 Required work:
 
 1. Validate circular invariants during group construction.
@@ -437,8 +462,9 @@ Required work:
    members. Current NVWS has one stage operand per buffer op, not one per
    result.
 4. Emit separate logical acquire/buffer/release rows for circular members.
-5. Materialize one physical local backing for the circular group, with leading
-   depth equal to `buffer.copy`.
+5. In the post-render circular rewrite, materialize one physical local backing
+   for the circular group, with leading depth equal to `buffer.copy`, and
+   rewrite the logical local backings/views to use it.
 6. Assign fold keys so K/V empty logical semaphores fold to one physical empty
    semaphore and K/V full logical semaphores fold to one separate physical full
    semaphore:
@@ -451,11 +477,20 @@ Required work:
 
 7. Compute and author `pending_count` while logical semaphore streams are still
    distinct.
-8. When folding logical semaphores with the same `semaphore.id`, validate that
-   all logical semaphores for that id have the same authored `pending_count`.
-   The folded `nvws.semaphore.create` receives that value. Do not recompute the
-   folded count from the post-fold physical release stream.
-9. Update `NVWS_SemaphoreAcquireOp` assembly/parser/printer so acquire supports
+8. In the post-render circular rewrite, fold logical semaphores with the same
+   `semaphore.id`. Validate that all logical semaphores for that id have the
+   same authored `pending_count`. The folded `nvws.semaphore.create` receives
+   that value. Do not recompute the folded count from the post-fold physical
+   release stream.
+9. After folding logical semaphores/backings, preserve all live loop-carried
+   permission tokens as-is. Multiple carrier token slots for one folded circular
+   physical semaphore are legal. Do not coalesce them. Do not require per-token
+   stage threading. Circular stage assignment is driven by the shared cursor plus
+   authored per-op offsets.
+10. Relax or bypass `verifySingleCarrierPerGroup` for folded circular groups.
+    The existing one-carrier-slot verifier remains valid for non-circular
+    groups only.
+11. Update `NVWS_SemaphoreAcquireOp` assembly/parser/printer so acquire supports
    all three forms:
 
    ```mlir
@@ -467,17 +502,17 @@ Required work:
    Before AssignStagePhase, circular acquire uses the stage-only form and the
    stage value is a signed offset. After AssignStagePhase, acquire uses the
    stage+phase form.
-10. Compute a signed circular offset for each folded semaphore event from the
+12. Compute a signed circular offset for each folded semaphore event from the
    event order, not directly from `buffer.start`.
-11. Author that offset in the existing stage operand on folded
+13. Author that offset in the existing stage operand on folded
    `nvws.semaphore.acquire`, `nvws.semaphore.release`, and
    `nvws.semaphore.buffer` operations. A negative offset such as `-1` is valid
    in this pre-AssignStagePhase IR.
-12. Validate that first-producer program order matches ascending
+14. Validate that first-producer program order matches ascending
     `buffer.start`; mismatch is malformed circular IR and must not be silently
     ignored.
-13. Do not add a `stage.offset` attribute.
-14. Preserve `buffer.circular`, `buffer.start`, `buffer.id`, and `buffer.copy`
+15. Do not add a `stage.offset` attribute.
+16. Preserve `buffer.circular`, `buffer.start`, `buffer.id`, and `buffer.copy`
    where downstream passes can inspect them.
 
 Exit gate:
@@ -487,11 +522,17 @@ Exit gate:
 - The same test shows one physical local backing for the circular group.
 - The same test shows folded circular semaphore ops carrying stage operands
   that are offsets before AssignStagePhase, including the `-1` K-consumer case
-  for `st k; st v; use k; use v`.
+  for `ld k; ld v; use k; use v`.
 - The same test shows folded `nvws.semaphore.create` carries the authored
   `pending_count` for its `semaphore.id`.
+- Loop-carried circular K/V tests cover the four partition-assignment examples
+  from `fable/circular-buffer-disign.md` and prove multiple live loop-carried
+  permission tokens for one folded circular semaphore are passed unchanged.
 - A negative test rejects folding if logical semaphores with the same
   `semaphore.id` disagree on authored `pending_count`.
+- A folded circular test proves `verifySingleCarrierPerGroup` is relaxed or
+  bypassed for folded circular groups only, while the non-circular verifier
+  remains enforced.
 
 ### C2 - AssignStagePhase consumes stage operands as offsets
 
@@ -503,7 +544,9 @@ Required work:
 2. Require circular events to author a stage operand, even when the offset is
    zero, unless the implementation deliberately accepts absence as offset `0`.
    The stricter verifier is preferred because it catches malformed circular IR.
-3. Keep the existing fresh-write stage update:
+3. Visit circular `nvws.semaphore.acquire`, `nvws.semaphore.buffer`, and
+   `nvws.semaphore.release` operations in program order for the folded group.
+4. Keep the existing fresh-write stage update for circular acquires:
 
    ```text
    baseStage = state.stage
@@ -511,23 +554,31 @@ Required work:
      baseStage = (baseStage + 1) % depth
    ```
 
-4. Compute the event stage from the authored offset:
+5. For circular `buffer` and `release`, `baseStage = state.stage`; these ops do
+   not advance the shared cursor.
+6. Compute each circular op's event stage from that op's authored offset:
 
    ```text
-   offset = signed value from acquire.stage before assignment
+   offset = signed value from op.stage before assignment
    eventStage = positive_mod(baseStage + offset, depth)
    ```
 
-5. Store `state.stage = baseStage`, not `eventStage`, so the shared circular
+7. Store `state.stage = baseStage`, not `eventStage`, so the shared circular
    cursor remains the unshifted producer cursor.
-6. Overwrite `acquire.stage = eventStage`.
-7. Compute acquire phase from `eventStage`, because LowerAref indexes the
+8. Overwrite `op.stage = eventStage`.
+9. Compute acquire phase from `eventStage`, because LowerAref indexes the
    mbarrier using the final stage operand.
-8. Propagate `eventStage` through the acquire token to corresponding
-   `nvws.semaphore.buffer` and `nvws.semaphore.release` operations.
-9. If a token user already had a preexisting stage operand, verify it matches
-   the acquire event offset before overwriting it with `eventStage`.
-10. Do not maintain separate logical-stage and data-stage operands in this
+10. Single-phase eligibility for circular groups must account for authored
+   offsets when forming the virtual-stage key, or conservatively mark circular
+   groups multiphase. The conservative multiphase choice is correct for the
+   first implementation.
+11. For circular groups, do not propagate stage through the acquire token.
+   Circular `buffer` and `release` stages are computed from their own authored
+   stage operands and the current shared cursor.
+12. Loop/if state threading for circular groups must thread the shared cursor
+    independent of any one carrier token.
+13. Keep token-based stage propagation for non-circular groups only.
+14. Do not maintain separate logical-stage and data-stage operands in this
     design.
 
 Exit gate:
@@ -539,6 +590,10 @@ Exit gate:
 - The same test proves acquire, buffer, and release for one event receive the
   same final physical stage.
 - The same test proves phase is computed from the final physical stage.
+- A multi-token folded circular test proves two live loop-carried tokens for one
+  folded circular semaphore are passed unchanged, while buffer/release stages
+  are computed from their own authored offsets and the shared cursor, not from
+  token lineage.
 
 ### C3 - Generic verifier and LowerAref pending-count contract
 
@@ -575,8 +630,8 @@ Required work:
 Required final-stage shape for one K/V depth-2 iteration:
 
 ```text
-acq empty[0] ; st k  ; rel full [0]
-acq empty[1] ; st v  ; rel full [1]
+acq empty[0] ; ld k  ; rel full [0]
+acq empty[1] ; ld v  ; rel full [1]
 acq full [0] ; use k ; rel empty[0]
 acq full [1] ; use v ; rel empty[1]
 ```
