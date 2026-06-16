@@ -57,13 +57,14 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 // its post-store reader both close into carried {2}); both acquire sites
 // show the uniform pending count (2). The in-loop store itself takes NO
 // edge: {2}'s WAR is discharged transitively ({1} synced behind {2} via
-// its own read edge), {1}'s own read by program order. The outer S3
-// component is ungated, so the hold rule renders it natively at point of
-// use: the wrap acquire sits directly before the hold's first toucher
-// (the {3} store), there is no separate entry row (historically the entry
-// duplicated the OUTER regain S3), and the outer EXIT yield is "native".
+// its own read edge), {1}'s own read by program order. Under the v5 uniform
+// hold rule, the outer S3 component remains carrier-bearing: the prefix's
+// release has arrive multiplicity 2, so condition E rejects point-of-use
+// (`rel-count`) to preserve the one-carrier-slot rule.
 // CHECK: SYNC-DAG
-// CHECK: |- a  S3  {3}
+// CHECK: |- a  S3  root  ; entry
+// CHECK-NEXT: |- scf.for {{.*}} holdrule{c0:gated(rel-count)}
+// CHECK-NEXT: |- ENTER
 // CHECK-NEXT: |- W m0  ttg.local_store {3}
 // CHECK-NEXT: |- r  S0(2)  {3} [none]
 // CHECK-NEXT: |- a  S0(2)  {2}
@@ -79,5 +80,6 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 // CHECK-NEXT: |- r  S0  {0} [none]
 // CHECK-NEXT: |- a  S0(2)  {2}
 // CHECK: |- r  S3  {2} [none]
-// CHECK-NEXT: |- EXIT pieces{P0:W:{3}} yield{c0: native}
+// CHECK-NEXT: |- a  S3  {3}
+// CHECK-NEXT: |- EXIT pieces{P0:W:{3}} yield{c0: a S3}
 // CHECK: SEMAS c0: S0{count=2} S1{count=1} S2{count=1} S3{count=1 entry inherit={@0.3}}

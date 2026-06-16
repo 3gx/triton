@@ -30,9 +30,9 @@
 // HOLD: holdrule{c0:gated(entry-sema-mismatch)}
 // HOLD: holdrule{c0:gated(region-crossing)}
 // HOLD: holdrule{c0:gated(entry-sema-mismatch)}
-// HOLD: holdrule{c0:gated(nested-final)}
+// HOLD: holdrule{c0:gated(trailing-use)}
 // HOLD: holdrule{c0:gated(entry-consumed)}
-// HOLD: holdrule{c0:gated(nested-final)}
+// HOLD: holdrule{c0:gated(trailing-use)}
 // HOLD: holdrule{c0:gated(entry-consumed)}
 // HOLD: holdrule{c0:pointofuse->nvws.descriptor_load}
 // HOLD: holdrule{c0:pointofuse->nvws.descriptor_load}

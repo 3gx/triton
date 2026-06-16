@@ -57,7 +57,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 
   // S3: trailing read after regain; negative expected.
   // DAG-LABEL: function: @uniform_hold_s3_trailing_read_after_regain
-  // DAG: holdrule{c0:gated(nested-final)}
+  // DAG: holdrule{c0:gated(region-not-transparent)}
   // DAG: holdrule{c0:gated(trailing-use)}
   // DAG: holdrule{c0:gated(result-consumed)}
   tt.func @uniform_hold_s3_trailing_read_after_regain(%lb: i32, %ub: i32, %step: i32) {
@@ -105,7 +105,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 
   // S5: region-spanning at WS-body depth 1, no middle, no op4.
   // DAG-LABEL: function: @uniform_hold_s5_ws_body_depth1
-  // DAG: holdrule{c0:pointofuse->ttg.local_store}
+  // DAG: holdrule{c0:pointofuse->ttg.local_store:regionTail}
   // DAG: holdrule{c0:gated(entry-consumed)}
   tt.func @uniform_hold_s5_ws_body_depth1(%lb: i32, %ub: i32, %step: i32) {
     %alloc = ttg.local_alloc {buffer.id = 985 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
@@ -124,7 +124,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 
   // S6: same-owner trailing read after the inner region.
   // DAG-LABEL: function: @uniform_hold_s6_same_owner_trailing_read
-  // DAG: holdrule{c0:gated(nested-final)}
+  // DAG: holdrule{c0:gated(trailing-use)}
   // DAG: holdrule{c0:gated(entry-consumed)}
   tt.func @uniform_hold_s6_same_owner_trailing_read(%lb: i32, %ub: i32, %step: i32) {
     %alloc = ttg.local_alloc {buffer.id = 986 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
@@ -161,7 +161,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 
   // S8: If-as-prefix-region inside the WS body.
   // DAG-LABEL: function: @uniform_hold_s8_if_prefix_region
-  // DAG: holdrule{c0:pointofuse->ttg.local_store}
+  // DAG: holdrule{c0:pointofuse->ttg.local_store:regionTail}
   // DAG: scf.if pieces{P0:W:{1}} parts{1,2} thread{c0:{1}}
   // DAG: EXIT pieces{P0:W:{1}} yield{c0: a S1}
   // DAG: EXIT yield{c0: pass}
@@ -182,8 +182,8 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 
   // S9: If inside the inner loop.
   // DAG-LABEL: function: @uniform_hold_s9_if_inside_inner_loop
-  // DAG: holdrule{c0:gated(nested-final)}
-  // DAG: holdrule{c0:gated(nested-final)}
+  // DAG: holdrule{c0:gated(no-buf)}
+  // DAG: holdrule{c0:gated(no-buf)}
   // DAG: scf.if pieces{P0:W:{1}} parts{1,2} thread{c0:{1}}
   // DAG: EXIT pieces{P0:W:{1}} yield{c0: a S1}
   // DAG: EXIT yield{c0: pass}
@@ -205,9 +205,10 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   }
 
   // S10: fan-out / multi-consumer.
-  // The producer-side hold is point-of-use; the fan-out inner region stays gated.
+  // Multiplicity violates the one-carrier-slot rule, so the producer-side
+  // hold stays carrier-bearing.
   // DAG-LABEL: function: @uniform_hold_s10_fanout_multi_consumer
-  // DAG: holdrule{c0:pointofuse->ttg.local_store}
+  // DAG: holdrule{c0:gated(rel-count)}
   // DAG: holdrule{c0:gated(result-consumed)}
   // DAG: SEMAS c0: S0{count=2}
   tt.func @uniform_hold_s10_fanout_multi_consumer(%lb: i32, %ub: i32, %step: i32) {

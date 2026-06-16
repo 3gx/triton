@@ -474,7 +474,7 @@ static LogicalResult rewriteSignatures(EmitCtx &ctx,
         for (const Crossing &c : n->crossings) {
           // Native point-of-use crossings (plan M2) materialize no slot:
           // the token is born and dies inside the body.
-          if (n->kind == Node::For && !c.holdGated)
+          if (n->kind == Node::For && !c.hold.materializesCarrier())
             continue;
           wanted[n->op].push_back(Want{&g, c.comp, c.slotOwner});
         }
@@ -731,7 +731,7 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
                                   DenseMap<Node *, Value> &emitted) {
   // Set this op's slot inits / record incoming carriers.
   for (const Crossing &c : n->crossings) {
-    if (n->kind == Node::For && !c.holdGated)
+    if (n->kind == Node::For && !c.hold.materializesCarrier())
       continue; // native point-of-use: no slot (plan M2)
     unsigned idx = slotIndexFor(ctx, n->op, &g, c.comp);
     Value incoming = rs.carrier.lookup(c.comp);
@@ -759,7 +759,7 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
     RenderState body = rs; // stage cache flows in; views do not
     body.view.clear();
     for (const Crossing &c : n->crossings) {
-      if (!c.holdGated) {
+      if (!c.hold.materializesCarrier()) {
         // Native point-of-use (plan M2): no incoming carrier — the moved
         // wrap acquire renders before the hold's first toucher and births
         // the body-local token there.
@@ -774,7 +774,7 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
     // Yield wiring: body-final carrier per slot (terminator looked up now).
     auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
     for (const Crossing &c : n->crossings) {
-      if (!c.holdGated) {
+      if (!c.hold.materializesCarrier()) {
         rs.carrier.erase(c.comp); // token died in the body; nothing flows out
         continue;
       }

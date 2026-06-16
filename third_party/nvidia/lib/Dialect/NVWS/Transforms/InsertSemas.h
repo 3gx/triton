@@ -125,16 +125,31 @@ struct Touch {
 // ---------------------------------------------------------------------------
 struct Node;
 
+struct Hold {
+  enum class Outcome {
+    CARRIER,
+    POINT_OF_USE,
+    CHILD_OWNS,
+  };
+
+  Outcome outcome = Outcome::CARRIER;
+  const char *reason = "";
+  SmallVector<Node *, 4> rows;
+  Node *entryAcquire = nullptr;
+  Node *closingRelease = nullptr;
+  Node *regain = nullptr;
+  Node *firstToucher = nullptr;
+  bool regionTail = false;
+
+  bool materializesCarrier() const { return outcome == Outcome::CARRIER; }
+  bool isPointOfUse() const { return outcome == Outcome::POINT_OF_USE; }
+  bool isChildOwns() const { return outcome == Outcome::CHILD_OWNS; }
+};
+
 // Carrier-threading facts, computed at stage 3 and stored ON the For/If
 // node (the DAG is the authority; "ThreadingPlan" is only the derived
 // emission-time aggregation across groups).
 struct Crossing {
-  enum class HoldKind {
-    GATED,
-    POINT_OF_USE,
-    PASSTHROUGH_DROP,
-  };
-
   CompId comp = 0;     // which token game (group implicit: the node's DAG)
   Owner slotOwner;     // partition stamped on this slot's
                        // ttg.partition.outputs entry and yield attrs —
@@ -146,25 +161,7 @@ struct Crossing {
                        // yield returns — the NEW token. nullptr =
                        // PASS-THROUGH: that chain yields the INCOMING
                        // carrier unchanged (the OLD token).
-  // HOLD-RULE gate facts. Computed at stage 3 for For-row crossings and
-  // printed in the SYNC dump. holdGated is retained as the emission-facing
-  // boolean: both POINT_OF_USE and PASSTHROUGH_DROP materialize no carrier slot.
-  HoldKind holdKind = HoldKind::GATED;
-  bool holdGated = true;            // true: keep the rotated boundary device
-  const char *holdGateReason = "";  // dump tag; empty when UNGATED
-  Node *holdFirstToucher = nullptr; // UNGATED: the point-of-use target row
-  Node *holdFeedAcquire = nullptr;  // UNGATED: the slot's feeding entry-
-                                    // instance acquire (unlinked at M2 —
-                                    // iteration 1 pairs with the initial
-                                    // permit instead)
-  bool holdRegionTail = false;      // POINT_OF_USE: finals[0] is a region row
-  // v5 uniform hold-builder side-band. M1 computes these fields beside the
-  // legacy gate; M2/M3 make them the emission authority.
-  HoldKind uniformHoldKind = HoldKind::GATED;
-  const char *uniformHoldReason = "";
-  Node *uniformFirstToucher = nullptr;
-  Node *uniformFeedAcquire = nullptr;
-  bool uniformRegionTail = false;
+  Hold hold;
 };
 
 struct Node {
