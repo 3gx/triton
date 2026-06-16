@@ -100,7 +100,6 @@ With `PYTHONPATH=.../python/`, `TRITON_ALWAYS_COMPILE=1`, `timeout 60`:
    `..._attention_forward[False-4-True-3-128-128-1024-1024]`,
    `..._attention_persistent_forward[True-8-True-3-128-128-1024-1024]` (arbiter).
 2. **grouped GEMM** `::test_grouped_gemm[16-4096-8192-1024]` (depth-3 arbiter).
-3. **MOE** `test_matmul.py::test_op[...mxfloat4_e2m1...]`.
 4. `timeout 60 python 06-fa.py`
 5. `timeout 60 sh run_nvws.sh`
 6. `timeout 60 sh run_nvws_1.sh`
