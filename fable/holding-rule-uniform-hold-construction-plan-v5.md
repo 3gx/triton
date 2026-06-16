@@ -90,6 +90,8 @@ Special blocker classes:
 - **TRANSPARENCY VERIFIER (M3):** the §3 clauses are asserted in `verifySyncDag`;
   a non-transparent region reaching `POINT_OF_USE` is a hard compile error.
 
+  DO NOT FUCKING FIX LIT TEST UNTILK RUNTIMEGATES BELOW ARE PASSING!!!
+
 ### Runtime — in this order, at M2 (first behavior change) and re-run at M3
 With `PYTHONPATH=.../python/`, `TRITON_ALWAYS_COMPILE=1`, `timeout 60`:
 1. **4× warp-spec pytests** (`test_warp_specialization.py`):
