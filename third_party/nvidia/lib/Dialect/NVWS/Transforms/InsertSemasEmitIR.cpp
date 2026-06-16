@@ -31,10 +31,17 @@ struct EmitCtx {
 // Per-group render-walk state.
 struct RenderState {
   DenseMap<CompId, Value> carrier;          // current carrier token per comp
+  DenseMap<CompId, int64_t> carrierOwner;   // ownerKey of carrier's acquire
+  // Retained-token state is not an emitter-side semaphore optimization. The
+  // SYNC-DAG has already decided whether a redundant edge exists. These facts
+  // only let the mechanical render walk pair an owner-retained token with the
+  // semaphore that produced it when the DAG omitted the fresh handoff.
+  DenseMap<std::pair<CompId, int64_t>, std::pair<Value, Value>>
+      retained;                             // (comp, owner) -> {tok, sema}
   DenseMap<CompId, Value> carrierSema;      // the create of that carrier's
                                             // acquire (buffer ops pair the
                                             // token with ITS semaphore)
-  DenseMap<MemberId, Value> view;           // member view cache
+  DenseMap<MemberId, std::pair<Value, int64_t>> view; // view + owner key
   DenseMap<int64_t, gpu::StageCluster> stageCache; // ownerKey -> stage/cluster
 };
 
@@ -586,14 +593,27 @@ static unsigned slotIndexFor(EmitCtx &ctx, Operation *op, GroupDag *g,
   llvm_unreachable("missing slot");
 }
 
+static void clearComponentCarrier(RenderState &rs, CompId comp) {
+  rs.carrier.erase(comp);
+  rs.carrierSema.erase(comp);
+  rs.carrierOwner.erase(comp);
+  SmallVector<std::pair<CompId, int64_t>, 4> keys;
+  for (auto &kv : rs.retained)
+    if (kv.first.first == comp)
+      keys.push_back(kv.first);
+  for (auto key : keys)
+    rs.retained.erase(key);
+}
+
 // Materialize (or fetch) the view of `member`, replaying the access's alias
 // chain (mining gap 4 rules).
 static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs,
                      const Touch &t, Operation *accessOp, const Owner &owner) {
   auto it = rs.view.find(t.member);
   Value base;
-  if (it != rs.view.end()) {
-    base = it->second;
+  int64_t viewKey = owner.has_value() ? ownerKey(owner) : -1;
+  if (it != rs.view.end() && it->second.second == viewKey) {
+    base = it->second.first;
   } else {
     // One buffer op yields all member views at once.
     OpBuilder b(accessOp);
@@ -608,10 +628,23 @@ static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs,
     }
     CompId comp = compOfMember(g, t.member);
     Value tok = rs.carrier.lookup(comp);
-    assert(tok && "no carrier for view");
     // Pair the token with ITS OWN semaphore (the acquire that produced the
     // carrier), like the old pass's ping/pong-side selection.
     Value semaVal = rs.carrierSema.lookup(comp);
+    // If SyncDag suppressed a redundant handoff, this access is still owned
+    // by a partition that has a retained token. Select that token here; do
+    // not synthesize, delete, or coalesce semaphores in the emitter.
+    if (owner.has_value()) {
+      auto co = rs.carrierOwner.find(comp);
+      if (co != rs.carrierOwner.end() && co->second != ownerKey(owner)) {
+        auto rt = rs.retained.find({comp, ownerKey(owner)});
+        if (rt != rs.retained.end()) {
+          tok = rt->second.first;
+          semaVal = rt->second.second;
+        }
+      }
+    }
+    assert(tok && "no carrier for view");
     assert(semaVal && "no semaphore for carrier");
     auto buf = emitInto<nvws::SemaphoreBufferOp>(
         b, accessOp->getLoc(), owner, gpu::getStageCluster(accessOp), semaVal,
@@ -623,8 +656,8 @@ static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs,
     // post-emit view-locality verifier rejects exactly that).
     for (auto [mi, v] : llvm::enumerate(buf.getBuffers()))
       if (compOfMember(g, static_cast<MemberId>(mi)) == comp)
-        rs.view[static_cast<MemberId>(mi)] = v;
-    base = rs.view[t.member];
+        rs.view[static_cast<MemberId>(mi)] = {v, viewKey};
+    base = rs.view[t.member].first;
   }
   // Replay the alias chain (old emitter :763-788): skip memdesc_index
   // steps already folded into the view type; clone with mapping; force the
@@ -763,7 +796,7 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
         // Native point-of-use (plan M2): no incoming carrier — the moved
         // wrap acquire renders before the hold's first toucher and births
         // the body-local token there.
-        body.carrier.erase(c.comp);
+        clearComponentCarrier(body, c.comp);
         continue;
       }
       unsigned idx = slotIndexFor(ctx, n->op, &g, c.comp);
@@ -775,7 +808,7 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
     auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
     for (const Crossing &c : n->crossings) {
       if (!c.hold.materializesCarrier()) {
-        rs.carrier.erase(c.comp); // token died in the body; nothing flows out
+        clearComponentCarrier(rs, c.comp); // token died in the body
         continue;
       }
       unsigned idx = slotIndexFor(ctx, n->op, &g, c.comp);
@@ -834,10 +867,16 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
     case Node::Exit:
       break; // markers; yield wiring is the parent's job
     case Node::Acquire: {
-      CompId comp = g.semaTable.semas[n->sema].component;
+      const Sema &sm = g.semaTable.semas[n->sema];
+      CompId comp = sm.component;
+      Owner waveOwner = sm.isEntry && !n->owner ? sm.inheritStamp : n->owner;
       if (Value v = emitted.lookup(n)) { // pre-rendered entry instance
         rs.carrier[comp] = v;
-        rs.carrierSema[comp] = g.semaTable.semas[n->sema].create;
+        rs.carrierSema[comp] = sm.create;
+        if (waveOwner.has_value()) {
+          rs.carrierOwner[comp] = ownerKey(waveOwner);
+          rs.retained[{comp, ownerKey(waveOwner)}] = {v, sm.create};
+        }
         rs.view.clear();
         break;
       }
@@ -865,10 +904,14 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
       auto acq = emitInto<nvws::SemaphoreAcquireOp>(
           b, before ? before->getLoc() : ctx.func.getLoc(), n->owner,
           stageFor(rs, n->owner, stageAnchor),
-          g.semaTable.semas[n->sema].create, ctx.tokenType);
+          sm.create, ctx.tokenType);
       emitted[n] = acq.getToken();
       rs.carrier[comp] = acq.getToken();
-      rs.carrierSema[comp] = g.semaTable.semas[n->sema].create;
+      rs.carrierSema[comp] = sm.create;
+      if (waveOwner.has_value()) {
+        rs.carrierOwner[comp] = ownerKey(waveOwner);
+        rs.retained[{comp, ownerKey(waveOwner)}] = {acq.getToken(), sm.create};
+      }
       rs.view.clear();
       lastReal = acq;
       break;
@@ -876,6 +919,18 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
     case Node::Release: {
       CompId comp = g.semaTable.semas[n->sema].component;
       Value tok = rs.carrier.lookup(comp);
+      // Same rule as buffer materialization: releases consume the token named
+      // by the SYNC-DAG owner state. A retained token here means the DAG did
+      // not create the redundant reacquire edge in the first place.
+      if (n->owner.has_value()) {
+        auto co = rs.carrierOwner.find(comp);
+        if (co != rs.carrierOwner.end() &&
+            co->second != ownerKey(n->owner)) {
+          auto rt = rs.retained.find({comp, ownerKey(n->owner)});
+          if (rt != rs.retained.end())
+            tok = rt->second.first;
+        }
+      }
       assert(tok && "release without carrier");
       OpBuilder b(ctx.func);
       if (lastReal)
@@ -1572,10 +1627,15 @@ LogicalResult emitIR(triton::FuncOp funcOp,
     std::function<void(Node *)> seed = [&](Node *head) {
       for (Node *n = head; n; n = n->next)
         if (n->kind == Node::Acquire && emitted.count(n)) {
-          rs.carrier[g.semaTable.semas[n->sema].component] =
-              emitted.lookup(n);
-          rs.carrierSema[g.semaTable.semas[n->sema].component] =
-              g.semaTable.semas[n->sema].create;
+          const Sema &sm = g.semaTable.semas[n->sema];
+          rs.carrier[sm.component] = emitted.lookup(n);
+          rs.carrierSema[sm.component] = sm.create;
+          Owner o = sm.isEntry && !n->owner ? sm.inheritStamp : n->owner;
+          if (o.has_value()) {
+            rs.carrierOwner[sm.component] = ownerKey(o);
+            rs.retained[{sm.component, ownerKey(o)}] = {emitted.lookup(n),
+                                                        sm.create};
+          }
         }
     };
     if (!g.root->children.empty())

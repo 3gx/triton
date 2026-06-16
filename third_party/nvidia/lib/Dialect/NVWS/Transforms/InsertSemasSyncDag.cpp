@@ -34,6 +34,8 @@
 #include "InsertSemasSyncDag.h"
 #include "InsertSemasOwnerDag.h"
 
+#include <set>
+
 namespace mlir {
 namespace triton {
 namespace nvws_semas {
@@ -103,6 +105,20 @@ static void unionPayloads(SmallVector<AsyncOp, 1> &into,
 // elision is suspended: the touch MUST take a fresh edge. `waveSrc` is the
 // wave owner's last chain row (the baton handoff site) used as fallback
 // source when the piece's own holders provide none.
+// An edge from (srcRow, srcOwner) to a row of `who` orders that row's
+// completion behind who's acquire — ONE event covering every piece whose
+// pending release point is that same row. Mark all such holders, across
+// games: their later touches by `who` need no further edge and may ride a
+// retained token.
+static void markSyncedEverywhere(ChainState &st, Node *srcRow,
+                                 const Owner &srcOwner, const Owner &who) {
+  for (auto &[pid, gm] : st.games)
+    for (HolderRec &h : gm.holders)
+      if (h.lastRow == srcRow && sameOwner(h.owner, srcOwner) &&
+          !llvm::is_contained(h.syncedBehind, ownerKey(who)))
+        h.syncedBehind.push_back(ownerKey(who));
+}
+
 static void applyTouch(ChainState &st, PieceId p, const Owner &who,
                        Effect effect, Node *row,
                        const SmallVector<AsyncOp, 1> &rowPayloads,
@@ -127,11 +143,14 @@ static void applyTouch(ChainState &st, PieceId p, const Owner &who,
         continue; // transitively synchronized — edge redundant
       ctx.edges.push_back(
           EdgeRec{h.lastRow, row, h.owner, who, h.lastPayloads, {p}});
+      markSyncedEverywhere(st, h.lastRow, h.owner, who);
       edged = true;
     }
-    if (force && !edged && waveSrc && !sameOwner(waveOwner, who))
+    if (force && !edged && waveSrc && !sameOwner(waveOwner, who)) {
       ctx.edges.push_back(
           EdgeRec{waveSrc, row, waveOwner, who, wavePay, {p}});
+      markSyncedEverywhere(st, waveSrc, waveOwner, who);
+    }
     gm.holders.assign(1, HolderRec{who, row, rowPayloads, {}});
     gm.versionProducer = who;
     return;
@@ -144,10 +163,11 @@ static void applyTouch(ChainState &st, PieceId p, const Owner &who,
         ctx.edges.push_back(EdgeRec{primary->lastRow, row, primary->owner,
                                     who, primary->lastPayloads,
                                     {p}});
-        primary->syncedBehind.push_back(ownerKey(who));
+        markSyncedEverywhere(st, primary->lastRow, primary->owner, who);
       } else if (waveSrc && !sameOwner(waveOwner, who)) {
         ctx.edges.push_back(
             EdgeRec{waveSrc, row, waveOwner, who, wavePay, {p}});
+        markSyncedEverywhere(st, waveSrc, waveOwner, who);
       }
     }
     h->lastRow = row;
@@ -162,9 +182,28 @@ static void applyTouch(ChainState &st, PieceId p, const Owner &who,
     ctx.edges.push_back(EdgeRec{primary->lastRow, row, primary->owner, who,
                                 primary->lastPayloads,
                                 {p}});
-    primary->syncedBehind.push_back(ownerKey(who));
+    markSyncedEverywhere(st, primary->lastRow, primary->owner, who);
   }
   gm.holders.push_back(HolderRec{who, row, rowPayloads, {}});
+}
+
+// True iff the normal elision rules require zero new ordering edges for this
+// touch. Wave-locality force can then stand down and let the owner reuse a
+// retained partition-local token from an earlier wave in this same chain.
+static bool retentionEligible(ChainState &st, PieceId p, const Owner &who,
+                              Effect effect) {
+  auto it = st.games.find(p);
+  if (it == st.games.end() || !it->second.live)
+    return false;
+  PieceGame &gm = it->second;
+  if (effect == Effect::W) {
+    for (HolderRec &h : gm.holders)
+      if (!sameOwner(h.owner, who) &&
+          !llvm::is_contained(h.syncedBehind, ownerKey(who)))
+        return false;
+    return true;
+  }
+  return findHolder(gm, who) != nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -221,10 +260,19 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SyncCtx &ctx,
     SmallVector<AsyncOp, 1> pay;
   };
   std::map<CompId, WaveSt> wave;
+  // Owners that held the carrier earlier in this chain. Their token is still
+  // live partition-local SSA until their next acquire, scoped to this chain.
+  std::map<CompId, std::set<int64_t>> hadWave;
+  // In this branch, a token may not materialize a new buffer view after it
+  // has fed a release in the same block. Retention is therefore only legal
+  // while the owner's earlier token has not been released by a handoff.
+  std::map<CompId, std::set<int64_t>> releasedWave;
   auto compOf = [&](PieceId p) { return g.pieceTable.pieceComp[p]; };
   if (head->kind == Node::Enter)
     for (auto &[p, pi] : sortedPieceInfo(head)) {
       WaveSt &w = wave[compOf(p)];
+      if (pi.owner.has_value())
+        hadWave[compOf(p)].insert(ownerKey(pi.owner));
       if (!w.lastRow) {
         w.owner = pi.owner;
         w.valid = true;
@@ -259,25 +307,35 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SyncCtx &ctx,
         WaveSt &w = wave[compOf(p)];
         bool force = w.valid && n->owner.has_value() &&
                      w.owner.has_value() && !sameOwner(w.owner, n->owner);
-        // NOTE (TOKEN RETENTION — deliberately NOT implemented, spec
-        // Addendum A): when this toucher held the carrier earlier in the
-        // SAME chain and every conflicting holder is already
-        // transitively synchronized behind it, this forced edge creates
-        // a semaphore that can never block (same source completion, same
-        // acquiring partition, later in its program order — meta-FA
-        // S2/S6 class). Eliding it here (force stands down; the touch
-        // rides the partition's retained token) was implemented and
-        // gate-green in commit 844bf8fa63, but cost ~5% FA performance:
-        // the always-satisfied wait doubles as a runtime pacing point
-        // (without it the merged store issues into the mma's operand-
-        // streaming window). Keep the "redundant" semaphore on purpose.
+        // Redundant-semaphore elimination is a SYNC-DAG construction rule,
+        // not an emitter cleanup. If this row can legally ride a retained
+        // partition-local token, do not create the edge: no edge means no
+        // semaphore, no acquire/release nodes, and nothing later to delete.
+        // The proof is intentionally local and conservative:
+        //   1. this owner held the component earlier in the same chain;
+        //   2. the retained token has not already fed a release in this block;
+        //   3. the normal token game says zero ordering edges are needed.
+        // If any condition fails, keep the normal forced handoff so EmitIR
+        // remains a mechanical renderer of the finalized SYNC-DAG.
+        bool retained =
+            force && hadWave[compOf(p)].count(ownerKey(n->owner)) &&
+            !releasedWave[compOf(p)].count(ownerKey(n->owner)) &&
+            retentionEligible(st, p, n->owner, e);
+        if (retained)
+          force = false;
+        Owner oldWaveOwner = w.owner;
+        bool oldWaveValid = w.valid;
         applyTouch(st, p, n->owner, e, n, pay, ctx, /*wsAdopt=*/false,
                    force, w.lastRow, w.owner, w.pay);
-        if (n->owner.has_value()) {
+        if (n->owner.has_value() && !retained) {
+          if (oldWaveValid && oldWaveOwner.has_value() &&
+              !sameOwner(oldWaveOwner, n->owner))
+            releasedWave[compOf(p)].insert(ownerKey(oldWaveOwner));
           w.owner = n->owner;
           w.valid = true;
           w.lastRow = n;
           w.pay.assign(1, asyncPayloadOf(n->op));
+          hadWave[compOf(p)].insert(ownerKey(n->owner));
         }
       }
       break;
@@ -355,11 +413,16 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SyncCtx &ctx,
         }
         for (auto &[c, ou] : ro) {
           WaveSt &w = wave[c];
+          // Retained tokens do not survive a region row; token threading
+          // changed, so retention rescopes from the regained carried owner.
+          hadWave[c].clear();
+          releasedWave[c].clear();
           if (ou.second && ou.first.has_value()) {
             w.owner = ou.first;
             w.valid = true;
             w.lastRow = n;
             w.pay.assign(1, AsyncOp::NONE);
+            hadWave[c].insert(ownerKey(ou.first));
           } else {
             w.valid = false;
           }
@@ -1881,9 +1944,20 @@ void computeBackingPlan(GroupDag &g, triton::FuncOp funcOp,
 // ---------------------------------------------------------------------------
 static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
   std::map<CompId, Owner> carrier; // tracked comps only
+  std::map<CompId, std::set<int64_t>> retained;
+  auto isRetained = [&](CompId c, const Owner &o) {
+    auto it = retained.find(c);
+    return o.has_value() && it != retained.end() &&
+           it->second.count(ownerKey(o));
+  };
   auto seedFromPieces = [&](Node *n) {
+    std::set<CompId> cleared;
     for (auto &[p, pi] : sortedPieceInfo(n)) {
       CompId c = g.pieceTable.pieceComp[p];
+      if (cleared.insert(c).second)
+        retained[c].clear();
+      if (pi.owner.has_value())
+        retained[c].insert(ownerKey(pi.owner));
       auto it = carrier.find(c);
       if (it == carrier.end())
         carrier.emplace(c, pi.owner);
@@ -1897,15 +1971,18 @@ static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
     switch (n->kind) {
     case Node::Acquire: {
       const Sema &sm = g.semaTable.semas[n->sema];
-      carrier[sm.component] = sm.isEntry && !n->owner ? sm.inheritStamp
-                                                      : n->owner;
+      Owner o = sm.isEntry && !n->owner ? sm.inheritStamp : n->owner;
+      carrier[sm.component] = o;
+      if (o.has_value())
+        retained[sm.component].insert(ownerKey(o));
       break;
     }
     case Node::Release: {
       const Sema &sm = g.semaTable.semas[n->sema];
       auto it = carrier.find(sm.component);
       if (n->owner && it != carrier.end() && it->second &&
-          !sameOwner(it->second, n->owner))
+          !sameOwner(it->second, n->owner) &&
+          !isRetained(sm.component, n->owner))
         return (n->sat && n->sat->op ? n->sat->op : g.root->op)
                    ->emitError("nvws-insert-semas: wave-locality violation: "
                                "release owned by partition ")
@@ -1920,7 +1997,8 @@ static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
         CompId c = compOfMember(g, t.member);
         auto it = carrier.find(c);
         if (it != carrier.end() && it->second &&
-            !sameOwner(it->second, n->owner))
+            !sameOwner(it->second, n->owner) &&
+            !isRetained(c, n->owner))
           return n->op->emitError(
                      "nvws-insert-semas: wave-locality violation: access "
                      "owned by partition ")

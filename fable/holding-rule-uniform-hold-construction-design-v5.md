@@ -493,3 +493,76 @@ Accept v5 iff: the M1 oracle is green corpus-wide against `legacy ∪ the flip m
 easy transparent cases go point-of-use (with a measured moving-parts reduction and
 the §3 verifier green), and M3 lands the region-tail subclass — all runtime gates
 passing. Otherwise v3 stands.
+
+---
+
+## Appendix B. Retained-token redundant-semaphore reduction
+
+This appendix records a post-v5 design amendment. It supersedes the §11 "No token
+retention, no combine, no elision" scope line only for the specific same-owner
+retained-token optimization described here. The uniform hold rule itself remains
+unchanged: this is a SYNC-DAG construction improvement, not a hold-outcome rule.
+
+### B.1 Ownership of the optimization
+
+Redundant semaphore removal belongs in SYNC-DAG construction. If a handoff is
+proved redundant, the builder must not create the edge. No edge means no
+semaphore group, no acquire/release nodes, and nothing for the emitter to delete.
+The emitter must remain a mechanical renderer of the finalized SYNC-DAG.
+
+The professional implementation rule is therefore:
+
+1. Decide redundancy while walking the token game in `InsertSemasSyncDag`.
+2. Encode the result as DAG facts: either the normal handoff edge exists, or the
+   row is allowed to use an owner-retained token.
+3. In `InsertSemasEmitIR`, render those facts only. The emitter may select the
+   retained token/semaphore that the DAG facts name, but it must not synthesize,
+   delete, coalesce, or second-guess semaphores.
+
+### B.2 Eligibility rule
+
+A forced wave handoff from owner `P` back to owner `Q` may be suppressed iff all
+of the following hold:
+
+1. `Q` held the component earlier in the same chain, so a partition-local token
+   for `Q` exists (`hadWave`).
+2. The normal token game requires zero ordering edges for this touch: for a write,
+   every conflicting holder is already transitively synchronized behind `Q`; for
+   a read, `Q` is rereading a version it already holds (`retentionEligible`).
+3. `Q`'s retained token has not already fed a release in the same block
+   (`releasedWave`). This preserves the existing no-use-after-release verifier:
+   no token may materialize a new `semaphore.buffer` after a release that consumes
+   that token.
+4. The retention scope is the current chain only. Region rows clear retention and
+   rescope it from the regained carried owner; retained tokens do not cross a
+   region boundary implicitly.
+
+If any condition fails, the builder keeps the normal forced handoff. This is the
+safe fallback and it is intentionally over-synchronizing rather than unsound.
+
+### B.3 Required verifier and emitter facts
+
+The SYNC verifier must accept an `Access` or `Release` owned by `Q` when `Q` has a
+valid retained token for the component, even if the current carrier owner is a
+different partition. That is not a relaxation of token locality: the retained
+token is still a token acquired by `Q` and consumed by `Q`.
+
+The emitter needs only enough state to render that DAG shape:
+
+- current carrier token and its semaphore per component;
+- owner key for the current carrier;
+- retained `(component, owner) -> {token, semaphore}` facts;
+- owner-keyed view cache, because a buffer view is bound to the token/partition
+  that produced it.
+
+When a retained owner needs a buffer or release, the emitter uses the retained
+token and the semaphore that produced that token. This is mechanical rendering.
+It is not an emitter-side semaphore optimization.
+
+### B.4 Failure policy
+
+If `verifyNoUseAfterRelease`, carrier-locality, or token/view-locality rejects a
+retained-token shape, the fix belongs in SYNC-DAG construction. Do not weaken the
+emitter verifier and do not add an emitter cleanup pass. The correct repair is to
+make the retention proof more conservative so the builder emits the normal
+semaphore whenever the retained token cannot be rendered safely.
