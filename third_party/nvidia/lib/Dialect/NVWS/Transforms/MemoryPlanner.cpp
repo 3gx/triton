@@ -152,6 +152,8 @@ struct LocalBuffer {
   bool isInnermost = false;
   bool isTMA = false;
   bool isCrossStage = false;
+  bool isCircular = false;
+  unsigned circularStart = 0;
   SmemBufferPriority priority = SmemBufferPriority::Lowest;
   Interval<size_t> liveness = Interval<size_t>(0, 0);
 };
@@ -166,6 +168,10 @@ struct ChannelAnnotation {
 static void setI32Attr(Operation *op, StringRef name, int32_t value) {
   op->setAttr(name, IntegerAttr::get(IntegerType::get(op->getContext(), 32),
                                      value));
+}
+
+static void setUnitAttr(Operation *op, StringRef name) {
+  op->setAttr(name, UnitAttr::get(op->getContext()));
 }
 
 static void eraseAttr(Operation *op, StringRef name) {
@@ -1267,6 +1273,7 @@ private:
         }
         buffer.bufferId = it->second;
         buffer.numCopies = numBuffers;
+        buffer.isCircular = true;
       } else {
         buffer.bufferId = nextBufferId++;
         buffer.numCopies = 1;
@@ -1418,24 +1425,60 @@ private:
         candidate.bufferId = owner.bufferId;
         unsigned oldCopies = candidate.numCopies;
         candidate.numCopies = std::max(candidate.numCopies, owner.numCopies);
-        if (computeTotalSmem() <= smemBudget)
+        if (computeTotalSmem() <= smemBudget) {
+          owner.isCircular = true;
+          candidate.isCircular = true;
           continue;
+        }
         candidate.bufferId = oldId;
         candidate.numCopies = oldCopies;
       }
     }
   }
 
+  void assignCircularStarts() {
+    llvm::MapVector<unsigned, SmallVector<LocalBuffer *>> groups;
+    for (auto &bufferPtr : buffers) {
+      LocalBuffer &buffer = *bufferPtr;
+      if (!buffer.isCircular)
+        continue;
+      groups[buffer.bufferId].push_back(&buffer);
+    }
+
+    for (auto &entry : groups) {
+      SmallVector<LocalBuffer *> &group = entry.second;
+      if (group.size() < 2) {
+        group.front()->isCircular = false;
+        group.front()->circularStart = 0;
+        continue;
+      }
+
+      unsigned requiredCopies = static_cast<unsigned>(group.size());
+      for (LocalBuffer *buffer : group)
+        buffer->numCopies = std::max(buffer->numCopies, requiredCopies);
+
+      for (auto [idx, buffer] : llvm::enumerate(group))
+        buffer->circularStart = static_cast<unsigned>(idx);
+    }
+  }
+
   void emitAttrs() {
+    assignCircularStarts();
     for (auto &bufferPtr : buffers) {
       LocalBuffer &buffer = *bufferPtr;
       eraseAttr(buffer.alloc, "buffer.id");
       eraseAttr(buffer.alloc, "buffer.copy");
       eraseAttr(buffer.alloc, "buffer.offset");
+      eraseAttr(buffer.alloc, "buffer.circular");
+      eraseAttr(buffer.alloc, "buffer.start");
       setI32Attr(buffer.alloc, "buffer.id", buffer.bufferId);
       setI32Attr(buffer.alloc, "buffer.copy", buffer.numCopies);
       if (buffer.offset != 0)
         setI32Attr(buffer.alloc, "buffer.offset", buffer.offset);
+      if (buffer.isCircular) {
+        setUnitAttr(buffer.alloc, "buffer.circular");
+        setI32Attr(buffer.alloc, "buffer.start", buffer.circularStart);
+      }
     }
   }
 

@@ -333,3 +333,306 @@ For each blocker, report:
 6. Update LowerSemaphore planned-depth skip.
 7. Add LowerSemaphore preservation tests.
 8. Build, run targeted lit, then rerun `run_nvws.sh`/`run_meta.sh` dumps.
+
+## Chapter 2: circular buffer
+
+Status: DESIGN ONLY extension to Chapter 1.
+
+Design reference: `fable/circular-buffer-disign.md`.
+
+Chapter 1 ports local allocation planning and makes `buffer.copy` authoritative
+for planned local depth. Chapter 2 adds the missing circular-local-reuse
+contract. Without this chapter, two local allocs such as K and V can share one
+physical backing and depth, but NVWS still has no IR fact saying which logical
+channel uses which slot in the circular ring.
+
+### Goal
+
+Support local circular reuse groups without aliasing distinct logical buffers
+into the same physical SMEM slot.
+
+End state:
+
+1. The memory planner marks circular local reuse explicitly with
+   `buffer.circular = true` and `buffer.start`.
+2. `buffer.start` is a stable channel-order seed in the circular group. It is
+   assigned from first-producer program order and is not copied directly into
+   semaphore stage operands.
+3. Circular local members with the same `buffer.id` are independent logical
+   semaphore channels but share one physical SMEM data backing.
+4. InsertSemas builds independent logical semaphore streams for circular
+   members, then folds streams with the same physical `semaphore.id`.
+5. After InsertSemas and before AssignStagePhase, the existing
+   `nvws.semaphore.acquire` / `release` / `buffer` stage operand carries a
+   signed circular offset, e.g. `-1`.
+6. AssignStagePhase consumes that stage operand as an offset, computes the final
+   physical stage modulo `buffer.copy`, and overwrites the stage operand before
+   LowerAref.
+7. `pending_count` is authored and validated before or during InsertSemas
+   folding. After that it is ground truth.
+8. LowerAref remains unchanged for circular stage lowering and sees only final
+   physical stage operands.
+9. `SemaphoreCreateOp::verify()` and LowerAref / lower-semaphore use authored
+   `pending_count` verbatim for folded circular semaphores and do not re-derive
+   it from folded physical IR.
+
+### Metadata contract
+
+For a circular local reuse group, every member alloc has:
+
+```mlir
+buffer.id = N : i32
+buffer.copy = D : i32
+buffer.circular = true
+buffer.start = S : i32
+```
+
+Required invariants:
+
+1. The marker is valid only on `ttg.local_alloc`.
+2. `buffer.copy > 0`.
+3. `0 <= buffer.start < buffer.copy`.
+4. All circular allocs with one `buffer.id` have identical `buffer.copy`.
+5. All circular allocs with one `buffer.id` have identical logical local buffer
+   size. The implementation should enforce identical memdesc type unless a
+   later design adds a local reinterpret/slice contract.
+6. `buffer.start` values in one circular group are distinct.
+7. `buffer.offset` and `buffer.circular` are mutually exclusive.
+
+`buffer.offset` remains the TMEM spatial-packing marker. `buffer.circular` plus
+`buffer.start` is the local/SMEM circular-channel marker.
+
+### C0 - Memory planner emits circular markers
+
+Required work:
+
+1. When SMEM circular reuse chooses a local reuse group, assign the same
+   `buffer.id` and `buffer.copy` to all members.
+2. Add `buffer.circular = true` to those members.
+3. Add stable `buffer.start` values in first-producer program order. For the
+   K/V two-channel case, if K is produced before V, K gets start `0` and V gets
+   start `1`.
+4. Do not add `buffer.offset` to circular local groups.
+5. Assert or diagnose if the group members do not have identical local
+   size/type.
+6. Do not mark non-circular same-`buffer.id` cases as circular. Epilogue
+   liveness fusion and TMEM spatial packing keep their existing metadata.
+
+Exit gate:
+
+- A memory-planner lit test proves the K/V shape has one shared `buffer.id`,
+  shared `buffer.copy`, `buffer.circular = true`, and starts `0/1`.
+- The same test or a paired InsertSemas test proves `buffer.start` matches
+  first-producer program order.
+- A negative or avoidance test proves unequal local sizes are not circularized.
+
+### C1 - InsertSemas models circular members as logical channels
+
+Required work:
+
+1. Validate circular invariants during group construction.
+2. Do not treat same-`buffer.id` circular members as overlapping logical pieces.
+   They are independent logical channels separated by `buffer.start`.
+3. Do not emit one variadic `nvws.semaphore.buffer` for multiple circular
+   members. Current NVWS has one stage operand per buffer op, not one per
+   result.
+4. Emit separate logical acquire/buffer/release rows for circular members.
+5. Materialize one physical local backing for the circular group, with leading
+   depth equal to `buffer.copy`.
+6. Assign fold keys so K/V empty logical semaphores fold to one physical empty
+   semaphore and K/V full logical semaphores fold to one separate physical full
+   semaphore:
+
+   ```text
+   K_empty.semaphore.id = V_empty.semaphore.id = E
+   K_full.semaphore.id  = V_full.semaphore.id  = F
+   E != F
+   ```
+
+7. Compute and author `pending_count` while logical semaphore streams are still
+   distinct.
+8. When folding logical semaphores with the same `semaphore.id`, validate that
+   all logical semaphores for that id have the same authored `pending_count`.
+   The folded `nvws.semaphore.create` receives that value. Do not recompute the
+   folded count from the post-fold physical release stream.
+9. Update `NVWS_SemaphoreAcquireOp` assembly/parser/printer so acquire supports
+   all three forms:
+
+   ```mlir
+   nvws.semaphore.acquire %sem
+   nvws.semaphore.acquire %sem[%stage]
+   nvws.semaphore.acquire %sem[%stage, %phase]
+   ```
+
+   Before AssignStagePhase, circular acquire uses the stage-only form and the
+   stage value is a signed offset. After AssignStagePhase, acquire uses the
+   stage+phase form.
+10. Compute a signed circular offset for each folded semaphore event from the
+   event order, not directly from `buffer.start`.
+11. Author that offset in the existing stage operand on folded
+   `nvws.semaphore.acquire`, `nvws.semaphore.release`, and
+   `nvws.semaphore.buffer` operations. A negative offset such as `-1` is valid
+   in this pre-AssignStagePhase IR.
+12. Validate that first-producer program order matches ascending
+    `buffer.start`; mismatch is malformed circular IR and must not be silently
+    ignored.
+13. Do not add a `stage.offset` attribute.
+14. Preserve `buffer.circular`, `buffer.start`, `buffer.id`, and `buffer.copy`
+   where downstream passes can inspect them.
+
+Exit gate:
+
+- An InsertSemas lit test shows circular K/V as separate logical semaphore
+  rows, not one two-result `nvws.semaphore.buffer`.
+- The same test shows one physical local backing for the circular group.
+- The same test shows folded circular semaphore ops carrying stage operands
+  that are offsets before AssignStagePhase, including the `-1` K-consumer case
+  for `st k; st v; use k; use v`.
+- The same test shows folded `nvws.semaphore.create` carries the authored
+  `pending_count` for its `semaphore.id`.
+- A negative test rejects folding if logical semaphores with the same
+  `semaphore.id` disagree on authored `pending_count`.
+
+### C2 - AssignStagePhase consumes stage operands as offsets
+
+Required work:
+
+1. For circular semaphore groups, read any preexisting semaphore stage operand
+   before overwriting it. In pre-AssignStagePhase circular IR, that value is a
+   signed offset.
+2. Require circular events to author a stage operand, even when the offset is
+   zero, unless the implementation deliberately accepts absence as offset `0`.
+   The stricter verifier is preferred because it catches malformed circular IR.
+3. Keep the existing fresh-write stage update:
+
+   ```text
+   baseStage = state.stage
+   if acquire is a fresh write:
+     baseStage = (baseStage + 1) % depth
+   ```
+
+4. Compute the event stage from the authored offset:
+
+   ```text
+   offset = signed value from acquire.stage before assignment
+   eventStage = positive_mod(baseStage + offset, depth)
+   ```
+
+5. Store `state.stage = baseStage`, not `eventStage`, so the shared circular
+   cursor remains the unshifted producer cursor.
+6. Overwrite `acquire.stage = eventStage`.
+7. Compute acquire phase from `eventStage`, because LowerAref indexes the
+   mbarrier using the final stage operand.
+8. Propagate `eventStage` through the acquire token to corresponding
+   `nvws.semaphore.buffer` and `nvws.semaphore.release` operations.
+9. If a token user already had a preexisting stage operand, verify it matches
+   the acquire event offset before overwriting it with `eventStage`.
+10. Do not maintain separate logical-stage and data-stage operands in this
+    design.
+
+Exit gate:
+
+- An AssignStagePhase lit test starts with circular semaphore ops that already
+  have offset stage operands, including `-1`.
+- The same test proves AssignStagePhase overwrites those operands with final
+  non-negative physical stages modulo depth.
+- The same test proves acquire, buffer, and release for one event receive the
+  same final physical stage.
+- The same test proves phase is computed from the final physical stage.
+
+### C3 - Generic verifier and LowerAref pending-count contract
+
+Required work:
+
+1. No LowerAref semantic change is required for circular local buffer stage
+   lowering.
+2. By the time LowerAref runs, AssignStagePhase has replaced every circular
+   offset stage operand with a final physical stage.
+3. `rewriteAcquire` and `rewriteRelease` already use the final stage for
+   mbarrier wait/arrive.
+4. `rewriteBuffer` already uses the final stage on `nvws.semaphore.buffer` for
+   data `ttg.memdesc_index`.
+5. LowerAref must not see negative circular offsets. If it does, that is an
+   upstream AssignStagePhase verifier failure.
+6. Update `third_party/nvidia/lib/Dialect/NVWS/IR/Ops.cpp` so
+   `SemaphoreCreateOp::verify()` does not exact-rederive `pending_count` from
+   folded physical IR for folded circular semaphores. For this path, authored
+   `pending_count` is ground truth because InsertSemas validated it before
+   folding by `semaphore.id`.
+7. Make the folded-circular predicate concrete in code. The verifier bypass
+   must be gated by a reliable marker, preferably by tracing the semaphore
+   backing to local alloc metadata with `buffer.circular`, and must not apply
+   to ordinary non-circular semaphores.
+8. Update LowerAref / lower-semaphore so it also uses the authored
+   `pending_count` attribute verbatim. Remove or bypass the current exact
+   re-derivation from folded IR in this path.
+9. LowerAref must not infer circular behavior from duplicate operands, inspect
+   `buffer.start`, or implement per-result circular offsets. If a circular
+   group reaches LowerAref as one variadic buffer op that needs per-result
+   offsets, that is an upstream InsertSemas or AssignStagePhase verifier
+   failure.
+
+Required final-stage shape for one K/V depth-2 iteration:
+
+```text
+acq empty[0] ; st k  ; rel full [0]
+acq empty[1] ; st v  ; rel full [1]
+acq full [0] ; use k ; rel empty[0]
+acq full [1] ; use v ; rel empty[1]
+```
+
+Exit gate:
+
+- Source inspection or an existing lowering lit test confirms LowerAref still
+  lowers acquire/release stages to mbarriers and buffer stages to data
+  `ttg.memdesc_index`.
+- A verifier lit test proves `SemaphoreCreateOp::verify()` accepts folded
+  circular IR whose authored `pending_count` was validated before folding and
+  would be overcounted by stage-blind post-fold analysis.
+- A LowerAref/lower-semaphore lit test proves authored `pending_count` is used
+  verbatim for mbarrier initialization and is not rejected by stage-blind
+  reanalysis of folded circular IR.
+- The circular AssignStagePhase lit test is sufficient to prove LowerAref will
+  index K/V into different physical slots without a circular-specific rewrite.
+
+### C4 - End-to-end circular gates
+
+Build first:
+
+```sh
+cd /home/scratch.egaburov_sw/oai-triton/triton-src/triton-solid-01.git/build/cmake.linux-x86_64-cpython-3.12/
+ninja triton triton-opt
+```
+
+Then run targeted lit tests from the build directory:
+
+```sh
+/home/egaburov/work/oai-triton/triton-src/llvm-project.git/build//bin/llvm-lit -v \
+  test/NVWS/MetaAutoWS \
+  test/NVWS/insert_semas*.mlir \
+  test/NVWS/lower_semaphore*.mlir
+```
+
+Then rerun the repro with dumps:
+
+```sh
+MLIR_ENABLE_DUMP=1 sh run_nvws.sh
+```
+
+Required end-to-end result:
+
+- K/V planned circular local reuse carries `buffer.circular` and
+  `buffer.start`.
+- InsertSemas emits separate logical circular channels.
+- InsertSemas folds logical channels by physical `semaphore.id` and authors
+  circular offsets in existing stage operands.
+- InsertSemas validates and authors one `pending_count` per folded
+  `semaphore.id`.
+- AssignStagePhase consumes those operands as offsets and overwrites them with
+  final physical stages.
+- LowerAref remains unchanged and indexes K/V into different physical SMEM
+  slots because AssignStagePhase assigned final physical stages.
+- `SemaphoreCreateOp::verify()` and LowerAref / lower-semaphore use authored
+  `pending_count` without stage-blind reanalysis of the folded circular stream.
+- `run_nvws.sh` does not fail shared-memory OOR and does not alias K/V into the
+  same circular slot.
