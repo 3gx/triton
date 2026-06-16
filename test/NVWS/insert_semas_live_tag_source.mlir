@@ -1,5 +1,4 @@
 // RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas -cse | FileCheck %s
-// RUN: env NVWS_INSERT_SEMA_DUMP_DAG=1 triton-opt %s -allow-unregistered-dialect --nvws-insert-semas -cse 2>&1 >/dev/null | FileCheck %s --check-prefix=DAG
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
@@ -80,28 +79,3 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     tt.return
   }
 }
-
-// DAG-LABEL: GROUP buffer.id=910 memory=local
-// DAG: ACCESS-DAG
-// DAG: |  |  |- W  m0  ttg.local_store {2}
-// DAG: |  |  |  |- R  m0  ttg.local_load {1}
-// DAG: OWNER-DAG
-// DAG: |  |- scf.for (WS, tag=0) pieces{P0:W:{2}}
-// DAG: |  |  |- ENTER pieces{P0:W:{2}}
-// DAG: |  |  |- W  m0  ttg.local_store {2}
-// DAG: |  |  |- scf.for pieces{P0:R:{1}}
-// DAG: |  |  |  |- ENTER pieces{P0:R:{1}}
-// DAG: |  |  |  |- R  m0  ttg.local_load {1}
-// DAG: |  |  |  |- EXIT pieces{P0:R:{1}}
-// DAG: |  |  |- EXIT pieces{P0:W:{2}}
-// DAG: SYNC-DAG
-// DAG: |  |- scf.for (WS, tag=0) pieces{P0:W:{2}} parts{1,2} thread{c0:{2}} holdrule{c0:pointofuse->ttg.local_store}
-// DAG: |  |  |- a  S1  {2}
-// DAG: |  |  |- W m0  ttg.local_store {2}
-// DAG: |  |  |- r  S0  {2} [none]
-// DAG: |  |  |- a  S0  {1}
-// DAG: |  |  |- scf.for pieces{P0:R:{1}} parts{1}
-// DAG: |  |  |  |- R m0  ttg.local_load {1}
-// DAG: |  |  |- r  S1  {1} [none]
-// DAG: |  |  |- EXIT pieces{P0:W:{2}} yield{c0: native}
-// DAG: SEMAS c0: S0{count=1} S1{count=1 entry inherit={@0.2}}

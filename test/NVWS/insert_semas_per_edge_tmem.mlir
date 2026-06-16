@@ -1,25 +1,9 @@
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas -cse | FileCheck %s
-// RUN: env NVWS_INSERT_SEMA_DUMP_DAG=1 triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas -cse 2>&1 >/dev/null | FileCheck %s --check-prefix=DAG
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  // DAG-LABEL: function: @tmem_single_producer_multi_consumer_fanout
-  // DAG: GROUP buffer.id=300 memory=tmem members=1
-  // DAG: SYNC-DAG
-  // DAG: |  |- a  S2(2)  root  ; entry
-  // DAG: |  |  |- W m0  ttng.tmem_store {0}
-  // DAG: |  |  |- r  S0  {0} [none]
-  // DAG: |  |  |- r  S1  {0} [none]
-  // DAG: |  |  |- a  S0  {1}
-  // DAG: |  |  |- R m0  ttng.tmem_load {1}
-  // DAG: |  |  |- r  S2  {1} [none]
-  // DAG: |  |  |- a  S1  {2}
-  // DAG: |  |  |- R m0  ttng.tmem_load {2}
-  // DAG: |  |  |- r  S2  {2} [none]
-  // DAG: |  |  |- a  S2(2)  {0}
-  // DAG: SEMAS c0: S0{count=1} S1{count=1} S2{count=2 entry inherit={@0.0}}
   // CHECK-LABEL: @tmem_single_producer_multi_consumer_fanout
   tt.func @tmem_single_producer_multi_consumer_fanout(%lb: i32, %ub: i32, %step: i32) {
     %c0 = arith.constant 0 : i32
@@ -77,28 +61,6 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 #smem = #ttg.shared_memory
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  // DAG-LABEL: function: @tmem_qk_alpha_pacc_three_member_edges
-  // DAG: GROUP buffer.id=301 memory=tmem members=3
-  // DAG: members: m0[0,128) m1[64,65) m2[0,64)
-  // DAG: pieces: P0=[0,64){m0,m2}c0 P1=[64,65){m0,m1}c0 P2=[65,128){m0}c0
-  // DAG: SYNC-DAG
-  // DAG: |  |- a  S3(2)  root  ; entry
-  // DAG: |  |  |- W m0  ttng.tmem_store {1}
-  // DAG: |  |  |- r  S0  {1} [none]
-  // DAG: |  |  |- r  S2  {1} [none]
-  // DAG: |  |  |- a  S0  {5}
-  // DAG: |  |  |- R m0  ttng.tmem_load {5}
-  // DAG: |  |  |- W m1  ttng.tmem_store {5}
-  // DAG: |  |  |- r  S1  {5} [none]
-  // DAG: |  |  |- a  S1  {0}
-  // DAG: |  |  |- R m1  ttng.tmem_load {0}
-  // DAG: |  |  |- r  S3  {0} [none]
-  // DAG: |  |  |- a  S2  {5}
-  // DAG: |  |  |- W m2  ttng.tmem_alloc {5}
-  // DAG: |  |  |- r  S3  {5} [none]
-  // DAG: |  |  |- a  S3(2)  {1}
-  // DAG: |  |  |- R m2,W m0  ttng.tc_gen5_mma {1}
-  // DAG: SEMAS c0: S0{count=1} S1{count=1} S2{count=1} S3{count=2 entry inherit={@0.1}}
   // CHECK-LABEL: @tmem_qk_alpha_pacc_three_member_edges
   tt.func @tmem_qk_alpha_pacc_three_member_edges(
       %rhs: !ttg.memdesc<128x128xf16, #shared, #smem>,
@@ -261,18 +223,6 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  // DAG-LABEL: function: @tmem_same_owner_reads_close_at_yield
-  // DAG: SYNC-DAG
-  // DAG: holdrule{c0:pointofuse->ttng.tmem_store}
-  // DAG: |  |  |- a  S1  {5}
-  // DAG: |  |  |- W m0  ttng.tmem_store {5}
-  // DAG: |  |  |- r  S0  {5} [none]
-  // DAG: |  |  |- a  S0  {0}
-  // DAG: |  |  |- R m0  ttng.tmem_load {0}
-  // DAG: |  |  |- R m0  ttng.tmem_load {0}
-  // DAG: |  |  |- r  S1  {0} [none]
-  // DAG: yield{c0: native}
-  // DAG: SEMAS c0: S0{count=1} S1{count=1 entry inherit={@8.5}}
   // CHECK-LABEL: @tmem_same_owner_reads_close_at_yield
   tt.func @tmem_same_owner_reads_close_at_yield(%lb: i32, %ub: i32, %step: i32) {
     %c0 = arith.constant 0 : i32

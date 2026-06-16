@@ -1,4 +1,3 @@
-// RUN: env NVWS_INSERT_SEMA_DUMP_DAG=1 triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas -o /dev/null 2>&1 | FileCheck %s
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas -cse | FileCheck %s --check-prefix=EMIT
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas --nvws-lower-semaphore -cse | FileCheck %s --check-prefix=LOWER
 //
@@ -6,8 +5,6 @@
 // pass-produced shape (fable/integrate-pending-count-plan.md): the
 // scaled release carries arrive_count = 2 in emitted IR, and the
 // lowering transcribes both counts into the mbarrier init/arrive.
-// EMIT: nvws.semaphore.create {{.*}} {pending_count = 2 : i32}
-// EMIT: nvws.semaphore.release {{.*}} {arrive_count = 2 : i32, ttg.partition = array<i32: 3>}
 // LOWER: ttng.init_barrier {{.*}}, 2
 // LOWER: ttng.arrive_barrier {{.*}}, 2
 
@@ -31,21 +28,51 @@
 !ty = tensor<1xi32, #blocked>
 
 module attributes {"ttg.num-warps" = 4 : i32} {
-  // CHECK: function: @release_multiplicity_unified_fanin_regain
+  // EMIT-LABEL: @release_multiplicity_unified_fanin_regain
   tt.func @release_multiplicity_unified_fanin_regain(%lb: i32, %ub: i32, %step: i32) {
+    // EMIT: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 700 : i32}
     %alloc = ttg.local_alloc {buffer.id = 700 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+    // EMIT: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] true {pending_count = 1 : i32}
+    // EMIT: [[FULL2:%.*]] = nvws.semaphore.create [[ALLOC]] false {pending_count = 2 : i32}
+    // EMIT: [[S3:%.*]] = nvws.semaphore.create [[ALLOC]] false {pending_count = 1 : i32}
+    // EMIT: [[S4:%.*]] = nvws.semaphore.create [[ALLOC]] false {pending_count = 1 : i32}
+    // EMIT: [[INIT:%.*]] = nvws.semaphore.acquire [[EMPTY]] : {{.*}} -> !ttg.async.token
+    // EMIT: [[OUTER:%.*]] = scf.for {{.*}} iter_args([[CARRY:%.*]] = [[INIT]]) -> (!ttg.async.token)
     scf.for %i = %lb to %ub step %step : i32 {
       %v = "producer"() {ttg.partition = array<i32: 3>} : () -> !ty
+      // EMIT: [[BUF3:%.*]] = nvws.semaphore.buffer [[EMPTY]], [[CARRY]] {ttg.partition = array<i32: 3>}
+      // EMIT: ttg.local_store {{%.*}}, [[BUF3]] {ttg.partition = array<i32: 3>}
+      // EMIT: nvws.semaphore.release [[FULL2]], [[CARRY]] [#nvws.async_op<none>] {arrive_count = 2 : i32, ttg.partition = array<i32: 3>}
       ttg.local_store %v, %alloc {ttg.partition = array<i32: 3>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+      // EMIT: [[ACQ2:%.*]] = nvws.semaphore.acquire [[FULL2]] {ttg.partition = array<i32: 2>} : {{.*}} -> !ttg.async.token
+      // EMIT: [[INNER:%.*]] = scf.for {{.*}} iter_args([[JCARRY:%.*]] = [[ACQ2]]) -> (!ttg.async.token)
       scf.for %j = %lb to %ub step %step : i32 {
+        // EMIT: [[BUF2:%.*]] = nvws.semaphore.buffer [[FULL2]], [[JCARRY]] {ttg.partition = array<i32: 2>}
+        // EMIT: ttg.local_load [[BUF2]] {ttg.partition = array<i32: 2>}
+        // EMIT: nvws.semaphore.release [[S3]], [[JCARRY]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 2>}
         %l2 = ttg.local_load %alloc {ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !ty
         "use2"(%l2) {ttg.partition = array<i32: 2>} : (!ty) -> ()
+        // EMIT: [[ACQ1:%.*]] = nvws.semaphore.acquire [[S3]] {ttg.partition = array<i32: 1>} : {{.*}} -> !ttg.async.token
+        // EMIT: [[BUF1:%.*]] = nvws.semaphore.buffer [[S3]], [[ACQ1]] {ttg.partition = array<i32: 1>}
+        // EMIT: ttg.local_load [[BUF1]] {ttg.partition = array<i32: 1>}
         %l1 = ttg.local_load %alloc {ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !ty
         %c = "correct"(%l1) {ttg.partition = array<i32: 1>} : (!ty) -> !ty
+        // EMIT: ttg.local_store {{%.*}}, [[BUF1]] {ttg.partition = array<i32: 1>}
+        // EMIT: nvws.semaphore.release [[S4]], [[ACQ1]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>}
+        // EMIT: nvws.semaphore.release [[FULL2]], [[ACQ1]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>}
         ttg.local_store %c, %alloc {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+        // EMIT: [[ACQ0:%.*]] = nvws.semaphore.acquire [[S4]] {ttg.partition = array<i32: 0>} : {{.*}} -> !ttg.async.token
+        // EMIT: [[BUF0:%.*]] = nvws.semaphore.buffer [[S4]], [[ACQ0]] {ttg.partition = array<i32: 0>}
+        // EMIT: ttg.local_load [[BUF0]] {ttg.partition = array<i32: 0>}
         %l0 = ttg.local_load %alloc {ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !ty
+        // EMIT: nvws.semaphore.release [[FULL2]], [[ACQ0]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>}
         "use0"(%l0) {ttg.partition = array<i32: 0>} : (!ty) -> ()
+        // EMIT: [[ACQ2B:%.*]] = nvws.semaphore.acquire [[FULL2]] {ttg.partition = array<i32: 2>} : {{.*}} -> !ttg.async.token
+        // EMIT: scf.yield {ttg.partition = array<i32: 0, 1, 2>} [[ACQ2B]]
       } {ttg.partition = array<i32: 0, 1, 2>}
+      // EMIT: nvws.semaphore.release [[EMPTY]], [[INNER]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 2>}
+      // EMIT: [[ACQ3:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 3>} : {{.*}} -> !ttg.async.token
+      // EMIT: scf.yield {ttg.partition = array<i32: 0, 1, 2, 3>} [[ACQ3]]
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2, 3>, ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32}
     tt.return
   }
@@ -61,25 +88,3 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 // hold rule, the outer S3 component remains carrier-bearing: the prefix's
 // release has arrive multiplicity 2, so condition E rejects point-of-use
 // (`rel-count`) to preserve the one-carrier-slot rule.
-// CHECK: SYNC-DAG
-// CHECK: |- a  S3  root  ; entry
-// CHECK-NEXT: |- scf.for {{.*}} holdrule{c0:gated(rel-count)}
-// CHECK-NEXT: |- ENTER
-// CHECK-NEXT: |- W m0  ttg.local_store {3}
-// CHECK-NEXT: |- r  S0(2)  {3} [none]
-// CHECK-NEXT: |- a  S0(2)  {2}
-// CHECK: |- R m0  ttg.local_load {2}
-// CHECK-NEXT: |- r  S1  {2} [none]
-// CHECK-NEXT: |- a  S1  {1}
-// CHECK-NEXT: |- R m0  ttg.local_load {1}
-// CHECK-NEXT: |- W m0  ttg.local_store {1}
-// CHECK-NEXT: |- r  S2  {1} [none]
-// CHECK-NEXT: |- r  S0  {1} [none]
-// CHECK-NEXT: |- a  S2  {0}
-// CHECK-NEXT: |- R m0  ttg.local_load {0}
-// CHECK-NEXT: |- r  S0  {0} [none]
-// CHECK-NEXT: |- a  S0(2)  {2}
-// CHECK: |- r  S3  {2} [none]
-// CHECK-NEXT: |- a  S3  {3}
-// CHECK-NEXT: |- EXIT pieces{P0:W:{3}} yield{c0: a S3}
-// CHECK: SEMAS c0: S0{count=2} S1{count=1} S2{count=1} S3{count=1 entry inherit={@0.3}}

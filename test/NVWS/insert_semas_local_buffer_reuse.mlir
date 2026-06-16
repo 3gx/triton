@@ -111,6 +111,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // (Regression guard: wave locality is scoped per component; the two
   // independent streams must not be cross-serialized.)
   // CHECK-LABEL: @local_non_overlapping_aliased_buffers
+  // No semaphores: non-overlapping aliased buffers never co-own, so nothing is inserted.
+  // CHECK-NOT: nvws.semaphore
   tt.func @local_non_overlapping_aliased_buffers(%lb: i32, %ub: i32, %step: i32) {
     %c0 = arith.constant 0 : i32
     %cst0 = arith.constant dense<0.000000e+00> : tensor<128x128xf16, #blocked>

@@ -1,5 +1,4 @@
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas -cse | FileCheck %s
-// RUN: env NVWS_INSERT_SEMA_DUMP_DAG=1 triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas -cse 2>&1 >/dev/null | FileCheck %s --check-prefix=DAG
 
 // Dedicated mirror of the meta-FA stats group (GROUP buffer.id=4 in
 // insert_semas_meta_fa_fwd: m0[64,65) m1[66,67) m2[65,66) m3[0,128)
@@ -44,42 +43,6 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // other directly - overlap is priced per shared piece.
   //
   // Owners form a ring: slivers W{1}->R{2}, acc W{2}->R{0}, p W{0}->R{1}.
-  // DAG-LABEL: function: @tmem_mixed_overlap_spanning_member
-  // DAG: GROUP buffer.id=520 memory=tmem members=5
-  // DAG: members: m0[64,65) m1[66,67) m2[65,66) m3[0,128) m4[0,64)
-  // DAG: pieces: P0=[0,64){m3,m4}c0 P1=[64,65){m0,m3}c0 P2=[65,66){m2,m3}c0 P3=[66,67){m1,m3}c0 P4=[67,128){m3}c0
-  // DAG: footprints: m0={P1} m1={P3} m2={P2} m3={P0,P1,P2,P3,P4} m4={P0}
-  // DAG: SYNC-DAG
-  // DAG: holdrule{c0:pointofuse->ttng.tmem_store}
-  // DAG: |  |  |- a  S7(2)  {1}
-  // DAG: |  |  |- W m0  ttng.tmem_store {1}
-  // DAG: |  |  |- r  S0  {1} [none]
-  // DAG: |  |  |- a  S0  {2}
-  // DAG: |  |  |- R m0  ttng.tmem_load {2}
-  // DAG: |  |  |- r  S1  {2} [none]
-  // DAG: |  |  |- a  S1  {1}
-  // DAG: |  |  |- W m1  ttng.tmem_store {1}
-  // DAG: |  |  |- r  S2  {1} [none]
-  // DAG: |  |  |- a  S2  {2}
-  // DAG: |  |  |- R m1  ttng.tmem_load {2}
-  // DAG: |  |  |- r  S3  {2} [none]
-  // DAG: |  |  |- a  S3  {1}
-  // DAG: |  |  |- W m2  ttng.tmem_store {1}
-  // DAG: |  |  |- r  S4  {1} [none]
-  // DAG: |  |  |- a  S4  {2}
-  // DAG: |  |  |- R m2  ttng.tmem_load {2}
-  // DAG: |  |  |- W m3  ttng.tmem_store {2}
-  // DAG: |  |  |- r  S5  {2} [none]
-  // DAG: |  |  |- r  S7  {2} [none]
-  // DAG: |  |  |- a  S5  {0}
-  // DAG: |  |  |- R m3  ttng.tmem_load {0}
-  // DAG: |  |  |- r  S7  {0} [none]
-  // DAG: |  |  |- W m4  ttng.tmem_store {0}
-  // DAG: |  |  |- r  S6  {0} [none]
-  // DAG: |  |  |- a  S6  {1}
-  // DAG: |  |  |- R m4  ttng.tmem_load {1}
-  // DAG: |  |  |- EXIT pieces{P0:W:{2},P1:W:{1},P2:W:{1},P3:W:{1},P4:W:{2}} yield{c0: native}
-  // DAG: SEMAS c0: S0{count=1} S1{count=1} S2{count=1} S3{count=1} S4{count=1} S5{count=1} S6{count=1} S7{count=2 entry inherit={@0.1}}
   // CHECK-LABEL: @tmem_mixed_overlap_spanning_member
   tt.func @tmem_mixed_overlap_spanning_member(%lb: i32, %ub: i32, %step: i32) {
     %c0 = arith.constant 0 : i32
@@ -196,42 +159,6 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // pays for its OWN producer->consumer handoff - but the golden diff
   // against function 1 shows exactly what the spanning overlap costs:
   // the cross-member weave, and nothing else.
-  // DAG-LABEL: function: @tmem_disjoint_slivers_cross_partition
-  // DAG: GROUP buffer.id=521 memory=tmem members=4
-  // DAG: members: m0[64,65) m1[66,67) m2[65,66) m3[0,64)
-  // DAG: pieces: P0=[0,64){m3}c0 P1=[64,65){m0}c1 P2=[65,66){m2}c2 P3=[66,67){m1}c3
-  // DAG: SYNC-DAG
-  // DAG: |  |- a  S3  root  ; entry
-  // DAG: holdrule{c0:gated(trailing-use),c1:pointofuse->ttng.tmem_store,c2:pointofuse->ttng.tmem_store,c3:pointofuse->ttng.tmem_store}
-  // DAG: |  |  |- a  S5  {1}
-  // DAG: |  |  |- W m0  ttng.tmem_store {1}
-  // DAG: |  |  |- r  S0  {1} [none]
-  // DAG: |  |  |- a  S0  {2}
-  // DAG: |  |  |- R m0  ttng.tmem_load {2}
-  // DAG: |  |  |- r  S5  {2} [none]
-  // DAG: |  |  |- a  S7  {1}
-  // DAG: |  |  |- W m1  ttng.tmem_store {1}
-  // DAG: |  |  |- r  S1  {1} [none]
-  // DAG: |  |  |- a  S1  {2}
-  // DAG: |  |  |- R m1  ttng.tmem_load {2}
-  // DAG: |  |  |- r  S7  {2} [none]
-  // DAG: |  |  |- a  S6  {1}
-  // DAG: |  |  |- W m2  ttng.tmem_store {1}
-  // DAG: |  |  |- r  S2  {1} [none]
-  // DAG: |  |  |- a  S2  {2}
-  // DAG: |  |  |- R m2  ttng.tmem_load {2}
-  // DAG: |  |  |- r  S6  {2} [none]
-  // DAG: |  |  |- a  S4  {0}
-  // DAG: |  |  |- W m3  ttng.tmem_store {0}
-  // DAG: |  |  |- r  S3  {0} [none]
-  // DAG: |  |  |- a  S3  {1}
-  // DAG: |  |  |- R m3  ttng.tmem_load {1}
-  // DAG: |  |  |- r  S4  {1} [none]
-  // DAG: |  |  |- EXIT pieces{P0:W:{0},P1:W:{1},P2:W:{1},P3:W:{1}} yield{c0: a S3,c1: native,c2: native,c3: native}
-  // DAG: SEMAS c0: S3{count=1 entry inherit={@1.0}} S4{count=1 entry inherit={@1.0}}
-  // DAG: SEMAS c1: S0{count=1} S5{count=1 entry inherit={@1.1}}
-  // DAG: SEMAS c2: S2{count=1} S6{count=1 entry inherit={@1.1}}
-  // DAG: SEMAS c3: S1{count=1} S7{count=1 entry inherit={@1.1}}
   // CHECK-LABEL: @tmem_disjoint_slivers_cross_partition
   tt.func @tmem_disjoint_slivers_cross_partition(%lb: i32, %ub: i32, %step: i32) {
     %c0 = arith.constant 0 : i32
@@ -318,13 +245,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   //
   //       p{0}   alpha{1}   l{1}   m{1}     no edges, no handoffs
   //
-  // DAG-LABEL: function: @tmem_disjoint_slivers_same_owner
-  // DAG: GROUP buffer.id=522 memory=tmem members=4
-  // DAG: pieces: P0=[0,64){m3}c0 P1=[64,65){m0}c1 P2=[65,66){m2}c2 P3=[66,67){m1}c3
-  // DAG: SYNC-DAG
   // Four single-owner components: no acquire/release rows at all.
-  // DAG-NOT: |- a  S
-  // DAG-NOT: |- r  S
   // CHECK-LABEL: @tmem_disjoint_slivers_same_owner
   tt.func @tmem_disjoint_slivers_same_owner(%lb: i32, %ub: i32, %step: i32) {
     %c0 = arith.constant 0 : i32

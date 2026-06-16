@@ -1,9 +1,7 @@
-// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas -cse | FileCheck %s
 
-// Commit 2 (dump-only): no FileCheck of IR is needed — the pass must run
-// cleanly without mutating IR. The OWNERSHIP-DAG / ACCESS-DAG content is
-// audited side-by-side with the matching capture under
-// logs/per-edge-plan/commit2/.
+// The pass inserts ZERO semaphores for every nested-region access pattern
+// below. Each function asserts that no nvws.semaphore op is emitted.
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -15,6 +13,8 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // Access is inside the then-region. Verify outer for and inner if are
   // both annotated in OWNERSHIP-DAG via transitive-event propagation;
   // the "something" arith op contributes no row.
+  // CHECK-LABEL: tt.func @for_outer_if_inner_access
+  // CHECK-NOT: nvws.semaphore
   tt.func @for_outer_if_inner_access(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
     %alloc = ttg.local_alloc {buffer.id = 800 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {
@@ -41,6 +41,8 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // Verify the outer if is annotated transitively, AND its annotation
   // uses tagged display `{@0.X}` because it is anchored outside the WS
   // loop.
+  // CHECK-LABEL: tt.func @if_outer_for_inner_access
+  // CHECK-NOT: nvws.semaphore
   tt.func @if_outer_for_inner_access(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
     %alloc = ttg.local_alloc {buffer.id = 801 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.if %cond {
@@ -66,6 +68,8 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // Access is in the inner if's then-region. Both outer and inner if
   // must be annotated via transitive access; the outer if has no direct
   // event.
+  // CHECK-LABEL: tt.func @if_outer_if_inner_access
+  // CHECK-NOT: nvws.semaphore
   tt.func @if_outer_if_inner_access(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
     %alloc = ttg.local_alloc {buffer.id = 802 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {
@@ -92,6 +96,8 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // Pattern 4: depth-2 for->for nesting. Outer scf.for is WS-tagged,
   // inner scf.for is plain. Access is in the inner body. Verify outer
   // for is annotated transitively via the inner for's annotation.
+  // CHECK-LABEL: tt.func @for_outer_for_inner_access
+  // CHECK-NOT: nvws.semaphore
   tt.func @for_outer_for_inner_access(%lb: i32, %ub: i32, %step: i32) {
     %alloc = ttg.local_alloc {buffer.id = 803 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {
@@ -116,6 +122,8 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // Pattern 5: depth-3 alternating for->if->for, access in the inner
   // for body. Outer scf.for is WS-tagged. Every ancestor on the path
   // (outer for, if, inner for) must be annotated transitively.
+  // CHECK-LABEL: tt.func @triple_for_if_for_access
+  // CHECK-NOT: nvws.semaphore
   tt.func @triple_for_if_for_access(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
     %alloc = ttg.local_alloc {buffer.id = 804 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {
@@ -143,6 +151,8 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // innermost if. The outer if is anchored outside the WS loop and must
   // show tagged display `{@0.X}` on its branches. All three regioned
   // ops on the path must be annotated.
+  // CHECK-LABEL: tt.func @triple_if_for_if_access
+  // CHECK-NOT: nvws.semaphore
   tt.func @triple_if_for_if_access(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
     %alloc = ttg.local_alloc {buffer.id = 805 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.if %cond {
@@ -169,6 +179,8 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // outermost scf.for and access at the leaf. Verifies arbitrary
   // depth: every ancestor on the path is annotated, every sibling
   // empty region (else of each if) is reconciled.
+  // CHECK-LABEL: tt.func @quad_for_if_for_if_access
+  // CHECK-NOT: nvws.semaphore
   tt.func @quad_for_if_for_if_access(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
     %alloc = ttg.local_alloc {buffer.id = 806 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {
@@ -197,6 +209,8 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // WS-tagged scf.for. Only one of the two ifs has access. The other
   // must be absent from the OWNERSHIP-DAG and ACCESS-DAG entirely;
   // the one with access must appear with proper annotation.
+  // CHECK-LABEL: tt.func @sibling_if_only_one_with_access
+  // CHECK-NOT: nvws.semaphore
   tt.func @sibling_if_only_one_with_access(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
     %alloc = ttg.local_alloc {buffer.id = 807 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {
@@ -223,6 +237,8 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // Pattern 9: sibling scf.fors at the same nesting level inside a
   // WS-tagged outer scf.for. Only the first inner for has access. The
   // second inner for must be absent from both DAGs.
+  // CHECK-LABEL: tt.func @sibling_for_only_one_with_access
+  // CHECK-NOT: nvws.semaphore
   tt.func @sibling_for_only_one_with_access(%lb: i32, %ub: i32, %step: i32) {
     %alloc = ttg.local_alloc {buffer.id = 808 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {
