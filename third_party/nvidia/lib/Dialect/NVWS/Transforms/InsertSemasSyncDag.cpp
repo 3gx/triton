@@ -1422,6 +1422,29 @@ static bool isRegionNode(const Node *n) {
   return n && (n->kind == Node::For || n->kind == Node::If);
 }
 
+static bool isAcquireForComp(GroupDag &g, const Node *n, CompId comp) {
+  return n->kind == Node::Acquire &&
+         g.semaTable.semas[n->sema].component == comp;
+}
+
+static bool isReleaseForComp(GroupDag &g, const Node *n, CompId comp) {
+  return n->kind == Node::Release &&
+         g.semaTable.semas[n->sema].component == comp;
+}
+
+static bool isAccessForComp(GroupDag &g, Node *n, CompId comp) {
+  return n->kind == Node::Access && nodeInvolvesComp(g, n, comp);
+}
+
+static bool isRegionCrossingForComp(const Node *n, CompId comp) {
+  return isRegionNode(n) && crossesComp(n, comp);
+}
+
+static bool rowHasCompEvent(GroupDag &g, Node *n, CompId comp) {
+  return isAcquireForComp(g, n, comp) || isReleaseForComp(g, n, comp) ||
+         nodeInvolvesComp(g, n, comp);
+}
+
 static bool regionEntryOwner(GroupDag &g, Node *region, CompId comp,
                              Owner &owner) {
   bool found = false;
@@ -1440,27 +1463,10 @@ static bool regionEntryOwner(GroupDag &g, Node *region, CompId comp,
 }
 
 static bool chainHasCompEvent(GroupDag &g, Node *head, CompId comp) {
-  for (Node *n = head; n; n = n->next) {
-    if (n->kind == Node::Acquire || n->kind == Node::Release) {
-      if (g.semaTable.semas[n->sema].component == comp)
-        return true;
-    } else if (nodeInvolvesComp(g, n, comp)) {
+  for (Node *n = head; n; n = n->next)
+    if (rowHasCompEvent(g, n, comp))
       return true;
-    }
-  }
   return false;
-}
-
-static bool noCompEventAfterFinal(GroupDag &g, Node *final, CompId comp) {
-  for (Node *m = final ? final->next : nullptr; m; m = m->next) {
-    if (m->kind == Node::Acquire || m->kind == Node::Release) {
-      if (g.semaTable.semas[m->sema].component == comp)
-        return false;
-    } else if (nodeInvolvesComp(g, m, comp)) {
-      return false;
-    }
-  }
-  return true;
 }
 
 static Owner returnedOwnerForFinal(GroupDag &g, Node *final, CompId comp,
@@ -1518,7 +1524,7 @@ static bool isHoldTransparentRegion(GroupDag &g, Node *region, CompId comp,
     Node *childFinal = i < rc->finals.size() ? rc->finals[i] : nullptr;
     if (!childFinal && chainHasCompEvent(g, region->children[i], comp))
       return false;
-    if (childFinal && !noCompEventAfterFinal(g, childFinal, comp))
+    if (childFinal && chainHasCompEvent(g, childFinal->next, comp))
       return false;
     Owner returned = returnedOwnerForFinal(g, childFinal, comp, entryOwner);
     if (!sameOwner(returned, holdOwner))
@@ -1562,6 +1568,90 @@ static bool childOwnsCarrier(const Node *region, CompId comp) {
   return false;
 }
 
+static bool hasTrailingCompUse(GroupDag &g, Node *regain, CompId comp) {
+  for (Node *m = regain->next; m; m = m->next)
+    if (isAccessForComp(g, m, comp) || isRegionCrossingForComp(m, comp) ||
+        isReleaseForComp(g, m, comp))
+      return true;
+  return false;
+}
+
+struct HoldFeed {
+  Node *acquire = nullptr;
+  const char *rejectReason = nullptr;
+};
+
+static HoldFeed findHoldFeedAcquire(GroupDag &g, Node *F, CompId comp) {
+  for (Node *cur = F;; cur = cur->parent) {
+    for (Node *m = cur->prev; m; m = m->prev) {
+      if (isAcquireForComp(g, m, comp))
+        return {m, nullptr};
+      if (isAccessForComp(g, m, comp))
+        return {nullptr, "entry-consumed"};
+      if (isRegionCrossingForComp(m, comp))
+        return {nullptr, "region-feed"};
+      if (isReleaseForComp(g, m, comp))
+        return {nullptr, "release-feed"};
+    }
+    if (!cur->parent || !isRegionNode(cur->parent))
+      return {nullptr, "no-entry-acquire"};
+  }
+}
+
+struct HoldPrefix {
+  Node *firstToucher = nullptr;
+  Node *closingRelease = nullptr;
+  SmallVector<Node *, 4> rows;
+  unsigned releases = 0;
+  bool releaseBeforeFirstToucher = false;
+  const char *rejectReason = nullptr;
+};
+
+static HoldPrefix analyzeHoldPrefix(GroupDag &g, Node *F, CompId comp,
+                                    Owner slotOwner, Node *regain,
+                                    bool regionTail) {
+  HoldPrefix p;
+  for (Node *m = F->children[0]; m; m = m->next) {
+    if (regionTail && m == regain)
+      break;
+    if (isAcquireForComp(g, m, comp))
+      break;
+    if (isRegionCrossingForComp(m, comp)) {
+      if (!p.firstToucher) {
+        p.rejectReason = "region-crossing";
+        return p;
+      }
+      if (!isHoldTransparentRegion(g, m, comp, slotOwner)) {
+        p.rejectReason = "region-not-transparent";
+        return p;
+      }
+      p.rows.push_back(m);
+      continue;
+    }
+    if (isAccessForComp(g, m, comp)) {
+      if (!p.firstToucher) {
+        p.firstToucher = m;
+        p.releaseBeforeFirstToucher = p.releases != 0;
+      }
+      p.rows.push_back(m);
+    }
+    if (isReleaseForComp(g, m, comp)) {
+      p.releases += std::max(1u, m->count);
+      if (!p.closingRelease)
+        p.closingRelease = m;
+    }
+  }
+
+  unsigned expectedReleases = regionTail ? 0 : 1;
+  if (!p.firstToucher)
+    p.rejectReason = "no-buf";
+  else if (p.releases != expectedReleases)
+    p.rejectReason = "rel-count";
+  else if (p.releaseBeforeFirstToucher)
+    p.rejectReason = "rel-before-buf";
+  return p;
+}
+
 static Hold buildUniformHold(GroupDag &g, Node *F, const Crossing &c) {
   auto forOp = F->op ? dyn_cast<scf::ForOp>(F->op) : scf::ForOp();
   if (!forOp || !gpu::hasWarpSpecializeTag(outerWSLoop(forOp)))
@@ -1584,123 +1674,41 @@ static Hold buildUniformHold(GroupDag &g, Node *F, const Crossing &c) {
     return carrierHold("region-not-transparent", regain);
   }
 
-  for (Node *m = regain->next; m; m = m->next) {
-    if (m->kind == Node::Access && nodeInvolvesComp(g, m, comp))
-      return carrierHold("trailing-use", regain);
-    if ((m->kind == Node::For || m->kind == Node::If) && crossesComp(m, comp))
-      return carrierHold("trailing-use", regain);
-    if (m->kind == Node::Release &&
-        g.semaTable.semas[m->sema].component == comp)
-      return carrierHold("trailing-use", regain);
-  }
+  if (hasTrailingCompUse(g, regain, comp))
+    return carrierHold("trailing-use", regain);
 
-  Node *feed = nullptr;
-  for (Node *cur = F; !feed; cur = cur->parent) {
-    for (Node *m = cur->prev; m; m = m->prev) {
-      if (m->kind == Node::Acquire &&
-          g.semaTable.semas[m->sema].component == comp) {
-        feed = m;
-        break;
-      }
-      if (m->kind == Node::Access && nodeInvolvesComp(g, m, comp))
-        return carrierHold("entry-consumed", regain);
-      if ((m->kind == Node::For || m->kind == Node::If) && crossesComp(m, comp))
-        return carrierHold("region-feed", regain);
-      if (m->kind == Node::Release &&
-          g.semaTable.semas[m->sema].component == comp)
-        return carrierHold("release-feed", regain);
-    }
-    if (!cur->parent || (cur->parent->kind != Node::For &&
-                         cur->parent->kind != Node::If))
-      break;
-  }
-  if (!feed)
-    return carrierHold("no-entry-acquire", regain);
+  HoldFeed feed = findHoldFeedAcquire(g, F, comp);
+  if (!feed.acquire)
+    return carrierHold(feed.rejectReason, regain);
   std::optional<SemaId> regainSema =
-      regionTail ? returnedSemaForFinal(g, regain, comp, feed->sema)
+      regionTail ? returnedSemaForFinal(g, regain, comp, feed.acquire->sema)
                  : std::optional<SemaId>(regain->sema);
-  if (!regainSema || feed->sema != *regainSema)
+  if (!regainSema || feed.acquire->sema != *regainSema)
     return carrierHold("entry-sema-mismatch", regain);
 
   if (regionResultConsumedAfter(g, F, comp))
     return carrierHold("result-consumed", regain);
 
-  Node *bufRow = nullptr;
-  Node *closingRelease = nullptr;
-  SmallVector<Node *, 4> rows;
-  unsigned rels = 0;
-  bool relBeforeBuf = false;
-  for (Node *m = F->children[0]; m; m = m->next) {
-    if (regionTail && m == regain)
-      break;
-    if (m->kind == Node::Acquire &&
-        g.semaTable.semas[m->sema].component == comp)
-      break;
-    if ((m->kind == Node::For || m->kind == Node::If) && crossesComp(m, comp)) {
-      if (!bufRow)
-        return carrierHold("region-crossing", regain);
-      if (!isHoldTransparentRegion(g, m, comp, c.slotOwner))
-        return carrierHold("region-not-transparent", regain);
-      rows.push_back(m);
-      continue;
-    }
-    if (m->kind == Node::Access && nodeInvolvesComp(g, m, comp)) {
-      if (!bufRow) {
-        bufRow = m;
-        if (rels)
-          relBeforeBuf = true;
-      }
-      rows.push_back(m);
-    }
-    if (m->kind == Node::Release &&
-        g.semaTable.semas[m->sema].component == comp) {
-      rels += std::max(1u, m->count);
-      if (!closingRelease)
-        closingRelease = m;
-    }
-  }
-  if (!regionTail) {
-    if (!bufRow || rels != 1 || relBeforeBuf)
-      return carrierHold(!bufRow      ? "no-buf"
-                         : rels != 1  ? "rel-count"
-                                      : "rel-before-buf",
-                         regain);
-  } else {
-    if (!bufRow || rels != 0 || relBeforeBuf)
-      return carrierHold(!bufRow      ? "no-buf"
-                         : rels != 0  ? "rel-count"
-                                      : "rel-before-buf",
-                         regain);
-  }
-  if (!prefixRowIsSingleBufferView(F, bufRow))
+  HoldPrefix prefix =
+      analyzeHoldPrefix(g, F, comp, c.slotOwner, regain, regionTail);
+  if (prefix.rejectReason)
+    return carrierHold(prefix.rejectReason, regain);
+  if (!prefixRowIsSingleBufferView(F, prefix.firstToucher))
     return carrierHold("prefix-not-buffer-view", regain);
-  return pointOfUseHold(bufRow, feed, closingRelease, regain, std::move(rows),
+  return pointOfUseHold(prefix.firstToucher, feed.acquire,
+                        prefix.closingRelease, regain, std::move(prefix.rows),
                         regionTail);
 }
 
-static std::string holdDescription(const Hold &h) {
-  switch (h.outcome) {
-  case Hold::Outcome::CARRIER:
-    return std::string("gated(") + h.reason + ")";
-  case Hold::Outcome::POINT_OF_USE:
-    return "pointofuse";
-  case Hold::Outcome::CHILD_OWNS:
-    return "passthrough-drop";
-  }
-  llvm_unreachable("unknown hold outcome");
-}
-
-static LogicalResult computeHoldRules(GroupDag &g, Node *head) {
+static void computeHoldRules(GroupDag &g, Node *head) {
   for (Node *n = head; n; n = n->next) {
     for (Node *child : n->children)
       if (child)
-        if (failed(computeHoldRules(g, child)))
-          return failure();
+        computeHoldRules(g, child);
     if (n->kind == Node::For)
       for (Crossing &c : n->crossings)
         c.hold = buildUniformHold(g, n, c);
   }
-  return success();
 }
 
 // Detach a node from its chain, fixing the owning head pointer when the
@@ -2026,21 +2034,23 @@ static LogicalResult verifyPointOfUseTransparency(GroupDag &g, Node *F,
                                                   const Crossing &c) {
   const Hold &h = c.hold;
   Node *pointAcquire = h.regionTail ? h.entryAcquire : h.regain;
+  if (pointAcquire->next != h.firstToucher)
+    return F->op->emitError(
+        "nvws-insert-semas: point-of-use acquire is not adjacent to "
+        "its first buffer use");
   for (Node *m = F->children[0]; m && m != pointAcquire; m = m->next) {
-    if (m->kind == Node::Acquire || m->kind == Node::Release) {
-      if (g.semaTable.semas[m->sema].component == c.comp)
-        return (m->op ? m->op : F->op)
-            ->emitError("nvws-insert-semas: carrier use before "
-                        "point-of-use acquire");
-    } else if (m->kind == Node::Access && nodeInvolvesComp(g, m, c.comp)) {
+    if (isAcquireForComp(g, m, c.comp) || isReleaseForComp(g, m, c.comp))
+      return (m->op ? m->op : F->op)
+          ->emitError("nvws-insert-semas: carrier use before "
+                      "point-of-use acquire");
+    if (isAccessForComp(g, m, c.comp))
       return (m->op ? m->op : F->op)
           ->emitError("nvws-insert-semas: carrier access before "
                       "point-of-use acquire");
-    } else if (isRegionNode(m) && crossesComp(m, c.comp)) {
+    if (isRegionCrossingForComp(m, c.comp))
       return (m->op ? m->op : F->op)
           ->emitError("nvws-insert-semas: carrier region before "
                       "point-of-use acquire");
-    }
   }
 
   auto verifyTransparentRegion = [&](Node *region) -> LogicalResult {
@@ -2055,13 +2065,13 @@ static LogicalResult verifyPointOfUseTransparency(GroupDag &g, Node *F,
     if (row == h.firstToucher)
       sawFirstToucher = true;
     if (row->kind == Node::Access) {
-      if (!nodeInvolvesComp(g, row, c.comp))
+      if (!isAccessForComp(g, row, c.comp))
         return (row->op ? row->op : F->op)
             ->emitError("nvws-insert-semas: point-of-use hold row does not "
                         "touch its component");
       continue;
     }
-    if (isRegionNode(row) && crossesComp(row, c.comp)) {
+    if (isRegionCrossingForComp(row, c.comp)) {
       if (failed(verifyTransparentRegion(row)))
         return failure();
       continue;
@@ -2077,12 +2087,21 @@ static LogicalResult verifyPointOfUseTransparency(GroupDag &g, Node *F,
   if (h.regionTail)
     if (failed(verifyTransparentRegion(h.regain)))
       return failure();
-  if (!h.regionTail && (!h.closingRelease ||
-                        std::max(1u, h.closingRelease->count) != 1))
-    return (h.closingRelease && h.closingRelease->op ? h.closingRelease->op
-                                                     : F->op)
-        ->emitError("nvws-insert-semas: point-of-use hold requires exactly "
-                    "one closing release");
+  if (h.regionTail) {
+    Node *closing = h.regain->next;
+    if (!closing || closing->kind != Node::Release ||
+        g.semaTable.semas[closing->sema].component != c.comp ||
+        closing->sema != h.entryAcquire->sema || closing != h.closingRelease)
+      return F->op->emitError(
+          "nvws-insert-semas: regionTail point-of-use lacks closing "
+          "release after region result");
+  } else if (!h.closingRelease || std::max(1u, h.closingRelease->count) != 1) {
+    Operation *op = h.closingRelease && h.closingRelease->op
+                        ? h.closingRelease->op
+                        : F->op;
+    return op->emitError("nvws-insert-semas: point-of-use hold requires "
+                         "exactly one closing release");
+  }
   return success();
 }
 
@@ -2146,50 +2165,17 @@ static LogicalResult verifySyncDag(GroupDag &g) {
   if (!g.root->children.empty())
     if (failed(verifyHolds(g.root->children[0])))
       return failure();
-  // For native point-of-use crossings, the moved acquire must be the immediate
-  // predecessor of the first buffer user it guards. The SYNC DAG does not encode
-  // which later access will use which emitted semaphore.buffer value, so this
-  // verifier intentionally checks only the lifetime boundary it can prove
-  // exactly: no release can sit between the moved acquire and the first use.
-  std::function<LogicalResult(Node *)> verifyPointOfUsePlacement =
-      [&](Node *head) -> LogicalResult {
-    for (Node *n = head; n; n = n->next) {
-      if (n->kind == Node::For) {
-        for (const Crossing &c : n->crossings) {
-          if (!c.hold.isPointOfUse())
-            continue;
-          Node *acq = c.hold.regionTail ? c.hold.entryAcquire : c.finals[0];
-          if (acq->next != c.hold.firstToucher)
-            return n->op->emitError(
-                "nvws-insert-semas: point-of-use acquire is not adjacent to "
-                "its first buffer use");
-          if (c.hold.regionTail) {
-            Node *tail = c.finals[0];
-            Node *closing = tail ? tail->next : nullptr;
-            if (!closing || closing->kind != Node::Release ||
-                g.semaTable.semas[closing->sema].component != c.comp ||
-                closing->sema != c.hold.entryAcquire->sema ||
-                closing != c.hold.closingRelease)
-              return n->op->emitError(
-                  "nvws-insert-semas: regionTail point-of-use lacks closing "
-                  "release after region result");
-          }
-        }
-      }
-      if (n->kind == Node::For || n->kind == Node::If)
-        for (Node *child : n->children)
-          if (failed(verifyPointOfUsePlacement(child)))
-            return failure();
-    }
-    return success();
-  };
-  if (!g.root->children.empty())
-    if (failed(verifyPointOfUsePlacement(g.root->children[0])))
-      return failure();
   // Per sema: #releases == count; release precedes its sat acquire in the
   // same chain; payloads non-empty.
   SmallVector<unsigned> releaseCount(g.semaTable.semas.size(), 0);
-  std::function<LogicalResult(Node *)> walk = [&](Node *head) -> LogicalResult {
+  // M3 acquirer-class criterion (spec section 5.3): per semaphore, the
+  // acquiring owners contain at most ONE concrete partition; root is
+  // additionally allowed (the carrier-inherit case). Two distinct
+  // partitions are not expressible as one phase-tracked semaphore.
+  SmallVector<std::optional<int64_t>> acqClass(g.semaTable.semas.size(),
+                                               std::nullopt);
+  std::function<LogicalResult(Node *)> verifySemaNodes =
+      [&](Node *head) -> LogicalResult {
     for (Node *n = head; n; n = n->next) {
       if (n->kind == Node::Release) {
         releaseCount[n->sema] += std::max(1u, n->count);
@@ -2210,30 +2196,6 @@ static LogicalResult verifySyncDag(GroupDag &g) {
                 "nvws-insert-semas: release does not precede its acquire");
         }
       }
-      if (n->kind == Node::For || n->kind == Node::If)
-        for (Node *child : n->children)
-          if (failed(walk(child)))
-            return failure();
-    }
-    return success();
-  };
-  if (!g.root->children.empty())
-    if (failed(walk(g.root->children[0])))
-      return failure();
-  for (auto [sid, s] : llvm::enumerate(g.semaTable.semas)) {
-    if (releaseCount[sid] != s.expectedReleases)
-      return g.root->op->emitError("nvws-insert-semas: semaphore ")
-             << s.name << " has " << releaseCount[sid] << " releases, expected "
-             << s.expectedReleases;
-  }
-  // M3 acquirer-class criterion (spec section 5.3): per semaphore, the
-  // acquiring owners contain at most ONE concrete partition; root is
-  // additionally allowed (the carrier-inherit case). Two distinct
-  // partitions are not expressible as one phase-tracked semaphore.
-  SmallVector<std::optional<int64_t>> acqClass(g.semaTable.semas.size(),
-                                               std::nullopt);
-  std::function<LogicalResult(Node *)> m3 = [&](Node *head) -> LogicalResult {
-    for (Node *n = head; n; n = n->next) {
       if (n->kind == Node::Acquire &&
           n->count != g.semaTable.semas[n->sema].count)
         return g.root->op->emitError("nvws-insert-semas: semaphore ")
@@ -2249,14 +2211,20 @@ static LogicalResult verifySyncDag(GroupDag &g) {
       }
       if (n->kind == Node::For || n->kind == Node::If)
         for (Node *child : n->children)
-          if (failed(m3(child)))
+          if (failed(verifySemaNodes(child)))
             return failure();
     }
     return success();
   };
   if (!g.root->children.empty())
-    if (failed(m3(g.root->children[0])))
+    if (failed(verifySemaNodes(g.root->children[0])))
       return failure();
+  for (auto [sid, s] : llvm::enumerate(g.semaTable.semas)) {
+    if (releaseCount[sid] != s.expectedReleases)
+      return g.root->op->emitError("nvws-insert-semas: semaphore ")
+             << s.name << " has " << releaseCount[sid] << " releases, expected "
+             << s.expectedReleases;
+  }
   return success();
 }
 
@@ -2281,8 +2249,7 @@ LogicalResult buildSyncDag(GroupDag &g, triton::FuncOp funcOp,
   if (!g.root->children.empty()) {
     computeCrossings(g, g.root->children[0], numComps);
     pruneDeadIfCrossings(g, g.root->children[0], /*region=*/nullptr);
-    if (failed(computeHoldRules(g, g.root->children[0])))
-      return failure();
+    computeHoldRules(g, g.root->children[0]);
     applyHoldRulePlacement(g, g.root->children[0]); // plan M2: native shape
     computeRequiredParts(g.root->children[0]);
   }
