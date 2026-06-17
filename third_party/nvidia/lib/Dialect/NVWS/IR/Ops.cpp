@@ -310,6 +310,76 @@ void CreateTokenOp::build(::mlir::OpBuilder &builder,
   build(builder, state, resultType, num, loadType);
 }
 
+ParseResult SemaphoreAcquireOp::parse(OpAsmParser &parser,
+                                      OperationState &result) {
+  OpAsmParser::UnresolvedOperand semaphore;
+  OpAsmParser::UnresolvedOperand stage;
+  OpAsmParser::UnresolvedOperand phase;
+  bool hasStage = false;
+  bool hasPhase = false;
+  SemaphoreType semaphoreType;
+  ::mlir::triton::gpu::AsyncTokenType tokenType;
+
+  if (parser.parseOperand(semaphore))
+    return failure();
+  if (succeeded(parser.parseOptionalLSquare())) {
+    hasStage = true;
+    if (parser.parseOperand(stage))
+      return failure();
+    if (succeeded(parser.parseOptionalComma())) {
+      hasPhase = true;
+      if (parser.parseOperand(phase))
+        return failure();
+    }
+    if (parser.parseRSquare())
+      return failure();
+  }
+  if (parser.parseOptionalAttrDict(result.attributes) || parser.parseColon() ||
+      parser.parseCustomTypeWithFallback(semaphoreType) ||
+      parser.parseArrow() || parser.parseCustomTypeWithFallback(tokenType))
+    return failure();
+
+  Builder &builder = parser.getBuilder();
+  if (parser.resolveOperand(semaphore, semaphoreType, result.operands))
+    return failure();
+  Type i32Type = builder.getI32Type();
+  if (hasStage &&
+      parser.resolveOperand(stage, i32Type, result.operands))
+    return failure();
+  if (hasPhase &&
+      parser.resolveOperand(phase, i32Type, result.operands))
+    return failure();
+
+  result.addAttribute("operand_segment_sizes",
+                      builder.getDenseI32ArrayAttr(
+                          {1, hasStage ? 1 : 0, hasPhase ? 1 : 0}));
+  result.addTypes(tokenType);
+  return success();
+}
+
+void SemaphoreAcquireOp::print(OpAsmPrinter &p) {
+  p << " " << getSemaphore();
+  if (getStage()) {
+    p << "[" << getStage();
+    if (getPhase())
+      p << ", " << getPhase();
+    p << "]";
+  }
+  p.printOptionalAttrDict((*this)->getAttrs(), {getOperandSegmentSizesAttrName()});
+  p << " : ";
+  Type semaphoreType = getSemaphore().getType();
+  if (auto validType = dyn_cast<SemaphoreType>(semaphoreType))
+    p.printStrippedAttrOrType(validType);
+  else
+    p << semaphoreType;
+  p << " -> ";
+  Type tokenType = getToken().getType();
+  if (auto validType = dyn_cast<::mlir::triton::gpu::AsyncTokenType>(tokenType))
+    p.printStrippedAttrOrType(validType);
+  else
+    p << tokenType;
+}
+
 void SemaphoreAcquireOp::setStage(Value stage) {
   getStageMutable().assign(stage);
 }

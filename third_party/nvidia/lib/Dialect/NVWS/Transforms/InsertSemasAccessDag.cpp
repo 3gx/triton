@@ -14,11 +14,13 @@ namespace mlir {
 namespace triton {
 namespace nvws_semas {
 
-SmallVector<GroupDag, 0> collectGroups(triton::FuncOp funcOp) {
+FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp) {
   llvm::MapVector<int64_t, SmallVector<Operation *, 2>> tmemBuckets,
       localBuckets;
+  SmallVector<Operation *, 4> circularLocals;
   llvm::DenseSet<int64_t> syntheticIds; // negative keys = synthetic
   int64_t nextSynthetic = -1;
+  LogicalResult result = success();
 
   funcOp.walk([&](Operation *op) {
     if (auto alloc = dyn_cast<nvidia_gpu::TMEMAllocOp>(op)) {
@@ -34,6 +36,31 @@ SmallVector<GroupDag, 0> collectGroups(triton::FuncOp funcOp) {
       if (!type.getMutableMemory())
         return;
       std::optional<int64_t> id = getI64Attr(op, kBufferIdAttrName);
+      if (op->hasAttr(kBufferCircularAttrName)) {
+        if (!id) {
+          result = op->emitError(
+              "nvws-insert-semas: circular local alloc requires buffer.id");
+          return;
+        }
+        if (!op->hasAttr(kBufferCopyAttrName)) {
+          result = op->emitError(
+              "nvws-insert-semas: circular local alloc requires buffer.copy");
+          return;
+        }
+        if (!op->hasAttr(kBufferStartAttrName)) {
+          result = op->emitError(
+              "nvws-insert-semas: circular local alloc requires buffer.start");
+          return;
+        }
+        if (op->hasAttr(kBufferOffsetAttrName)) {
+          result = op->emitError(
+              "nvws-insert-semas: circular local alloc must not carry "
+              "buffer.offset");
+          return;
+        }
+        circularLocals.push_back(op);
+        return;
+      }
       int64_t key = id ? *id : nextSynthetic--;
       if (!id)
         syntheticIds.insert(key);
@@ -41,21 +68,26 @@ SmallVector<GroupDag, 0> collectGroups(triton::FuncOp funcOp) {
       return;
     }
   });
+  if (failed(result))
+    return failure();
 
   SmallVector<GroupDag, 0> groups;
   auto makeGroup = [&](MemKind memory, int64_t id,
-                       ArrayRef<Operation *> allocs) {
+                       ArrayRef<Operation *> allocs, bool circular = false) {
     groups.emplace_back();
     GroupDag &g = groups.back();
     g.groupIdx = static_cast<unsigned>(groups.size() - 1);
     g.bufferId = id;
     g.synthetic = syntheticIds.contains(id);
     g.memory = memory;
+    g.circular = circular;
     for (Operation *allocOp : allocs) {
       Member m;
       m.allocOp = allocOp;
       m.type = cast<gpu::MemDescType>(allocOp->getResult(0).getType());
-      m.offset = getI64Attr(allocOp, kBufferOffsetAttrName).value_or(0);
+      m.circular = circular;
+      m.circularStart = getI64Attr(allocOp, kBufferStartAttrName).value_or(0);
+      m.offset = circular ? 0 : getI64Attr(allocOp, kBufferOffsetAttrName).value_or(0);
       m.extent = memberExtent(memory, m.type);
       MemberId idx = static_cast<MemberId>(g.pieceTable.members.size());
       g.pieceTable.members.push_back(m);
@@ -67,6 +99,9 @@ SmallVector<GroupDag, 0> collectGroups(triton::FuncOp funcOp) {
     makeGroup(MemKind::Tmem, id, allocs);
   for (auto &[id, allocs] : localBuckets)
     makeGroup(MemKind::Local, id, allocs);
+  for (Operation *allocOp : circularLocals)
+    makeGroup(MemKind::Local, *getI64Attr(allocOp, kBufferIdAttrName),
+              ArrayRef<Operation *>(allocOp), /*circular=*/true);
   return groups;
 }
 

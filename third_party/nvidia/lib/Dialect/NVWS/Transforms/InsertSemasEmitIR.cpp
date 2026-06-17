@@ -35,6 +35,7 @@ struct RenderState {
                                             // acquire (buffer ops pair the
                                             // token with ITS semaphore)
   DenseMap<MemberId, Value> view;           // member view cache
+  DenseMap<MemberId, nvws::SemaphoreBufferOp> viewBuffer;
   DenseMap<int64_t, gpu::StageCluster> stageCache; // ownerKey -> stage/cluster
 };
 
@@ -267,8 +268,9 @@ static LogicalResult emitBackingsAndCreates(EmitCtx &ctx, GroupDag &g) {
       backing = alloc.getResult();
     }
     // Preserve buffer.* attrs verbatim (contract A).
-    SmallVector<StringRef, 3> attrNames{kBufferIdAttrName,
-                                        kBufferOffsetAttrName, "buffer.copy"};
+    SmallVector<StringRef, 5> attrNames{
+        kBufferIdAttrName, kBufferOffsetAttrName, kBufferCopyAttrName,
+        kBufferCircularAttrName, kBufferStartAttrName};
     for (StringRef name : attrNames)
       if (Attribute a = m.allocOp->getAttr(name))
         backing.getDefiningOp()->setAttr(name, a);
@@ -589,11 +591,13 @@ static unsigned slotIndexFor(EmitCtx &ctx, Operation *op, GroupDag *g,
 // Materialize (or fetch) the view of `member`, replaying the access's alias
 // chain (mining gap 4 rules).
 static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs,
-                     const Touch &t, Operation *accessOp, const Owner &owner) {
+                     const Touch &t, Operation *accessOp, const Owner &owner,
+                     nvws::SemaphoreBufferOp &usedBuffer) {
   auto it = rs.view.find(t.member);
   Value base;
   if (it != rs.view.end()) {
     base = it->second;
+    usedBuffer = rs.viewBuffer.lookup(t.member);
   } else {
     // One buffer op yields all member views at once.
     OpBuilder b(accessOp);
@@ -624,7 +628,11 @@ static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs,
     for (auto [mi, v] : llvm::enumerate(buf.getBuffers()))
       if (compOfMember(g, static_cast<MemberId>(mi)) == comp)
         rs.view[static_cast<MemberId>(mi)] = v;
+    for (auto [mi, v] : llvm::enumerate(buf.getBuffers()))
+      if (compOfMember(g, static_cast<MemberId>(mi)) == comp)
+        rs.viewBuffer[static_cast<MemberId>(mi)] = buf;
     base = rs.view[t.member];
+    usedBuffer = buf;
   }
   // Replay the alias chain (old emitter :763-788): skip memdesc_index
   // steps already folded into the view type; clone with mapping; force the
@@ -663,10 +671,15 @@ static LogicalResult renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
                                   RenderState &rs, Operation *&anchor) {
   Operation *op = n->op;
   anchor = op;
+  n->emittedOp = op;
   if (n->owner)
     rs.stageCache[ownerKey(n->owner)] = gpu::getStageCluster(op);
   for (const Touch &t : n->touches) {
-    Value view = getView(ctx, g, rs, t, op, n->owner);
+    nvws::SemaphoreBufferOp bufferOp;
+    Value view = getView(ctx, g, rs, t, op, n->owner, bufferOp);
+    if (bufferOp && !llvm::is_contained(n->emittedBuffers,
+                                        bufferOp.getOperation()))
+      n->emittedBuffers.push_back(bufferOp.getOperation());
     // Sourceful allocs become an explicit store into the view (contract D).
     if (auto ta = dyn_cast<nvidia_gpu::TMEMAllocOp>(op)) {
       OpBuilder b(op);
@@ -677,6 +690,7 @@ static LogicalResult renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
       anchor = emitInto<nvidia_gpu::TMEMStoreOp>(b, op->getLoc(), n->owner,
                                                  pidsc.second, Type(), view,
                                                  Value(), ta.getSrc(), vTrue);
+      n->emittedOp = anchor;
       // RAUW dominated uses, excluding creates and the new store.
       ta.getResult().replaceUsesWithIf(view, [&](OpOperand &use) {
         return !isa<nvws::SemaphoreCreateOp>(use.getOwner()) &&
@@ -703,6 +717,7 @@ static LogicalResult renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
       anchor = emitInto<gpu::LocalStoreOp>(b, op->getLoc(), n->owner,
                                            gpu::getStageCluster(op), src,
                                            view);
+      n->emittedOp = anchor;
       la.getResult().replaceUsesWithIf(view, [&](OpOperand &use) {
         return !isa<nvws::SemaphoreCreateOp>(use.getOwner()) &&
                !g.accessRowOps.contains(use.getOwner());
@@ -758,6 +773,7 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
   if (auto forOp = dyn_cast<scf::ForOp>(n->op)) {
     RenderState body = rs; // stage cache flows in; views do not
     body.view.clear();
+    body.viewBuffer.clear();
     for (const Crossing &c : n->crossings) {
       if (!c.hold.materializesCarrier()) {
         // Native point-of-use (plan M2): no incoming carrier — the moved
@@ -790,6 +806,7 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
     // it, loop.stage/cluster are meaningless and must not be stamped
     // (oracle fact, m2/m3 outside-loop releases).
     rs.view.clear();
+    rs.viewBuffer.clear();
     return success();
   }
 
@@ -797,6 +814,8 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
   RenderState thenSt = rs, elseSt = rs;
   thenSt.view.clear();
   elseSt.view.clear();
+  thenSt.viewBuffer.clear();
+  elseSt.viewBuffer.clear();
   if (failed(renderChain(ctx, g, n->children[0], thenSt, emitted)))
     return failure();
   if (n->children.size() > 1 && n->children[1])
@@ -821,6 +840,7 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
   for (auto &[k, v] : elseSt.stageCache)
     rs.stageCache.try_emplace(k, v);
   rs.view.clear();
+  rs.viewBuffer.clear();
   return success();
 }
 
@@ -839,6 +859,7 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
         rs.carrier[comp] = v;
         rs.carrierSema[comp] = g.semaTable.semas[n->sema].create;
         rs.view.clear();
+        rs.viewBuffer.clear();
         break;
       }
       Operation *before = nextRealOp(n->next);
@@ -867,9 +888,11 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
           stageFor(rs, n->owner, stageAnchor),
           g.semaTable.semas[n->sema].create, ctx.tokenType);
       emitted[n] = acq.getToken();
+      n->emittedOp = acq;
       rs.carrier[comp] = acq.getToken();
       rs.carrierSema[comp] = g.semaTable.semas[n->sema].create;
       rs.view.clear();
+      rs.viewBuffer.clear();
       lastReal = acq;
       break;
     }
@@ -892,6 +915,7 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
       // the lowering passes it to the mbarrier arrive.
       rel.setArriveCountAttr(b.getI32IntegerAttr(n->count));
       emitted[n] = Value();
+      n->emittedOp = rel;
       lastReal = rel;
       break;
     }
@@ -979,6 +1003,265 @@ static void coalesceBackings(GroupDag &g) {
     alloc->erase();
     g.backingPlan.backing[i] = repl;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Circular local post-render fold.
+// ---------------------------------------------------------------------------
+static int64_t circularDepth(GroupDag &g) {
+  return g.backingPlan.numStages;
+}
+
+static LogicalResult validateCircularSet(ArrayRef<GroupDag *> set) {
+  if (set.empty())
+    return success();
+  gpu::MemDescType type = set.front()->pieceTable.members.front().type;
+  int64_t depth = circularDepth(*set.front());
+  DenseSet<int64_t> starts;
+  for (GroupDag *g : set) {
+    if (!g->isLocal() || !g->isCircular() ||
+        g->pieceTable.members.size() != 1)
+      return g->root->op->emitError(
+          "nvws-insert-semas: malformed circular local logical group");
+    const Member &m = g->pieceTable.members.front();
+    if (m.type != type)
+      return m.allocOp->emitError(
+          "nvws-insert-semas: circular local group has mismatched member "
+          "types");
+    if (circularDepth(*g) != depth)
+      return m.allocOp->emitError(
+          "nvws-insert-semas: circular local group has mismatched depth");
+    if (m.circularStart < 0 || m.circularStart >= depth)
+      return m.allocOp->emitError(
+          "nvws-insert-semas: circular buffer.start is outside buffer.copy");
+    if (!starts.insert(m.circularStart).second)
+      return m.allocOp->emitError(
+          "nvws-insert-semas: duplicate circular buffer.start in one group");
+  }
+  return success();
+}
+
+static Effect accessEffectForMember(const Node *n, MemberId member) {
+  Effect effect = Effect::R;
+  for (const Touch &t : n->touches)
+    if (t.member == member)
+      effect = joinEffect(effect, t.effect);
+  return effect;
+}
+
+static Node *nextAccessWithOffset(Node *n, const DenseMap<Node *, int64_t> &m) {
+  for (Node *cur = n->next; cur; cur = cur->next)
+    if (cur->kind == Node::Access && m.contains(cur))
+      return cur;
+  return nullptr;
+}
+
+static Node *prevAccessWithOffset(Node *n, const DenseMap<Node *, int64_t> &m) {
+  for (Node *cur = n->prev; cur; cur = cur->prev)
+    if (cur->kind == Node::Access && m.contains(cur))
+      return cur;
+  return nullptr;
+}
+
+static Value materializeI32Before(Operation *op, int64_t value) {
+  OpBuilder b(op);
+  auto cst = emitInto<arith::ConstantOp>(b, op->getLoc(), resolveOwner(op),
+                                         gpu::getStageCluster(op),
+                                         b.getI32IntegerAttr(value));
+  return cst.getResult();
+}
+
+static void setSemaphoreStage(Operation *op, Value stage) {
+  if (auto acq = dyn_cast<nvws::SemaphoreAcquireOp>(op)) {
+    acq.setStage(stage);
+    return;
+  }
+  if (auto rel = dyn_cast<nvws::SemaphoreReleaseOp>(op)) {
+    rel.setStage(stage);
+    return;
+  }
+  auto buf = cast<nvws::SemaphoreBufferOp>(op);
+  buf.setStage(stage);
+}
+
+static LogicalResult assignCircularOffsets(EmitCtx &ctx,
+                                           ArrayRef<GroupDag *> set) {
+  struct Event {
+    GroupDag *group;
+    Node *node;
+  };
+  DenseMap<Operation *, SmallVector<Event, 1>> eventsByOp;
+  for (GroupDag *g : set)
+    forEachNode(*g, [&](Node *n) {
+      if (n->kind != Node::Access)
+        return;
+      Operation *anchor = n->emittedOp ? n->emittedOp : n->op;
+      if (!anchor)
+        return;
+      eventsByOp[anchor].push_back(Event{g, n});
+    });
+
+  SmallVector<Event, 8> ordered;
+  ctx.func.walk([&](Operation *op) {
+    auto it = eventsByOp.find(op);
+    if (it == eventsByOp.end())
+      return;
+    for (Event e : it->second)
+      ordered.push_back(e);
+  });
+  if (ordered.empty())
+    return success();
+
+  int64_t depth = circularDepth(*set.front());
+  int64_t currentOrdinal = -1;
+  DenseMap<GroupDag *, int64_t> lastProducedOrdinal;
+  DenseMap<Node *, int64_t> offsetByAccess;
+  for (Event event : ordered) {
+    const Member &m = event.group->pieceTable.members.front();
+    Effect effect = accessEffectForMember(event.node, 0);
+    if (effect == Effect::W) {
+      ++currentOrdinal;
+      int64_t expectedStart = currentOrdinal % depth;
+      if (m.circularStart != expectedStart)
+        return m.allocOp->emitError(
+                   "nvws-insert-semas: circular producer order does not "
+                   "match buffer.start; expected ")
+               << expectedStart << ", got " << m.circularStart;
+      lastProducedOrdinal[event.group] = currentOrdinal;
+      offsetByAccess[event.node] = 0;
+      continue;
+    }
+    auto it = lastProducedOrdinal.find(event.group);
+    if (it == lastProducedOrdinal.end())
+      return m.allocOp->emitError(
+          "nvws-insert-semas: circular consumer appears before producer");
+    offsetByAccess[event.node] = it->second - currentOrdinal;
+  }
+
+  DenseMap<Operation *, int64_t> opOffset;
+  auto setOpOffset = [&](Operation *op, int64_t offset) -> LogicalResult {
+    auto it = opOffset.find(op);
+    if (it != opOffset.end()) {
+      if (it->second != offset)
+        return op->emitError(
+            "nvws-insert-semas: conflicting circular offsets for one "
+            "semaphore op");
+      return success();
+    }
+    opOffset[op] = offset;
+    return success();
+  };
+
+  auto assignNodeOffsets = [&](GroupDag *g) -> LogicalResult {
+    LogicalResult result = success();
+    forEachNode(*g, [&](Node *n) {
+      if (failed(result))
+        return;
+      if (n->kind == Node::Acquire) {
+        if (Node *access = nextAccessWithOffset(n, offsetByAccess))
+          result = setOpOffset(n->emittedOp, offsetByAccess.lookup(access));
+        return;
+      }
+      if (n->kind == Node::Release) {
+        if (Node *access = prevAccessWithOffset(n, offsetByAccess))
+          result = setOpOffset(n->emittedOp, offsetByAccess.lookup(access));
+        return;
+      }
+      if (n->kind == Node::Access) {
+        auto it = offsetByAccess.find(n);
+        if (it == offsetByAccess.end())
+          return;
+        for (Operation *bufferOp : n->emittedBuffers)
+          if (succeeded(result))
+            result = setOpOffset(bufferOp, it->second);
+      }
+    });
+    return result;
+  };
+
+  for (GroupDag *g : set) {
+    if (failed(assignNodeOffsets(g)))
+      return failure();
+  }
+
+  for (auto [op, offset] : opOffset) {
+    if (!op)
+      continue;
+    setSemaphoreStage(op, materializeI32Before(op, offset));
+  }
+  return success();
+}
+
+static LogicalResult foldCircularBackingsAndCreates(ArrayRef<GroupDag *> set) {
+  if (set.size() < 2)
+    return success();
+  GroupDag *baseGroup = set.front();
+  for (GroupDag *g : set)
+    if (g->pieceTable.members.front().circularStart == 0) {
+      baseGroup = g;
+      break;
+    }
+  Value base = baseGroup->backingPlan.backing.front();
+  for (GroupDag *g : set) {
+    Value backing = g->backingPlan.backing.front();
+    if (backing == base)
+      continue;
+    if (backing.getType() != base.getType())
+      return backing.getDefiningOp()->emitError(
+          "nvws-insert-semas: circular logical backing type mismatch");
+    backing.replaceAllUsesWith(base);
+    g->backingPlan.backing.front() = base;
+    if (Operation *op = backing.getDefiningOp())
+      if (op->use_empty())
+        op->erase();
+  }
+
+  nvws::SemaphoreCreateOp primaryReleased;
+  nvws::SemaphoreCreateOp primaryUnreleased;
+  for (GroupDag *g : set) {
+    for (Sema &s : g->semaTable.semas) {
+      auto create = s.create.getDefiningOp<nvws::SemaphoreCreateOp>();
+      if (!create)
+        continue;
+      bool isReleased = create.getIsReleased();
+      nvws::SemaphoreCreateOp &primary =
+          isReleased ? primaryReleased : primaryUnreleased;
+      if (!primary) {
+        primary = create;
+        continue;
+      }
+      auto lhs = primary.getPendingCountAttr();
+      auto rhs = create.getPendingCountAttr();
+      if (!lhs || !rhs || lhs.getInt() != rhs.getInt())
+        return create.emitError(
+            "nvws-insert-semas: circular folded semaphores disagree on "
+            "pending_count");
+      create.getResult().replaceAllUsesWith(primary.getResult());
+      s.create = primary.getResult();
+      if (create->use_empty())
+        create.erase();
+    }
+  }
+  return success();
+}
+
+static LogicalResult foldCircularGroups(EmitCtx &ctx,
+                                        MutableArrayRef<GroupDag> groups) {
+  llvm::MapVector<int64_t, SmallVector<GroupDag *, 4>> byBufferId;
+  for (GroupDag &g : groups)
+    if (g.isCircular() && !g.semaTable.semas.empty())
+      byBufferId[g.bufferId].push_back(&g);
+
+  for (auto &[id, set] : byBufferId) {
+    (void)id;
+    if (failed(validateCircularSet(set)))
+      return failure();
+    if (failed(assignCircularOffsets(ctx, set)))
+      return failure();
+    if (failed(foldCircularBackingsAndCreates(set)))
+      return failure();
+  }
+  return success();
 }
 
 // ---------------------------------------------------------------------------
@@ -1527,6 +1810,9 @@ static LogicalResult verifySingleCarrierPerGroup(triton::FuncOp funcOp) {
       if (!create || create.getBuffers().empty())
         continue;
       Value backing = create.getBuffers().front();
+      if (auto alloc = backing.getDefiningOp<gpu::LocalAllocOp>())
+        if (alloc->hasAttr(kBufferCircularAttrName))
+          continue;
       if (++slotsPerBacking[backing] > 1) {
         forOp.emitError(
             "nvws-insert-semas: two carrier token slots for one semaphore "
@@ -1593,6 +1879,8 @@ LogicalResult emitIR(triton::FuncOp funcOp,
     if (failed(renderChain(ctx, g, g.root->children[0], rs, emitted)))
       return failure();
   }
+  if (failed(foldCircularGroups(ctx, groups)))
+    return failure();
   // Step 6.
   for (GroupDag &g : groups)
     coalesceBackings(g);

@@ -168,6 +168,7 @@ struct Node {
   enum Kind { Func, For, If, Enter, Exit, Access, Acquire, Release };
   Kind kind = Access;
   Operation *op = nullptr;     // For/If/Access anchor; null otherwise
+  Operation *emittedOp = nullptr; // emitted protocol/access anchor, if any
   Node *parent = nullptr;
   Node *prev = nullptr, *next = nullptr;
   SmallVector<Node *, 2> children; // For: body head; If: then head[, else head]
@@ -182,6 +183,8 @@ struct Node {
                                     // a UNION after dedupe merges (emitted
                                     // as the release's async_ops array)
   Node *sat = nullptr;             // Release -> the ONE Acquire it satisfies
+  SmallVector<Operation *, 2> emittedBuffers; // semaphore.buffer ops used by
+                                              // this access row
   SmallVector<Crossing, 1> crossings; // For/If only (stage 3): carrier
                                       // slots crossing this region
   SmallVector<int, 2> requiredParts;  // For/If only (stage 3): sorted union
@@ -211,6 +214,8 @@ struct Member {
                       // local = leading dim of the memdesc shape (the memory
                       // planner's offset unit — corpus-proven: 128x128xf16
                       // members at offsets 0/64 overlap, 0/256 do not).
+  bool circular = false;
+  int64_t circularStart = 0;
 };
 
 struct Piece { // cut-point interval (spec section 3 item 2)
@@ -273,6 +278,7 @@ struct GroupDag {
   int64_t bufferId = 0;   // buffer.id attr value, or synthetic (negative)
   bool synthetic = false; // no buffer.id attr on the alloc
   MemKind memory = MemKind::Tmem;
+  bool circular = false;
   PieceTable pieceTable;
   // Alias map: tracked memdesc SSA value -> (member, view chain from the
   // member's alloc). Lookup-only (never iterated for output).
@@ -292,6 +298,8 @@ struct GroupDag {
   BackingPlan backingPlan;
 
   bool isTmem() const { return memory == MemKind::Tmem; }
+  bool isLocal() const { return memory == MemKind::Local; }
+  bool isCircular() const { return circular; }
   Node *newNode(Node::Kind k, Operation *op, Node *parent) {
     nodes.push_back(std::make_unique<Node>());
     Node *n = nodes.back().get();
@@ -308,6 +316,9 @@ struct GroupDag {
 // ---------------------------------------------------------------------------
 inline constexpr StringLiteral kBufferIdAttrName = "buffer.id";
 inline constexpr StringLiteral kBufferOffsetAttrName = "buffer.offset";
+inline constexpr StringLiteral kBufferCopyAttrName = "buffer.copy";
+inline constexpr StringLiteral kBufferCircularAttrName = "buffer.circular";
+inline constexpr StringLiteral kBufferStartAttrName = "buffer.start";
 
 inline std::optional<int64_t> getI64Attr(Operation *op, StringRef name) {
   if (auto attr = op->getAttrOfType<IntegerAttr>(name))

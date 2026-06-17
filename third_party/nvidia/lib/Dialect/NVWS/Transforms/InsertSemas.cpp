@@ -67,7 +67,10 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner) {
     return success();
 
   // Stage 1: discovery + pieces + access events + region effect summaries.
-  SmallVector<GroupDag, 0> groups = collectGroups(funcOp);
+  FailureOr<SmallVector<GroupDag, 0>> groupsOr = collectGroups(funcOp);
+  if (failed(groupsOr))
+    return failure();
+  SmallVector<GroupDag, 0> groups = std::move(*groupsOr);
   for (GroupDag &g : groups)
     if (failed(buildAccessDag(g, funcOp)))
       return failure();

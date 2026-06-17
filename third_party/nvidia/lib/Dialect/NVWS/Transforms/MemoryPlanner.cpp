@@ -1273,7 +1273,7 @@ private:
         }
         buffer.bufferId = it->second;
         buffer.numCopies = numBuffers;
-        buffer.isCircular = true;
+        buffer.isCircular = smemCircularReuse;
       } else {
         buffer.bufferId = nextBufferId++;
         buffer.numCopies = 1;

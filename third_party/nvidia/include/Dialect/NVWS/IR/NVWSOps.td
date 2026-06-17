@@ -70,10 +70,7 @@ def NVWS_SemaphoreAcquireOp : NVWS_Op<"semaphore.acquire", [
                        Optional<I32>:$stage,
                        Optional<I32>:$phase);
   let results = (outs TTG_AsyncToken:$token);
-  let assemblyFormat = [{
-    $semaphore (`[` $stage^ `,` $phase `]`)? attr-dict
-    `:` type($semaphore) `->` type($token)
-  }];
+  let hasCustomAssemblyFormat = 1;
   let builders = [
     OpBuilder<(ins "Value":$semaphore, "Type":$tokenType), [{
       build($_builder, $_state, tokenType, semaphore, Value(), Value());

@@ -17,7 +17,7 @@ namespace mlir {
 namespace triton {
 namespace nvws_semas {
 
-SmallVector<GroupDag, 0> collectGroups(triton::FuncOp funcOp);
+FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp);
 
 LogicalResult buildAccessDag(GroupDag &g, triton::FuncOp funcOp);
 
