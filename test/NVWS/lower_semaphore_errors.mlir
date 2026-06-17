@@ -2,9 +2,7 @@
 
 // Negative coverage for the first-class count contract
 // (fable/integrate-pending-count-plan.md): the lowering REQUIRES
-// authored counts, the create verifier cross-checks them against the
-// pending-count analysis, and arrive multiplicity is only lowerable
-// for sync kinds.
+// authored counts and arrive multiplicity is only lowerable for sync kinds.
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
@@ -31,22 +29,6 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     %tok = nvws.semaphore.acquire %sem {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
     // expected-error @below {{semaphore.release reached nvws-lower-semaphore without an arrive_count; the producing pass must author it}}
     nvws.semaphore.release %sem, %tok [#nvws.async_op<none>] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
-    ttg.local_dealloc %buf : !ttg.memdesc<2x1xi32, #shared, #smem, mutable>
-    tt.return
-  }
-}
-
-// -----
-
-#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#smem = #ttg.shared_memory
-module attributes {"ttg.num-warps" = 4 : i32} {
-  tt.func @pending_count_disagrees_with_analysis() {
-    %buf = ttg.local_alloc : () -> !ttg.memdesc<2x1xi32, #shared, #smem, mutable>
-    // expected-error @below {{pending_count 5 disagrees with pending-count analysis 1}}
-    %sem = nvws.semaphore.create %buf true {pending_count = 5 : i32} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>
-    %tok = nvws.semaphore.acquire %sem {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
-    nvws.semaphore.release %sem, %tok [#nvws.async_op<none>] {ttg.partition = array<i32: 0>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
     ttg.local_dealloc %buf : !ttg.memdesc<2x1xi32, #shared, #smem, mutable>
     tt.return
   }

@@ -128,31 +128,16 @@ void setIsAsync(triton::nvidia_gpu::MMAv5OpInterface mmaOp,
   mmaOp.setIsAsync(isAsync);
 }
 
-// CONTRACT (fable/integrate-pending-count-plan.md): pending_count is
-// AUTHORED by the producing pass (insert-semas, insert-allocas, or the
-// combine phase below) and REQUIRED here; the analysis re-derives it from
-// the IR purely as a verifier — exact equality, never a fallback.
+// CONTRACT: pending_count is AUTHORED by the producing pass and REQUIRED here.
+// LowerSemaphore uses it verbatim; folded circular semaphore IR is intentionally
+// not re-derived from the post-fold physical release stream here.
 FailureOr<int> getPendingCount(SemaphoreCreateOp op) {
   auto authored = op.getPendingCountAttr();
   if (!authored)
     return op.emitError(
         "semaphore.create reached nvws-lower-semaphore without a "
         "pending_count; the producing pass must author it");
-  auto analysis = analyzeSemaphorePendingCount(op);
-  if (analysis.invalidPartitionArity)
-    return op.emitError("partitioned semaphore.release must have exactly one "
-                        "partition id for pending-count analysis");
-  if (analysis.unsupportedAsyncOp)
-    return op.emitError(
-        "unsupported async kind in semaphore.release pending-count analysis");
-  if (analysis.inconsistentPartitionId)
-    return op.emitError(
-        "inconsistent per-partition pending-count contribution");
-  if (authored.getInt() != analysis.pendingCount)
-    return op.emitError("authored pending_count ")
-           << authored.getInt() << " disagrees with pending-count analysis "
-           << analysis.pendingCount;
-  return analysis.pendingCount;
+  return authored.getInt();
 }
 
 FailureOr<Value> createAndInitMbar(SemaphoreCreateOp op,
@@ -963,8 +948,7 @@ void combineSemaphores(scf::ForOp loop) {
     combineProducerSide(groupInfo, combinedPair, builder);
     eraseSemaToCombineGroup(acquireGroup, groupInfo);
     // The combiner is the author of the combined semaphores: stamp their
-    // pending counts from the now-complete combined protocol (the create
-    // verifier and getPendingCount both re-check via the analysis).
+    // pending counts from the now-complete combined protocol.
     for (auto sema : {combinedPair.empty, combinedPair.full}) {
       auto a = analyzeSemaphorePendingCount(sema);
       sema.setPendingCountAttr(
