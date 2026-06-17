@@ -1579,8 +1579,10 @@ for HEAD_DIM in [128]:  #64, 128]:
                     x_names=["N_CTX"],
                     x_vals=[2**i for i in range(10, 17)],  #0, 15)],
                     line_arg="provider",
-                    line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
-                    line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
+                    #line_vals=["triton-fp8"] + (["flash"] if HAS_FLASH else []),
+                    #line_names=["Triton [FP8]"] + (["Flash-2"] if HAS_FLASH else []),
+                    line_vals=["triton-fp16", "triton-fp8"],
+                    line_names=["Triton [FP16]", "triton-fp8"],
                     styles=[("red", "-"), ("blue", "-"), ("green", "-")],
                     ylabel="TFLOPS",
                     plot_name=f"fused-attention-{baseVariant}-{mode}-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
@@ -1638,7 +1640,7 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider
 if __name__ == "__main__":
     if is_blackwell():
         print("Test op...")
-        test_op(Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="fwd", baseVariant="ws_persistent", provider="triton-fp16", SUBTILING=True, VECT_MUL=1, FADD2_REDUCE=False, bwd_config_idx=0)
+        test_op(Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="fwd", baseVariant="ws_persistent", provider="triton-fp8", SUBTILING=True, VECT_MUL=1, FADD2_REDUCE=False, bwd_config_idx=0)
         print("Running benchmarks...")
         bench_flash_attention.run(print_data=True)
     else:
