@@ -1154,6 +1154,10 @@ struct AssignStagePhase {
           if (matchPattern(offset, m_ConstantInt(&constant)) &&
               constant.isZero())
             return baseStage;
+          if (matchPattern(offset, m_ConstantInt(&constant)))
+            offset = createIntoStage(arith::ConstantIntOp{},
+                                     constant.getSExtValue(),
+                                     constant.getBitWidth());
           auto rawStage = createIntoStage(arith::AddIOp{}, baseStage, offset);
           auto depth = createIntoStage(arith::ConstantIntOp{}, getDepth(), 32);
           auto remStage = createIntoStage(arith::RemSIOp{}, rawStage, depth);
@@ -1247,6 +1251,10 @@ struct AssignStagePhase {
           if (matchPattern(offset, m_ConstantInt(&constant)) &&
               constant.isZero())
             return baseStage;
+          if (matchPattern(offset, m_ConstantInt(&constant)))
+            offset = createIntoStage(arith::ConstantIntOp{},
+                                     constant.getSExtValue(),
+                                     constant.getBitWidth());
           auto rawStage = createIntoStage(arith::AddIOp{}, baseStage, offset);
           auto depth = createIntoStage(arith::ConstantIntOp{}, getDepth(), 32);
           auto remStage = createIntoStage(arith::RemSIOp{}, rawStage, depth);

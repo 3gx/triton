@@ -115,6 +115,7 @@ void AutomaticWarpSpecialization::runOnOperation() {
   if (useMetaPartitioner) {
     NVWSMemoryPlannerOptions memoryPlannerOptions;
     memoryPlannerOptions.numBuffers = numStages;
+    memoryPlannerOptions.smemCircularReuse = true;
     addPassWithPartitionVerifier(createNVWSMemoryPlanner(memoryPlannerOptions));
   }
   NVWSInsertSemasOptions insertSemasOptions;

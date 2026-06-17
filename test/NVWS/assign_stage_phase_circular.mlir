@@ -48,15 +48,16 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       nvws.semaphore.release %full[%z_v], %tv [#nvws.async_op<none>] {arrive_count = 1 : i32, loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
 
       %m1_k = arith.constant {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} -1 : i32
-      // CHECK: [[K_M1:%.*]] = arith.constant {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} -1 : i32
-      // CHECK: [[K_ACQ_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_M1]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 3>} : i32
+      // CHECK: [[K_ACQ_M1:%.*]] = arith.constant {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 3>} -1 : i32
+      // CHECK: [[K_ACQ_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_ACQ_M1]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 3>} : i32
       // CHECK: [[K_ACQ_REM:%.*]] = arith.remsi [[K_ACQ_RAW]], [[K_DEPTH]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 3>} : i32
       // CHECK: [[K_ACQ_NEG:%.*]] = arith.cmpi slt, [[K_ACQ_REM]], [[K_ZERO]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 3>} : i32
       // CHECK: [[K_ACQ_WRAP:%.*]] = arith.addi [[K_ACQ_REM]], [[K_DEPTH]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 3>} : i32
       // CHECK: [[K_ACQ_STAGE:%.*]] = arith.select [[K_ACQ_NEG]], [[K_ACQ_WRAP]], [[K_ACQ_REM]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 3>} : i32
       // CHECK: [[K_FULL_PHASE:%.*]] = arith.andi {{%.*}}, {{%.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : i32
       // CHECK: [[K_FULL_TOK:%.*]] = nvws.semaphore.acquire [[FULL]][[[K_ACQ_STAGE]], [[K_FULL_PHASE]]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
-      // CHECK: [[K_BUF_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_M1]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[K_BUF_M1:%.*]] = arith.constant {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} -1 : i32
+      // CHECK: [[K_BUF_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_BUF_M1]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : i32
       // CHECK: [[K_BUF_DEPTH:%.*]] = arith.constant {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} 2 : i32
       // CHECK: [[K_BUF_REM:%.*]] = arith.remsi [[K_BUF_RAW]], [[K_BUF_DEPTH]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : i32
       // CHECK: [[K_BUF_ZERO:%.*]] = arith.constant {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} 0 : i32
@@ -129,15 +130,16 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       nvws.semaphore.release %full[%z0], %tv [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
 
       %m1 = arith.constant {ttg.partition = array<i32: 2>} -1 : i32
-      // CHECK: [[K_M1:%.*]] = arith.constant {ttg.partition = array<i32: 2>} -1 : i32
-      // CHECK: [[K_ACQ_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_M1]] {ttg.partition = array<i32: 1, 2>} : i32
+      // CHECK: [[K_ACQ_M1:%.*]] = arith.constant {ttg.partition = array<i32: 1, 2>} -1 : i32
+      // CHECK: [[K_ACQ_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_ACQ_M1]] {ttg.partition = array<i32: 1, 2>} : i32
       // CHECK: [[K_ACQ_REM:%.*]] = arith.remsi [[K_ACQ_RAW]], [[K_DEPTH]] {ttg.partition = array<i32: 1, 2>} : i32
       // CHECK: [[K_ACQ_NEG:%.*]] = arith.cmpi slt, [[K_ACQ_REM]], [[K_ZERO]] {ttg.partition = array<i32: 1, 2>} : i32
       // CHECK: [[K_ACQ_WRAP:%.*]] = arith.addi [[K_ACQ_REM]], [[K_DEPTH]] {ttg.partition = array<i32: 1, 2>} : i32
       // CHECK: [[K_ACQ_STAGE:%.*]] = arith.select [[K_ACQ_NEG]], [[K_ACQ_WRAP]], [[K_ACQ_REM]] {ttg.partition = array<i32: 1, 2>} : i32
       // CHECK: [[K_FULL_PHASE:%.*]] = arith.andi {{%.*}}, {{%.*}} {ttg.partition = array<i32: 2>} : i32
       // CHECK: [[K_FULL_TOK:%.*]] = nvws.semaphore.acquire [[FULL]][[[K_ACQ_STAGE]], [[K_FULL_PHASE]]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
-      // CHECK: [[K_BUF_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_M1]] {ttg.partition = array<i32: 2>} : i32
+      // CHECK: [[K_BUF_M1:%.*]] = arith.constant {ttg.partition = array<i32: 2>} -1 : i32
+      // CHECK: [[K_BUF_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_BUF_M1]] {ttg.partition = array<i32: 2>} : i32
       // CHECK: [[K_BUF_DEPTH:%.*]] = arith.constant {ttg.partition = array<i32: 2>} 2 : i32
       // CHECK: [[K_BUF_REM:%.*]] = arith.remsi [[K_BUF_RAW]], [[K_BUF_DEPTH]] {ttg.partition = array<i32: 2>} : i32
       // CHECK: [[K_BUF_ZERO:%.*]] = arith.constant {ttg.partition = array<i32: 2>} 0 : i32
@@ -211,15 +213,16 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       nvws.semaphore.release %full[%z_v], %tv [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
 
       %m1 = arith.constant {ttg.partition = array<i32: 3>} -1 : i32
-      // CHECK: [[K_M1:%.*]] = arith.constant {ttg.partition = array<i32: 3>} -1 : i32
-      // CHECK: [[K_ACQ_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_M1]] {ttg.partition = array<i32: 1, 2, 3, 4>} : i32
+      // CHECK: [[K_ACQ_M1:%.*]] = arith.constant {ttg.partition = array<i32: 1, 2, 3, 4>} -1 : i32
+      // CHECK: [[K_ACQ_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_ACQ_M1]] {ttg.partition = array<i32: 1, 2, 3, 4>} : i32
       // CHECK: [[K_ACQ_REM:%.*]] = arith.remsi [[K_ACQ_RAW]], [[K_DEPTH]] {ttg.partition = array<i32: 1, 2, 3, 4>} : i32
       // CHECK: [[K_ACQ_NEG:%.*]] = arith.cmpi slt, [[K_ACQ_REM]], [[K_ZERO]] {ttg.partition = array<i32: 1, 2, 3, 4>} : i32
       // CHECK: [[K_ACQ_WRAP:%.*]] = arith.addi [[K_ACQ_REM]], [[K_DEPTH]] {ttg.partition = array<i32: 1, 2, 3, 4>} : i32
       // CHECK: [[K_ACQ_STAGE:%.*]] = arith.select [[K_ACQ_NEG]], [[K_ACQ_WRAP]], [[K_ACQ_REM]] {ttg.partition = array<i32: 1, 2, 3, 4>} : i32
       // CHECK: [[K_FULL_PHASE:%.*]] = arith.andi {{%.*}}, {{%.*}} {ttg.partition = array<i32: 3>} : i32
       // CHECK: [[K_FULL_TOK:%.*]] = nvws.semaphore.acquire [[FULL]][[[K_ACQ_STAGE]], [[K_FULL_PHASE]]] {ttg.partition = array<i32: 3>} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
-      // CHECK: [[K_BUF_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_M1]] {ttg.partition = array<i32: 3>} : i32
+      // CHECK: [[K_BUF_M1:%.*]] = arith.constant {ttg.partition = array<i32: 3>} -1 : i32
+      // CHECK: [[K_BUF_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_BUF_M1]] {ttg.partition = array<i32: 3>} : i32
       // CHECK: [[K_BUF_DEPTH:%.*]] = arith.constant {ttg.partition = array<i32: 3>} 2 : i32
       // CHECK: [[K_BUF_REM:%.*]] = arith.remsi [[K_BUF_RAW]], [[K_BUF_DEPTH]] {ttg.partition = array<i32: 3>} : i32
       // CHECK: [[K_BUF_ZERO:%.*]] = arith.constant {ttg.partition = array<i32: 3>} 0 : i32
@@ -292,15 +295,16 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       nvws.semaphore.release %full[%z0], %tv [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
 
       %m1 = arith.constant {ttg.partition = array<i32: 2>} -1 : i32
-      // CHECK: [[K_M1:%.*]] = arith.constant {ttg.partition = array<i32: 2>} -1 : i32
-      // CHECK: [[K_ACQ_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_M1]] {ttg.partition = array<i32: 1, 2, 3>} : i32
+      // CHECK: [[K_ACQ_M1:%.*]] = arith.constant {ttg.partition = array<i32: 1, 2, 3>} -1 : i32
+      // CHECK: [[K_ACQ_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_ACQ_M1]] {ttg.partition = array<i32: 1, 2, 3>} : i32
       // CHECK: [[K_ACQ_REM:%.*]] = arith.remsi [[K_ACQ_RAW]], [[K_DEPTH]] {ttg.partition = array<i32: 1, 2, 3>} : i32
       // CHECK: [[K_ACQ_NEG:%.*]] = arith.cmpi slt, [[K_ACQ_REM]], [[K_ZERO]] {ttg.partition = array<i32: 1, 2, 3>} : i32
       // CHECK: [[K_ACQ_WRAP:%.*]] = arith.addi [[K_ACQ_REM]], [[K_DEPTH]] {ttg.partition = array<i32: 1, 2, 3>} : i32
       // CHECK: [[K_ACQ_STAGE:%.*]] = arith.select [[K_ACQ_NEG]], [[K_ACQ_WRAP]], [[K_ACQ_REM]] {ttg.partition = array<i32: 1, 2, 3>} : i32
       // CHECK: [[K_FULL_PHASE:%.*]] = arith.andi {{%.*}}, {{%.*}} {ttg.partition = array<i32: 2>} : i32
       // CHECK: [[K_FULL_TOK:%.*]] = nvws.semaphore.acquire [[FULL]][[[K_ACQ_STAGE]], [[K_FULL_PHASE]]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
-      // CHECK: [[K_BUF_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_M1]] {ttg.partition = array<i32: 2>} : i32
+      // CHECK: [[K_BUF_M1:%.*]] = arith.constant {ttg.partition = array<i32: 2>} -1 : i32
+      // CHECK: [[K_BUF_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_BUF_M1]] {ttg.partition = array<i32: 2>} : i32
       // CHECK: [[K_BUF_DEPTH:%.*]] = arith.constant {ttg.partition = array<i32: 2>} 2 : i32
       // CHECK: [[K_BUF_REM:%.*]] = arith.remsi [[K_BUF_RAW]], [[K_BUF_DEPTH]] {ttg.partition = array<i32: 2>} : i32
       // CHECK: [[K_BUF_ZERO:%.*]] = arith.constant {ttg.partition = array<i32: 2>} 0 : i32
@@ -374,15 +378,16 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       nvws.semaphore.release %full[%z_v], %tv [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
 
       %m1 = arith.constant {ttg.partition = array<i32: 3>} -1 : i32
-      // CHECK: [[K_M1:%.*]] = arith.constant {ttg.partition = array<i32: 3>} -1 : i32
-      // CHECK: [[K_ACQ_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_M1]] {ttg.partition = array<i32: 1, 2, 3>} : i32
+      // CHECK: [[K_ACQ_M1:%.*]] = arith.constant {ttg.partition = array<i32: 1, 2, 3>} -1 : i32
+      // CHECK: [[K_ACQ_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_ACQ_M1]] {ttg.partition = array<i32: 1, 2, 3>} : i32
       // CHECK: [[K_ACQ_REM:%.*]] = arith.remsi [[K_ACQ_RAW]], [[K_DEPTH]] {ttg.partition = array<i32: 1, 2, 3>} : i32
       // CHECK: [[K_ACQ_NEG:%.*]] = arith.cmpi slt, [[K_ACQ_REM]], [[K_ZERO]] {ttg.partition = array<i32: 1, 2, 3>} : i32
       // CHECK: [[K_ACQ_WRAP:%.*]] = arith.addi [[K_ACQ_REM]], [[K_DEPTH]] {ttg.partition = array<i32: 1, 2, 3>} : i32
       // CHECK: [[K_ACQ_STAGE:%.*]] = arith.select [[K_ACQ_NEG]], [[K_ACQ_WRAP]], [[K_ACQ_REM]] {ttg.partition = array<i32: 1, 2, 3>} : i32
       // CHECK: [[K_FULL_PHASE:%.*]] = arith.andi {{%.*}}, {{%.*}} {ttg.partition = array<i32: 3>} : i32
       // CHECK: [[K_FULL_TOK:%.*]] = nvws.semaphore.acquire [[FULL]][[[K_ACQ_STAGE]], [[K_FULL_PHASE]]] {ttg.partition = array<i32: 3>} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
-      // CHECK: [[K_BUF_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_M1]] {ttg.partition = array<i32: 3>} : i32
+      // CHECK: [[K_BUF_M1:%.*]] = arith.constant {ttg.partition = array<i32: 3>} -1 : i32
+      // CHECK: [[K_BUF_RAW:%.*]] = arith.addi [[V_STAGE]], [[K_BUF_M1]] {ttg.partition = array<i32: 3>} : i32
       // CHECK: [[K_BUF_DEPTH:%.*]] = arith.constant {ttg.partition = array<i32: 3>} 2 : i32
       // CHECK: [[K_BUF_REM:%.*]] = arith.remsi [[K_BUF_RAW]], [[K_BUF_DEPTH]] {ttg.partition = array<i32: 3>} : i32
       // CHECK: [[K_BUF_ZERO:%.*]] = arith.constant {ttg.partition = array<i32: 3>} 0 : i32
