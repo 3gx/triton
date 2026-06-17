@@ -2,7 +2,6 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/TypeRange.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
-#include "nvidia/include/Dialect/NVWS/IR/SemaphorePendingCount.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
@@ -147,34 +146,6 @@ LogicalResult SemaphoreCreateOp::verify() {
 
     if (failed(verifyNoDuplicateAsyncOps(releaseOp, releaseOp.getAsyncOps())))
       return failure();
-  }
-
-  auto pendingCountAnalysis = analyzeSemaphorePendingCount(*this);
-  if (pendingCountAnalysis.invalidPartitionArity) {
-    return emitError("partitioned semaphore.release must have exactly one "
-                     "partition id for pending-count analysis, got ")
-           << pendingCountAnalysis.invalidPartitionArity.value();
-  }
-  if (pendingCountAnalysis.unsupportedAsyncOp) {
-    return emitError(
-               "unsupported async kind in semaphore.release for pending-count "
-               "analysis: ")
-           << static_cast<int>(pendingCountAnalysis.unsupportedAsyncOp.value());
-  }
-  if (pendingCountAnalysis.inconsistentPartitionId) {
-    return emitError("inconsistent pending-count contribution for partition ")
-           << pendingCountAnalysis.inconsistentPartitionId.value()
-           << ": expected " << pendingCountAnalysis.expectedContribution
-           << ", got " << pendingCountAnalysis.actualContribution;
-  }
-  // First-class pending count (authored by the producing pass) must agree
-  // exactly with the analysis — the analysis folds arrive_count in, so any
-  // disagreement is authored-metadata corruption, never a convention gap.
-  if (auto authored = getPendingCountAttr()) {
-    if (authored.getInt() != pendingCountAnalysis.pendingCount)
-      return emitError("pending_count ") << authored.getInt()
-             << " disagrees with pending-count analysis "
-             << pendingCountAnalysis.pendingCount;
   }
 
   return success();
