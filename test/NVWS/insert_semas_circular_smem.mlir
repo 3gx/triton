@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas -cse | FileCheck %s
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas -cse | FileCheck %s --check-prefix=COUNT
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked2d = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [1, 4], order = [1, 0]}>
@@ -11,6 +12,12 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @circular_model_descriptor_load_mma
+  // COUNT-LABEL: @circular_model_descriptor_load_mma
+  // COUNT-COUNT-1: ttg.local_alloc
+  // COUNT-NOT: ttg.local_alloc
+  // COUNT-COUNT-2: nvws.semaphore.create
+  // COUNT-NOT: ttg.local_alloc
+  // COUNT-NOT: nvws.semaphore.create
   // CHECK: [[BASE:%.*]] = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 300 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
   // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] true {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
   // CHECK: [[FULL:%.*]] = nvws.semaphore.create [[BASE]] false {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
@@ -68,6 +75,12 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @circular_tutorial_1_1_to_2_2
+  // COUNT-LABEL: @circular_tutorial_1_1_to_2_2
+  // COUNT-COUNT-1: ttg.local_alloc
+  // COUNT-NOT: ttg.local_alloc
+  // COUNT-COUNT-2: nvws.semaphore.create
+  // COUNT-NOT: ttg.local_alloc
+  // COUNT-NOT: nvws.semaphore.create
   // CHECK: [[BASE:%.*]] = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 301 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
   // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] true {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
   // CHECK: [[FULL:%.*]] = nvws.semaphore.create [[BASE]] false {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
@@ -120,6 +133,12 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @circular_tutorial_1_2_to_3_4
+  // COUNT-LABEL: @circular_tutorial_1_2_to_3_4
+  // COUNT-COUNT-1: ttg.local_alloc
+  // COUNT-NOT: ttg.local_alloc
+  // COUNT-COUNT-2: nvws.semaphore.create
+  // COUNT-NOT: ttg.local_alloc
+  // COUNT-NOT: nvws.semaphore.create
   // CHECK: [[BASE:%.*]] = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 302 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
   // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] true {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
   // CHECK: [[FULL:%.*]] = nvws.semaphore.create [[BASE]] false {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
@@ -173,6 +192,12 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @circular_tutorial_1_1_to_2_3
+  // COUNT-LABEL: @circular_tutorial_1_1_to_2_3
+  // COUNT-COUNT-1: ttg.local_alloc
+  // COUNT-NOT: ttg.local_alloc
+  // COUNT-COUNT-2: nvws.semaphore.create
+  // COUNT-NOT: ttg.local_alloc
+  // COUNT-NOT: nvws.semaphore.create
   // CHECK: [[BASE:%.*]] = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 303 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
   // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] true {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
   // CHECK: [[FULL:%.*]] = nvws.semaphore.create [[BASE]] false {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
@@ -225,6 +250,12 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @circular_tutorial_1_2_to_3_3
+  // COUNT-LABEL: @circular_tutorial_1_2_to_3_3
+  // COUNT-COUNT-1: ttg.local_alloc
+  // COUNT-NOT: ttg.local_alloc
+  // COUNT-COUNT-2: nvws.semaphore.create
+  // COUNT-NOT: ttg.local_alloc
+  // COUNT-NOT: nvws.semaphore.create
   // CHECK: [[BASE:%.*]] = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 304 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
   // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] true {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
   // CHECK: [[FULL:%.*]] = nvws.semaphore.create [[BASE]] false {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
