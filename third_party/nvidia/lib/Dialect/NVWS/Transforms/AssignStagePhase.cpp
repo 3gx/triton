@@ -87,6 +87,8 @@ struct AssignStagePhase {
   SetVector<int> allGroupPartitionIds;  // all partition IDs across all acquires
   DenseMap<Value, Value> initialPhases; // initial phase by semaphore
   DenseMap<std::pair<Operation *, Value>, int> tokToStagePosMap;
+  DenseMap<Value, Value> tokenLogicalStage;
+  bool authoredStageOffsets = false;
 
   int getDepth() const {
     assert(!groupSemaphores.empty());
@@ -95,6 +97,19 @@ struct AssignStagePhase {
   }
 
   // --- Single-phase eligibility analysis ------------------------------------
+
+  bool computeAuthoredStageOffsets() const {
+    for (Value sema : groupSemaphores) {
+      for (Operation *user : sema.getDefiningOp()->getUsers()) {
+        auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user);
+        if (acquireOp && acquireOp.getStage() && !acquireOp.getPhase())
+          return true;
+      }
+    }
+    return false;
+  }
+
+  bool hasAuthoredStageOffsets() const { return authoredStageOffsets; }
 
   // Recursively walks the warp-specialized loop and simulates one iteration of
   // the release/acquire ring.
@@ -174,6 +189,12 @@ struct AssignStagePhase {
     if (getDepth() == 1)
       return true;
 
+    // A preexisting stage operand is an authored offset. Keep the first
+    // implementation conservative: use multiphase instead of trying to prove
+    // single-phase eligibility over shifted virtual stages.
+    if (hasAuthoredStageOffsets())
+      return false;
+
     // Find the first group acquire inside a warp-specialized loop.
     scf::ForOp wsLoop;
     for (Value sema : groupSemaphores) {
@@ -225,6 +246,7 @@ struct AssignStagePhase {
         SetVector<int>(sortedPartitionIds.begin(), sortedPartitionIds.end());
     if (allGroupPartitionIds.empty())
       allGroupPartitionIds.insert(0);
+    authoredStageOffsets = computeAuthoredStageOffsets();
   }
 
   unsigned getSemaphoreOrder(Value semaphore) const {
@@ -467,6 +489,52 @@ struct AssignStagePhase {
           return releaseOp;
     return {};
   }
+
+  Value getSemaphore(Operation *op) const {
+    if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(op))
+      return acquireOp.getSemaphore();
+    if (auto bufferOp = dyn_cast<SemaphoreBufferOp>(op))
+      return bufferOp.getSemaphore();
+    if (auto releaseOp = dyn_cast<SemaphoreReleaseOp>(op))
+      return releaseOp.getSemaphore();
+    return {};
+  }
+
+  SemaphoreStageInterface getAuthoredStageOp(Operation *op) const {
+    if (!hasAuthoredStageOffsets())
+      return {};
+    if (isa<SemaphoreAcquireOp>(op))
+      return {};
+    auto stageOp = dyn_cast<SemaphoreStageInterface>(op);
+    if (!stageOp || !stageOp.getStage())
+      return {};
+    Value sema = getSemaphore(op);
+    if (!sema || !groupSemaphores.contains(sema))
+      return {};
+    return stageOp;
+  }
+
+  void widenStageBlockArgUse(SemaphoreStageInterface stageOp, Value stage) {
+    auto blk = dyn_cast<BlockArgument>(stage);
+    if (!blk)
+      return;
+
+    assert(hasPartition(stageOp));
+    auto stageOpIds = getPartitionIds(stageOp);
+    auto forOp = cast<scf::ForOp>(blk.getOwner()->getParentOp());
+    auto pos = findValuePosInRange(forOp.getRegionIterArgs(), stage);
+    assert(pos);
+
+    assert(hasPartition(forOp));
+    auto forOpIds = getPartitionIds(forOp);
+    forOpIds.insert(stageOpIds.begin(), stageOpIds.end());
+    setPartition(forOp, forOpIds);
+
+    auto forOpOutputsIds = getPartitionOutputs(forOp);
+    forOpOutputsIds[*pos].insert(stageOpIds.begin(), stageOpIds.end());
+    setPartitionOutputs(forOp, forOpOutputsIds);
+  }
+
   // --- Access classification -----------------------------------------------
 
   std::optional<AccessKind>
@@ -1081,10 +1149,26 @@ struct AssignStagePhase {
           return createInto(phasePids, opTy,
                             std::forward<decltype(args)>(args)...);
         };
+        auto applyStageOffset = [&](Value baseStage, Value offset) -> Value {
+          APInt constant;
+          if (matchPattern(offset, m_ConstantInt(&constant)) &&
+              constant.isZero())
+            return baseStage;
+          auto rawStage = createIntoStage(arith::AddIOp{}, baseStage, offset);
+          auto depth = createIntoStage(arith::ConstantIntOp{}, getDepth(), 32);
+          auto remStage = createIntoStage(arith::RemSIOp{}, rawStage, depth);
+          auto zero = createIntoStage(arith::ConstantIntOp{}, 0, 32);
+          auto isNegative = createIntoStage(arith::CmpIOp{},
+                                            arith::CmpIPredicate::slt, remStage,
+                                            zero);
+          auto wrappedStage = createIntoStage(arith::AddIOp{}, remStage, depth);
+          return createIntoStage(arith::SelectOp{}, isNegative, wrappedStage,
+                                 remStage);
+        };
 
         // Stage update.
         Value rawStage = state.stage;
-        Value acquireStage = rawStage;
+        Value baseStage = rawStage;
         bool advanceStage = isFirstUseFreshWriteAfterAcquire(acquireOp);
         if (advanceStage) {
           auto nextStage =
@@ -1096,11 +1180,17 @@ struct AssignStagePhase {
           auto zero = createIntoStage(arith::ConstantIntOp{}, 0, 32);
           auto wrappedStage =
               createIntoStage(arith::SelectOp{}, stageWrapped, zero, nextStage);
-          acquireStage = wrappedStage;
+          baseStage = wrappedStage;
         }
-        state.stage = acquireStage;
+        Value authoredOffset =
+            acquireOp.getPhase() ? Value() : acquireOp.getStage();
+        Value acquireStage =
+            authoredOffset ? applyStageOffset(baseStage, authoredOffset)
+                           : baseStage;
+        state.stage = baseStage;
         acquireOp.getStageMutable().assign(acquireStage);
         state.token = acquireOp.getToken();
+        tokenLogicalStage[acquireOp.getToken()] = baseStage;
 
         // Phase update. Internal phase state stays group-specific, but the
         // acquire itself always receives the final parity bit consumed by
@@ -1136,6 +1226,40 @@ struct AssignStagePhase {
           state.phases[key] = phaseState;
           acquireOp.getPhaseMutable().assign(acquirePhase);
         }
+      } else if (auto stageOp = getAuthoredStageOp(&op)) {
+        ImplicitLocOpBuilder b(op.getLoc(), &op);
+        auto wsTag = getWarpSpecializeTag(&op);
+        auto stageCluster = getStageCluster(&op);
+        std::optional<SetVector<int>> stagePids;
+        if (hasPartition(&op))
+          stagePids = getPartitionIds(&op);
+        auto createIntoStage = [&](auto opTy, auto... args) {
+          using ty = decltype(opTy);
+          auto newOp = triton::gpu::createInto<ty>(
+              b, b.getLoc(), stagePids, stageCluster,
+              std::forward<decltype(args)>(args)...);
+          if (wsTag)
+            setWarpSpecializeTag(newOp, *wsTag);
+          return newOp;
+        };
+        auto applyStageOffset = [&](Value baseStage, Value offset) -> Value {
+          APInt constant;
+          if (matchPattern(offset, m_ConstantInt(&constant)) &&
+              constant.isZero())
+            return baseStage;
+          auto rawStage = createIntoStage(arith::AddIOp{}, baseStage, offset);
+          auto depth = createIntoStage(arith::ConstantIntOp{}, getDepth(), 32);
+          auto remStage = createIntoStage(arith::RemSIOp{}, rawStage, depth);
+          auto zero = createIntoStage(arith::ConstantIntOp{}, 0, 32);
+          auto isNegative = createIntoStage(arith::CmpIOp{},
+                                            arith::CmpIPredicate::slt, remStage,
+                                            zero);
+          auto wrappedStage = createIntoStage(arith::AddIOp{}, remStage, depth);
+          return createIntoStage(arith::SelectOp{}, isNegative, wrappedStage,
+                                 remStage);
+        };
+        widenStageBlockArgUse(stageOp, state.stage);
+        stageOp.setStage(applyStageOffset(state.stage, stageOp.getStage()));
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
         assignStateInForOp(forOp, state);
       } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
@@ -1154,24 +1278,9 @@ struct AssignStagePhase {
         continue;
       visited.insert(owner);
       if (auto stageOp = dyn_cast<SemaphoreStageInterface>(owner)) {
-        if (auto blk = dyn_cast<BlockArgument>(stage)) {
-          assert(hasPartition(stageOp));
-          auto stageOpIds = getPartitionIds(stageOp);
-          auto forOp = cast<scf::ForOp>(blk.getOwner()->getParentOp());
-          auto pos = findValuePosInRange(forOp.getRegionIterArgs(), stage);
-          assert(pos);
-
-          // update op partitions
-          assert(hasPartition(forOp));
-          auto forOpIds = getPartitionIds(forOp);
-          forOpIds.insert(stageOpIds.begin(), stageOpIds.end());
-          setPartition(forOp, forOpIds);
-
-          auto forOpOutputsIds = getPartitionOutputs(forOp);
-          // Widen only the stage slot (phases are handled separately)
-          forOpOutputsIds[*pos].insert(stageOpIds.begin(), stageOpIds.end());
-          setPartitionOutputs(forOp, forOpOutputsIds);
-        }
+        if (hasAuthoredStageOffsets() && stageOp.getStage())
+          continue;
+        widenStageBlockArgUse(stageOp, stage);
         stageOp.setStage(stage);
       } else if (auto forOp = dyn_cast<scf::ForOp>(owner)) {
         auto tokPos = tokUse.getOperandNumber() - forOp.getNumControlOperands();
@@ -1223,8 +1332,11 @@ struct AssignStagePhase {
       for (auto user : semaOp->getUsers()) {
         if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user)) {
           DenseSet<Operation *> visited;
-          impl.propagateStage(acquireOp.getToken(), acquireOp.getStage(),
-                              visited);
+          Value logicalStage =
+              impl.tokenLogicalStage.lookup(acquireOp.getToken());
+          assert(logicalStage &&
+                 "acquire missing logical stage after assign-stage-phase");
+          impl.propagateStage(acquireOp.getToken(), logicalStage, visited);
         }
       }
     }
