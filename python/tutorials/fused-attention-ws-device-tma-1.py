@@ -1597,7 +1597,7 @@ for HEAD_DIM in [128]:  #64, 128]:
 @triton.testing.perf_report(configs)
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider, device=DEVICE):
     assert mode in ["fwd", "bwd"]
-    print(f"BATCH: {BATCH}, H: {H}, N_CTX: {N_CTX}, HEAD_DIM: {HEAD_DIM}, mode: {mode}, baseVariant: {baseVariant}, provider: {provider}, device: {device}")
+    print(f"BATCH: {BATCH}, H: {H}, N_CTX: {N_CTX}, HEAD_DIM: {HEAD_DIM}, mode: {mode}, provider: {provider}")
     import sys
     sys.stdout.flush()
     dtype = torch.float16

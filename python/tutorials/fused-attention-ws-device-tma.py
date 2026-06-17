@@ -1577,7 +1577,7 @@ for HEAD_DIM in [128]:  #64, 128]:
             configs.append(
                 triton.testing.Benchmark(
                     x_names=["N_CTX"],
-                    x_vals=[2**i for i in range(14, 15)],  #0, 15)],
+                    x_vals=[2**i for i in range(10, 17)],  #0, 15)],
                     line_arg="provider",
                     line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
                     line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
@@ -1597,6 +1597,7 @@ for HEAD_DIM in [128]:  #64, 128]:
 @triton.testing.perf_report(configs)
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider, device=DEVICE):
     assert mode in ["fwd", "bwd"]
+    print(f"BATCH: {BATCH}, H: {H}, N_CTX: {N_CTX}, HEAD_DIM: {HEAD_DIM}, mode: {mode}, provider: {provider}")
     dtype = torch.float16
     if "triton" in provider:
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
