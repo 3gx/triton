@@ -40,6 +40,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/ScopeExit.h"
+#include <numeric>
 
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
@@ -63,18 +64,32 @@ struct AssignStagePhase {
     int partitionId;
     unsigned semaphoreOrder;
     Value semaphore;
+    int stageLane = -1;
+
+    bool hasStageLane() const { return stageLane >= 0; }
 
     bool operator==(const PhaseKey &other) const {
-      return partitionId == other.partitionId && semaphore == other.semaphore;
+      return partitionId == other.partitionId &&
+             semaphore == other.semaphore && stageLane == other.stageLane;
     }
 
     bool operator<(const PhaseKey &other) const {
       if (partitionId != other.partitionId)
         return partitionId < other.partitionId;
-      return semaphoreOrder < other.semaphoreOrder;
+      if (semaphoreOrder != other.semaphoreOrder)
+        return semaphoreOrder < other.semaphoreOrder;
+      if (stageLane != other.stageLane)
+        return stageLane < other.stageLane;
+      return false;
     }
   };
   using OrderedPhaseKeys = std::set<PhaseKey>;
+
+  struct PhaseShiftUse {
+    Operation *op;
+    Value acquireStage;
+    int stageLane;
+  };
 
   struct State {
     Value stage;                      // shared stage index (per buffer group)
@@ -89,6 +104,9 @@ struct AssignStagePhase {
   DenseMap<std::pair<Operation *, Value>, int> tokToStagePosMap;
   DenseMap<Value, Value> tokenLogicalStage;
   bool authoredStageOffsets = false;
+  std::map<PhaseKey, SmallVector<int>> stageLanesByBaseKey;
+  SmallVector<PhaseShiftUse> phaseShiftUses;
+  bool multiStagePhaseFailure = false;
 
   int getDepth() const {
     assert(!groupSemaphores.empty());
@@ -247,6 +265,7 @@ struct AssignStagePhase {
     if (allGroupPartitionIds.empty())
       allGroupPartitionIds.insert(0);
     authoredStageOffsets = computeAuthoredStageOffsets();
+    computeMultiStagePhaseLanes();
   }
 
   unsigned getSemaphoreOrder(Value semaphore) const {
@@ -255,8 +274,225 @@ struct AssignStagePhase {
     return std::distance(groupSemaphores.begin(), it);
   }
 
-  PhaseKey getPhaseKey(int partitionId, Value semaphore) const {
-    return PhaseKey{partitionId, getSemaphoreOrder(semaphore), semaphore};
+  PhaseKey getPhaseKey(int partitionId, Value semaphore,
+                       int stageLane = -1) const {
+    return PhaseKey{partitionId, getSemaphoreOrder(semaphore), semaphore,
+                    stageLane};
+  }
+
+  SmallVector<PhaseKey> getPhaseKeys(int partitionId, Value semaphore) const {
+    PhaseKey baseKey = getPhaseKey(partitionId, semaphore);
+    auto it = stageLanesByBaseKey.find(baseKey);
+    if (it == stageLanesByBaseKey.end())
+      return {baseKey};
+
+    SmallVector<PhaseKey> keys;
+    for (int stageLane : it->second)
+      keys.push_back(getPhaseKey(partitionId, semaphore, stageLane));
+    return keys;
+  }
+
+  PhaseKey getSelectedPhaseKey(int partitionId,
+                               SemaphoreAcquireOp acquireOp) const {
+    PhaseKey baseKey = getPhaseKey(partitionId, acquireOp.getSemaphore());
+    if (!stageLanesByBaseKey.count(baseKey))
+      return baseKey;
+
+    auto stageCluster = getStageCluster(acquireOp);
+    assert(stageCluster && "affected acquire must have static loop.stage");
+    return getPhaseKey(partitionId, acquireOp.getSemaphore(),
+                       stageCluster->first);
+  }
+
+  bool hasAffectedPhaseKeys() const { return !stageLanesByBaseKey.empty(); }
+  bool hasMultiStagePhaseFailure() const { return multiStagePhaseFailure; }
+
+  static int64_t positiveMod(int64_t value, int64_t mod) {
+    int64_t rem = value % mod;
+    return rem < 0 ? rem + mod : rem;
+  }
+
+  bool acquireAppliesToKey(SemaphoreAcquireOp acquireOp, PhaseKey key) const {
+    if (acquireOp.getSemaphore() != key.semaphore)
+      return false;
+    if (!hasPartition(acquireOp))
+      return allGroupPartitionIds.contains(key.partitionId);
+    return llvm::is_contained(getPartitionIds(acquireOp), key.partitionId);
+  }
+
+  std::optional<int64_t>
+  getAuthoredStageOffset(SemaphoreAcquireOp acquireOp) const {
+    if (acquireOp.getPhase() || !acquireOp.getStage())
+      return 0;
+
+    APInt constant;
+    if (!matchPattern(acquireOp.getStage(), m_ConstantInt(&constant)))
+      return std::nullopt;
+    return constant.getSExtValue();
+  }
+
+  bool opContainsGroupAcquire(Operation *op) const {
+    bool found = false;
+    op->walk([&](SemaphoreAcquireOp acquireOp) {
+      if (groupSemaphores.contains(acquireOp.getSemaphore()))
+        found = true;
+    });
+    return found;
+  }
+
+  bool collectDirectGroupAcquireEvents(
+      scf::ForOp loop, SmallVectorImpl<SemaphoreAcquireOp> &events) const {
+    for (Operation &op : *loop.getBody()) {
+      if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(&op)) {
+        if (groupSemaphores.contains(acquireOp.getSemaphore()))
+          events.push_back(acquireOp);
+        continue;
+      }
+
+      if (op.getNumRegions() != 0 && opContainsGroupAcquire(&op))
+        return false;
+    }
+    return true;
+  }
+
+  scf::ForOp
+  getSingleCandidateLoop(ArrayRef<SemaphoreAcquireOp> acquires) const {
+    if (acquires.empty())
+      return {};
+    scf::ForOp loop = acquires.front()->getParentOfType<scf::ForOp>();
+    if (!loop)
+      return {};
+    for (SemaphoreAcquireOp acquireOp : acquires) {
+      if (acquireOp->getParentOfType<scf::ForOp>() != loop)
+        return {};
+      if (acquireOp->getBlock() != loop.getBody())
+        return {};
+    }
+    return loop;
+  }
+
+  bool proveStageDisjointSlotOwnership(
+      PhaseKey key, ArrayRef<SemaphoreAcquireOp> candidateAcquires) {
+    scf::ForOp loop = getSingleCandidateLoop(candidateAcquires);
+    if (!loop) {
+      candidateAcquires.front()->emitError(
+          "multi-stage phase split requires one statically walkable loop body");
+      multiStagePhaseFailure = true;
+      return false;
+    }
+
+    SmallVector<SemaphoreAcquireOp> groupEvents;
+    if (!collectDirectGroupAcquireEvents(loop, groupEvents)) {
+      candidateAcquires.front()->emitError(
+          "multi-stage phase split requires path-invariant group acquire "
+          "sequence");
+      multiStagePhaseFailure = true;
+      return false;
+    }
+
+    int64_t advanceCount = 0;
+    DenseMap<Operation *, int64_t> advancePositionByAcquire;
+    for (SemaphoreAcquireOp acquireOp : groupEvents) {
+      if (isFirstUseFreshWriteAfterAcquire(acquireOp))
+        ++advanceCount;
+      advancePositionByAcquire[acquireOp.getOperation()] = advanceCount;
+    }
+
+    if (advanceCount == 0) {
+      candidateAcquires.front()->emitError(
+          "multi-stage phase split requires at least one State.stage advance");
+      multiStagePhaseFailure = true;
+      return false;
+    }
+
+    int64_t gcd = std::gcd(static_cast<int64_t>(getDepth()), advanceCount);
+    assert(gcd > 0 && "expected positive slot-class gcd");
+
+    std::map<int64_t, std::set<int>> stagesBySlotClass;
+    for (SemaphoreAcquireOp acquireOp : groupEvents) {
+      if (!acquireAppliesToKey(acquireOp, key))
+        continue;
+
+      auto stageCluster = getStageCluster(acquireOp);
+      if (!stageCluster) {
+        acquireOp->emitError(
+            "multi-stage phase split requires static loop.stage");
+        multiStagePhaseFailure = true;
+        return false;
+      }
+
+      std::optional<int64_t> authoredOffset =
+          getAuthoredStageOffset(acquireOp);
+      if (!authoredOffset) {
+        acquireOp->emitError(
+            "multi-stage phase split requires constant authored stage offset");
+        multiStagePhaseFailure = true;
+        return false;
+      }
+
+      int64_t classOffset =
+          advancePositionByAcquire.lookup(acquireOp.getOperation()) +
+          *authoredOffset;
+      int64_t slotClass = positiveMod(classOffset, gcd);
+      stagesBySlotClass[slotClass].insert(stageCluster->first);
+    }
+
+    for (auto &[slotClass, stages] : stagesBySlotClass) {
+      if (stages.size() <= 1)
+        continue;
+      candidateAcquires.front()->emitError(
+          "multi-stage phase split cannot prove disjoint stage-owned slots");
+      multiStagePhaseFailure = true;
+      return false;
+    }
+
+    return true;
+  }
+
+  void computeMultiStagePhaseLanes() {
+    std::map<PhaseKey, std::set<int>> stagesByKey;
+    std::map<PhaseKey, SmallVector<SemaphoreAcquireOp>> acquiresByKey;
+    std::set<PhaseKey> keysWithMissingStage;
+
+    for (Value sema : groupSemaphores) {
+      for (Operation *user : sema.getDefiningOp()->getUsers()) {
+        auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user);
+        if (!acquireOp)
+          continue;
+
+        auto partitionIds = hasPartition(acquireOp) ? getPartitionIds(acquireOp)
+                                                    : allGroupPartitionIds;
+        auto stageCluster = getStageCluster(acquireOp);
+        for (int pid : partitionIds) {
+          PhaseKey key = getPhaseKey(pid, sema);
+          acquiresByKey[key].push_back(acquireOp);
+          if (!stageCluster) {
+            keysWithMissingStage.insert(key);
+            continue;
+          }
+          stagesByKey[key].insert(stageCluster->first);
+        }
+      }
+    }
+
+    for (auto &[key, acquires] : acquiresByKey) {
+      auto stagesIt = stagesByKey.find(key);
+      if (stagesIt == stagesByKey.end() || stagesIt->second.size() <= 1)
+        continue;
+
+      if (keysWithMissingStage.count(key)) {
+        acquires.front()->emitError(
+            "multi-stage phase split requires static loop.stage");
+        multiStagePhaseFailure = true;
+        continue;
+      }
+
+      if (!proveStageDisjointSlotOwnership(key, acquires))
+        continue;
+
+      stageLanesByBaseKey[key] =
+          SmallVector<int>(stagesIt->second.begin(), stagesIt->second.end());
+    }
   }
 
   // --- useD analysis --------------------------------------------------------
@@ -862,9 +1098,10 @@ struct AssignStagePhase {
         summary.hasStageUse = true;
         auto partitionIds = hasPartition(acquireOp) ? getPartitionIds(acquireOp)
                                                     : allGroupPartitionIds;
-        for (int pid : partitionIds)
-          summary.acquiredPhaseKeys.insert(
-              getPhaseKey(pid, acquireOp.getSemaphore()));
+        for (int pid : partitionIds) {
+          auto keys = getPhaseKeys(pid, acquireOp.getSemaphore());
+          summary.acquiredPhaseKeys.insert(keys.begin(), keys.end());
+        }
       } else if (getTrackedBufferOp(&op, trackedTokens.getArrayRef())) {
         summary.hasStageUse = true;
       } else if (auto releaseOp =
@@ -933,6 +1170,34 @@ struct AssignStagePhase {
     auto [it, inserted] =
         state.phases.try_emplace(key, initialPhases.at(key.semaphore));
     return it->second;
+  }
+
+  bool isProducedInStage(Value value, int stageLane) const {
+    APInt constant;
+    if (matchPattern(value, m_ConstantInt(&constant)))
+      return true;
+
+    Operation *defOp = value.getDefiningOp();
+    if (!defOp)
+      return false;
+
+    auto stageCluster = getStageCluster(defOp);
+    if (!stageCluster)
+      return false;
+
+    return stageCluster->first == stageLane;
+  }
+
+  void emitCrossStageAcquireStageDiagnostics() const {
+    for (const PhaseShiftUse &use : phaseShiftUses) {
+      if (isProducedInStage(use.acquireStage, use.stageLane))
+        continue;
+      use.op->emitWarning(
+          "multi-stage phase split uses acquire stage value produced in "
+          "another or unknown loop.stage; pipeline scheduling may fail until "
+          "stage computation is made stage-local");
+      return;
+    }
   }
 
   // Infer partition IDs for a yield argumend value.
@@ -1131,15 +1396,21 @@ struct AssignStagePhase {
           stagePids = allGroupPartitionIds;
         }
 
-        auto createInto = [&](std::optional<SetVector<int>> pids, auto opTy,
-                              auto... args) {
+        auto createIntoAt = [&](std::optional<SetVector<int>> pids,
+                                StageCluster targetStageCluster, auto opTy,
+                                auto... args) {
           using ty = decltype(opTy);
           auto op = triton::gpu::createInto<ty>(
-              b, b.getLoc(), pids, stageCluster,
+              b, b.getLoc(), pids, targetStageCluster,
               std::forward<decltype(args)>(args)...);
           if (wsTag)
             setWarpSpecializeTag(op, *wsTag);
           return op;
+        };
+        auto createInto = [&](std::optional<SetVector<int>> pids, auto opTy,
+                              auto... args) {
+          return createIntoAt(pids, stageCluster, opTy,
+                              std::forward<decltype(args)>(args)...);
         };
         auto createIntoStage = [&](auto opTy, auto... args) {
           return createInto(stagePids, opTy,
@@ -1148,6 +1419,29 @@ struct AssignStagePhase {
         auto createIntoPhase = [&](auto opTy, auto... args) {
           return createInto(phasePids, opTy,
                             std::forward<decltype(args)>(args)...);
+        };
+        auto createIntoPhaseForKey = [&](PhaseKey key, auto opTy,
+                                         auto... args) {
+          if (!key.hasStageLane())
+            return createIntoPhase(opTy,
+                                   std::forward<decltype(args)>(args)...);
+
+          std::optional<SetVector<int>> keyPids;
+          keyPids.emplace();
+          keyPids->insert(key.partitionId);
+
+          StageCluster keyStageCluster = stageCluster;
+          if (keyStageCluster)
+            keyStageCluster->first = key.stageLane;
+
+          return createIntoAt(keyPids, keyStageCluster, opTy,
+                              std::forward<decltype(args)>(args)...);
+        };
+        auto recordPhaseShiftUse = [&](Operation *op, PhaseKey key,
+                                       Value shiftAmount) {
+          if (!key.hasStageLane())
+            return;
+          phaseShiftUses.push_back(PhaseShiftUse{op, shiftAmount, key.stageLane});
         };
         auto applyStageOffset = [&](Value baseStage, Value offset) -> Value {
           APInt constant;
@@ -1203,29 +1497,35 @@ struct AssignStagePhase {
           if (hasPartition(&op) &&
               !llvm::is_contained(getPartitionIds(&op), pid))
             continue;
-          PhaseKey key = getPhaseKey(pid, acquireOp.getSemaphore());
+          PhaseKey key = getSelectedPhaseKey(pid, acquireOp);
           Value phaseState = getPhase(state, key);
           Value acquirePhase = phaseState;
           if (useSinglePhaseForGroup) {
-            auto nextPhase =
-                createIntoPhase(arith::XOrIOp{}, phaseState,
-                                createIntoPhase(arith::ConstantIntOp{}, 1, 32));
-            auto zero = createIntoPhase(arith::ConstantIntOp{}, 0, 32);
-            auto phaseWrapped = createIntoPhase(
+            auto nextPhase = createIntoPhaseForKey(
+                key, arith::XOrIOp{}, phaseState,
+                createIntoPhaseForKey(key, arith::ConstantIntOp{}, 1, 32));
+            auto zero = createIntoPhaseForKey(key, arith::ConstantIntOp{}, 0, 32);
+            auto phaseWrapped = createIntoPhaseForKey(
+                key,
                 arith::CmpIOp{}, arith::CmpIPredicate::eq, acquireStage, zero);
-            phaseState = createIntoPhase(arith::SelectOp{}, phaseWrapped,
-                                         nextPhase, phaseState);
+            phaseState = createIntoPhaseForKey(
+                key, arith::SelectOp{}, phaseWrapped, nextPhase, phaseState);
             acquirePhase = phaseState;
           } else {
-            auto phaseBit = createIntoPhase(
-                arith::ShLIOp{}, createIntoPhase(arith::ConstantIntOp{}, 1, 32),
+            auto phaseBit = createIntoPhaseForKey(
+                key, arith::ShLIOp{},
+                createIntoPhaseForKey(key, arith::ConstantIntOp{}, 1, 32),
                 acquireStage);
-            phaseState = createIntoPhase(arith::XOrIOp{}, phaseState, phaseBit);
-            acquirePhase =
-                createIntoPhase(arith::ShRUIOp{}, phaseState, acquireStage);
-            acquirePhase =
-                createIntoPhase(arith::AndIOp{}, acquirePhase,
-                                createIntoPhase(arith::ConstantIntOp{}, 1, 32));
+            recordPhaseShiftUse(phaseBit.getOperation(), key, acquireStage);
+            phaseState =
+                createIntoPhaseForKey(key, arith::XOrIOp{}, phaseState, phaseBit);
+            auto shiftedPhase = createIntoPhaseForKey(
+                key, arith::ShRUIOp{}, phaseState, acquireStage);
+            acquirePhase = shiftedPhase;
+            recordPhaseShiftUse(shiftedPhase.getOperation(), key, acquireStage);
+            acquirePhase = createIntoPhaseForKey(
+                key, arith::AndIOp{}, acquirePhase,
+                createIntoPhaseForKey(key, arith::ConstantIntOp{}, 1, 32));
           }
           state.phases[key] = phaseState;
           acquireOp.getPhaseMutable().assign(acquirePhase);
@@ -1311,8 +1611,11 @@ struct AssignStagePhase {
 
     // Compute single-phase eligibility per buffer group.
     AssignStagePhase impl(semaOps);
-    bool singlePhaseEligible = impl.computeSinglePhaseEligibility();
-    impl.useSinglePhaseForGroup = singlePhaseEligible;
+    if (impl.hasMultiStagePhaseFailure())
+      return failure();
+    bool finalUseSinglePhase =
+        !impl.hasAffectedPhaseKeys() && impl.computeSinglePhaseEligibility();
+    impl.useSinglePhaseForGroup = finalUseSinglePhase;
 
     // Insert after the last semaOp so all semaphores are defined.
     ImplicitLocOpBuilder b(semaOps.back()->getLoc(), semaOps.back());
@@ -1327,13 +1630,14 @@ struct AssignStagePhase {
     // multiphase:    isReleased=true  -> 0, isReleased=false -> -1
     for (auto semaOp : semaOps) {
       uint32_t initPhase = semaOp.getIsReleased() ? 0x00000000u : 0xFFFFFFFFu;
-      if (singlePhaseEligible) {
+      if (finalUseSinglePhase) {
         initPhase = semaOp.getIsReleased() ? 0x00000000u : 0x00000001u;
       }
       impl.initialPhases[semaOp.getResult()] =
           arith::ConstantIntOp::create(b, static_cast<int64_t>(initPhase), 32);
     }
     impl.assignStateInBlock(firstSemaOp->getBlock(), initState);
+    impl.emitCrossStageAcquireStageDiagnostics();
 
     // Propagate stage to release/buffer ops via token chain.
     for (auto semaOp : semaOps) {
