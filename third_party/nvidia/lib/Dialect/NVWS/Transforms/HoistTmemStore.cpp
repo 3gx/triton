@@ -35,6 +35,7 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
+#include "triton/Dialect/TritonGPU/Transforms/PartitionBuilder.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -134,6 +135,44 @@ void repairPartitionMetadata(scf::ForOp loop) {
       }
     });
   } while (changed);
+}
+
+bool mergeStageCluster(Operation *neighbor, Operation *op,
+                       StageCluster &inferred) {
+  if (!neighbor || neighbor->getBlock() != op->getBlock())
+    return true;
+
+  StageCluster neighborStageCluster = getStageCluster(neighbor);
+  if (!neighborStageCluster)
+    return true;
+
+  if (!inferred) {
+    inferred = neighborStageCluster;
+    return true;
+  }
+
+  return *inferred == *neighborStageCluster;
+}
+
+void repairReshapeScheduleMetadata(scf::ForOp loop) {
+  OpBuilder builder(loop.getContext());
+  loop.walk([&](ReshapeOp reshape) {
+    Operation *op = reshape.getOperation();
+    if (getStageCluster(op))
+      return;
+
+    StageCluster inferred;
+    if (!mergeStageCluster(reshape.getSrc().getDefiningOp(), op, inferred))
+      return;
+
+    for (Operation *user : reshape.getResult().getUsers()) {
+      if (!mergeStageCluster(user, op, inferred))
+        return;
+    }
+
+    if (inferred)
+      setStageCluster(builder, op, inferred);
+  });
 }
 
 bool underWSLoop(Operation *op) {
@@ -435,8 +474,10 @@ public:
       signalPassFailure();
 
     m.walk([&](scf::ForOp loop) {
-      if (loop->hasAttr(kWarpSpecializeAttrName))
+      if (loop->hasAttr(kWarpSpecializeAttrName)) {
         repairPartitionMetadata(loop);
+        repairReshapeScheduleMetadata(loop);
+      }
     });
 
     m.walk([&](scf::ForOp loop) {
