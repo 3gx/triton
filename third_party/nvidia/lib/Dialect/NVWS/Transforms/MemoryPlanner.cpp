@@ -1137,6 +1137,26 @@ static bool isDescriptorLoadProducer(Operation *op) {
   return false;
 }
 
+static bool samePartitionIds(Operation *lhs, Operation *rhs) {
+  if (!lhs || !rhs || !ttg::hasPartition(lhs) || !ttg::hasPartition(rhs))
+    return true;
+  SetVector<int> lhsIds = ttg::getPartitionIds(lhs);
+  SetVector<int> rhsIds = ttg::getPartitionIds(rhs);
+  if (lhsIds.size() != rhsIds.size())
+    return false;
+  return llvm::all_of(lhsIds, [&](int id) { return rhsIds.contains(id); });
+}
+
+static Operation *getProducerOp(LocalBuffer &buffer) {
+  if (buffer.channel && buffer.channel->getSrcOp())
+    return buffer.channel->getSrcOp();
+  return buffer.alloc.getOperation();
+}
+
+static bool hasDifferentProducerPartitions(LocalBuffer &lhs, LocalBuffer &rhs) {
+  return !samePartitionIds(getProducerOp(lhs), getProducerOp(rhs));
+}
+
 static Operation *findOriginalLoadOp(Value value, DenseSet<Value> &visited) {
   if (!value || !visited.insert(value).second)
     return nullptr;
@@ -1249,7 +1269,7 @@ private:
   }
 
   void runLegacyPlan(unsigned &nextBufferId) {
-    DenseMap<Type, unsigned> innermostBufferIds;
+    DenseMap<Type, SmallVector<LocalBuffer *>> innermostBufferOwners;
     for (auto &bufferPtr : buffers) {
       LocalBuffer &buffer = *bufferPtr;
       buffer.pinned = false;
@@ -1267,11 +1287,20 @@ private:
 
       if (buffer.isInnermost && isTwoDimensional(buffer.alloc)) {
         Type elementType = buffer.alloc.getType().getElementType();
-        auto it = innermostBufferIds.find(elementType);
-        if (it == innermostBufferIds.end()) {
-          it = innermostBufferIds.insert({elementType, nextBufferId++}).first;
+        LocalBuffer *reuseOwner = nullptr;
+        auto &owners = innermostBufferOwners[elementType];
+        for (LocalBuffer *owner : owners) {
+          if (!hasDifferentProducerPartitions(*owner, buffer)) {
+            reuseOwner = owner;
+            break;
+          }
         }
-        buffer.bufferId = it->second;
+        if (!reuseOwner) {
+          buffer.bufferId = nextBufferId++;
+          owners.push_back(&buffer);
+        } else {
+          buffer.bufferId = reuseOwner->bufferId;
+        }
         buffer.numCopies = numBuffers;
         buffer.isCircular = smemCircularReuse;
       } else {
@@ -1419,6 +1448,8 @@ private:
         if (!compatibleForReuse(owner, candidate))
           continue;
         if (owner.liveness.intersects(candidate.liveness))
+          continue;
+        if (hasDifferentProducerPartitions(owner, candidate))
           continue;
 
         unsigned oldId = candidate.bufferId;
