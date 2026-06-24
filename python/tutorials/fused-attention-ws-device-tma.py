@@ -1639,7 +1639,12 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider
 
 if __name__ == "__main__":
     if is_blackwell():
-        print("Test op...")
+        import sys
+        print("Test op fp16...")
+        sys.stdout.flush()
+        test_op(Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="fwd", baseVariant="ws_persistent", provider="triton-fp16", SUBTILING=True, VECT_MUL=1, FADD2_REDUCE=False, bwd_config_idx=0)
+        print("Test op fp8...")
+        sys.stdout.flush()
         test_op(Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="fwd", baseVariant="ws_persistent", provider="triton-fp8", SUBTILING=True, VECT_MUL=1, FADD2_REDUCE=False, bwd_config_idx=0)
         print("Running benchmarks...")
         bench_flash_attention.run(print_data=True)
