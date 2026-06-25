@@ -76,10 +76,12 @@ public:
     // bitwidth=16
     unsigned elemBitWidth =
         lhs.getType().getElementType().getIntOrFloatBitWidth();
+#if 1 // egx
     // We don't currently support fp8 (not sure if we can)
     if (elemBitWidth != 16 && elemBitWidth != 32) {
       return failure();
     }
+#endif
     const unsigned colStride = 1;
     auto aTMemEncoding = TensorMemoryEncodingAttr::get(
         context, accTMemEncoding.getBlockM(), lhs.getType().getShape()[1],
