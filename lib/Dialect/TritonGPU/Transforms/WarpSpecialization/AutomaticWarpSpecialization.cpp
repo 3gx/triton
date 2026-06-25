@@ -127,7 +127,7 @@ void AutomaticWarpSpecialization::runOnOperation() {
   pm.addPass(createNVWSLowerWarpGroup());
   scheduleLoopsOptions.numStages = numStages;
   scheduleLoopsOptions.useMetaWS = useMetaPartitioner;
-  pm.addPass(createTritonGPUScheduleLoops(scheduleLoopsOptions));
+  //pm.addPass(createTritonGPUScheduleLoops(scheduleLoopsOptions));
   if (failed(runPipeline(pm, getOperation())))
     return signalPassFailure();
 
