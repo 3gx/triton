@@ -1520,3 +1520,37 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     tt.return
   }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @loop_carried_authored_stage_buffer_metadata
+  tt.func @loop_carried_authored_stage_buffer_metadata(%lb: i32, %ub: i32, %step: i32) {
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<2x1xi32, #shared, #smem, mutable>
+    // CHECK: [[SEM:%.*]] = nvws.semaphore.create %{{.*}} true
+    // CHECK: [[FOR:%.*]]:5 = scf.for
+    // CHECK: nvws.semaphore.buffer [[SEM]][{{%.*}}], {{%.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>}
+    // CHECK: nvws.semaphore.buffer [[SEM]][{{%.*}}], {{%.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>}
+    // CHECK: ttg.partition.outputs = [array<i32: 1>, array<i32: 2>, array<i32: 0, 1, 2>
+    %sem = nvws.semaphore.create %buf true : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>
+    %tok0 = nvws.semaphore.acquire %sem {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+    %tok1 = nvws.semaphore.acquire %sem {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+    %tok2:2 = scf.for %i = %lb to %ub step %step iter_args(%tok_a = %tok0, %tok_b = %tok1) -> (!ttg.async.token, !ttg.async.token) : i32 {
+      %slot = arith.constant {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} 0 : i32
+      %view0 = nvws.semaphore.buffer %sem[%slot], %tok_a {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+      nvws.semaphore.release %sem[%slot], %tok_a [#nvws.async_op<none>] {arrive_count = 1 : i32, loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
+      %slot_1 = arith.constant {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} 0 : i32
+      %view1 = nvws.semaphore.buffer %sem[%slot_1], %tok_b {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+      nvws.semaphore.release %sem[%slot_1], %tok_b [#nvws.async_op<none>] {arrive_count = 1 : i32, loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
+      %next_a = nvws.semaphore.acquire %sem {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+      %next_b = nvws.semaphore.acquire %sem {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+      scf.yield {ttg.partition = array<i32: 1, 2>} %next_a, %next_b : !ttg.async.token, !ttg.async.token
+    } {ttg.partition = array<i32: 1, 2>, ttg.partition.outputs = [array<i32: 1>, array<i32: 2>], ttg.warp_specialize.tag = 0 : i32}
+    ttg.local_dealloc %buf : !ttg.memdesc<2x1xi32, #shared, #smem, mutable>
+    tt.return
+  }
+}

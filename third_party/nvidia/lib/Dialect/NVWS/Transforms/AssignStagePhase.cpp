@@ -1229,6 +1229,31 @@ struct AssignStagePhase {
     return argIds;
   }
 
+  void recordForInputTokenStageMappings(scf::ForOp forOp, unsigned oldNumArgs,
+                                        unsigned stagePos) {
+    Value stage = forOp.getRegionIterArgs()[stagePos];
+    for (unsigned i = 0; i < oldNumArgs; ++i) {
+      if (!tokenLogicalStage.lookup(forOp.getInitArgs()[i]))
+        continue;
+      Value iterToken = forOp.getRegionIterArgs()[i];
+      tokToStagePosMap[{forOp, iterToken}] = stagePos;
+      tokenLogicalStage[iterToken] = stage;
+    }
+  }
+
+  void recordYieldTokenStageMappings(Operation *parentOp, scf::YieldOp yieldOp,
+                                     unsigned oldNumResults,
+                                     unsigned stagePos) {
+    Value stage = parentOp->getResult(stagePos);
+    for (unsigned i = 0; i < oldNumResults; ++i) {
+      Value yieldedToken = yieldOp.getOperand(i);
+      if (!tokenLogicalStage.lookup(yieldedToken))
+        continue;
+      tokToStagePosMap[{yieldOp, yieldedToken}] = stagePos;
+      tokenLogicalStage[parentOp->getResult(i)] = stage;
+    }
+  }
+
   void assignStateInForOp(scf::ForOp forOp, State &state) {
     Value newTok;
     if (auto pos = findValuePosInRange(forOp.getInitArgs(), state.token)) {
@@ -1262,9 +1287,24 @@ struct AssignStagePhase {
     auto forOpOutputsIds = getPartitionOutputs(forOp);
     forOp = addIterArgsToLoop(builder, forOp, extraIterArgs);
 
+    // Make loop result partition metadata match the added iter args before
+    // recursing. The body walk may widen the new stage block arg's metadata.
+    forOpIds.insert(allGroupPartitionIds.begin(), allGroupPartitionIds.end());
+    forOpOutputsIds.push_back(SetVector<int>(allGroupPartitionIds.begin(),
+                                             allGroupPartitionIds.end()));
+    for (PhaseKey key : summary.acquiredPhaseKeys) {
+      SetVector<int> argIds;
+      argIds.insert(key.partitionId);
+      forOpIds.insert(argIds.begin(), argIds.end());
+      forOpOutputsIds.push_back(argIds);
+    }
+    setPartition(forOp, forOpIds);
+    setPartitionOutputs(forOp, forOpOutputsIds);
+
     state.stage = forOp.getRegionIterArgs()[nArgs];
     for (auto [i, key] : llvm::enumerate(summary.acquiredPhaseKeys))
       state.phases[key] = forOp.getRegionIterArgs()[nArgs + 1 + i];
+    recordForInputTokenStageMappings(forOp, nArgs, nArgs);
 
     auto stateInBlock = assignStateInBlock(forOp.getBody(), state);
 
@@ -1280,16 +1320,21 @@ struct AssignStagePhase {
     tokToStagePosMap[{forOp, state.token}] = nArgs;
     tokToStagePosMap[{forOp.getBody()->getTerminator(), stateInBlock.token}] =
         nArgs;
+    recordYieldTokenStageMappings(
+        forOp, cast<scf::YieldOp>(forOp.getBody()->getTerminator()), nArgs,
+        nArgs);
 
-    // Annotate stage with all group partition IDs.
-    forOpIds.insert(allGroupPartitionIds.begin(), allGroupPartitionIds.end());
-    forOpOutputsIds.push_back(SetVector<int>(allGroupPartitionIds.begin(),
-                                             allGroupPartitionIds.end()));
-    // Annotate phase values with per-key partition IDs.
+    forOpIds = getPartitionIds(forOp);
+    forOpOutputsIds = getPartitionOutputs(forOp);
+    assert(forOpOutputsIds.size() >= nArgs + extraYieldArgs.size());
+    // Preserve any stage-result widening done during the recursive walk.
+    forOpOutputsIds[nArgs].insert(allGroupPartitionIds.begin(),
+                                  allGroupPartitionIds.end());
+    // Replace provisional phase result IDs with IDs inferred from final values.
     for (auto [i, key] : llvm::enumerate(summary.acquiredPhaseKeys)) {
       auto argIds = inferPartitionIds(extraYieldArgs[1 + i], key.partitionId);
       forOpIds.insert(argIds.begin(), argIds.end());
-      forOpOutputsIds.push_back(argIds);
+      forOpOutputsIds[nArgs + 1 + i] = argIds;
     }
     setPartition(forOp, forOpIds);
     setPartitionOutputs(forOp, forOpOutputsIds);
@@ -1341,6 +1386,8 @@ struct AssignStagePhase {
         thenYieldOp.getNumOperands();
     tokToStagePosMap[{newIfOp.elseYield(), elseState.token}] =
         elseYieldOp.getNumOperands();
+    recordYieldTokenStageMappings(newIfOp, thenYieldOp, nResults, nResults);
+    recordYieldTokenStageMappings(newIfOp, elseYieldOp, nResults, nResults);
 
     thenYieldOp->insertOperands(thenYieldOp.getNumOperands(), thenState.stage);
     elseYieldOp->insertOperands(elseYieldOp.getNumOperands(), elseState.stage);
