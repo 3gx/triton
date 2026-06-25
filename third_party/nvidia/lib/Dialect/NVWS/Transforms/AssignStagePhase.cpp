@@ -84,33 +84,6 @@ struct AssignStagePhase {
     }
   };
   using OrderedPhaseKeys = std::set<PhaseKey>;
-  using StateKey = StageCluster;
-
-  struct StateKeyLess {
-    bool operator()(const StateKey &lhs, const StateKey &rhs) const {
-      if (lhs.has_value() != rhs.has_value())
-        return !lhs.has_value();
-      if (!lhs)
-        return false;
-      return *lhs < *rhs;
-    }
-  };
-  using OrderedStateKeys = std::set<StateKey, StateKeyLess>;
-  using StateValueMap = std::map<StateKey, Value, StateKeyLess>;
-  using StateIndexMap = std::map<StateKey, unsigned, StateKeyLess>;
-
-  struct StatePhaseKey {
-    PhaseKey phaseKey;
-    StateKey stateKey;
-
-    bool operator<(const StatePhaseKey &other) const {
-      if (phaseKey < other.phaseKey)
-        return true;
-      if (other.phaseKey < phaseKey)
-        return false;
-      return StateKeyLess{}(stateKey, other.stateKey);
-    }
-  };
 
   struct PhaseShiftUse {
     Operation *op;
@@ -119,21 +92,17 @@ struct AssignStagePhase {
   };
 
   struct State {
-    // Replicated state values by loop (stage, cluster). All copies model the
-    // same logical state machine and are advanced together.
-    StateValueMap stages;
-    std::map<StatePhaseKey, Value> phases; // phase values by (pid, sema, key)
-    Value token;                           // token used for stage propagation
+    Value stage;                      // shared stage index (per buffer group)
+    std::map<PhaseKey, Value> phases; // phase values by (pid, sema)
+    Value token;                      // token used for stage propagation
   };
 
   SetVector<Value> groupSemaphores;
   bool useSinglePhaseForGroup = false;
   SetVector<int> allGroupPartitionIds;  // all partition IDs across all acquires
-  OrderedStateKeys stateKeys;           // loop (stage, cluster) copies to keep
-  bool replicateStateByStageCluster = false;
   DenseMap<Value, Value> initialPhases; // initial phase by semaphore
-  DenseMap<std::pair<Operation *, Value>, StateIndexMap> tokToStagePosMap;
-  DenseMap<Value, StateValueMap> tokenLogicalStages;
+  DenseMap<std::pair<Operation *, Value>, int> tokToStagePosMap;
+  DenseMap<Value, Value> tokenLogicalStage;
   bool authoredStageOffsets = false;
   std::map<PhaseKey, SmallVector<int>> stageLanesByBaseKey;
   SmallVector<PhaseShiftUse> phaseShiftUses;
@@ -285,32 +254,11 @@ struct AssignStagePhase {
     for (auto semaOp : semaOps) {
       groupSemaphores.insert(semaOp.getResult());
       for (auto user : semaOp->getUsers()) {
-        if (isa<SemaphoreAcquireOp, SemaphoreBufferOp, SemaphoreReleaseOp>(
-                user))
-          stateKeys.insert(getStateKey(user));
         if (isa<SemaphoreAcquireOp>(user) && hasPartition(user)) {
           auto ids = getPartitionIds(user);
           sortedPartitionIds.insert(ids.begin(), ids.end());
         }
       }
-    }
-    std::map<int, std::set<int>> clustersByStage;
-    for (StateKey key : stateKeys) {
-      if (key)
-        clustersByStage[key->first].insert(key->second);
-    }
-    replicateStateByStageCluster =
-        llvm::any_of(clustersByStage, [](const auto &entry) {
-          return entry.second.size() > 1;
-        });
-    if (replicateStateByStageCluster) {
-      if (stateKeys.size() > 1)
-        stateKeys.erase(StateKey{});
-      if (stateKeys.empty())
-        stateKeys.insert(StateKey{});
-    } else {
-      stateKeys.clear();
-      stateKeys.insert(StateKey{});
     }
     allGroupPartitionIds =
         SetVector<int>(sortedPartitionIds.begin(), sortedPartitionIds.end());
@@ -1218,50 +1166,9 @@ struct AssignStagePhase {
     return summary;
   }
 
-  StateKey getStateKey(Operation *op) const {
-    for (Operation *cur = op; cur; cur = cur->getParentOp())
-      if (auto stageCluster = getStageCluster(cur))
-        return stageCluster;
-    return std::nullopt;
-  }
-
-  StateKey getAvailableStateKey(Operation *op) const {
-    if (!replicateStateByStageCluster)
-      return StateKey{};
-    StateKey key = getStateKey(op);
-    if (stateKeys.count(key))
-      return key;
-    assert(!key && !stateKeys.empty() &&
-           "missing state.stage copy for scheduled operation");
-    return *stateKeys.begin();
-  }
-
-  StateKey getEmitStateKey(StateKey stateKey, StateKey opStateKey) const {
-    return replicateStateByStageCluster ? stateKey : opStateKey;
-  }
-
-  Value getStage(State &state, StateKey key) const {
-    auto it = state.stages.find(key);
-    assert(it != state.stages.end() && "missing state.stage copy");
-    return it->second;
-  }
-
-  Value getStageForOp(State &state, Operation *op) const {
-    return getStage(state, getAvailableStateKey(op));
-  }
-
-  Value getStageForOp(const StateValueMap &stages, Operation *op) const {
-    auto key = getAvailableStateKey(op);
-    auto it = stages.find(key);
-    assert(it != stages.end() && "missing propagated state.stage copy");
-    return it->second;
-  }
-
-  Value getPhase(State &state, PhaseKey key, StateKey stateKey) {
-    StatePhaseKey phaseStateKey{key, stateKey};
+  Value getPhase(State &state, PhaseKey key) {
     auto [it, inserted] =
-        state.phases.try_emplace(phaseStateKey,
-                                 initialPhases.at(key.semaphore));
+        state.phases.try_emplace(key, initialPhases.at(key.semaphore));
     return it->second;
   }
 
@@ -1322,37 +1229,28 @@ struct AssignStagePhase {
     return argIds;
   }
 
-  StateValueMap getStageValuesFromPositions(ValueRange values,
-                                            const StateIndexMap &positions) {
-    StateValueMap stages;
-    for (auto &[key, pos] : positions)
-      stages[key] = values[pos];
-    return stages;
-  }
-
   void recordForInputTokenStageMappings(scf::ForOp forOp, unsigned oldNumArgs,
-                                        const StateIndexMap &stagePositions) {
+                                        unsigned stagePos) {
+    Value stage = forOp.getRegionIterArgs()[stagePos];
     for (unsigned i = 0; i < oldNumArgs; ++i) {
-      if (!tokenLogicalStages.lookup(forOp.getInitArgs()[i]).size())
+      if (!tokenLogicalStage.lookup(forOp.getInitArgs()[i]))
         continue;
       Value iterToken = forOp.getRegionIterArgs()[i];
-      tokToStagePosMap[{forOp, iterToken}] = stagePositions;
-      tokenLogicalStages[iterToken] =
-          getStageValuesFromPositions(forOp.getRegionIterArgs(),
-                                      stagePositions);
+      tokToStagePosMap[{forOp, iterToken}] = stagePos;
+      tokenLogicalStage[iterToken] = stage;
     }
   }
 
   void recordYieldTokenStageMappings(Operation *parentOp, scf::YieldOp yieldOp,
                                      unsigned oldNumResults,
-                                     const StateIndexMap &stagePositions) {
+                                     unsigned stagePos) {
+    Value stage = parentOp->getResult(stagePos);
     for (unsigned i = 0; i < oldNumResults; ++i) {
       Value yieldedToken = yieldOp.getOperand(i);
-      if (!tokenLogicalStages.lookup(yieldedToken).size())
+      if (!tokenLogicalStage.lookup(yieldedToken))
         continue;
-      tokToStagePosMap[{yieldOp, yieldedToken}] = stagePositions;
-      tokenLogicalStages[parentOp->getResult(i)] =
-          getStageValuesFromPositions(parentOp->getResults(), stagePositions);
+      tokToStagePosMap[{yieldOp, yieldedToken}] = stagePos;
+      tokenLogicalStage[parentOp->getResult(i)] = stage;
     }
   }
 
@@ -1367,7 +1265,6 @@ struct AssignStagePhase {
       return;
 
     SmallVector<Value> extraIterArgs;
-    SmallVector<StatePhaseKey> extraPhaseKeys;
     llvm::MapVector<int, Value *> tokenRefs;
     if (auto pos = findValuePosInRange(forOp.getInitArgs(), state.token)) {
       // keep reference of the token position to latest token value
@@ -1377,21 +1274,13 @@ struct AssignStagePhase {
       state.token = forOp.getRegionIterArgs()[*pos];
     }
 
-    unsigned nArgs = forOp.getRegionIterArgs().size();
-    StateIndexMap stagePositions;
-    for (auto stateKey : stateKeys) {
-      stagePositions[stateKey] =
-          nArgs + static_cast<unsigned>(extraIterArgs.size());
-      extraIterArgs.push_back(getStage(state, stateKey));
-    }
+    extraIterArgs.push_back(state.stage);
     for (PhaseKey key : summary.acquiredPhaseKeys) {
-      for (auto stateKey : stateKeys) {
-        extraPhaseKeys.push_back(StatePhaseKey{key, stateKey});
-        extraIterArgs.push_back(getPhase(state, key, stateKey));
-      }
+      extraIterArgs.push_back(getPhase(state, key));
     }
 
     OpBuilder builder(forOp);
+    size_t nArgs = forOp.getRegionIterArgs().size();
 
     assert(hasPartition(forOp));
     auto forOpIds = getPartitionIds(forOp);
@@ -1401,24 +1290,21 @@ struct AssignStagePhase {
     // Make loop result partition metadata match the added iter args before
     // recursing. The body walk may widen the new stage block arg's metadata.
     forOpIds.insert(allGroupPartitionIds.begin(), allGroupPartitionIds.end());
-    for (auto stateKey : stateKeys)
-      forOpOutputsIds.push_back(SetVector<int>(allGroupPartitionIds.begin(),
-                                               allGroupPartitionIds.end()));
-    for (StatePhaseKey phaseStateKey : extraPhaseKeys) {
+    forOpOutputsIds.push_back(SetVector<int>(allGroupPartitionIds.begin(),
+                                             allGroupPartitionIds.end()));
+    for (PhaseKey key : summary.acquiredPhaseKeys) {
       SetVector<int> argIds;
-      argIds.insert(phaseStateKey.phaseKey.partitionId);
+      argIds.insert(key.partitionId);
       forOpIds.insert(argIds.begin(), argIds.end());
       forOpOutputsIds.push_back(argIds);
     }
     setPartition(forOp, forOpIds);
     setPartitionOutputs(forOp, forOpOutputsIds);
 
-    for (auto &[key, pos] : stagePositions)
-      state.stages[key] = forOp.getRegionIterArgs()[pos];
-    unsigned phaseBase = nArgs + static_cast<unsigned>(stateKeys.size());
-    for (auto [i, phaseStateKey] : llvm::enumerate(extraPhaseKeys))
-      state.phases[phaseStateKey] = forOp.getRegionIterArgs()[phaseBase + i];
-    recordForInputTokenStageMappings(forOp, nArgs, stagePositions);
+    state.stage = forOp.getRegionIterArgs()[nArgs];
+    for (auto [i, key] : llvm::enumerate(summary.acquiredPhaseKeys))
+      state.phases[key] = forOp.getRegionIterArgs()[nArgs + 1 + i];
+    recordForInputTokenStageMappings(forOp, nArgs, nArgs);
 
     auto stateInBlock = assignStateInBlock(forOp.getBody(), state);
 
@@ -1427,42 +1313,35 @@ struct AssignStagePhase {
     // associate token with stage positional argument in the iterArgs &
     // yieldOp we will need this in propagateStage function that will assign
     // stage to arefBuffer and arefExit ops
-    for (auto stateKey : stateKeys)
-      extraYieldArgs.push_back(getStage(stateInBlock, stateKey));
-    for (StatePhaseKey phaseStateKey : extraPhaseKeys)
-      extraYieldArgs.push_back(
-          getPhase(stateInBlock, phaseStateKey.phaseKey,
-                   phaseStateKey.stateKey));
+    extraYieldArgs.push_back(stateInBlock.stage);
+    for (PhaseKey key : summary.acquiredPhaseKeys)
+      extraYieldArgs.push_back(getPhase(stateInBlock, key));
     appendToForOpYield(forOp, extraYieldArgs);
-    tokToStagePosMap[{forOp, state.token}] = stagePositions;
+    tokToStagePosMap[{forOp, state.token}] = nArgs;
     tokToStagePosMap[{forOp.getBody()->getTerminator(), stateInBlock.token}] =
-        stagePositions;
+        nArgs;
     recordYieldTokenStageMappings(
         forOp, cast<scf::YieldOp>(forOp.getBody()->getTerminator()), nArgs,
-        stagePositions);
+        nArgs);
 
     forOpIds = getPartitionIds(forOp);
     forOpOutputsIds = getPartitionOutputs(forOp);
     assert(forOpOutputsIds.size() >= nArgs + extraYieldArgs.size());
     // Preserve any stage-result widening done during the recursive walk.
-    for (auto &[key, pos] : stagePositions)
-      forOpOutputsIds[pos].insert(allGroupPartitionIds.begin(),
+    forOpOutputsIds[nArgs].insert(allGroupPartitionIds.begin(),
                                   allGroupPartitionIds.end());
     // Replace provisional phase result IDs with IDs inferred from final values.
-    for (auto [i, phaseStateKey] : llvm::enumerate(extraPhaseKeys)) {
-      auto argIds =
-          inferPartitionIds(extraYieldArgs[stateKeys.size() + i],
-                            phaseStateKey.phaseKey.partitionId);
+    for (auto [i, key] : llvm::enumerate(summary.acquiredPhaseKeys)) {
+      auto argIds = inferPartitionIds(extraYieldArgs[1 + i], key.partitionId);
       forOpIds.insert(argIds.begin(), argIds.end());
-      forOpOutputsIds[phaseBase + i] = argIds;
+      forOpOutputsIds[nArgs + 1 + i] = argIds;
     }
     setPartition(forOp, forOpIds);
     setPartitionOutputs(forOp, forOpOutputsIds);
 
-    for (auto &[key, pos] : stagePositions)
-      state.stages[key] = forOp.getResult(pos);
-    for (auto [i, phaseStateKey] : llvm::enumerate(extraPhaseKeys))
-      state.phases[phaseStateKey] = forOp.getResult(phaseBase + i);
+    state.stage = forOp.getResult(nArgs);
+    for (auto [i, key] : llvm::enumerate(summary.acquiredPhaseKeys))
+      state.phases[key] = forOp.getResult(nArgs + 1 + i);
     for (auto [idx, tokenRef] : tokenRefs)
       *tokenRef = forOp.getResult(idx);
   }
@@ -1478,22 +1357,12 @@ struct AssignStagePhase {
       return;
 
     SmallVector<Type> extraIfResults;
-    SmallVector<StatePhaseKey> extraPhaseKeys;
-    for (auto stateKey : stateKeys)
-      extraIfResults.push_back(getStage(state, stateKey).getType());
-    for (PhaseKey key : thenSummary.acquiredPhaseKeys) {
-      for (auto stateKey : stateKeys) {
-        extraPhaseKeys.push_back(StatePhaseKey{key, stateKey});
-        extraIfResults.push_back(getPhase(state, key, stateKey).getType());
-      }
-    }
+    extraIfResults.push_back(state.stage.getType());
+    for (PhaseKey key : thenSummary.acquiredPhaseKeys)
+      extraIfResults.push_back(getPhase(state, key).getType());
 
     OpBuilder builder(ifOp);
-    unsigned nResults = ifOp.getResults().size();
-    StateIndexMap stagePositions;
-    for (auto [i, stateKey] : llvm::enumerate(stateKeys))
-      stagePositions[stateKey] = nResults + static_cast<unsigned>(i);
-    unsigned phaseBase = nResults + static_cast<unsigned>(stateKeys.size());
+    size_t nResults = ifOp.getResults().size();
     auto newIfOp = replaceIfOpWithNewSignature(builder, ifOp, extraIfResults);
 
     auto thenState = assignStateInBlock(newIfOp.thenBlock(), state);
@@ -1514,27 +1383,19 @@ struct AssignStagePhase {
       tokenRefs[*pos] = &state.token;
     }
     tokToStagePosMap[{newIfOp.thenYield(), thenState.token}] =
-        stagePositions;
+        thenYieldOp.getNumOperands();
     tokToStagePosMap[{newIfOp.elseYield(), elseState.token}] =
-        stagePositions;
-    recordYieldTokenStageMappings(newIfOp, thenYieldOp, nResults,
-                                  stagePositions);
-    recordYieldTokenStageMappings(newIfOp, elseYieldOp, nResults,
-                                  stagePositions);
+        elseYieldOp.getNumOperands();
+    recordYieldTokenStageMappings(newIfOp, thenYieldOp, nResults, nResults);
+    recordYieldTokenStageMappings(newIfOp, elseYieldOp, nResults, nResults);
 
-    for (auto stateKey : stateKeys) {
+    thenYieldOp->insertOperands(thenYieldOp.getNumOperands(), thenState.stage);
+    elseYieldOp->insertOperands(elseYieldOp.getNumOperands(), elseState.stage);
+    for (PhaseKey key : thenSummary.acquiredPhaseKeys) {
       thenYieldOp->insertOperands(thenYieldOp.getNumOperands(),
-                                  getStage(thenState, stateKey));
+                                  getPhase(thenState, key));
       elseYieldOp->insertOperands(elseYieldOp.getNumOperands(),
-                                  getStage(elseState, stateKey));
-    }
-    for (StatePhaseKey phaseStateKey : extraPhaseKeys) {
-      thenYieldOp->insertOperands(thenYieldOp.getNumOperands(),
-                                  getPhase(thenState, phaseStateKey.phaseKey,
-                                           phaseStateKey.stateKey));
-      elseYieldOp->insertOperands(elseYieldOp.getNumOperands(),
-                                  getPhase(elseState, phaseStateKey.phaseKey,
-                                           phaseStateKey.stateKey));
+                                  getPhase(elseState, key));
     }
 
     assert(hasPartition(ifOp));
@@ -1544,18 +1405,13 @@ struct AssignStagePhase {
 
     // Stage: all group partition IDs.
     ifOpIds.insert(allGroupPartitionIds.begin(), allGroupPartitionIds.end());
-    for (auto stateKey : stateKeys)
-      ifOpOutputsIds.push_back(SetVector<int>(allGroupPartitionIds.begin(),
-                                              allGroupPartitionIds.end()));
+    ifOpOutputsIds.push_back(SetVector<int>(allGroupPartitionIds.begin(),
+                                            allGroupPartitionIds.end()));
     // Phase: per-key partition IDs.
-    for (StatePhaseKey phaseStateKey : extraPhaseKeys) {
+    for (PhaseKey key : thenSummary.acquiredPhaseKeys) {
       SetVector<int> phaseIds;
-      for (Value arg :
-           {getPhase(thenState, phaseStateKey.phaseKey,
-                     phaseStateKey.stateKey),
-            getPhase(elseState, phaseStateKey.phaseKey,
-                     phaseStateKey.stateKey)}) {
-        auto ids = inferPartitionIds(arg, phaseStateKey.phaseKey.partitionId);
+      for (Value arg : {getPhase(thenState, key), getPhase(elseState, key)}) {
+        auto ids = inferPartitionIds(arg, key.partitionId);
         phaseIds.insert(ids.begin(), ids.end());
       }
       ifOpOutputsIds.push_back(phaseIds);
@@ -1564,10 +1420,9 @@ struct AssignStagePhase {
     setPartition(newIfOp, ifOpIds);
     setPartitionOutputs(newIfOp, ifOpOutputsIds);
 
-    for (auto &[key, pos] : stagePositions)
-      state.stages[key] = newIfOp.getResult(pos);
-    for (auto [i, phaseStateKey] : llvm::enumerate(extraPhaseKeys))
-      state.phases[phaseStateKey] = newIfOp.getResult(phaseBase + i);
+    state.stage = newIfOp.getResult(nResults);
+    for (auto [i, key] : llvm::enumerate(thenSummary.acquiredPhaseKeys))
+      state.phases[key] = newIfOp.getResult(nResults + 1 + i);
     for (auto [idx, tokenRef] : tokenRefs)
       *tokenRef = newIfOp.getResult(idx);
   }
@@ -1577,8 +1432,7 @@ struct AssignStagePhase {
       if (auto acquireOp = getAcquireOp(&op)) {
         ImplicitLocOpBuilder b(acquireOp.getLoc(), acquireOp);
         auto wsTag = getWarpSpecializeTag(&op);
-        StateKey opStateKey = getStateKey(&op);
-        StateKey opStorageKey = getAvailableStateKey(&op);
+        auto stageCluster = getStageCluster(&op);
 
         std::optional<SetVector<int>> phasePids, stagePids;
         if (hasPartition(&op)) {
@@ -1596,27 +1450,38 @@ struct AssignStagePhase {
           auto op = triton::gpu::createInto<ty>(
               b, b.getLoc(), pids, targetStageCluster,
               std::forward<decltype(args)>(args)...);
-          setStageCluster(b, op, targetStageCluster);
           if (wsTag)
             setWarpSpecializeTag(op, *wsTag);
           return op;
         };
-        auto createIntoStageForKey = [&](StateKey stateKey, auto opTy,
-                                         auto... args) {
-          return createIntoAt(stagePids, stateKey, opTy,
+        auto createInto = [&](std::optional<SetVector<int>> pids, auto opTy,
+                              auto... args) {
+          return createIntoAt(pids, stageCluster, opTy,
                               std::forward<decltype(args)>(args)...);
         };
-        auto createIntoPhaseForKey = [&](PhaseKey key, StateKey stateKey,
-                                         auto opTy, auto... args) {
-          std::optional<SetVector<int>> pids = phasePids;
-          if (key.hasStageLane()) {
-            pids.emplace();
-            pids->insert(key.partitionId);
-            if (stateKey)
-              stateKey->first = key.stageLane;
-          }
+        auto createIntoStage = [&](auto opTy, auto... args) {
+          return createInto(stagePids, opTy,
+                            std::forward<decltype(args)>(args)...);
+        };
+        auto createIntoPhase = [&](auto opTy, auto... args) {
+          return createInto(phasePids, opTy,
+                            std::forward<decltype(args)>(args)...);
+        };
+        auto createIntoPhaseForKey = [&](PhaseKey key, auto opTy,
+                                         auto... args) {
+          if (!key.hasStageLane())
+            return createIntoPhase(opTy,
+                                   std::forward<decltype(args)>(args)...);
 
-          return createIntoAt(pids, stateKey, opTy,
+          std::optional<SetVector<int>> keyPids;
+          keyPids.emplace();
+          keyPids->insert(key.partitionId);
+
+          StageCluster keyStageCluster = stageCluster;
+          if (keyStageCluster)
+            keyStageCluster->first = key.stageLane;
+
+          return createIntoAt(keyPids, keyStageCluster, opTy,
                               std::forward<decltype(args)>(args)...);
         };
         auto recordPhaseShiftUse = [&](Operation *op, PhaseKey key,
@@ -1625,74 +1490,52 @@ struct AssignStagePhase {
             return;
           phaseShiftUses.push_back(PhaseShiftUse{op, shiftAmount, key.stageLane});
         };
-        auto applyStageOffset = [&](Value baseStage, Value offset,
-                                    StateKey stateKey) -> Value {
+        auto applyStageOffset = [&](Value baseStage, Value offset) -> Value {
           APInt constant;
           if (matchPattern(offset, m_ConstantInt(&constant)) &&
               constant.isZero())
             return baseStage;
           if (matchPattern(offset, m_ConstantInt(&constant)))
-            offset = createIntoStageForKey(stateKey, arith::ConstantIntOp{},
-                                           constant.getSExtValue(),
-                                           constant.getBitWidth());
-          auto rawStage =
-              createIntoStageForKey(stateKey, arith::AddIOp{}, baseStage,
-                                    offset);
-          auto depth = createIntoStageForKey(stateKey, arith::ConstantIntOp{},
-                                             getDepth(), 32);
-          auto remStage =
-              createIntoStageForKey(stateKey, arith::RemSIOp{}, rawStage,
-                                    depth);
-          auto zero =
-              createIntoStageForKey(stateKey, arith::ConstantIntOp{}, 0, 32);
-          auto isNegative = createIntoStageForKey(
-              stateKey, arith::CmpIOp{}, arith::CmpIPredicate::slt, remStage,
-              zero);
-          auto wrappedStage =
-              createIntoStageForKey(stateKey, arith::AddIOp{}, remStage,
-                                    depth);
-          return createIntoStageForKey(stateKey, arith::SelectOp{},
-                                       isNegative, wrappedStage, remStage);
+            offset = createIntoStage(arith::ConstantIntOp{},
+                                     constant.getSExtValue(),
+                                     constant.getBitWidth());
+          auto rawStage = createIntoStage(arith::AddIOp{}, baseStage, offset);
+          auto depth = createIntoStage(arith::ConstantIntOp{}, getDepth(), 32);
+          auto remStage = createIntoStage(arith::RemSIOp{}, rawStage, depth);
+          auto zero = createIntoStage(arith::ConstantIntOp{}, 0, 32);
+          auto isNegative = createIntoStage(arith::CmpIOp{},
+                                            arith::CmpIPredicate::slt, remStage,
+                                            zero);
+          auto wrappedStage = createIntoStage(arith::AddIOp{}, remStage, depth);
+          return createIntoStage(arith::SelectOp{}, isNegative, wrappedStage,
+                                 remStage);
         };
 
         // Stage update.
+        Value rawStage = state.stage;
+        Value baseStage = rawStage;
         bool advanceStage = isFirstUseFreshWriteAfterAcquire(acquireOp);
+        if (advanceStage) {
+          auto nextStage =
+              createIntoStage(arith::AddIOp{}, rawStage,
+                              createIntoStage(arith::ConstantIntOp{}, 1, 32));
+          auto stageWrapped = createIntoStage(
+              arith::CmpIOp{}, arith::CmpIPredicate::eq, nextStage,
+              createIntoStage(arith::ConstantIntOp{}, getDepth(), 32));
+          auto zero = createIntoStage(arith::ConstantIntOp{}, 0, 32);
+          auto wrappedStage =
+              createIntoStage(arith::SelectOp{}, stageWrapped, zero, nextStage);
+          baseStage = wrappedStage;
+        }
         Value authoredOffset =
             acquireOp.getPhase() ? Value() : acquireOp.getStage();
-        StateValueMap baseStages;
-        StateValueMap acquireStages;
-        for (auto stateKey : stateKeys) {
-          StateKey emitStateKey = getEmitStateKey(stateKey, opStateKey);
-          Value rawStage = getStage(state, stateKey);
-          Value baseStage = rawStage;
-          if (advanceStage) {
-            auto one = createIntoStageForKey(emitStateKey,
-                                             arith::ConstantIntOp{}, 1, 32);
-            auto nextStage =
-                createIntoStageForKey(emitStateKey, arith::AddIOp{}, rawStage,
-                                      one);
-            auto depth = createIntoStageForKey(
-                emitStateKey, arith::ConstantIntOp{}, getDepth(), 32);
-            auto stageWrapped = createIntoStageForKey(
-                emitStateKey, arith::CmpIOp{}, arith::CmpIPredicate::eq,
-                nextStage, depth);
-            auto zero = createIntoStageForKey(emitStateKey,
-                                              arith::ConstantIntOp{}, 0, 32);
-            baseStage = createIntoStageForKey(
-                emitStateKey, arith::SelectOp{}, stageWrapped, zero,
-                nextStage);
-          }
-          baseStages[stateKey] = baseStage;
-          acquireStages[stateKey] =
-              authoredOffset ? applyStageOffset(baseStage, authoredOffset,
-                                                emitStateKey)
-                             : baseStage;
-        }
-        state.stages = baseStages;
-        Value acquireStage = acquireStages[opStorageKey];
+        Value acquireStage =
+            authoredOffset ? applyStageOffset(baseStage, authoredOffset)
+                           : baseStage;
+        state.stage = baseStage;
         acquireOp.getStageMutable().assign(acquireStage);
         state.token = acquireOp.getToken();
-        tokenLogicalStages[acquireOp.getToken()] = baseStages;
+        tokenLogicalStage[acquireOp.getToken()] = baseStage;
 
         // Phase update. Internal phase state stays group-specific, but the
         // acquire itself always receives the final parity bit consumed by
@@ -1702,68 +1545,50 @@ struct AssignStagePhase {
               !llvm::is_contained(getPartitionIds(&op), pid))
             continue;
           PhaseKey key = getSelectedPhaseKey(pid, acquireOp);
-          Value acquirePhase;
-          for (auto stateKey : stateKeys) {
-            StateKey emitStateKey = getEmitStateKey(stateKey, opStateKey);
-            Value localAcquireStage = acquireStages[stateKey];
-            Value phaseState = getPhase(state, key, stateKey);
-            Value localAcquirePhase = phaseState;
-            if (useSinglePhaseForGroup) {
-              auto nextPhase = createIntoPhaseForKey(
-                  key, emitStateKey, arith::XOrIOp{}, phaseState,
-                  createIntoPhaseForKey(key, emitStateKey,
-                                        arith::ConstantIntOp{}, 1, 32));
-              auto zero = createIntoPhaseForKey(
-                  key, emitStateKey, arith::ConstantIntOp{}, 0, 32);
-              auto phaseWrapped = createIntoPhaseForKey(
-                  key, emitStateKey, arith::CmpIOp{}, arith::CmpIPredicate::eq,
-                  localAcquireStage, zero);
-              phaseState = createIntoPhaseForKey(
-                  key, emitStateKey, arith::SelectOp{}, phaseWrapped,
-                  nextPhase, phaseState);
-              localAcquirePhase = phaseState;
-            } else {
-              auto phaseBit = createIntoPhaseForKey(
-                  key, emitStateKey, arith::ShLIOp{},
-                  createIntoPhaseForKey(key, emitStateKey,
-                                        arith::ConstantIntOp{}, 1, 32),
-                  localAcquireStage);
-              recordPhaseShiftUse(phaseBit.getOperation(), key,
-                                  localAcquireStage);
-              phaseState = createIntoPhaseForKey(
-                  key, emitStateKey, arith::XOrIOp{}, phaseState, phaseBit);
-              auto shiftedPhase = createIntoPhaseForKey(
-                  key, emitStateKey, arith::ShRUIOp{}, phaseState,
-                  localAcquireStage);
-              localAcquirePhase = shiftedPhase;
-              recordPhaseShiftUse(shiftedPhase.getOperation(), key,
-                                  localAcquireStage);
-              localAcquirePhase = createIntoPhaseForKey(
-                  key, emitStateKey, arith::AndIOp{}, localAcquirePhase,
-                  createIntoPhaseForKey(key, emitStateKey,
-                                        arith::ConstantIntOp{}, 1, 32));
-            }
-            state.phases[StatePhaseKey{key, stateKey}] = phaseState;
-            if (stateKey == opStorageKey)
-              acquirePhase = localAcquirePhase;
+          Value phaseState = getPhase(state, key);
+          Value acquirePhase = phaseState;
+          if (useSinglePhaseForGroup) {
+            auto nextPhase = createIntoPhaseForKey(
+                key, arith::XOrIOp{}, phaseState,
+                createIntoPhaseForKey(key, arith::ConstantIntOp{}, 1, 32));
+            auto zero = createIntoPhaseForKey(key, arith::ConstantIntOp{}, 0, 32);
+            auto phaseWrapped = createIntoPhaseForKey(
+                key,
+                arith::CmpIOp{}, arith::CmpIPredicate::eq, acquireStage, zero);
+            phaseState = createIntoPhaseForKey(
+                key, arith::SelectOp{}, phaseWrapped, nextPhase, phaseState);
+            acquirePhase = phaseState;
+          } else {
+            auto phaseBit = createIntoPhaseForKey(
+                key, arith::ShLIOp{},
+                createIntoPhaseForKey(key, arith::ConstantIntOp{}, 1, 32),
+                acquireStage);
+            recordPhaseShiftUse(phaseBit.getOperation(), key, acquireStage);
+            phaseState =
+                createIntoPhaseForKey(key, arith::XOrIOp{}, phaseState, phaseBit);
+            auto shiftedPhase = createIntoPhaseForKey(
+                key, arith::ShRUIOp{}, phaseState, acquireStage);
+            acquirePhase = shiftedPhase;
+            recordPhaseShiftUse(shiftedPhase.getOperation(), key, acquireStage);
+            acquirePhase = createIntoPhaseForKey(
+                key, arith::AndIOp{}, acquirePhase,
+                createIntoPhaseForKey(key, arith::ConstantIntOp{}, 1, 32));
           }
-          assert(acquirePhase && "missing acquire phase for op state key");
+          state.phases[key] = phaseState;
           acquireOp.getPhaseMutable().assign(acquirePhase);
         }
       } else if (auto stageOp = getAuthoredStageOp(&op)) {
         ImplicitLocOpBuilder b(op.getLoc(), &op);
         auto wsTag = getWarpSpecializeTag(&op);
-        StateKey stateKey = getAvailableStateKey(&op);
-        StateKey emitStateKey = getEmitStateKey(stateKey, getStateKey(&op));
+        auto stageCluster = getStageCluster(&op);
         std::optional<SetVector<int>> stagePids;
         if (hasPartition(&op))
           stagePids = getPartitionIds(&op);
         auto createIntoStage = [&](auto opTy, auto... args) {
           using ty = decltype(opTy);
           auto newOp = triton::gpu::createInto<ty>(
-              b, b.getLoc(), stagePids, emitStateKey,
+              b, b.getLoc(), stagePids, stageCluster,
               std::forward<decltype(args)>(args)...);
-          setStageCluster(b, newOp, emitStateKey);
           if (wsTag)
             setWarpSpecializeTag(newOp, *wsTag);
           return newOp;
@@ -1788,9 +1613,8 @@ struct AssignStagePhase {
           return createIntoStage(arith::SelectOp{}, isNegative, wrappedStage,
                                  remStage);
         };
-        Value baseStage = getStageForOp(state, &op);
-        widenStageBlockArgUse(stageOp, baseStage);
-        stageOp.setStage(applyStageOffset(baseStage, stageOp.getStage()));
+        widenStageBlockArgUse(stageOp, state.stage);
+        stageOp.setStage(applyStageOffset(state.stage, stageOp.getStage()));
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
         assignStateInForOp(forOp, state);
       } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
@@ -1801,7 +1625,7 @@ struct AssignStagePhase {
     return state;
   }
 
-  void propagateStage(Value token, const StateValueMap &stages,
+  void propagateStage(Value token, Value stage,
                       DenseSet<Operation *> &visited) {
     for (auto &tokUse : token.getUses()) {
       auto owner = tokUse.getOwner();
@@ -1811,26 +1635,19 @@ struct AssignStagePhase {
       if (auto stageOp = dyn_cast<SemaphoreStageInterface>(owner)) {
         if (hasAuthoredStageOffsets() && stageOp.getStage())
           continue;
-        Value stage = getStageForOp(stages, owner);
         widenStageBlockArgUse(stageOp, stage);
         stageOp.setStage(stage);
       } else if (auto forOp = dyn_cast<scf::ForOp>(owner)) {
         auto tokPos = tokUse.getOperandNumber() - forOp.getNumControlOperands();
         auto iterTok = forOp.getRegionIterArg(tokPos);
-        auto stagePositions = tokToStagePosMap.at({forOp, iterTok});
-        propagateStage(
-            iterTok,
-            getStageValuesFromPositions(forOp.getRegionIterArgs(),
-                                        stagePositions),
-            visited);
+        auto stagePos = tokToStagePosMap.at({forOp, iterTok});
+        propagateStage(iterTok, forOp.getRegionIterArgs()[stagePos], visited);
       } else if (auto yieldOp = dyn_cast<scf::YieldOp>(owner)) {
         auto tokPos = tokUse.getOperandNumber();
-        auto stagePositions = tokToStagePosMap.at({yieldOp, token});
+        auto stagePos = tokToStagePosMap.at({yieldOp, token});
         auto parentOp = yieldOp->getParentOp();
         propagateStage(parentOp->getResult(tokUse.getOperandNumber()),
-                       getStageValuesFromPositions(parentOp->getResults(),
-                                                   stagePositions),
-                       visited);
+                       parentOp->getResult(stagePos), visited);
       }
     }
   }
@@ -1854,9 +1671,7 @@ struct AssignStagePhase {
     State initState;
     auto firstSemaOp = semaOps.front();
     int depth = cast<SemaphoreType>(firstSemaOp.getType()).getNumStages();
-    Value initStage = arith::ConstantIntOp::create(b, depth - 1, 32);
-    for (auto stateKey : impl.stateKeys)
-      initState.stages[stateKey] = initStage;
+    initState.stage = arith::ConstantIntOp::create(b, depth - 1, 32);
     // Per-semaphore initial phases:
     // single-phase:  isReleased=true  -> 0, isReleased=false -> 1
     // multiphase:    isReleased=true  -> 0, isReleased=false -> -1
@@ -1876,13 +1691,11 @@ struct AssignStagePhase {
       for (auto user : semaOp->getUsers()) {
         if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user)) {
           DenseSet<Operation *> visited;
-          auto logicalStagesIt =
-              impl.tokenLogicalStages.find(acquireOp.getToken());
-          assert(logicalStagesIt != impl.tokenLogicalStages.end() &&
-                 !logicalStagesIt->second.empty() &&
+          Value logicalStage =
+              impl.tokenLogicalStage.lookup(acquireOp.getToken());
+          assert(logicalStage &&
                  "acquire missing logical stage after assign-stage-phase");
-          impl.propagateStage(acquireOp.getToken(), logicalStagesIt->second,
-                              visited);
+          impl.propagateStage(acquireOp.getToken(), logicalStage, visited);
         }
       }
     }
