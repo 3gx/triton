@@ -257,6 +257,12 @@ ParseResult WarpGroupOp::parse(OpAsmParser &p, OperationState &result) {
   result.addAttribute(getNumWarpsAttrName(result.name),
                       p.getBuilder().getDenseI32ArrayAttr(partitionNumWarps));
 
+  if (!result.regions.empty() && !result.regions.front()->empty()) {
+    Operation *terminator = result.regions.front()->front().getTerminator();
+    if (auto yieldOp = dyn_cast<WarpGroupYieldOp>(terminator))
+      result.addTypes(yieldOp.getOperandTypes());
+  }
+
   return success();
 }
 
