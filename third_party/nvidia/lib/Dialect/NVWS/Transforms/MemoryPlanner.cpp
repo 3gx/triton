@@ -1157,6 +1157,10 @@ static bool hasDifferentProducerPartitions(LocalBuffer &lhs, LocalBuffer &rhs) {
   return !samePartitionIds(getProducerOp(lhs), getProducerOp(rhs));
 }
 
+static bool isCrossStageDescriptorLoadBuffer(LocalBuffer &buffer) {
+  return buffer.isCrossStage && isDescriptorLoadProducer(getProducerOp(buffer));
+}
+
 static Operation *findOriginalLoadOp(Value value, DenseSet<Value> &visited) {
   if (!value || !visited.insert(value).second)
     return nullptr;
@@ -1290,7 +1294,9 @@ private:
         LocalBuffer *reuseOwner = nullptr;
         auto &owners = innermostBufferOwners[elementType];
         for (LocalBuffer *owner : owners) {
-          if (!hasDifferentProducerPartitions(*owner, buffer)) {
+          if (!hasDifferentProducerPartitions(*owner, buffer) &&
+              !(isCrossStageDescriptorLoadBuffer(*owner) &&
+                isCrossStageDescriptorLoadBuffer(buffer))) {
             reuseOwner = owner;
             break;
           }
@@ -1450,6 +1456,9 @@ private:
         if (owner.liveness.intersects(candidate.liveness))
           continue;
         if (hasDifferentProducerPartitions(owner, candidate))
+          continue;
+        if (isCrossStageDescriptorLoadBuffer(owner) &&
+            isCrossStageDescriptorLoadBuffer(candidate))
           continue;
 
         unsigned oldId = candidate.bufferId;
