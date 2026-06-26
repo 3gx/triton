@@ -7,12 +7,25 @@
 // The key buffers in allocation order:
 //   [0] _1: output staging (SMEM), copy=1
 //   [1] _0: output staging (SMEM), copy=1
-//   [2] v: cross-stage V buffer (SMEM), copy=3
-//   [3] k: cross-stage K buffer (SMEM), copy=3
-//   [4] q0_1: query buffer (SMEM), copy=1
-//   [5] q0_0: query buffer (SMEM), copy=1
+//   [2] v/k: cross-stage KV buffers (SMEM), copy=3 (share buffer.id)
+//   [3] q0_1: query buffer (SMEM), copy=1
+//   [4] q0_0: query buffer (SMEM), copy=1
 //
-// TMEM allocation relationships are checked below with symbolic buffer ids.
+// TMEM allocations with packing:
+//   [5] acc_0_10: f32 accumulator, owns buffer 5
+//   [6] acc_1_8: f32 accumulator, owns buffer 6
+//   [7] qk_0/alpha_0/m_ij_0/l_i0_1: packed in buffer 7
+//       - qk_0 owns buffer 7
+//       - acc_0 (f16) reuses at offset 0
+//       - alpha_0 at offset 64
+//       - m_ij_0 at offset 65
+//       - l_i0_1 at offset 66
+//   [8] qk_1/alpha_1/m_ij_1/l_i0_0: packed in buffer 8
+//       - qk_1 owns buffer 8
+//       - acc_1 (f16) reuses at offset 0
+//       - alpha_1 at offset 64
+//       - m_ij_1 at offset 65
+//       - l_i0_0 at offset 66
 
 // CHECK-LABEL: tt.func public @_attn_fwd_persist
 // CHECK: %acc_1 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = [[ACC1:[0-9]+]] : i32, buffer.offset = 0 : i32}
