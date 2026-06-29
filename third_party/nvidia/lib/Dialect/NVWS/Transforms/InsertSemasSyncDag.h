@@ -8,8 +8,9 @@
 // grouped by destination (fan-in), materialized as Acquire/Release nodes
 // spliced into the chains, then completed with per-component entry
 // acquires, carrier crossings (threading facts ON the For/If nodes),
-// requiredParts clone sets, and the BackingPlan. Pure analysis: the IR is
-// not touched.
+// requiredParts clone sets, and the BackingPlan.  Graph construction is pure
+// analysis.  After every group is complete, schedule finalization may raise
+// existing loop.cluster attrs to legalize zero-slack semaphore recurrences.
 //
 // Walk rules (spec section 5.1):
 //   1. W by p: edge from every holder != p; piece becomes Exclusive(p).
@@ -43,12 +44,15 @@ namespace nvws_semas {
 CompId compOfMember(GroupDag &g, MemberId m);
 
 LogicalResult computeBackingPlan(GroupDag &g, triton::FuncOp funcOp,
-                                 bool useMetaPartitioner, int &numTmemBlocks);
+                                 bool useMetaPartitioner,
+                                 int lowerSemaphoreNumStages,
+                                 int &numTmemBlocks);
 
 LogicalResult buildSyncDag(GroupDag &g, triton::FuncOp funcOp,
-                           bool useMetaPartitioner, int &numTmemBlocks);
+                           bool useMetaPartitioner,
+                           int lowerSemaphoreNumStages, int &numTmemBlocks);
 
-void finalizeSyncSchedule(MutableArrayRef<GroupDag> groups);
+LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups);
 
 void dumpGroupSyncDag(GroupDag &g, triton::FuncOp funcOp);
 

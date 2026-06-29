@@ -34,6 +34,9 @@
 #include "InsertSemasSyncDag.h"
 #include "InsertSemasOwnerDag.h"
 
+#include <limits>
+#include <numeric>
+
 namespace mlir {
 namespace triton {
 namespace nvws_semas {
@@ -1004,6 +1007,7 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SyncCtx &ctx) {
         s.inheritStamp = acq->owner;
       }
     }
+    acq->scheduleAnchor = dstAnchor;
     spliceBefore(acq, dstAnchor);
     s.expectedReleases += m * relCount;
     for (unsigned idx : grp.idxs) {
@@ -1014,6 +1018,7 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SyncCtx &ctx) {
       rel->count = relCount; // arrive multiplicity (default 1)
       rel->payloads = e.payloads;
       rel->sat = acq;
+      rel->scheduleAnchor = e.src;
       Node *anchor = lastAfter.lookup(e.src);
       spliceAfter(rel, anchor ? anchor : e.src);
       lastAfter[e.src] = rel;
@@ -1904,6 +1909,7 @@ static void applyHoldRulePlacement(GroupDag &g, Node *head) {
         Sema &s = g.semaTable.semas[pointAcquire->sema];
         pointAcquire->owner = c.slotOwner;
         unlinkFromChain(pointAcquire);
+        pointAcquire->scheduleAnchor = c.hold.firstToucher;
         spliceBefore(pointAcquire, c.hold.firstToucher);
 
         Node *closing = g.newNode(Node::Release, /*op=*/nullptr, tail->parent);
@@ -1912,6 +1918,7 @@ static void applyHoldRulePlacement(GroupDag &g, Node *head) {
         closing->count = 1;
         closing->payloads.push_back(AsyncOp::NONE);
         closing->sat = pointAcquire;
+        closing->scheduleAnchor = tail;
         spliceAfter(closing, tail);
         s.expectedReleases += closing->count;
         c.hold.closingRelease = closing;
@@ -1919,6 +1926,7 @@ static void applyHoldRulePlacement(GroupDag &g, Node *head) {
       }
       Node *regain = c.finals[0];
       unlinkFromChain(regain);
+      regain->scheduleAnchor = c.hold.firstToucher;
       spliceBefore(regain, c.hold.firstToucher);
       if (c.hold.keepsEntryAcquire) {
         Sema &recurrenceSema = g.semaTable.semas[regain->sema];
@@ -2028,7 +2036,9 @@ static LogicalResult getPlannedBufferCopy(GroupDag &g,
 }
 
 LogicalResult computeBackingPlan(GroupDag &g, triton::FuncOp funcOp,
-                                 bool useMetaPartitioner, int &numTmemBlocks) {
+                                 bool useMetaPartitioner,
+                                 int lowerSemaphoreNumStages,
+                                 int &numTmemBlocks) {
   // POSTERITY: this is the ONLY decision in the whole pass that consumes
   // useMetaPartitioner (audited against the pre-rewrite pass, which used it
   // identically and nowhere else): the meta partitioner makes its own
@@ -2051,6 +2061,20 @@ LogicalResult computeBackingPlan(GroupDag &g, triton::FuncOp funcOp,
   } else if (g.isTmem() && !untouched && !useMetaPartitioner &&
       isMultiStagedGroup(g, numTmemBlocks))
     g.backingPlan.numStages = 2;
+  g.backingPlan.semaphoreDepth = g.backingPlan.numStages;
+
+  // LowerSemaphore auto-multibuffers only descriptor-fed local groups without
+  // an authored buffer.copy.  Keep allocation planning unchanged, but record
+  // the exact later semaphore depth now so recurrence scheduling and ASP use
+  // the same physical ring.
+  bool hasProducerLoad = false;
+  forEachNode(g, [&](Node *node) {
+    if (node->kind == Node::Release &&
+        llvm::is_contained(node->payloads, AsyncOp::TMALoad))
+      hasProducerLoad = true;
+  });
+  if (!untouched && g.isLocal() && !plannedBufferCopy && hasProducerLoad)
+    g.backingPlan.semaphoreDepth = std::max(1, lowerSemaphoreNumStages);
   // Hoist anchor: before the first WS-tagged loop (function scope).
   Operation *anchor = nullptr;
   funcOp.walk([&](scf::ForOp forOp) {
@@ -2494,12 +2518,365 @@ static LogicalResult verifySyncDag(GroupDag &g) {
 // ---------------------------------------------------------------------------
 // Schedule facts for generated sync rows.
 //
-// The SYNC-DAG owns these facts. EMIT-IR only transcribes them. Real-row
-// anchors retain the existing behavior. A virtual acquire at a scheduled-loop
-// exit keeps its owner/stage lane but must be placed at that lane's region
-// frontier, including operations represented by other buffer groups.
+// A semaphore handoff is a data dependency even though it is not represented
+// by SSA.  Preserve that dependency while projecting the ownership DAG onto a
+// pipelined loop schedule.  For a source U, destination V, loop distance d,
+// and N operations per unrolled iteration, PipelineExpander requires:
+//
+//   order(V) + stage(V) * N >= order(U) + stage(U) * N - d * N
+//
+// Static stages are an input contract.  A positive stage slack is already
+// legal, zero slack becomes an order constraint, and negative slack is a hard
+// error.  The zero-slack repair raises destination clusters (and their SSA and
+// semaphore dependants) without changing either stage or unrelated clusters.
+// EMIT-IR then only transcribes the legalized real-row and sync-row schedules.
 // ---------------------------------------------------------------------------
 using ScheduleCache = DenseMap<int64_t, gpu::StageCluster>;
+
+struct ScheduleEdge {
+  Operation *src = nullptr;
+  Operation *dst = nullptr;
+};
+
+struct SlotSchedule {
+  int64_t advancesPerIteration = 0;
+  DenseMap<Node *, int64_t> ordinalByAccess;
+  bool complete = true;
+};
+
+static Effect accessEffect(const Node *n) {
+  Effect effect = Effect::R;
+  for (const Touch &touch : n->touches)
+    effect = joinEffect(effect, touch.effect);
+  return effect;
+}
+
+static Operation *realScheduleAnchor(Node *anchor, bool source) {
+  for (Node *n = anchor; n; n = source ? n->prev : n->next)
+    if ((n->kind == Node::Access || n->kind == Node::For ||
+         n->kind == Node::If) &&
+        n->op)
+      return n->op;
+  return nullptr;
+}
+
+struct LoopAnchorPair {
+  scf::ForOp loop;
+  Operation *src = nullptr;
+  Operation *dst = nullptr;
+};
+
+// Find the innermost scheduled loop in which both anchors are represented by
+// direct body operations.  Those direct operations are the units ordered by
+// CoarseSchedule and PipelineExpander.
+static std::optional<LoopAnchorPair>
+findCommonScheduledLoop(Operation *src, Operation *dst) {
+  for (Operation *parent = src->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    auto loop = dyn_cast<scf::ForOp>(parent);
+    if (!loop ||
+        !loop->hasAttr(triton::kScheduledMaxStageAttrName))
+      continue;
+    Operation *srcInLoop = loop.getBody()->findAncestorOpInBlock(*src);
+    Operation *dstInLoop = loop.getBody()->findAncestorOpInBlock(*dst);
+    if (srcInLoop && dstInLoop)
+      return LoopAnchorPair{loop, srcInLoop, dstInLoop};
+  }
+  return std::nullopt;
+}
+
+static bool precedesInChain(Node *src, Node *dst) {
+  for (Node *n = src->next; n; n = n->next)
+    if (n == dst)
+      return true;
+  return false;
+}
+
+// Reconstruct the abstract backing-stage ordinal used by AssignStagePhase.
+// A stage advances only for an acquire whose first anchored access is a fresh
+// write, exactly matching isFirstUseFreshWriteAfterAcquire.  Reads and writes
+// without such an acquire retain the most recent version of their logical
+// group.  Circular logical groups are supplied as one physical set, matching
+// the fold performed by EMIT-IR.
+static SlotSchedule computeSlotSchedule(ArrayRef<GroupDag *> physicalSet,
+                                        scf::ForOp loop) {
+  struct Event {
+    GroupDag *group = nullptr;
+    Node *node = nullptr;
+    Operation *op = nullptr;
+    unsigned groupOrder = 0;
+  };
+
+  DenseMap<Operation *, unsigned> operationOrder;
+  for (auto [index, op] :
+       llvm::enumerate(loop.getBody()->without_terminator()))
+    operationOrder[&op] = index;
+
+  SlotSchedule result;
+  SmallVector<Event, 8> events;
+  DenseMap<Node *, unsigned> advancesByAccess;
+  for (auto [groupOrder, group] : llvm::enumerate(physicalSet)) {
+    forEachNode(*group, [&](Node *node) {
+      if (node->kind != Node::Acquire || !node->scheduleAnchor ||
+          node->scheduleAnchor->kind != Node::Access ||
+          accessEffect(node->scheduleAnchor) != Effect::W)
+        return;
+      Operation *direct = loop.getBody()->findAncestorOpInBlock(
+          *node->scheduleAnchor->op);
+      if (direct == node->scheduleAnchor->op)
+        ++advancesByAccess[node->scheduleAnchor];
+    });
+    forEachNode(*group, [&](Node *node) {
+      if (node->kind != Node::Access || !node->op)
+        return;
+      Operation *direct = loop.getBody()->findAncestorOpInBlock(*node->op);
+      if (!direct)
+        return;
+      // A conditional/nested access has path-dependent stage progression.
+      // Do not invent a recurrence distance for it.
+      if (direct != node->op) {
+        result.complete = false;
+        return;
+      }
+      events.push_back(Event{group, node, direct,
+                             static_cast<unsigned>(groupOrder)});
+    });
+  }
+
+  llvm::sort(events, [&](const Event &lhs, const Event &rhs) {
+    unsigned lhsOrder = operationOrder.lookup(lhs.op);
+    unsigned rhsOrder = operationOrder.lookup(rhs.op);
+    return lhsOrder != rhsOrder ? lhsOrder < rhsOrder
+                                : lhs.groupOrder < rhs.groupOrder;
+  });
+
+  int64_t ordinal = -1;
+  int64_t advanceCount = 0;
+  DenseMap<GroupDag *, int64_t> lastProducedOrdinal;
+  for (const Event &event : events) {
+    if (accessEffect(event.node) == Effect::W) {
+      unsigned advances = advancesByAccess.lookup(event.node);
+      // One access cannot name two different physical stages.  Reject that
+      // unsupported protocol shape instead of assigning it an invented slot.
+      if (advances > 1)
+        result.complete = false;
+      ordinal += advances;
+      advanceCount += advances;
+      if (ordinal < 0) {
+        result.complete = false;
+        continue;
+      }
+      lastProducedOrdinal[event.group] = ordinal;
+      result.ordinalByAccess[event.node] = ordinal;
+      continue;
+    }
+    auto it = lastProducedOrdinal.find(event.group);
+    if (it == lastProducedOrdinal.end()) {
+      result.complete = false;
+      continue;
+    }
+    result.ordinalByAccess[event.node] = it->second;
+  }
+  result.advancesPerIteration = advanceCount;
+  return result;
+}
+
+static int64_t positiveMod(int64_t value, int64_t modulus) {
+  int64_t remainder = value % modulus;
+  return remainder < 0 ? remainder + modulus : remainder;
+}
+
+// Find the first future logical iteration in which dst addresses the physical
+// slot released by src.  The search bound is one complete orbit of the backing
+// ring, depth / gcd(depth, advances).
+static std::optional<int64_t>
+computeRecurrenceDistance(const SlotSchedule &slots, int64_t depth,
+                          Node *src, Node *dst) {
+  auto srcIt = slots.ordinalByAccess.find(src);
+  auto dstIt = slots.ordinalByAccess.find(dst);
+  if (!slots.complete || srcIt == slots.ordinalByAccess.end() ||
+      dstIt == slots.ordinalByAccess.end() ||
+      slots.advancesPerIteration <= 0)
+    return std::nullopt;
+
+  int64_t orbit =
+      depth / std::gcd(depth, slots.advancesPerIteration);
+  for (int64_t distance = 1; distance <= orbit; ++distance)
+    if (positiveMod(dstIt->second +
+                        distance * slots.advancesPerIteration,
+                    depth) == positiveMod(srcIt->second, depth))
+      return distance;
+  return std::nullopt;
+}
+
+static LogicalResult addSyncScheduleEdges(
+    MutableArrayRef<GroupDag> groups,
+    llvm::MapVector<Operation *, SmallVector<ScheduleEdge, 4>> &edgesByLoop) {
+  SmallVector<SmallVector<GroupDag *, 2>, 8> physicalSets;
+  DenseMap<GroupDag *, unsigned> setByGroup;
+  llvm::MapVector<int64_t, unsigned> circularSetByBuffer;
+  for (GroupDag &group : groups) {
+    unsigned setIndex;
+    if (group.isCircular()) {
+      auto [it, inserted] = circularSetByBuffer.insert(
+          {group.bufferId, static_cast<unsigned>(physicalSets.size())});
+      if (inserted)
+        physicalSets.emplace_back();
+      setIndex = it->second;
+    } else {
+      setIndex = physicalSets.size();
+      physicalSets.emplace_back();
+    }
+    physicalSets[setIndex].push_back(&group);
+    setByGroup[&group] = setIndex;
+  }
+
+  std::map<std::pair<unsigned, Operation *>, SlotSchedule> slotCache;
+  for (GroupDag &group : groups) {
+    LogicalResult result = success();
+    forEachNode(group, [&](Node *release) {
+      if (failed(result) || release->kind != Node::Release || !release->sat)
+        return;
+      Node *acquire = release->sat;
+      Operation *src = realScheduleAnchor(release->scheduleAnchor,
+                                          /*source=*/true);
+      Operation *dst = realScheduleAnchor(acquire->scheduleAnchor,
+                                          /*source=*/false);
+      if (!src || !dst)
+        return;
+
+      std::optional<LoopAnchorPair> anchors =
+          findCommonScheduledLoop(src, dst);
+      if (!anchors || anchors->src == anchors->dst)
+        return;
+      gpu::StageCluster srcSchedule = gpu::getStageCluster(anchors->src);
+      gpu::StageCluster dstSchedule = gpu::getStageCluster(anchors->dst);
+      if (!srcSchedule || !dstSchedule)
+        return;
+
+      int64_t distance = 0;
+      if (!precedesInChain(release, acquire)) {
+        unsigned setIndex = setByGroup.lookup(&group);
+        auto key = std::make_pair(setIndex, anchors->loop.getOperation());
+        auto it = slotCache.find(key);
+        if (it == slotCache.end())
+          it = slotCache
+                   .emplace(key, computeSlotSchedule(physicalSets[setIndex],
+                                                     anchors->loop))
+                   .first;
+        std::optional<int64_t> recurrenceDistance = computeRecurrenceDistance(
+            it->second, group.backingPlan.semaphoreDepth,
+            release->scheduleAnchor, acquire->scheduleAnchor);
+        if (!recurrenceDistance) {
+          InFlightDiagnostic diag = anchors->src->emitError(
+              "nvws-insert-semas: cannot prove physical-slot recurrence "
+              "distance for a scheduled semaphore handoff");
+          diag.attachNote(anchors->dst->getLoc())
+              << "next ownership wave starts here";
+          result = failure();
+          return;
+        }
+        distance = *recurrenceDistance;
+      }
+
+      int64_t slack = distance + dstSchedule->first - srcSchedule->first;
+      if (slack < 0) {
+        InFlightDiagnostic diag = anchors->src->emitError(
+            "nvws-insert-semas: fixed loop.stage assignment cannot satisfy "
+            "semaphore handoff");
+        diag << " (source stage " << srcSchedule->first
+             << ", destination stage " << dstSchedule->first
+             << ", recurrence distance " << distance << ")";
+        diag.attachNote(anchors->dst->getLoc())
+            << "destination would execute before the released slot can be "
+               "reacquired";
+        result = failure();
+        return;
+      }
+      if (slack == 0)
+        edgesByLoop[anchors->loop.getOperation()].push_back(
+            ScheduleEdge{anchors->src, anchors->dst});
+    });
+    if (failed(result))
+      return failure();
+  }
+  return success();
+}
+
+static void addZeroSlackSSAEdges(scf::ForOp loop,
+                                 SmallVectorImpl<ScheduleEdge> &edges) {
+  for (Operation &consumer : loop.getBody()->without_terminator()) {
+    gpu::StageCluster consumerSchedule = gpu::getStageCluster(&consumer);
+    if (!consumerSchedule)
+      continue;
+    for (Value operand : getNestedOperands(&consumer)) {
+      auto [producer, distance] =
+          triton::getDefiningOpAndDistance(loop, operand);
+      if (!producer)
+        continue;
+      producer = loop.getBody()->findAncestorOpInBlock(*producer);
+      if (!producer || producer == &consumer)
+        continue;
+      gpu::StageCluster producerSchedule = gpu::getStageCluster(producer);
+      if (!producerSchedule)
+        continue;
+      int64_t slack = distance + consumerSchedule->first -
+                      producerSchedule->first;
+      if (slack == 0)
+        edges.push_back(ScheduleEdge{producer, &consumer});
+    }
+  }
+}
+
+static LogicalResult legalizeLoopSchedule(scf::ForOp loop,
+                                          ArrayRef<ScheduleEdge> edges) {
+  SmallVector<Operation *, 32> scheduledOps;
+  DenseMap<Operation *, int64_t> cluster;
+  for (Operation &op : loop.getBody()->without_terminator()) {
+    gpu::StageCluster schedule = gpu::getStageCluster(&op);
+    if (!schedule)
+      continue;
+    scheduledOps.push_back(&op);
+    cluster[&op] = schedule->second;
+  }
+
+  bool changed = false;
+  for (unsigned iteration = 0; iteration <= scheduledOps.size(); ++iteration) {
+    changed = false;
+    for (const ScheduleEdge &edge : edges) {
+      if (!cluster.contains(edge.src) || !cluster.contains(edge.dst))
+        continue;
+      // Operations in one cluster retain IR order.  A reversed IR pair needs
+      // a distinct following cluster; an already-forward pair may share one.
+      int64_t separation = edge.src->isBeforeInBlock(edge.dst) ? 0 : 1;
+      int64_t required = cluster.lookup(edge.src) + separation;
+      if (cluster.lookup(edge.dst) >= required)
+        continue;
+      cluster[edge.dst] = required;
+      changed = true;
+    }
+    if (!changed)
+      break;
+    if (iteration == scheduledOps.size())
+      return loop.emitError(
+          "nvws-insert-semas: cyclic zero-slack semaphore schedule");
+  }
+
+  OpBuilder builder(loop.getContext());
+  for (Operation *op : scheduledOps) {
+    gpu::StageCluster oldSchedule = gpu::getStageCluster(op);
+    int64_t newCluster = cluster.lookup(op);
+    if (newCluster == oldSchedule->second)
+      continue;
+    if (newCluster > std::numeric_limits<int32_t>::max())
+      return op->emitError(
+          "nvws-insert-semas: legalized loop.cluster exceeds i32 range");
+    gpu::setStageCluster(builder, op,
+                         std::make_pair(oldSchedule->first,
+                                        static_cast<int>(newCluster)));
+  }
+  return success();
+}
 
 static Operation *nextScheduleAnchor(const Node *n) {
   for (const Node *m = n; m; m = m->next)
@@ -2570,7 +2947,7 @@ static void assignSyncScheduleChain(Node *head, ScheduleCache &cache) {
   }
 }
 
-static void moveTailAcquireToLaneExit(Node *n) {
+static void placeFinalAcquireAtLaneExit(Node *n) {
   if (n->kind != Node::Acquire || !n->owner || !n->stageCluster ||
       nextScheduleAnchor(n->next))
     return;
@@ -2593,7 +2970,17 @@ static void moveTailAcquireToLaneExit(Node *n) {
   n->stageCluster = std::make_pair(stage, exitCluster);
 }
 
-void finalizeSyncSchedule(MutableArrayRef<GroupDag> groups) {
+LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups) {
+  llvm::MapVector<Operation *, SmallVector<ScheduleEdge, 4>> edgesByLoop;
+  if (failed(addSyncScheduleEdges(groups, edgesByLoop)))
+    return failure();
+  for (auto &[loopOp, edges] : edgesByLoop) {
+    auto loop = cast<scf::ForOp>(loopOp);
+    addZeroSlackSSAEdges(loop, edges);
+    if (failed(legalizeLoopSchedule(loop, edges)))
+      return failure();
+  }
+
   for (GroupDag &g : groups) {
     if (g.root->children.empty())
       continue;
@@ -2601,15 +2988,17 @@ void finalizeSyncSchedule(MutableArrayRef<GroupDag> groups) {
     assignSyncScheduleChain(g.root->children[0], cache);
   }
   for (GroupDag &g : groups)
-    forEachNode(g, moveTailAcquireToLaneExit);
+    forEachNode(g, placeFinalAcquireAtLaneExit);
+  return success();
 }
 
 // ---------------------------------------------------------------------------
 // Driver for stage 3.
 // ---------------------------------------------------------------------------
 LogicalResult buildSyncDag(GroupDag &g, triton::FuncOp funcOp,
-                                  bool useMetaPartitioner,
-                                  int &numTmemBlocks) {
+                           bool useMetaPartitioner,
+                           int lowerSemaphoreNumStages,
+                           int &numTmemBlocks) {
   SyncCtx ctx;
   if (!g.root->children.empty()) {
     ChainState top; // function chain: games start at bottom (first-touch)
@@ -2638,7 +3027,8 @@ LogicalResult buildSyncDag(GroupDag &g, triton::FuncOp funcOp,
     applyHoldRulePlacement(g, g.root->children[0]); // plan M2: native shape
     computeRequiredParts(g.root->children[0]);
   }
-  if (failed(computeBackingPlan(g, funcOp, useMetaPartitioner, numTmemBlocks)))
+  if (failed(computeBackingPlan(g, funcOp, useMetaPartitioner,
+                                lowerSemaphoreNumStages, numTmemBlocks)))
     return failure();
   // Pipeline-invariant guard (contract D / mining gap 6): a managed (=
   // synchronized) group must not contain a tt-form descriptor-fed

@@ -49,14 +49,15 @@ namespace nvws = triton::nvws;
 using namespace nvws_semas;
 
 // ---------------------------------------------------------------------------
-// Dispatcher. Commit 1 of the plan: stage 1 (ACCESS-DAG) only — pure
-// analysis + diagnostics + dump. The pass mutates nothing until the EMIT-IR
-// commit lands; lit failures of test/NVWS/insert_semas* are expected.
+// Dispatcher for the four InsertSemas stages.  ACCESS/OWNER/SYNC construction
+// is analysis-only; schedule finalization may raise existing loop.cluster
+// annotations to make generated handoffs pipeline-legal; EMIT renders the IR.
 // ---------------------------------------------------------------------------
 // useMetaPartitioner has exactly ONE consumer in this pass: the TMEM
 // backing-stage decision (meta => numStages=1; see computeBackingPlan in
 // InsertSemasSyncDag.h). It influences nothing else.
-LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner) {
+LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner,
+                            int lowerSemaphoreNumStages) {
   // Only process functions that contain a warp-specialized loop.
   auto walkResult = funcOp.walk([&](scf::ForOp forOp) {
     if (forOp->hasAttr(triton::kWarpSpecializeAttrName))
@@ -82,13 +83,16 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner) {
       return failure();
 
   // Stage 3: the ownership walk -> edges -> semaphores (in-place sync-node
-  // injection) -> entry acquires, crossings, requiredParts, BackingPlan.
-  // numTmemBlocks accumulates the 1x/2x capacity check across groups.
+  // injection) -> entry acquires, crossings, requiredParts, BackingPlan, then
+  // global recurrence-aware schedule legalization. numTmemBlocks accumulates
+  // the 1x/2x capacity check across groups.
   int numTmemBlocks = 0;
   for (GroupDag &g : groups)
-    if (failed(buildSyncDag(g, funcOp, useMetaPartitioner, numTmemBlocks)))
+    if (failed(buildSyncDag(g, funcOp, useMetaPartitioner,
+                            lowerSemaphoreNumStages, numTmemBlocks)))
       return failure();
-  finalizeSyncSchedule(groups);
+  if (failed(finalizeSyncSchedule(groups)))
+    return failure();
 
   if (shouldDumpDag()) {
     llvm::errs() << "==== NVWS InsertSemas (commit 4: ACCESS-DAG + "
@@ -102,7 +106,7 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner) {
     }
   }
 
-  // Stage 4: EMIT-IR (the only mutating stage).
+  // Stage 4: EMIT-IR renders the already-decided protocol and schedule.
   return emitIR(funcOp, groups);
 }
 
@@ -115,7 +119,7 @@ public:
 
   void runOnOperation() override {
     auto walkResult = getOperation().walk([&](triton::FuncOp funcOp) {
-      if (failed(runOnFunction(funcOp, useMetaPartitioner)))
+      if (failed(runOnFunction(funcOp, useMetaPartitioner, numStages)))
         return WalkResult::interrupt();
       return WalkResult::advance();
     });

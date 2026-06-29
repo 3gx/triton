@@ -157,7 +157,9 @@ def NVWSInsertSemas: Pass<"nvws-insert-semas", "mlir::ModuleOp"> {
   let options = [
     Option<"useMetaPartitioner", "use-meta-partitioner",
            "bool", /*default*/"false",
-           "If true, InsertSemas is running after the NVWS meta partitioner">
+           "If true, InsertSemas is running after the NVWS meta partitioner">,
+    Option<"numStages", "num-stages", "int32_t", /*default*/"3",
+           "pipeline depth used by LowerSemaphore auto-multibuffering">
   ];
 }
 

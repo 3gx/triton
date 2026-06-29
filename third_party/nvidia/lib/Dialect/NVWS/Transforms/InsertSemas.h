@@ -203,6 +203,11 @@ struct Node {
   gpu::StageCluster stageCluster;   // Acquire/Release schedule fact, finalized
                                     // after all group SYNC-DAGs are built
   Node *sat = nullptr;             // Release -> the ONE Acquire it satisfies
+  // Scheduling provenance for a generated handoff.  A Release retains the
+  // real row that completed ownership, and its satisfied Acquire retains the
+  // real row that starts the next ownership wave.  finalizeSyncSchedule uses
+  // these anchors to legalize the pre-pipeline order; EMIT only transcribes it.
+  Node *scheduleAnchor = nullptr;
   SmallVector<Operation *, 2> emittedBuffers; // semaphore.buffer ops used by
                                               // this access row
   SmallVector<Crossing, 1> crossings; // For/If only (stage 3): carrier
@@ -280,6 +285,11 @@ struct SemaTable {
 struct BackingPlan {
   // Depth: buffer.copy when present; otherwise local=1 and TMEM=computed 1/2.
   int numStages = 1;
+  // Physical semaphore depth seen by AssignStagePhase.  LowerSemaphore may
+  // auto-multibuffer descriptor-fed local buffers even though InsertSemas
+  // emits their backing at depth one.  Recurrence scheduling must use that
+  // eventual depth without changing the emitted allocation here.
+  int semaphoreDepth = 1;
   Operation *hoistAnchor = nullptr;  // function scope, before outermost WS loop
   SmallVector<Value> backing;        // per member; backpatch slot (emit step 2)
 };

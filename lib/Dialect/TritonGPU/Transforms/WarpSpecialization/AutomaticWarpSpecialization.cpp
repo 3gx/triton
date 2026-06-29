@@ -120,6 +120,7 @@ void AutomaticWarpSpecialization::runOnOperation() {
   }
   NVWSInsertSemasOptions insertSemasOptions;
   insertSemasOptions.useMetaPartitioner = useMetaPartitioner;
+  insertSemasOptions.numStages = numStages;
   addPassWithPartitionVerifier(createNVWSInsertSemas(insertSemasOptions));
   addPassWithPartitionVerifier(createNVWSLowerSemaphore({numStages}));
   TritonGPUScheduleLoopsOptions scheduleLoopsOptions;
