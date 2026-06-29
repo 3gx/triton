@@ -49,11 +49,15 @@ the evidence.
    `nvws.semaphore.create %bufs true`; all others `false`. Fan-in pending
    counts are implicit in the IR (one acquire op, N release sites; counted
    by `nvws-lower-semaphore`); the count lives only in the SYNC-DAG.
-5. **All decisions before any mutation.** Stages 1–3 are pure analysis and
-   additionally produce the **BackingPlan** and the per-node **Crossing**
+5. **All protocol decisions before structural mutation.** Stages 1–3 build the
+   protocol by pure analysis and additionally produce the **BackingPlan** and
+   the per-node **Crossing**
    facts (§2 — crossings live on For/If DAG nodes; "ThreadingPlan" is their
    derived emission-time aggregation). The
-   emitter applies plans; it decides nothing. In particular the TMEM 1x/2x
+   emitter applies plans; it decides nothing. After all group DAGs are built,
+   the stage-3 schedule finalizer may raise existing `loop.cluster` attrs to
+   satisfy the recurrence constraints of contract I; it never changes
+   `loop.stage` or IR structure. In particular the TMEM 1x/2x
    stage check runs on the *unmodified* input IR, in the analysis path.
    Emission itself is bracketed by mechanical normalizations: a
    **pre-process** that nukes all original TMEM async tokens of managed
@@ -629,14 +633,19 @@ pass behave):
 
 Real-op anchors are recorded as node facts at stage 3 (SYNC-DAG); the cache
 is part of the deterministic render walk. Input access ops already carry
-the attrs (set by the TritonGPU **loop scheduler**, upstream of this pass —
-e.g. meta_fa_fwd :302 `loop.cluster = 4, loop.stage = 0`; the NVWS
-`AssignStagePhase` pass is a different thing: it runs *after* insert-semas
-and assigns the stage/phase *operands* on acquire/buffer/release, which is
-why emitting them bare is legal); this pass only ever copies, never
-derives a schedule. The post-emit verifier checks: every emitted
-acquire/buffer/release inside a pipelined loop whose anchor access carries
-stage/cluster carries it too — a miss is a hard diagnostic.
+attrs set by the TritonGPU loop scheduler. Before rendering, SYNC-DAG treats
+every release-to-satisfied-acquire pair as a first-class pipeline dependency.
+It computes the physical-slot recurrence distance from the backing depth and
+the same fresh-write stage advances used by `AssignStagePhase`. Static
+`loop.stage` assignments remain fixed: positive stage slack needs no repair,
+zero slack raises the destination access wave's `loop.cluster` (including its
+semaphore and SSA dependants), and negative slack or a cyclic ordering is a
+hard diagnostic. The depth fact includes `LowerSemaphore`'s later automatic
+multibuffering of descriptor-fed local buffers; an explicit `buffer.copy`
+continues to override it. After that legalization, acquire/buffer/release
+stamping is mechanical as specified above. `AssignStagePhase` still runs
+after insert-semas and assigns the dynamic stage/phase operands; it does not
+repair static schedule order.
 
 **Keystone walkthrough (meta_fa_fwd, buffer.id=4).** Members: qk `[0,128)`
 f32 (in WS loop), p `[0,64)` f16 (sourceful, in inner loop), alpha
