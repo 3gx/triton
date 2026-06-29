@@ -1550,7 +1550,10 @@ static Hold childOwnsHold(Node *regain) {
 
 static Hold pointOfUseHold(Node *firstToucher, Node *entryAcquire,
                            Node *closingRelease, Node *regain,
-                           SmallVector<Node *, 4> rows, bool regionTail) {
+                           SmallVector<Node *, 4> rows, bool regionTail,
+                           bool needsFinalAcquire,
+                           Node *finalAcquire, bool keepsEntryAcquire,
+                           Node *bridgeAcquire, Node *bridgeRelease) {
   Hold h;
   h.outcome = Hold::Outcome::POINT_OF_USE;
   h.rows = std::move(rows);
@@ -1558,6 +1561,11 @@ static Hold pointOfUseHold(Node *firstToucher, Node *entryAcquire,
   h.closingRelease = closingRelease;
   h.regain = regain;
   h.firstToucher = firstToucher;
+  h.finalAcquire = finalAcquire;
+  h.needsFinalAcquire = needsFinalAcquire;
+  h.keepsEntryAcquire = keepsEntryAcquire;
+  h.bridgeAcquire = bridgeAcquire;
+  h.bridgeRelease = bridgeRelease;
   h.regionTail = regionTail;
   return h;
 }
@@ -1574,6 +1582,28 @@ static bool hasTrailingCompUse(GroupDag &g, Node *regain, CompId comp) {
         isReleaseForComp(g, m, comp))
       return true;
   return false;
+}
+
+static Node *findBridgeAcquireAfter(GroupDag &g, Node *F, SemaId feedSema,
+                                    CompId comp, Owner owner,
+                                    Node *existingBridgeRelease) {
+  for (Node *m = F->next; m; m = m->next) {
+    if (!isAcquireForComp(g, m, comp) || m->sema != feedSema ||
+        !sameOwner(m->owner, owner))
+      continue;
+    // Before materialization the enclosing regain is the last component event
+    // in this chain.  On a fixed-point rebuild, allow only its already-recorded
+    // bridge release to trail it.
+    for (Node *tail = m->next; tail; tail = tail->next)
+      if ((isAcquireForComp(g, tail, comp) ||
+           isReleaseForComp(g, tail, comp) ||
+           isAccessForComp(g, tail, comp) ||
+           isRegionCrossingForComp(tail, comp)) &&
+          tail != existingBridgeRelease)
+        return nullptr;
+    return m;
+  }
+  return nullptr;
 }
 
 struct HoldFeed {
@@ -1664,6 +1694,11 @@ static Hold buildUniformHold(GroupDag &g, Node *F, const Crossing &c) {
   bool regionTail = false;
   if (!regain)
     return carrierHold("no-final");
+  // A child loop's one-shot drain is already the exact parent-visible
+  // boundary carrier.  An enclosing point-of-use rewrite must not move that
+  // acquire back above the child loop that produces its permit.
+  if (regain->finalPermissionAcquire)
+    return carrierHold("final-permission", regain);
   if (regain->kind == Node::For && childOwnsCarrier(regain, comp))
     return childOwnsHold(regain);
   if (isRegionNode(regain) && regain->kind != Node::Acquire) {
@@ -1683,11 +1718,34 @@ static Hold buildUniformHold(GroupDag &g, Node *F, const Crossing &c) {
   std::optional<SemaId> regainSema =
       regionTail ? returnedSemaForFinal(g, regain, comp, feed.acquire->sema)
                  : std::optional<SemaId>(regain->sema);
-  if (!regainSema || feed.acquire->sema != *regainSema)
+  bool parentConsumesResult = regionResultConsumedAfter(g, F, comp);
+  // An existing finalAcquire means this is a later fixed-point iteration where
+  // the synthetic drain itself now hides the parent consumer.
+  bool needsFinalAcquire = c.hold.finalAcquire || parentConsumesResult;
+  if (!regainSema)
     return carrierHold("entry-sema-mismatch", regain);
-
-  if (regionResultConsumedAfter(g, F, comp))
+  bool keepsEntryAcquire = feed.acquire->sema != *regainSema;
+  Node *bridgeAcquire = c.hold.bridgeAcquire;
+  // The established same-semaphore result-consumed shape remains carrier
+  // based.  The new final-acquire realization is only for the proven mismatch
+  // case where an explicit enclosing regain can bridge back to the local
+  // recurrence; widening it would change unrelated nested-loop protocols.
+  if (!keepsEntryAcquire && needsFinalAcquire)
     return carrierHold("result-consumed", regain);
+  if (keepsEntryAcquire) {
+    const Sema &feedSema = g.semaTable.semas[feed.acquire->sema];
+    Owner feedOwner = feed.acquire->owner ? feed.acquire->owner
+                                          : feedSema.inheritStamp;
+    // The outer acquire has already waited before the loop and may be dropped
+    // only by the same carried owner.  A final acquire is required to return
+    // the local recurrence's last permit to the parent continuation.
+    if (!bridgeAcquire)
+      bridgeAcquire = findBridgeAcquireAfter(
+          g, F, feed.acquire->sema, comp, c.slotOwner, c.hold.bridgeRelease);
+    if (regionTail || !needsFinalAcquire ||
+        !sameOwner(feedOwner, c.slotOwner) || !bridgeAcquire)
+      return carrierHold("entry-sema-mismatch", regain);
+  }
 
   HoldPrefix prefix =
       analyzeHoldPrefix(g, F, comp, c.slotOwner, regain, regionTail);
@@ -1697,18 +1755,34 @@ static Hold buildUniformHold(GroupDag &g, Node *F, const Crossing &c) {
     return carrierHold("prefix-not-buffer-view", regain);
   return pointOfUseHold(prefix.firstToucher, feed.acquire,
                         prefix.closingRelease, regain, std::move(prefix.rows),
-                        regionTail);
+                        regionTail, needsFinalAcquire, c.hold.finalAcquire,
+                        keepsEntryAcquire, bridgeAcquire,
+                        c.hold.bridgeRelease);
 }
 
-static void computeHoldRules(GroupDag &g, Node *head) {
+static LogicalResult computeHoldRules(GroupDag &g, Node *head) {
   for (Node *n = head; n; n = n->next) {
     for (Node *child : n->children)
       if (child)
-        computeHoldRules(g, child);
-    if (n->kind == Node::For)
-      for (Crossing &c : n->crossings)
-        c.hold = buildUniformHold(g, n, c);
+        if (failed(computeHoldRules(g, child)))
+          return failure();
+    if (n->kind == Node::For) {
+      for (Crossing &c : n->crossings) {
+        Node *finalAcquire = c.hold.finalAcquire;
+        Hold next = buildUniformHold(g, n, c);
+        // Once materialized, the acquire is part of the chain.  Losing its
+        // point-of-use owner on a later fixed-point iteration would leave an
+        // unowned protocol row, so reject that internal inconsistency here.
+        if (finalAcquire &&
+            (!next.isPointOfUse() || next.finalAcquire != finalAcquire))
+          return n->op->emitError(
+              "nvws-insert-semas: final-permission acquire invalidated its "
+              "point-of-use hold");
+        c.hold = std::move(next);
+      }
+    }
   }
+  return success();
 }
 
 // Detach a node from its chain, fixing the owning head pointer when the
@@ -1725,11 +1799,90 @@ static void unlinkFromChain(Node *n) {
   n->prev = n->next = nullptr;
 }
 
+// Materialize the boundary half of a point-of-use recurrence.  For N loop
+// iterations the semaphore has one initial permit plus N completed release
+// cycles (each cycle may be a multi-partition fan-in).  The N in-loop acquires
+// consume the initial permit and the first N-1 cycles; this one acquire consumes
+// the final cycle (or the initial permit for a zero-trip loop) and makes the
+// final carrier available to the parent continuation.
+static bool materializeFinalPermissionAcquires(GroupDag &g, Node *head) {
+  bool changed = false;
+  for (Node *n = head; n; n = n->next) {
+    if (n->kind == Node::For || n->kind == Node::If)
+      for (Node *child : n->children)
+        if (child)
+          changed |= materializeFinalPermissionAcquires(g, child);
+    if (n->kind != Node::For)
+      continue;
+
+    Node *anchor = n;
+    for (Crossing &c : n->crossings) {
+      if (!c.hold.isPointOfUse() || !c.hold.needsFinalAcquire)
+        continue;
+      Node *recurrenceAcquire =
+          c.hold.regionTail ? c.hold.entryAcquire : c.hold.regain;
+      if (!c.hold.finalAcquire) {
+        Node *finalAcquire =
+            g.newNode(Node::Acquire, /*op=*/nullptr, n->parent);
+        finalAcquire->owner = c.slotOwner;
+        finalAcquire->sema = recurrenceAcquire->sema;
+        finalAcquire->count = recurrenceAcquire->count;
+        finalAcquire->finalPermissionAcquire = true;
+        spliceAfter(finalAcquire, anchor);
+        anchor = finalAcquire;
+        c.hold.finalAcquire = finalAcquire;
+        changed = true;
+      } else {
+        anchor = c.hold.finalAcquire;
+      }
+
+      if (c.hold.keepsEntryAcquire && !c.hold.bridgeRelease) {
+        Node *bridge = g.newNode(Node::Release, /*op=*/nullptr,
+                                 c.hold.bridgeAcquire->parent);
+        bridge->owner = c.slotOwner;
+        bridge->sema = recurrenceAcquire->sema;
+        // One outer owner converts the completed outer wait into one full
+        // local semaphore cycle, including a multi-arrival recurrence.
+        bridge->count = recurrenceAcquire->count;
+        bridge->payloads.push_back(AsyncOp::NONE);
+        spliceAfter(bridge, c.hold.bridgeAcquire);
+        g.semaTable.semas[bridge->sema].expectedReleases += bridge->count;
+        c.hold.bridgeRelease = bridge;
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+// A final-permission acquire is inserted in the containing chain, so ancestor
+// crossings must see it as that chain's final carrier.  Preserve the crossing
+// set and recompute only its derived final/owner facts before rebuilding holds.
+static void refreshCrossingFinals(GroupDag &g, Node *head) {
+  for (Node *n = head; n; n = n->next) {
+    if (n->kind != Node::For && n->kind != Node::If)
+      continue;
+    for (Node *child : n->children)
+      if (child)
+        refreshCrossingFinals(g, child);
+    for (Crossing &c : n->crossings) {
+      c.finals.clear();
+      for (Node *child : n->children) {
+        Node *final = chainFinalForComp(g, child, c.comp);
+        c.finals.push_back(final);
+        if (final)
+          c.slotOwner = finalOwner(g, final, c.comp);
+      }
+    }
+  }
+}
+
 // HOLD-RULE native placement (plan M2; spec Addendum B.2.2): for UNGATED
 // crossings, move the wrap acquire (the regain) from the chain end to
-// immediately before the hold's first toucher, and unlink the feeding
-// entry-instance acquire — iteration 1 pairs with the initial permit (the
-// create stays is_released=true via the sema's isEntry fact). The crossing
+// immediately before the hold's first toucher.  A matching feeding acquire is
+// unlinked; a different enclosing acquire is retained as the outer gate and
+// the local recurrence semaphore is made initially released.  In either case,
+// iteration 1 pairs with the local initial permit. The crossing
 // record is kept (dump + requiredParts) but no slot/yield materializes:
 // the token is born and dies inside the body. verifySyncDag accepts the
 // shape as-is: the wrap release's backward sat link is the existing
@@ -1767,7 +1920,13 @@ static void applyHoldRulePlacement(GroupDag &g, Node *head) {
       Node *regain = c.finals[0];
       unlinkFromChain(regain);
       spliceBefore(regain, c.hold.firstToucher);
-      unlinkFromChain(c.hold.entryAcquire);
+      if (c.hold.keepsEntryAcquire) {
+        Sema &recurrenceSema = g.semaTable.semas[regain->sema];
+        recurrenceSema.isEntry = true;
+        recurrenceSema.inheritStamp = c.slotOwner;
+      } else {
+        unlinkFromChain(c.hold.entryAcquire);
+      }
     }
   }
 }
@@ -2067,6 +2226,7 @@ static LogicalResult verifyPointOfUseTransparency(GroupDag &g, Node *F,
                                                   const Crossing &c) {
   const Hold &h = c.hold;
   Node *pointAcquire = h.regionTail ? h.entryAcquire : h.regain;
+  Node *recurrenceAcquire = pointAcquire;
   if (pointAcquire->next != h.firstToucher)
     return F->op->emitError(
         "nvws-insert-semas: point-of-use acquire is not adjacent to "
@@ -2134,6 +2294,76 @@ static LogicalResult verifyPointOfUseTransparency(GroupDag &g, Node *F,
                         : F->op;
     return op->emitError("nvws-insert-semas: point-of-use hold requires "
                          "exactly one closing release");
+  }
+
+  if (h.needsFinalAcquire) {
+    Node *finalAcquire = h.finalAcquire;
+    if (!finalAcquire || finalAcquire->kind != Node::Acquire ||
+        !finalAcquire->finalPermissionAcquire ||
+        finalAcquire->parent != F->parent ||
+        finalAcquire->sema != recurrenceAcquire->sema ||
+        finalAcquire->count != recurrenceAcquire->count ||
+        !sameOwner(finalAcquire->owner, c.slotOwner))
+      return F->op->emitError(
+          "nvws-insert-semas: malformed final-permission acquire");
+
+    bool reachedFinalAcquire = false;
+    for (Node *m = F->next; m; m = m->next) {
+      if (m == finalAcquire) {
+        reachedFinalAcquire = true;
+        break;
+      }
+      // Other components may have their own final acquires between this loop
+      // and ours, but this component must be drained before its first parent
+      // continuation event.
+      if (isAcquireForComp(g, m, c.comp) ||
+          isReleaseForComp(g, m, c.comp) ||
+          isAccessForComp(g, m, c.comp) ||
+          isRegionCrossingForComp(m, c.comp))
+        return (m->op ? m->op : F->op)
+            ->emitError("nvws-insert-semas: component use precedes its "
+                        "final-permission acquire");
+    }
+    if (!reachedFinalAcquire)
+      return F->op->emitError(
+          "nvws-insert-semas: final-permission acquire is not after its loop");
+  } else if (h.finalAcquire) {
+    return F->op->emitError(
+        "nvws-insert-semas: unexpected final-permission acquire");
+  }
+
+  if (h.keepsEntryAcquire) {
+    const Sema &recurrenceSema = g.semaTable.semas[recurrenceAcquire->sema];
+    Node *bridgeAcquire = h.bridgeAcquire;
+    Node *bridgeRelease = h.bridgeRelease;
+    if (!recurrenceSema.isEntry || !bridgeAcquire || !bridgeRelease ||
+        bridgeAcquire->kind != Node::Acquire ||
+        bridgeAcquire->sema != h.entryAcquire->sema ||
+        bridgeAcquire->parent != F->parent ||
+        !sameOwner(bridgeAcquire->owner, c.slotOwner) ||
+        bridgeRelease->kind != Node::Release ||
+        bridgeRelease->parent != bridgeAcquire->parent ||
+        bridgeRelease->sema != recurrenceAcquire->sema ||
+        bridgeRelease->count != recurrenceAcquire->count ||
+        !sameOwner(bridgeRelease->owner, c.slotOwner) || bridgeRelease->sat)
+      return F->op->emitError(
+          "nvws-insert-semas: malformed outer-to-local semaphore bridge");
+
+    bool reachedBridgeAcquire = false;
+    bool reachedBridgeRelease = false;
+    for (Node *m = F->next; m; m = m->next) {
+      reachedBridgeAcquire |= m == bridgeAcquire;
+      if (m == bridgeRelease) {
+        reachedBridgeRelease = reachedBridgeAcquire;
+        break;
+      }
+    }
+    if (!reachedBridgeRelease)
+      return F->op->emitError(
+          "nvws-insert-semas: semaphore bridge is not after its loop");
+  } else if (h.bridgeAcquire || h.bridgeRelease) {
+    return F->op->emitError(
+        "nvws-insert-semas: unexpected outer-to-local semaphore bridge");
   }
   return success();
 }
@@ -2312,7 +2542,9 @@ static void assignSyncScheduleChain(Node *head, ScheduleCache &cache) {
     switch (n->kind) {
     case Node::Acquire:
       if (n->owner) {
-        if (Operation *anchor = nextScheduleAnchor(n->next))
+        if (n->finalPermissionAcquire)
+          n->stageCluster = cachedSchedule(cache, n->owner);
+        else if (Operation *anchor = nextScheduleAnchor(n->next))
           n->stageCluster = gpu::getStageCluster(anchor);
         else
           n->stageCluster = cachedSchedule(cache, n->owner);
@@ -2393,7 +2625,16 @@ LogicalResult buildSyncDag(GroupDag &g, triton::FuncOp funcOp,
   if (!g.root->children.empty()) {
     computeCrossings(g, g.root->children[0], numComps);
     pruneDeadIfCrossings(g, g.root->children[0], /*region=*/nullptr);
-    computeHoldRules(g, g.root->children[0]);
+    if (failed(computeHoldRules(g, g.root->children[0])))
+      return failure();
+    // Adding a final acquire can change which row an enclosing region returns.
+    // Iterate bottom-up until no enclosing loop newly qualifies for the same
+    // point-of-use plus final-permission realization.
+    while (materializeFinalPermissionAcquires(g, g.root->children[0])) {
+      refreshCrossingFinals(g, g.root->children[0]);
+      if (failed(computeHoldRules(g, g.root->children[0])))
+        return failure();
+    }
     applyHoldRulePlacement(g, g.root->children[0]); // plan M2: native shape
     computeRequiredParts(g.root->children[0]);
   }
@@ -2493,6 +2734,10 @@ static void printThreadInfo(llvm::raw_ostream &os, GroupDag &g,
         os << "passthrough-drop";
       if (c.hold.regionTail)
         os << ":regionTail";
+      if (c.hold.finalAcquire)
+        os << ":finalAcquire";
+      if (c.hold.bridgeRelease)
+        os << ":entryBridge";
     }
     os << "}";
   }

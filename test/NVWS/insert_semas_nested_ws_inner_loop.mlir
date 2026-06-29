@@ -64,4 +64,51 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK:           tt.return
     tt.return
   }
+
+  // The inner recurrence is identical to nested_ws_inner_loop, but the outer
+  // body consumes the same allocation after the inner loop.  The recurrence
+  // acquire must remain next to the inner MMA; one final EMPTY acquire after
+  // the inner loop hands its last permit to the outer continuation.
+  // CHECK-LABEL:   tt.func @nested_ws_inner_loop_parent_continuation(
+  // The local and outer EMPTY semaphores are independently initialized.  The
+  // outer acquire remains before the WS loop; the local acquire is not hoisted.
+  // CHECK:           [[LIVE_ALLOC:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  // CHECK:           [[LOCAL_EMPTY:%.*]] = nvws.semaphore.create [[LIVE_ALLOC]] true {pending_count = 1 : i32}
+  // CHECK:           [[OUTER_EMPTY:%.*]] = nvws.semaphore.create [[LIVE_ALLOC]] true {pending_count = 1 : i32}
+  // CHECK:           [[OUTER_ENTRY:%.*]] = nvws.semaphore.acquire [[OUTER_EMPTY]]
+  // Neither loop carries the local recurrence token.
+  // CHECK:           scf.for %{{[-A-Za-z0-9_.$#]+}} = %{{[-A-Za-z0-9_.$#]+}} to %{{[-A-Za-z0-9_.$#]+}} step %{{[-A-Za-z0-9_.$#]+}}  : i32 {
+  // CHECK-NEXT:        scf.for %{{[-A-Za-z0-9_.$#]+}} = %{{[-A-Za-z0-9_.$#]+}} to %{{[-A-Za-z0-9_.$#]+}} step %{{[-A-Za-z0-9_.$#]+}}  : i32 {
+  // CHECK:               [[LOCAL_ACQ:%.*]] = nvws.semaphore.acquire [[LOCAL_EMPTY]] {ttg.partition = array<i32: 1>}
+  // CHECK-NEXT:          [[LOCAL_BUF:%.*]] = nvws.semaphore.buffer [[LOCAL_EMPTY]], [[LOCAL_ACQ]] {ttg.partition = array<i32: 1>}
+  // CHECK-NEXT:          {{.*}} = ttng.tc_gen5_mma {{.*}}[[LOCAL_BUF]][]{{.*}} {ttg.partition = array<i32: 1>}
+  // CHECK:               nvws.semaphore.release [[LOCAL_EMPTY]], %{{.*}} [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>}
+  // CHECK:               "use_inner"
+  // The final local acquire is after the inner loop and is the token used by
+  // the first handoff in the outer continuation.
+  // CHECK:             } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = []}
+  // CHECK-NEXT:        [[FINAL_LOCAL:%.*]] = nvws.semaphore.acquire [[LOCAL_EMPTY]] {ttg.partition = array<i32: 1>}
+  // CHECK-NEXT:        nvws.semaphore.release %{{.*}}, [[FINAL_LOCAL]] [#nvws.async_op<tc5mma>]
+  // The enclosing regain closes the cycle by feeding LOCAL_EMPTY for the next
+  // outer iteration; without this bridge, iteration two deadlocks.
+  // CHECK:             [[OUTER_TAIL:%.*]] = nvws.semaphore.acquire [[OUTER_EMPTY]] {ttg.partition = array<i32: 1>}
+  // CHECK-NEXT:        nvws.semaphore.release [[LOCAL_EMPTY]], [[OUTER_TAIL]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>}
+  tt.func @nested_ws_inner_loop_parent_continuation(%lb: i32, %ub: i32, %step: i32) {
+    %true = arith.constant true
+    %res, %tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %o = scf.for %iv0 = %lb to %ub step %step iter_args(%t0 = %tok) -> (!ttg.async.token) : i32 {
+      %i = scf.for %iv = %lb to %ub step %step iter_args(%t1 = %t0) -> (!ttg.async.token) : i32 {
+        %sA = "loadA"(%iv) {ttg.partition = array<i32: 1>} : (i32) -> !ttg.memdesc<128x64xf16, #shared, #smem>
+        %sB = "loadB"(%iv) {ttg.partition = array<i32: 1>} : (i32) -> !ttg.memdesc<64x128xf16, #shared1, #smem>
+        %mma = ttng.tc_gen5_mma %sA, %sB, %res[%t1], %true, %true {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+        %val, %t2 = ttng.tmem_load %res[%mma] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+        "use_inner"(%val) {ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> ()
+        scf.yield {ttg.partition = array<i32: 0, 1>} %t2 : !ttg.async.token
+      } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0>]}
+      %outerVal, %t3 = ttng.tmem_load %res[%i] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+      "use_outer"(%outerVal) {ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> ()
+      scf.yield {ttg.partition = array<i32: 0, 1>} %t3 : !ttg.async.token
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0>], ttg.warp_specialize.tag = 1 : i32}
+    tt.return
+  }
 }

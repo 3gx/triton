@@ -139,6 +139,20 @@ struct Hold {
   Node *closingRelease = nullptr;
   Node *regain = nullptr;
   Node *firstToucher = nullptr;
+  // A point-of-use recurrence normally leaves its final permit unconsumed.
+  // When code after the loop needs that permit, SyncDag records the one-shot
+  // acquire that drains it after the loop instead of carrying every in-loop
+  // acquire through the loop boundary.
+  Node *finalAcquire = nullptr;
+  bool needsFinalAcquire = false;
+  // The enclosing recurrence may use a different semaphore to gate entry into
+  // this loop.  Keep that already-completed wait while the local recurrence
+  // starts from its own initial permit.  bridgeAcquire is the enclosing
+  // recurrence's regain; bridgeRelease converts that completed outer cycle
+  // into the local semaphore permit used by the next outer iteration.
+  bool keepsEntryAcquire = false;
+  Node *bridgeAcquire = nullptr;
+  Node *bridgeRelease = nullptr;
   bool regionTail = false;
 
   bool materializesCarrier() const { return outcome == Outcome::CARRIER; }
@@ -178,6 +192,10 @@ struct Node {
                                           // sorted by PieceId (determinism)
   SemaId sema = 0;
   unsigned count = 0;              // Acquire pending count
+  // True only for the one-shot acquire inserted after a point-of-use loop.
+  // Schedule assignment uses the exiting owner's lane rather than the next
+  // (possibly unrelated) buffer access as its anchor.
+  bool finalPermissionAcquire = false;
   SmallVector<AsyncOp, 1> payloads; // Release payload(s): the source
                                     // holder's last real access payload —
                                     // a UNION after dedupe merges (emitted
