@@ -88,6 +88,7 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner) {
   for (GroupDag &g : groups)
     if (failed(buildSyncDag(g, funcOp, useMetaPartitioner, numTmemBlocks)))
       return failure();
+  finalizeSyncSchedule(groups);
 
   if (shouldDumpDag()) {
     llvm::errs() << "==== NVWS InsertSemas (commit 4: ACCESS-DAG + "

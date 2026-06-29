@@ -36,7 +36,6 @@ struct RenderState {
                                             // token with ITS semaphore)
   DenseMap<MemberId, Value> view;           // member view cache
   DenseMap<MemberId, nvws::SemaphoreBufferOp> viewBuffer;
-  DenseMap<int64_t, gpu::StageCluster> stageCache; // ownerKey -> stage/cluster
 };
 
 // ---------------------------------------------------------------------------
@@ -75,16 +74,6 @@ static OpT emitInto(OpBuilder &b, Location loc, const Owner &owner,
     }
   }
   return op;
-}
-
-static gpu::StageCluster stageFor(RenderState &rs, const Owner &owner,
-                                  Operation *anchor) {
-  if (anchor)
-    return gpu::getStageCluster(anchor);
-  auto it = rs.stageCache.find(ownerKey(owner));
-  if (it != rs.stageCache.end())
-    return it->second;
-  return {};
 }
 
 // The next row at-or-after `n` that anchors a real op (insertion target for
@@ -672,8 +661,6 @@ static LogicalResult renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
   Operation *op = n->op;
   anchor = op;
   n->emittedOp = op;
-  if (n->owner)
-    rs.stageCache[ownerKey(n->owner)] = gpu::getStageCluster(op);
   for (const Touch &t : n->touches) {
     nvws::SemaphoreBufferOp bufferOp;
     Value view = getView(ctx, g, rs, t, op, n->owner, bufferOp);
@@ -771,7 +758,7 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
   }
 
   if (auto forOp = dyn_cast<scf::ForOp>(n->op)) {
-    RenderState body = rs; // stage cache flows in; views do not
+    RenderState body = rs; // carriers flow in; views do not
     body.view.clear();
     body.viewBuffer.clear();
     for (const Crossing &c : n->crossings) {
@@ -798,13 +785,6 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
       yield->setOperand(idx, body.carrier.lookup(c.comp));
       rs.carrier[c.comp] = forOp.getResult(idx);
     }
-    if (!gpu::hasWarpSpecializeTag(forOp))
-      rs.stageCache = std::move(body.stageCache);
-    // Stage facts flow out of inner (non-WS) loop bodies — the epilogue
-    // release after an inner loop inherits its in-body stage (oracle fact,
-    // gate-2 case 3) — but never escape the WS-tagged loop itself: outside
-    // it, loop.stage/cluster are meaningless and must not be stamped
-    // (oracle fact, m2/m3 outside-loop releases).
     rs.view.clear();
     rs.viewBuffer.clear();
     return success();
@@ -836,9 +816,6 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
     elseYield->setOperand(idx, elseV);
     rs.carrier[c.comp] = ifOp.getResult(idx);
   }
-  rs.stageCache = std::move(thenSt.stageCache);
-  for (auto &[k, v] : elseSt.stageCache)
-    rs.stageCache.try_emplace(k, v);
   rs.view.clear();
   rs.viewBuffer.clear();
   return success();
@@ -864,10 +841,8 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
       }
       Operation *before = nextRealOp(n->next);
       OpBuilder b(ctx.func);
-      Operation *stageAnchor = nullptr;
       if (before) {
         b.setInsertionPoint(before);
-        stageAnchor = before;
       } else if (lastReal &&
                  !isa<triton::FuncOp>(lastReal->getBlock()->getParentOp())) {
         // Trailing acquire of a region chain (no following access row):
@@ -885,8 +860,7 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
       }
       auto acq = emitInto<nvws::SemaphoreAcquireOp>(
           b, before ? before->getLoc() : ctx.func.getLoc(), n->owner,
-          stageFor(rs, n->owner, stageAnchor),
-          g.semaTable.semas[n->sema].create, ctx.tokenType);
+          n->stageCluster, g.semaTable.semas[n->sema].create, ctx.tokenType);
       emitted[n] = acq.getToken();
       n->emittedOp = acq;
       rs.carrier[comp] = acq.getToken();
@@ -909,7 +883,7 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
         b.setInsertionPointToStart(&ctx.func.getBody().front());
       auto rel = emitInto<nvws::SemaphoreReleaseOp>(
           b, lastReal ? lastReal->getLoc() : ctx.func.getLoc(), n->owner,
-          stageFor(rs, n->owner, nullptr), g.semaTable.semas[n->sema].create,
+          n->stageCluster, g.semaTable.semas[n->sema].create,
           tok, asyncOpsAttr(b.getContext(), n));
       // First-class arrive multiplicity: transcribe the DAG fact (r S(n));
       // the lowering passes it to the mbarrier arrive.
@@ -925,8 +899,6 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
         return failure();
       if (anchor) {
         lastReal = anchor;
-        if (n->owner)
-          rs.stageCache[ownerKey(n->owner)] = gpu::getStageCluster(anchor);
       }
       break;
     }

@@ -48,6 +48,8 @@ LogicalResult computeBackingPlan(GroupDag &g, triton::FuncOp funcOp,
 LogicalResult buildSyncDag(GroupDag &g, triton::FuncOp funcOp,
                            bool useMetaPartitioner, int &numTmemBlocks);
 
+void finalizeSyncSchedule(MutableArrayRef<GroupDag> groups);
+
 void dumpGroupSyncDag(GroupDag &g, triton::FuncOp funcOp);
 
 } // namespace nvws_semas

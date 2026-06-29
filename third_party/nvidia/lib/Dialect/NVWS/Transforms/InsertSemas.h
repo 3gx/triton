@@ -182,6 +182,8 @@ struct Node {
                                     // holder's last real access payload —
                                     // a UNION after dedupe merges (emitted
                                     // as the release's async_ops array)
+  gpu::StageCluster stageCluster;   // Acquire/Release schedule fact, finalized
+                                    // after all group SYNC-DAGs are built
   Node *sat = nullptr;             // Release -> the ONE Acquire it satisfies
   SmallVector<Operation *, 2> emittedBuffers; // semaphore.buffer ops used by
                                               // this access row

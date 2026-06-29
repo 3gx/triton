@@ -2262,6 +2262,117 @@ static LogicalResult verifySyncDag(GroupDag &g) {
 }
 
 // ---------------------------------------------------------------------------
+// Schedule facts for generated sync rows.
+//
+// The SYNC-DAG owns these facts. EMIT-IR only transcribes them. Real-row
+// anchors retain the existing behavior. A virtual acquire at a scheduled-loop
+// exit keeps its owner/stage lane but must be placed at that lane's region
+// frontier, including operations represented by other buffer groups.
+// ---------------------------------------------------------------------------
+using ScheduleCache = DenseMap<int64_t, gpu::StageCluster>;
+
+static Operation *nextScheduleAnchor(const Node *n) {
+  for (const Node *m = n; m; m = m->next)
+    if ((m->kind == Node::Access || m->kind == Node::For ||
+         m->kind == Node::If) &&
+        m->op)
+      return m->op;
+  return nullptr;
+}
+
+static gpu::StageCluster cachedSchedule(const ScheduleCache &cache,
+                                        const Owner &owner) {
+  auto it = cache.find(ownerKey(owner));
+  return it == cache.end() ? gpu::StageCluster{} : it->second;
+}
+
+static void assignSyncScheduleChain(Node *head, ScheduleCache &cache);
+
+static void assignSyncScheduleRegion(Node *n, ScheduleCache &cache) {
+  if (auto forOp = dyn_cast<scf::ForOp>(n->op)) {
+    ScheduleCache body = cache;
+    assignSyncScheduleChain(n->children[0], body);
+    if (!gpu::hasWarpSpecializeTag(forOp))
+      cache = std::move(body);
+    return;
+  }
+
+  ScheduleCache thenCache = cache;
+  ScheduleCache elseCache = cache;
+  assignSyncScheduleChain(n->children[0], thenCache);
+  if (n->children.size() > 1 && n->children[1])
+    assignSyncScheduleChain(n->children[1], elseCache);
+  cache = std::move(thenCache);
+  for (auto &[key, stageCluster] : elseCache)
+    cache.try_emplace(key, stageCluster);
+}
+
+static void assignSyncScheduleChain(Node *head, ScheduleCache &cache) {
+  for (Node *n = head; n; n = n->next) {
+    switch (n->kind) {
+    case Node::Acquire:
+      if (n->owner) {
+        if (Operation *anchor = nextScheduleAnchor(n->next))
+          n->stageCluster = gpu::getStageCluster(anchor);
+        else
+          n->stageCluster = cachedSchedule(cache, n->owner);
+      }
+      break;
+    case Node::Release:
+      if (n->owner)
+        n->stageCluster = cachedSchedule(cache, n->owner);
+      break;
+    case Node::Access:
+      if (n->owner)
+        cache[ownerKey(n->owner)] = gpu::getStageCluster(n->op);
+      break;
+    case Node::For:
+    case Node::If:
+      assignSyncScheduleRegion(n, cache);
+      break;
+    case Node::Enter:
+    case Node::Exit:
+    case Node::Func:
+      break;
+    }
+  }
+}
+
+static void moveTailAcquireToLaneExit(Node *n) {
+  if (n->kind != Node::Acquire || !n->owner || !n->stageCluster ||
+      nextScheduleAnchor(n->next))
+    return;
+
+  auto forOp = dyn_cast_or_null<scf::ForOp>(n->parent ? n->parent->op : nullptr);
+  if (!forOp || !forOp->hasAttr(triton::kScheduledMaxStageAttrName))
+    return;
+
+  auto [stage, cluster] = *n->stageCluster;
+  int exitCluster = cluster;
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    gpu::StageCluster candidate = gpu::getStageCluster(&op);
+    if (!candidate || candidate->first != stage || !gpu::hasPartition(&op))
+      continue;
+    SetVector<int> partitions = gpu::getPartitionIds(&op);
+    if (!partitions.contains(n->owner->first))
+      continue;
+    exitCluster = std::max(exitCluster, candidate->second);
+  }
+  n->stageCluster = std::make_pair(stage, exitCluster);
+}
+
+void finalizeSyncSchedule(MutableArrayRef<GroupDag> groups) {
+  for (GroupDag &g : groups) {
+    if (g.root->children.empty())
+      continue;
+    ScheduleCache cache;
+    assignSyncScheduleChain(g.root->children[0], cache);
+  }
+  for (GroupDag &g : groups)
+    forEachNode(g, moveTailAcquireToLaneExit);
+}
+
+// ---------------------------------------------------------------------------
 // Driver for stage 3.
 // ---------------------------------------------------------------------------
 LogicalResult buildSyncDag(GroupDag &g, triton::FuncOp funcOp,
