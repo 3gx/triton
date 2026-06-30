@@ -1,6 +1,15 @@
 # NVWS circular local buffer design
 
-Status: DESIGN ONLY (16jun26).
+Status: DOWNSTREAM METADATA DESIGN (16jun26), planner policy superseded
+29jun26 by `fable/nvws-memory-planner-meta-parity.md`.
+
+For algorithm 1, MemoryPlanner may mark a circular group only when Meta-AWS
+phase 4 selects the corresponding two-record reuse group. For algorithm 0,
+it marks the compatible innermost shared-id pool already selected by Meta and
+assigns one start per member. `buffer.circular` and `buffer.start` only expose
+those decisions to NVWS downstream passes; they do not authorize independent
+all-pairs coalescing, post-budget depth growth, or any other divergence from
+Meta's planner.
 
 Scope: NVWS local/SMEM circular reuse groups produced by
 `--nvws-memory-planner` and consumed by `--nvws-insert-semas`.
