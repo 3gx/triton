@@ -66,20 +66,25 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %mma = ttng.tc_gen5_mma %A_smem, %B_smem, %result[%acc_tok], %acc_flag, %true {async_task_id = array<i32: 0>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x256xf16, #shared, #smem, mutable>, !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>
         scf.yield {async_task_id = array<i32: 0, 1>} %true, %mma : i1, !ttg.async.token
       } {async_task_id = array<i32: 0, 1>}
-      // Epilogue: tmem_load → reshape → trans → split → truncf → local_store.
+      // Epilogue: tmem_load → reshape → trans → split → scale → truncf →
+      // local_store. NVWS must retain the unique TMEM-load provenance through
+      // the scale multiply so both subtiles still form one physical group.
       %res, %res_tok = ttng.tmem_load %result[%1#1] {async_task_id = array<i32: 2>} : !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x256xf32, #blocked>
       %reshaped = tt.reshape %res {async_task_id = array<i32: 2>} : tensor<128x256xf32, #blocked> -> tensor<128x2x128xf32, #blocked3>
       %transposed = tt.trans %reshaped {async_task_id = array<i32: 2>, order = array<i32: 0, 2, 1>} : tensor<128x2x128xf32, #blocked3> -> tensor<128x128x2xf32, #blocked4>
       %lhs, %rhs = tt.split %transposed {async_task_id = array<i32: 2>} : tensor<128x128x2xf32, #blocked4> -> tensor<128x128xf32, #blocked5>
+      %scale = arith.constant {async_task_id = array<i32: 2>} dense<2.000000e+00> : tensor<128x128xf32, #blocked5>
       // First sub-tile: truncf → convert_layout → local_store to C0_smem.
-      %lhs_f16 = arith.truncf %lhs {async_task_id = array<i32: 2>} : tensor<128x128xf32, #blocked5> to tensor<128x128xf16, #blocked5>
+      %lhs_scaled = arith.mulf %lhs, %scale {async_task_id = array<i32: 2>} : tensor<128x128xf32, #blocked5>
+      %lhs_f16 = arith.truncf %lhs_scaled {async_task_id = array<i32: 2>} : tensor<128x128xf32, #blocked5> to tensor<128x128xf16, #blocked5>
       %lhs_cvt = ttg.convert_layout %lhs_f16 {async_task_id = array<i32: 2>} : tensor<128x128xf16, #blocked5> -> tensor<128x128xf16, #blocked2>
       ttg.local_store %lhs_cvt, %C0_smem {async_task_id = array<i32: 2>} : tensor<128x128xf16, #blocked2> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       // Consumer of C0_smem: TMA store.
       %c0_val = ttg.local_load %C0_smem {async_task_id = array<i32: 2>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #blocked2>
       tt.descriptor_store %c_desc[%c0, %c0], %c0_val {async_task_id = array<i32: 2>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, tensor<128x128xf16, #blocked2>
       // Second sub-tile: truncf → convert_layout → local_store to C1_smem.
-      %rhs_f16 = arith.truncf %rhs {async_task_id = array<i32: 2>} : tensor<128x128xf32, #blocked5> to tensor<128x128xf16, #blocked5>
+      %rhs_scaled = arith.mulf %rhs, %scale {async_task_id = array<i32: 2>} : tensor<128x128xf32, #blocked5>
+      %rhs_f16 = arith.truncf %rhs_scaled {async_task_id = array<i32: 2>} : tensor<128x128xf32, #blocked5> to tensor<128x128xf16, #blocked5>
       %rhs_cvt = ttg.convert_layout %rhs_f16 {async_task_id = array<i32: 2>} : tensor<128x128xf16, #blocked5> -> tensor<128x128xf16, #blocked2>
       ttg.local_store %rhs_cvt, %C1_smem {async_task_id = array<i32: 2>} : tensor<128x128xf16, #blocked2> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       // Consumer of C1_smem: TMA store.

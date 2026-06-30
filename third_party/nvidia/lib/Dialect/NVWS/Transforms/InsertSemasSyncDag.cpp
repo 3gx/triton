@@ -2551,12 +2551,144 @@ static Effect accessEffect(const Node *n) {
   return effect;
 }
 
+struct MixedDepthLifecycle {
+  GroupDag *group = nullptr;
+  Node *writer = nullptr;
+  Node *reader = nullptr;
+};
+
+static LogicalResult collectMixedDepthLifecycle(GroupDag &group,
+                                                MixedDepthLifecycle &life) {
+  life.group = &group;
+  LogicalResult result = success();
+  forEachNode(group, [&](Node *node) {
+    if (failed(result) || node->kind != Node::Access)
+      return;
+    Node *&slot = accessEffect(node) == Effect::W ? life.writer : life.reader;
+    if (slot) {
+      result = node->op->emitError(
+          "nvws-insert-semas: mixed-depth TMEM reuse requires exactly one "
+          "writer and one reader per logical channel");
+      return;
+    }
+    slot = node;
+  });
+  if (failed(result))
+    return failure();
+  if (!life.writer || !life.reader)
+    return group.pieceTable.members.front().allocOp->emitError(
+        "nvws-insert-semas: mixed-depth TMEM reuse requires exactly one "
+        "writer and one reader per logical channel");
+  return success();
+}
+
+static LogicalResult addMixedDepthAliasScheduleEdges(
+    MutableArrayRef<GroupDag> groups,
+    llvm::MapVector<Operation *, SmallVector<ScheduleEdge, 4>> &edgesByLoop) {
+  llvm::MapVector<int64_t, SmallVector<GroupDag *, 2>> sets;
+  for (GroupDag &group : groups)
+    if (group.mixedDepthPhysicalAlias)
+      sets[group.bufferId].push_back(&group);
+
+  for (auto &[bufferId, set] : sets) {
+    if (set.size() != 2)
+      return set.front()->pieceTable.members.front().allocOp->emitError(
+                 "nvws-insert-semas: mixed-depth TMEM reuse requires exactly "
+                 "two logical channels for buffer.id ")
+             << bufferId;
+
+    for (GroupDag *group : set) {
+      if (group->pieceTable.members.size() != 1 || !group->isTmem())
+        return group->root->op->emitError(
+            "nvws-insert-semas: malformed mixed-depth TMEM logical group");
+    }
+
+    bool firstOwns = canOwnMixedDepthTmem(*set[0], *set[1]);
+    bool secondOwns = canOwnMixedDepthTmem(*set[1], *set[0]);
+    if (firstOwns == secondOwns)
+      return set.front()->pieceTable.members.front().allocOp->emitError(
+          "nvws-insert-semas: mixed-depth TMEM reuse has no unique physical "
+          "owner by span and element width");
+    GroupDag *owner = firstOwns ? set[0] : set[1];
+    GroupDag *reuser = firstOwns ? set[1] : set[0];
+    if (owner->backingPlan.numStages == reuser->backingPlan.numStages)
+      return reuser->pieceTable.members.front().allocOp->emitError(
+          "nvws-insert-semas: mixed-depth TMEM reuse lost its distinct "
+          "logical copy depths");
+
+    MixedDepthLifecycle a, b;
+    if (failed(collectMixedDepthLifecycle(*owner, a)) ||
+        failed(collectMixedDepthLifecycle(*reuser, b)))
+      return failure();
+
+    // This is Meta's two-channel alternating reuse proof. The owner writer
+    // precedes the reuser reader in one partition, while the owner reader
+    // precedes the reuser writer in the other. Together with the loop
+    // backedge, the physical order is A.W -> A.R -> B.W -> B.R -> A.W(next).
+    if (!a.writer->owner || !a.reader->owner || !b.writer->owner ||
+        !b.reader->owner || a.writer->owner != b.reader->owner ||
+        a.reader->owner != b.writer->owner ||
+        a.writer->owner == a.reader->owner)
+      return reuser->pieceTable.members.front().allocOp->emitError(
+          "nvws-insert-semas: mixed-depth TMEM reuse does not form the "
+          "required alternating two-owner cycle");
+
+    Operation *ops[] = {a.writer->op, a.reader->op, b.writer->op,
+                        b.reader->op};
+    Block *block = ops[0]->getBlock();
+    if (llvm::any_of(ArrayRef<Operation *>(ops),
+                     [&](Operation *op) { return op->getBlock() != block; }) ||
+        !a.writer->op->isBeforeInBlock(b.reader->op) ||
+        !a.reader->op->isBeforeInBlock(b.writer->op))
+      return reuser->pieceTable.members.front().allocOp->emitError(
+          "nvws-insert-semas: mixed-depth TMEM reuse is not ordered as "
+          "owner.write -> reuser.read and owner.read -> reuser.write");
+
+    auto loop = a.writer->op->getParentOfType<scf::ForOp>();
+    if (!loop || !loop->hasAttr(triton::kScheduledMaxStageAttrName))
+      return a.writer->op->emitError(
+          "nvws-insert-semas: mixed-depth TMEM reuse requires one scheduled "
+          "loop");
+    for (Operation *op : ops)
+      if (loop.getBody()->findAncestorOpInBlock(*op) != op)
+        return op->emitError(
+            "nvws-insert-semas: mixed-depth TMEM reuse accesses must be "
+            "direct operations in one scheduled loop body");
+
+    gpu::StageCluster ownerRead = gpu::getStageCluster(a.reader->op);
+    gpu::StageCluster reuserWrite = gpu::getStageCluster(b.writer->op);
+    gpu::StageCluster reuserRead = gpu::getStageCluster(b.reader->op);
+    gpu::StageCluster ownerWrite = gpu::getStageCluster(a.writer->op);
+    if (!ownerRead || !reuserWrite || !reuserRead || !ownerWrite)
+      return a.writer->op->emitError(
+          "nvws-insert-semas: mixed-depth TMEM reuse accesses require fixed "
+          "loop.stage/loop.cluster annotations");
+
+    int64_t sameIterationSlack = reuserWrite->first - ownerRead->first;
+    if (sameIterationSlack < 0)
+      return a.reader->op->emitError(
+          "nvws-insert-semas: mixed-depth TMEM same-iteration handoff has "
+          "negative pipeline-stage slack");
+    if (sameIterationSlack == 0)
+      edgesByLoop[loop.getOperation()].push_back(
+          ScheduleEdge{a.reader->op, b.writer->op});
+
+    int64_t backedgeSlack = 1 + ownerWrite->first - reuserRead->first;
+    if (backedgeSlack <= 0)
+      return b.reader->op->emitError(
+          "nvws-insert-semas: mixed-depth TMEM backedge does not have "
+          "positive pipeline-stage slack");
+  }
+  return success();
+}
+
 static Operation *realScheduleAnchor(Node *anchor, bool source) {
-  for (Node *n = anchor; n; n = source ? n->prev : n->next)
-    if ((n->kind == Node::Access || n->kind == Node::For ||
-         n->kind == Node::If) &&
-        n->op)
+  for (Node *n = anchor; n; n = source ? n->prev : n->next) {
+    if (n->kind == Node::Access)
+      return source && n->completionAnchor ? n->completionAnchor : n->op;
+    if ((n->kind == Node::For || n->kind == Node::If) && n->op)
       return n->op;
+  }
   return nullptr;
 }
 
@@ -2707,6 +2839,107 @@ computeRecurrenceDistance(const SlotSchedule &slots, int64_t depth,
                     depth) == positiveMod(srcIt->second, depth))
       return distance;
   return std::nullopt;
+}
+
+static bool isExactAliasMultistageGroup(const GroupDag &group) {
+  if (!group.isLocal() || group.isCircular() ||
+      group.mixedDepthPhysicalAlias ||
+      group.pieceTable.members.size() < 2 ||
+      group.backingPlan.semaphoreDepth <= 1)
+    return false;
+
+  const Member &first = group.pieceTable.members.front();
+  return llvm::all_of(group.pieceTable.members, [&](const Member &member) {
+    return member.offset == first.offset && member.extent == first.extent &&
+           member.type == first.type;
+  });
+}
+
+// A fused exact-alias group advances the shared ASP cursor once for each fresh
+// writer, while its ownership DAG still has one semaphore per handoff.  A
+// release into the next writer's semaphore must therefore signal that writer's
+// slot, not blindly inherit the source access's slot.  Backedges keep the
+// source slot when a future acquire visits it; otherwise they signal the next
+// iteration's destination slot (the fixed-slot case where advances % depth is
+// zero).
+static LogicalResult assignAliasedHandoffStageOffsets(GroupDag &group) {
+  if (!isExactAliasMultistageGroup(group))
+    return success();
+
+  DenseMap<Operation *, SlotSchedule> slotsByLoop;
+  bool hasShiftedRelease = false;
+  LogicalResult result = success();
+  forEachNode(group, [&](Node *release) {
+    if (failed(result) || release->kind != Node::Release || !release->sat)
+      return;
+
+    Node *src = release->scheduleAnchor;
+    Node *dst = release->sat->scheduleAnchor;
+    if (!src || !dst || src->kind != Node::Access ||
+        dst->kind != Node::Access || src->parent != dst->parent ||
+        !src->parent || src->parent->kind != Node::For) {
+      result = (src && src->op ? src->op : group.root->op)
+                   ->emitError("nvws-insert-semas: staged exact-alias handoff "
+                               "requires direct accesses in one loop body");
+      return;
+    }
+
+    auto loop = dyn_cast<scf::ForOp>(src->parent->op);
+    if (!loop || loop.getBody()->findAncestorOpInBlock(*src->op) != src->op ||
+        loop.getBody()->findAncestorOpInBlock(*dst->op) != dst->op) {
+      result = src->op->emitError(
+          "nvws-insert-semas: staged exact-alias handoff is not directly "
+          "represented in its ownership loop");
+      return;
+    }
+
+    auto [it, inserted] = slotsByLoop.try_emplace(loop.getOperation());
+    if (inserted)
+      it->second = computeSlotSchedule(ArrayRef<GroupDag *>{&group}, loop);
+    const SlotSchedule &slots = it->second;
+    auto srcIt = slots.ordinalByAccess.find(src);
+    auto dstIt = slots.ordinalByAccess.find(dst);
+    if (!slots.complete || srcIt == slots.ordinalByAccess.end() ||
+        dstIt == slots.ordinalByAccess.end() ||
+        slots.advancesPerIteration <= 0) {
+      result = src->op->emitError(
+          "nvws-insert-semas: cannot derive staged exact-alias handoff slots");
+      return;
+    }
+
+    int64_t depth = group.backingPlan.semaphoreDepth;
+    int64_t offset = 0;
+    if (precedesInChain(release, release->sat)) {
+      offset = positiveMod(dstIt->second - srcIt->second, depth);
+    } else if (!computeRecurrenceDistance(slots, depth, src, dst)) {
+      int64_t nextDst = dstIt->second + slots.advancesPerIteration;
+      offset = positiveMod(nextDst - srcIt->second, depth);
+    }
+
+    release->stageOffset = offset;
+    hasShiftedRelease |= offset != 0;
+  });
+  if (failed(result))
+    return result;
+  if (!hasShiftedRelease) {
+    // Keep zero-only groups on the ordinary token-stage propagation path.
+    // Explicit offsets are a group protocol and are authored only when at
+    // least one handoff actually changes slots.
+    forEachNode(group, [&](Node *node) {
+      if (node->kind == Node::Release)
+        node->stageOffset.reset();
+    });
+    return success();
+  }
+
+  // A zero acquire offset makes the explicit-stage protocol visible to ASP.
+  // ASP then uses multiphase parity and preserves every authored release
+  // offset instead of replacing it through token-stage propagation.
+  forEachNode(group, [&](Node *node) {
+    if (node->kind == Node::Acquire)
+      node->stageOffset = 0;
+  });
+  return success();
 }
 
 static LogicalResult addSyncScheduleEdges(
@@ -2932,8 +3165,11 @@ static void assignSyncScheduleChain(Node *head, ScheduleCache &cache) {
         n->stageCluster = cachedSchedule(cache, n->owner);
       break;
     case Node::Access:
-      if (n->owner)
-        cache[ownerKey(n->owner)] = gpu::getStageCluster(n->op);
+      if (n->owner) {
+        Operation *completion =
+            n->completionAnchor ? n->completionAnchor : n->op;
+        cache[ownerKey(n->owner)] = gpu::getStageCluster(completion);
+      }
       break;
     case Node::For:
     case Node::If:
@@ -2972,6 +3208,11 @@ static void placeFinalAcquireAtLaneExit(Node *n) {
 
 LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups) {
   llvm::MapVector<Operation *, SmallVector<ScheduleEdge, 4>> edgesByLoop;
+  for (GroupDag &group : groups)
+    if (failed(assignAliasedHandoffStageOffsets(group)))
+      return failure();
+  if (failed(addMixedDepthAliasScheduleEdges(groups, edgesByLoop)))
+    return failure();
   if (failed(addSyncScheduleEdges(groups, edgesByLoop)))
     return failure();
   for (auto &[loopOp, edges] : edgesByLoop) {
@@ -3186,6 +3427,8 @@ static void dumpSyncChain(GroupDag &g, const Node *head, unsigned depth,
       // (the in-loop regain acquirer is always a concrete partition).
       if (s.isEntry && !n->owner.has_value())
         os << "  ; entry";
+      if (n->stageOffset)
+        os << "  stage-offset=" << *n->stageOffset;
       os << "\n";
       break;
     }
@@ -3203,7 +3446,10 @@ static void dumpSyncChain(GroupDag &g, const Node *head, unsigned depth,
         first = false;
         os << asyncOpStr(p);
       }
-      os << "]\n";
+      os << "]";
+      if (n->stageOffset)
+        os << "  stage-offset=" << *n->stageOffset;
+      os << "\n";
       break;
     }
     case Node::For: {

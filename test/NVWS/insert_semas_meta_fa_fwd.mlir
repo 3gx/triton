@@ -533,18 +533,21 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       // CHECK:           nvws.semaphore.release [[O1_F]], [[O1_AE]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
       %10 = arith.truncf %acc0_77 {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear> to tensor<128x128xf16, #linear>
       ttg.local_store %10, %4 {ttg.partition = array<i32: 0>} : tensor<128x128xf16, #linear> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-      // Epilogue O0 local_load (partition 2): acquire O0 FULL, buffer, load,
-      // release O0 EMPTY.
+      // Epilogue O0 local_load (partition 2): acquire O0 FULL, buffer and
+      // load. Ownership remains live through its descriptor store below.
       // CHECK:           [[O0L_AF:%.*]] = nvws.semaphore.acquire [[O0_F]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
       // CHECK:           [[O0L_BUF:%.*]] = nvws.semaphore.buffer [[O0_F]], [[O0L_AF]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       // CHECK:           ttg.local_load [[O0L_BUF]] {ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #linear>
-      // CHECK:           nvws.semaphore.release [[O0_E]], [[O0L_AF]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
       %13 = ttg.local_load %3 {ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #linear>
       %14 = ttg.convert_layout %13 {ttg.partition = array<i32: 2>} : tensor<128x128xf16, #linear> -> tensor<128x128xf16, #blocked1>
-      // Epilogue O1 local_load (partition 2) mirrors O0.
+      // Epilogue O1 local_load (partition 2) mirrors O0. Each empty release
+      // follows the descriptor store that completes that channel's read.
       // CHECK:           [[O1L_AF:%.*]] = nvws.semaphore.acquire [[O1_F]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
       // CHECK:           [[O1L_BUF:%.*]] = nvws.semaphore.buffer [[O1_F]], [[O1L_AF]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       // CHECK:           ttg.local_load [[O1L_BUF]] {ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #linear>
+      // CHECK:           tt.descriptor_store
+      // CHECK:           nvws.semaphore.release [[O0_E]], [[O0L_AF]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
+      // CHECK:           tt.descriptor_store
       // CHECK:           nvws.semaphore.release [[O1_E]], [[O1L_AF]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
       %16 = ttg.local_load %4 {ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #linear>
       %17 = ttg.convert_layout %16 {ttg.partition = array<i32: 2>} : tensor<128x128xf16, #linear> -> tensor<128x128xf16, #blocked1>
