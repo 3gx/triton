@@ -66,6 +66,9 @@ start from the same false defaults as Meta; per-loop `tt.merge_*` and
 
 For each function:
 
+0. If the standalone pass receives `numBuffers < 1`, return without planning,
+   matching Meta's test-pass contract. Automatic WS supplies a positive stage
+   count and therefore always executes the remaining steps.
 1. Collect communication channels.
 2. Apply the effective per-loop SMEM options.
 3. Plan local/SMEM buffers first and return the next free `buffer.id`.
