@@ -1572,122 +1572,6 @@ static unsigned allocateSmemBuffers(
   return nextBufferId;
 }
 
-// Meta's planner decides which local allocations share an id and copy depth.
-// NVWS additionally exposes that already-selected reuse ring to InsertSemas;
-// this adapter must not alter the planner's id, depth, or budget decisions.
-static void emitNVWSCircularAttrs(
-    triton::FuncOp funcOp, SmallVector<Channel *> &channels, int smemAllocAlgo,
-    bool smemCircularReuse,
-    const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation) {
-  llvm::MapVector<int64_t, SmallVector<ttg::LocalAllocOp>> groups;
-  funcOp->walk<WalkOrder::PreOrder>([&](ttg::LocalAllocOp alloc) {
-    alloc->removeAttr("buffer.circular");
-    alloc->removeAttr("buffer.start");
-    if (!alloc.isSharedMemoryAlloc())
-      return;
-    if (auto id = alloc->getAttrOfType<IntegerAttr>("buffer.id"))
-      groups[id.getInt()].push_back(alloc);
-  });
-
-  if (!smemCircularReuse)
-    return;
-
-  auto i32Type = IntegerType::get(funcOp.getContext(), 32);
-  for (auto &[bufferId, group] : groups) {
-    if (group.size() < 2)
-      continue;
-
-    bool selectedReuseGroup = llvm::all_of(group, [&](ttg::LocalAllocOp alloc) {
-      return isInnermostSmemChannel(alloc, channels) &&
-             !allocToAnnotation.contains(alloc.getOperation());
-    });
-    if (smemAllocAlgo == 1)
-      selectedReuseGroup &= group.size() == 2;
-    if (!selectedReuseGroup)
-      continue;
-
-    for (auto [start, alloc] : llvm::enumerate(group)) {
-      alloc->setAttr("buffer.circular", UnitAttr::get(funcOp.getContext()));
-      alloc->setAttr("buffer.start", IntegerAttr::get(i32Type, start));
-    }
-  }
-}
-
-static LogicalResult validateNVWSSmemPlan(triton::FuncOp funcOp,
-                                          int smemAllocAlgo) {
-  llvm::MapVector<int64_t, SmallVector<ttg::LocalAllocOp>> groups;
-  funcOp->walk<WalkOrder::PreOrder>([&](ttg::LocalAllocOp alloc) {
-    if (!alloc.isSharedMemoryAlloc())
-      return;
-    if (auto id = alloc->getAttrOfType<IntegerAttr>("buffer.id"))
-      groups[id.getInt()].push_back(alloc);
-  });
-
-  for (auto &[bufferId, group] : groups) {
-    auto firstCopy = group.front()->getAttrOfType<IntegerAttr>("buffer.copy");
-    if (!firstCopy)
-      return group.front().emitError(
-          "NVWS memory planner omitted buffer.copy from planned local group");
-
-    SmallVector<ttg::LocalAllocOp> circular;
-    DenseSet<int64_t> starts;
-    for (ttg::LocalAllocOp alloc : group) {
-      auto copy = alloc->getAttrOfType<IntegerAttr>("buffer.copy");
-      if (!copy || copy.getInt() != firstCopy.getInt())
-        return alloc.emitError()
-               << "NVWS memory planner assigned inconsistent buffer.copy "
-                  "values to local buffer.id "
-               << bufferId;
-      if (!alloc->hasAttr("buffer.circular"))
-        continue;
-      circular.push_back(alloc);
-      auto start = alloc->getAttrOfType<IntegerAttr>("buffer.start");
-      if (!start || start.getInt() < 0 ||
-          start.getInt() >= firstCopy.getInt())
-        return alloc.emitError(
-            "NVWS circular local allocation has invalid buffer.start");
-      if (!starts.insert(start.getInt()).second)
-        return alloc.emitError(
-            "NVWS circular local group has duplicate buffer.start");
-    }
-
-    if (circular.empty())
-      continue;
-    if (circular.size() != group.size())
-      return circular.front().emitError(
-          "NVWS memory planner partially marked a local group circular");
-
-    if (smemAllocAlgo == 1) {
-      if (circular.size() != 2 || !starts.contains(0) ||
-          !starts.contains(1))
-        return circular.front().emitError(
-            "NVWS algorithm-1 circular local group must have two starts");
-      Type type = circular.front().getType();
-      if (llvm::any_of(circular, [type](ttg::LocalAllocOp alloc) {
-            return alloc.getType() != type;
-          }))
-        return circular.front().emitError(
-            "NVWS algorithm-1 circular local group has incompatible types");
-    } else if (firstCopy.getInt() < static_cast<int64_t>(circular.size())) {
-      return circular.front().emitError(
-          "NVWS algorithm-0 circular local group has fewer copies than "
-          "members");
-    }
-  }
-  return success();
-}
-
-// Meta omits buffer.offset on an owning TMEM allocation. NVWS consumers use an
-// explicit offset on every planned allocation, so materialize the equivalent
-// zero without changing the physical packing selected by Meta.
-static void emitNVWSTmemOwnerOffsets(triton::FuncOp funcOp) {
-  auto i32Type = IntegerType::get(funcOp.getContext(), 32);
-  funcOp->walk([&](ttng::TMEMAllocOp alloc) {
-    if (alloc->hasAttr("buffer.id") && !alloc->hasAttr("buffer.offset"))
-      alloc->setAttr("buffer.offset", IntegerAttr::get(i32Type, 0));
-  });
-}
-
 } // anonymous namespace
 
 /// Collect all users of a TMEM allocation from its channel.
@@ -3267,9 +3151,15 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
     LLVM_DEBUG(planner.dumpBuffers());
   }
 
-  emitNVWSCircularAttrs(funcOp, channels, effectiveSmemAllocAlgo,
-                        effectiveSmemCircularReuse, smemAllocAnnotations);
-  if (failed(validateNVWSSmemPlan(funcOp, effectiveSmemAllocAlgo)))
+  DenseSet<Operation *> circularEligibleAllocs;
+  funcOp->walk([&](ttg::LocalAllocOp alloc) {
+    if (isInnermostSmemChannel(alloc, channels) &&
+        !smemAllocAnnotations.contains(alloc.getOperation()))
+      circularEligibleAllocs.insert(alloc.getOperation());
+  });
+  if (failed(emitSmemPlanAnnotations(
+          funcOp, channels, effectiveSmemAllocAlgo,
+          effectiveSmemCircularReuse, circularEligibleAllocs)))
     return failure();
 
   // Dump combined key ops + channel graph (side by side visualization)
@@ -3299,7 +3189,7 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
     if (failed(planner.run(bufferId)))
       return failure();
   }
-  emitNVWSTmemOwnerOffsets(funcOp);
+  emitTmemOwnerOffsets(funcOp);
 
   // If a write decision file is provided, serialize decisions to file.
   if (!writeDecisionFile.empty()) {

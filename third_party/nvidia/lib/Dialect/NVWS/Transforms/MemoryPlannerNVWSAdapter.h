@@ -6,6 +6,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
@@ -91,6 +92,13 @@ struct TmemDataChannelPost final : Channel {
 
 LogicalResult collectPostChannels(
     SmallVectorImpl<std::unique_ptr<Channel>> &channels, FuncOp funcOp);
+
+// Translate Meta planner results into the additional attributes consumed by
+// NVWS InsertSemas. These adapters may not change buffer.id or buffer.copy.
+LogicalResult emitSmemPlanAnnotations(
+    FuncOp funcOp, ArrayRef<Channel *> channels, int smemAllocAlgo,
+    bool smemCircularReuse, const DenseSet<Operation *> &eligibleAllocs);
+void emitTmemOwnerOffsets(FuncOp funcOp);
 
 Operation *getSameLevelOp(Operation *producer, Operation *consumer);
 SmallVector<Operation *> getActualConsumers(Operation *consumer);

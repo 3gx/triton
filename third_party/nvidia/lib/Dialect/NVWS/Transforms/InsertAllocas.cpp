@@ -564,8 +564,15 @@ createSemaphoreProducer(OpBuilder &builder, CommunicationBuffer &sema,
     producerKind = AsyncOp::TMALoad;
     staleOps.push_back(alloc);
     staleOps.push_back(descOp);
-  } else if (isGlobalLoadAndAlloc<LocalAllocOp>(result)) {
-    llvm_unreachable("cpasync not supported yet");
+  } else if (auto opt = isGlobalLoadAndAlloc<LocalAllocOp>(result)) {
+    auto [alloc, load] = *opt;
+    (void)load;
+    // Meta schedules the regular load/local_alloc producer independently from
+    // its MMA consumers. NVWS represents that channel as the original load
+    // followed by an explicit store into the managed semaphore buffer.
+    createInto<LocalStoreOp>(builder, loc, producerPartitions, stageCluster,
+                             wsTag, alloc.getSrc(), dataBuf);
+    staleOps.push_back(alloc);
   } else if (auto alloc = result.getDefiningOp<LocalAllocOp>()) {
     createInto<LocalStoreOp>(builder, loc, producerPartitions, stageCluster,
                              wsTag, alloc.getSrc(), dataBuf);
@@ -577,7 +584,9 @@ createSemaphoreProducer(OpBuilder &builder, CommunicationBuffer &sema,
       producerKind = AsyncOp::TMALoad;
       staleOps.push_back(descOp);
     } else if (auto loadOp = result.getDefiningOp<triton::LoadOp>()) {
-      llvm_unreachable("cpasync not supported yet");
+      (void)loadOp;
+      createInto<LocalStoreOp>(builder, loc, producerPartitions, stageCluster,
+                               wsTag, result, dataBuf);
     } else {
       if (isTensorMemoryBuffer(dataBuf)) {
         createRank1TmemStore(builder, loc, result, dataBuf, producerPartitions,
