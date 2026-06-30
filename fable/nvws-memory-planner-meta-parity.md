@@ -1,6 +1,6 @@
 # NVWS MemoryPlanner Meta-AWS parity contract
 
-Status: IMPLEMENTED AND VERIFIED (29jun26).
+Status: CLEAN PORT IMPLEMENTED AND LIT-VERIFIED (30jun26).
 
 The root-cause evidence, final IR correlations, and executed validation matrix
 are recorded in `plans/root-case-pytest-failures-and-proposed-fix.md`.
@@ -20,6 +20,36 @@ classification, reuse decisions, copy-depth growth, and budget accounting.
 The NVWS implementation may differ only where its input IR or downstream
 passes require a mechanical adapter. Every such difference is listed in
 section 3. An unlisted policy difference is a bug.
+
+### 1.1 Implemented source layout
+
+`third_party/nvidia/lib/Dialect/NVWS/Transforms/MemoryPlanner.cpp` now retains
+Meta's class layout, phase order, allocation searches, sorting, budget
+accounting, and copy-growth loops in source order. The side-by-side delta is
+limited to the adaptations in section 3, the NVWS production-pass wrapper, and
+two NVWS safety fixes: unknown channel liveness is function-live, and
+allocations outside all innermost loops are sent through the final allocator.
+
+NVWS channel discovery is isolated in:
+
+```text
+MemoryPlannerNVWSAdapter.h
+MemoryPlannerNVWSAdapter.cpp
+```
+
+The adapter translates `ttg.partition` ownership and NVWS descriptor/TMEM
+shapes into the channel interface consumed by the copied Meta algorithms. It
+does not choose IDs, copy depths, reuse groups, or allocation order.
+
+`Allocation.h` grants the namespaced NVWS copies of `MemoryPlanner` and
+`MemoryPlannerTmem` the same private allocation access as the Meta classes.
+This keeps the two implementations link-distinct without rewriting Meta's
+allocation data structures.
+
+The automatic Blackwell pipeline forwards the target hardware SMEM budget to
+NVWS MemoryPlanner. Partition-scheduler options now start from the same false
+defaults as Meta; per-loop `tt.merge_*` and `tt.separate_epilogue_store`
+attributes select non-default behavior.
 
 ## 2. Meta policy copied into NVWS
 
@@ -188,8 +218,7 @@ changes planner copy depths nor allocates an extra QK buffer.
 Before returning from NVWS MemoryPlanner:
 
 1. Local-memory members of one physical `buffer.id` group have one consistent
-   `buffer.copy` value. TMEM members may differ only when the mixed-depth
-   alternating-reuse proof in section 3.5 succeeds.
+   `buffer.copy` value.
 2. Every algorithm-1 circular group has exactly two physical records, common
    depth and compatible local types, with distinct starts `0` and `1`.
    Every algorithm-0 circular group has one start per member in
@@ -198,8 +227,11 @@ Before returning from NVWS MemoryPlanner:
    physical copy depth. In particular, downstream annotation assignment never
    increases `buffer.copy`.
 
-Violation is a planner diagnostic. InsertSemas keeps its equivalent checks as
-defense in depth.
+Mixed-depth TMEM members deliberately retain different `buffer.copy` values.
+Their alternating-reuse proof requires the completed Access and Owner DAGs, so
+it runs in InsertSemas before schedule legalization or physical coalescing, as
+specified in section 3.5. A local postcondition violation is a planner
+diagnostic; InsertSemas repeats the local checks as defense in depth.
 
 ## 4. InsertSemas completion frontier
 
@@ -313,6 +345,10 @@ reused mbarrier.
    one-slot and two-slot semaphore rings, one coalesced physical TMEM backing,
    and legal pre/post-pipeline order.
 5. Existing MetaAutoWS planner tests remain green.
+6. The scaled-epilogue regression inserts the NVWS `arith.mulf` shape and checks
+   that both split SMEM destinations still receive one fused Meta ID.
+7. An incompatible algorithm-1 circular pair diagnoses in MemoryPlanner before
+   InsertSemas.
 
 ### 6.2 InsertSemas
 
@@ -338,3 +374,21 @@ reused mbarrier.
 7. For config 2, verify post-pipeline qkT, dpT, dV, dQ, and dK MMA operations
    remain present, so a runtime pass cannot be attributed to disabled MMA
    pipelining.
+
+## 8. Clean-port verification (30jun26)
+
+Executed after the clean port:
+
+```text
+ninja triton triton-opt
+  PASS
+
+llvm-lit -v test/NVWS test/Hopper/WarpSpecialization \
+  test/TritonGPU/automatic-warp-specialization.mlir
+  156 discovered: 155 passed, 1 expected failure
+```
+
+The new regressions cover the NVWS scaled-epilogue provenance adapter and the
+algorithm-1 circular-type postcondition. No pytest, GPU runtime, performance,
+or fresh IR-dump claim is added by the clean-port run; the older executed
+runtime matrix remains recorded separately in the root-cause report.

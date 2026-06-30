@@ -694,11 +694,11 @@ pre-ASP offsets, post-ASP successor slots, and multiphase bit arithmetic.
 
 ## 8. Implemented fix sequence
 
-The implemented NVWS-only sequence is:
+The implemented sequence is:
 
-1. Port Meta's SMEM planning phase order, physical-group budget accounting,
-   epilogue fusion, and TMEM copy policy into NVWS MemoryPlanner while retaining
-   NVWS downstream attributes.
+1. Keep NVWS MemoryPlanner as a source-ordered copy of Meta's planner and
+   isolate NVWS channel discovery, descriptor provenance, downstream
+   attributes, and local postconditions as explicit adapters.
 2. Preserve Meta's mixed-depth qkT/ppT TMEM plan with independent logical DAGs
    and one checked physical backing.
 3. Extend local-load ownership through descriptor-store completion.
@@ -706,6 +706,13 @@ The implemented NVWS-only sequence is:
    orbit-aware.
 
 No generic TMA lowering or tutorial source was changed by this implementation.
+
+The 30jun26 clean-port follow-up also forwards the hardware SMEM budget through
+AutomaticWarpSpecialization and restores Meta's false partition-scheduler
+defaults. The existing NVWS data-partition and partition-scheduler algorithms
+were audited against their Meta sources; their remaining deltas are NVWS IR
+coverage, cp.async avoidance, annotation finalization, and transactional pass
+wrapping, not missing Meta scheduling branches.
 
 ## 9. Verification results
 
@@ -726,6 +733,17 @@ Verified on 2026-06-29:
 4. Final full NVWS tutorial rerun: `28 passed, 20 skipped` in 30.20 seconds.
 5. Final full Meta-AWS control rerun: `28 passed, 20 skipped` in 23.07 seconds.
 6. Fresh post-pipeline config-2 IR retains all five MMA families.
+
+Clean-port follow-up on 2026-06-30:
+
+1. `ninja triton triton-opt` passed.
+2. Combined `test/NVWS`, `test/Hopper/WarpSpecialization`, and
+   `test/TritonGPU/automatic-warp-specialization.mlir` lit run discovered 156
+   tests: 155 passed and the existing Hopper planner test remained expectedly
+   failed.
+3. The clean-port follow-up did not rerun pytest, GPU runtime, performance, or
+   fresh IR capture; items 3-6 above refer to the 2026-06-29 implementation
+   state.
 
 ## 10. Rejected fixes
 
