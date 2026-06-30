@@ -286,6 +286,10 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp,
         SmallVector<int> producerIds = getTaskIds(currentProds.front());
         SmallVector<int> consumerIds = getTaskIds(&op);
         if (producerIds.size() != 1) {
+          // NVWS may retain several partition IDs on a producer that Meta's
+          // monolithic code partitioner represents as one channel owner. Do
+          // not invent an owner. When no channel can be modeled, the planner's
+          // unknown-channel path keeps the allocation function-live.
           currentProds.push_back(&op);
           continue;
         }
@@ -675,6 +679,132 @@ LogicalResult collectPostChannels(
     channels.push_back(std::move(channel));
   }
   return success();
+}
+
+LogicalResult emitSmemPlanAnnotations(
+    FuncOp funcOp, ArrayRef<Channel *> channels, int smemAllocAlgo,
+    bool smemCircularReuse, const DenseSet<Operation *> &eligibleAllocs) {
+  llvm::MapVector<int64_t, SmallVector<ttg::LocalAllocOp>> groups;
+  funcOp->walk<WalkOrder::PreOrder>([&](ttg::LocalAllocOp alloc) {
+    alloc->removeAttr("buffer.circular");
+    alloc->removeAttr("buffer.start");
+    if (!alloc.isSharedMemoryAlloc())
+      return;
+    if (auto id = alloc->getAttrOfType<IntegerAttr>("buffer.id"))
+      groups[id.getInt()].push_back(alloc);
+  });
+
+  // Algorithm 0 always creates Meta shared-id pools. Algorithm 1 creates a
+  // circular reuse group only when Meta's smemCircularReuse policy selected
+  // it. Keep that policy bit separate from the NVWS-only representation.
+  if (smemAllocAlgo == 1 && !smemCircularReuse)
+    return success();
+
+  auto i32Type = IntegerType::get(funcOp.getContext(), 32);
+  for (auto &[bufferId, group] : groups) {
+    (void)bufferId;
+    if (group.size() < 2)
+      continue;
+
+    bool selectedReuseGroup = llvm::all_of(group, [&](ttg::LocalAllocOp alloc) {
+      return eligibleAllocs.contains(alloc.getOperation());
+    });
+    if (smemAllocAlgo == 1)
+      selectedReuseGroup &= group.size() == 2;
+    if (!selectedReuseGroup)
+      continue;
+
+    // Meta skips physical SMEM folding for unlike memdesc types. Preserve the
+    // planner id but leave that fallback group non-circular.
+    Type groupType = group.front().getType();
+    SmallVector<std::pair<Operation *, ttg::LocalAllocOp>> ordered;
+    Block *producerBlock = nullptr;
+    for (ttg::LocalAllocOp alloc : group) {
+      if (alloc.getType() != groupType) {
+        ordered.clear();
+        break;
+      }
+      Channel *channel = nullptr;
+      for (Channel *candidate : channels) {
+        if (candidate->getAllocOp() == alloc) {
+          channel = candidate;
+          break;
+        }
+      }
+      Operation *producer = channel ? channel->getSrcOp() : nullptr;
+      if (!producer ||
+          (producerBlock && producer->getBlock() != producerBlock)) {
+        ordered.clear();
+        break;
+      }
+      producerBlock = producer->getBlock();
+      ordered.emplace_back(producer, alloc);
+    }
+    if (ordered.size() != group.size())
+      continue;
+
+    llvm::sort(ordered, [](const auto &lhs, const auto &rhs) {
+      return lhs.first->isBeforeInBlock(rhs.first);
+    });
+    for (auto [start, item] : llvm::enumerate(ordered)) {
+      ttg::LocalAllocOp alloc = item.second;
+      alloc->setAttr("buffer.circular", UnitAttr::get(funcOp.getContext()));
+      alloc->setAttr("buffer.start", IntegerAttr::get(i32Type, start));
+    }
+  }
+
+  for (auto &[bufferId, group] : groups) {
+    auto firstCopy = group.front()->getAttrOfType<IntegerAttr>("buffer.copy");
+    if (!firstCopy)
+      return group.front().emitError(
+          "NVWS memory planner omitted buffer.copy from planned local group");
+
+    SmallVector<ttg::LocalAllocOp> circular;
+    DenseSet<int64_t> starts;
+    for (ttg::LocalAllocOp alloc : group) {
+      auto copy = alloc->getAttrOfType<IntegerAttr>("buffer.copy");
+      if (!copy || copy.getInt() != firstCopy.getInt())
+        return alloc.emitError()
+               << "NVWS memory planner assigned inconsistent buffer.copy "
+                  "values to local buffer.id "
+               << bufferId;
+      if (!alloc->hasAttr("buffer.circular"))
+        continue;
+      circular.push_back(alloc);
+      auto start = alloc->getAttrOfType<IntegerAttr>("buffer.start");
+      if (!start || start.getInt() < 0 ||
+          start.getInt() >= firstCopy.getInt())
+        return alloc.emitError(
+            "NVWS circular local allocation has invalid buffer.start");
+      if (!starts.insert(start.getInt()).second)
+        return alloc.emitError(
+            "NVWS circular local group has duplicate buffer.start");
+    }
+
+    if (circular.empty())
+      continue;
+    if (circular.size() != group.size())
+      return circular.front().emitError(
+          "NVWS memory planner partially marked a local group circular");
+    if (smemAllocAlgo == 1 &&
+        (circular.size() != 2 || !starts.contains(0) || !starts.contains(1)))
+      return circular.front().emitError(
+          "NVWS algorithm-1 circular local group must have two starts");
+    if (smemAllocAlgo == 0 &&
+        firstCopy.getInt() < static_cast<int64_t>(circular.size()))
+      return circular.front().emitError(
+          "NVWS algorithm-0 circular local group has fewer copies than "
+          "members");
+  }
+  return success();
+}
+
+void emitTmemOwnerOffsets(FuncOp funcOp) {
+  auto i32Type = IntegerType::get(funcOp.getContext(), 32);
+  funcOp->walk([&](ttng::TMEMAllocOp alloc) {
+    if (alloc->hasAttr("buffer.id") && !alloc->hasAttr("buffer.offset"))
+      alloc->setAttr("buffer.offset", IntegerAttr::get(i32Type, 0));
+  });
 }
 
 Operation *getSameLevelOp(Operation *producer, Operation *consumer) {

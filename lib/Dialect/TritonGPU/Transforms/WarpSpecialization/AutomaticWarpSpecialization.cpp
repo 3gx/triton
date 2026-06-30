@@ -114,9 +114,6 @@ void AutomaticWarpSpecialization::runOnOperation() {
     NVWSMemoryPlannerOptions memoryPlannerOptions;
     memoryPlannerOptions.numBuffers = numStages;
     memoryPlannerOptions.smemBudget = smemBudget;
-    // NVWS exposes Meta-selected shared-id pools as circular rings consumed by
-    // InsertSemas; per-loop planner attributes still override this default.
-    memoryPlannerOptions.smemCircularReuse = true;
     addPassWithPartitionVerifier(createNVWSMemoryPlanner(memoryPlannerOptions));
   }
   NVWSInsertSemasOptions insertSemasOptions;
