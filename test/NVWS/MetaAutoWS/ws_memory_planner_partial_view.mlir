@@ -1,4 +1,4 @@
-// RUN: not triton-opt %s --nvws-memory-planner=num-buffers=0 -allow-unregistered-dialect 2>&1 | FileCheck %s
+// RUN: not triton-opt %s --nvws-memory-planner=num-buffers=1 -allow-unregistered-dialect 2>&1 | FileCheck %s
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>

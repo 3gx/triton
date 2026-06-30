@@ -3047,6 +3047,9 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               int smemAllocAlgo = 0, unsigned smemBudget = 0,
                               bool smemCircularReuse = false) {
 
+  // NVWS extension: translate partition-annotated NVWS IR into the Channel
+  // model consumed by the copied Meta planner. This changes channel discovery,
+  // not allocation policy, ID selection, copy growth, or budget accounting.
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
   if (failed(collectPostChannels(channelsOrigin, funcOp)))
@@ -3151,6 +3154,9 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
     LLVM_DEBUG(planner.dumpBuffers());
   }
 
+  // NVWS extension: expose Meta's completed SMEM plan through the attributes
+  // consumed by InsertSemas and allocation lowering. The adapter may describe
+  // an already-selected reuse group; it must not change planner IDs or copies.
   DenseSet<Operation *> circularEligibleAllocs;
   funcOp->walk([&](ttg::LocalAllocOp alloc) {
     if (isInnermostSmemChannel(alloc, channels) &&
@@ -3189,6 +3195,9 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
     if (failed(planner.run(bufferId)))
       return failure();
   }
+  // NVWS extension: InsertSemas requires an explicit physical offset on every
+  // planned TMEM owner. Meta carries the equivalent ownership in its later
+  // code-partition representation.
   emitTmemOwnerOffsets(funcOp);
 
   // If a write decision file is provided, serialize decisions to file.
@@ -3215,9 +3224,13 @@ public:
   using impl::NVWSMemoryPlannerBase<NVWSMemoryPlanner>::NVWSMemoryPlannerBase;
 
   void runOnOperation() override {
+    // Match Meta's standalone test-pass contract: the default zero-buffer
+    // invocation is a no-op. AutomaticWarpSpecialization always supplies its
+    // positive numStages value, so production planning is unaffected.
+    if (numBuffers < 1)
+      return;
     getOperation()->walk([&](FuncOp funcOp) {
-      unsigned effectiveNumBuffers =
-          numBuffers <= 0 ? 1u : static_cast<unsigned>(numBuffers);
+      unsigned effectiveNumBuffers = static_cast<unsigned>(numBuffers);
       unsigned effectiveSmemBudget =
           smemBudget <= 0 ? 0u : static_cast<unsigned>(smemBudget);
       if (failed(nvws::planner_impl::doMemoryPlanner(

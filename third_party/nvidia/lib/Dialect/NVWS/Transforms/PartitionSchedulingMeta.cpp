@@ -2391,9 +2391,12 @@ void splitDataPartitionedIfOps(scf::ForOp loop, PartitionSet &schedule) {
   }
 }
 
-// NVWS-only completion of partition metadata required by PartitionLoops.
-// Included inside PartitionSchedulingMeta.cpp's anonymous namespace so the
-// copied Meta scheduling algorithm remains mechanically recognizable.
+// NVWS extension: Meta's scheduler records the selected schedule for its code
+// partitioner. NVWS PartitionLoops instead consumes explicit attributes on
+// every region and scalar/address glue operation. The helpers below close an
+// already-selected schedule over that structural IR, propagate WS-loop tags,
+// and verify the resulting metadata. They do not construct the initial
+// partition layout or change the Meta load/MMA scheduling policy above.
 
 static SetVector<int> getChildPartitionUnion(Operation *op) {
   SetVector<int> result;
@@ -2998,6 +3001,8 @@ LogicalResult NVWSPartitionSchedulingMeta::runOnFuncOp(FuncOp funcOp) {
         kWarpSpecializeTagAttrName,
         IntegerAttr::get(IntegerType::get(loop.getContext(), 32), idx));
     scheduledLoops.push_back(loop);
+    // NVWS extension: complete the explicit metadata required by
+    // PartitionLoops before the Meta schedule is serialized.
     finalizePartitionAnnotations(loop);
     schedule.serialize(loop);
     // Clean Broadcast/ExpandDims that were left with no users
@@ -3011,9 +3016,13 @@ LogicalResult NVWSPartitionSchedulingMeta::runOnFuncOp(FuncOp funcOp) {
         op->erase();
     });
   }
+  // NVWS extension: post-loop partitioned producers also need an unambiguous
+  // WS-loop tag so downstream ownership analysis can associate their uses.
   if (failed(tagPartitionedOpsForFunc(funcOp, scheduledLoops)))
     return failure();
 
+  // NVWS extension: reject incomplete metadata here rather than allowing
+  // PartitionLoops or InsertSemas to infer a different ownership topology.
   for (scf::ForOp loop : scheduledLoops) {
     if (failed(verifyFinalizedPartitionAnnotations(funcOp, loop)))
       return failure();
