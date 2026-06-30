@@ -235,9 +235,12 @@ static bool needToSlice(Value v, unsigned dim, int size) {
   return shape.size() > dim && shape[dim] > size;
 }
 
-// Blackwell/NVWS IR-shape adapters used by the copied Meta data-partition
-// algorithm. These helpers extend sliceability; they do not choose a
-// partition dimension or change the partition-search policy.
+// NVWS extension map for Meta readers: the copied algorithm below keeps
+// Meta's partition-dimension search and slice-closure policy. NVWS adds only
+// representation support needed by the Blackwell pipeline: legal sliced TMEM
+// encodings, descriptor-gather coordinates, generic regionless operations,
+// and SMEM memdesc function-argument views. These helpers extend what can be
+// sliced; they do not choose which dimension or operation partition to use.
 
 static std::optional<Attribute> getSlicedTensorMemoryEncoding(
     MLIRContext *ctx, nvidia_gpu::TensorMemoryEncodingAttr tmem,
@@ -788,6 +791,9 @@ static bool getSliceToPartition(Value root,
   return true;
 }
 
+// Meta policy boundary: this is the canonical M-first, then N partition search.
+// NVWS-specific logic reached from here only answers whether its additional IR
+// representations can implement a candidate selected by that search.
 static bool computePartitionScheme(triton::FuncOp &funcOp,
                                    DataPartitionScheme &partitionScheme) {
   // Use dot to drive the partition
