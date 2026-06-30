@@ -49,11 +49,15 @@ the evidence.
    `nvws.semaphore.create %bufs true`; all others `false`. Fan-in pending
    counts are implicit in the IR (one acquire op, N release sites; counted
    by `nvws-lower-semaphore`); the count lives only in the SYNC-DAG.
-5. **All decisions before any mutation.** Stages 1–3 are pure analysis and
-   additionally produce the **BackingPlan** and the per-node **Crossing**
+5. **All protocol decisions before structural mutation.** Stages 1–3 build the
+   protocol by pure analysis and additionally produce the **BackingPlan** and
+   the per-node **Crossing**
    facts (§2 — crossings live on For/If DAG nodes; "ThreadingPlan" is their
    derived emission-time aggregation). The
-   emitter applies plans; it decides nothing. In particular the TMEM 1x/2x
+   emitter applies plans; it decides nothing. After all group DAGs are built,
+   the stage-3 schedule finalizer may raise existing `loop.cluster` attrs to
+   satisfy the recurrence constraints of contract I; it never changes
+   `loop.stage` or IR structure. In particular the TMEM 1x/2x
    stage check runs on the *unmodified* input IR, in the analysis path.
    Emission itself is bracketed by mechanical normalizations: a
    **pre-process** that nukes all original TMEM async tokens of managed
@@ -200,7 +204,8 @@ struct Touch {
 struct Node {
   enum Kind { Func, For, If, Enter, Exit, Access, Acquire, Release };
   Kind kind;
-  Operation *op;                    // For/If/Access anchor; null otherwise
+  Operation *op;                    // direct For/If/Access anchor
+  Operation *completionAnchor;      // Access ownership endpoint; defaults op
   Node *parent, *prev, *next;       // program-order chain in parent region
   SmallVector<Node*> children;      // For: body head; If: then head[, else head]
   Owner owner;                      // Access/Acquire/Release: executing partition
@@ -211,6 +216,7 @@ struct Node {
   AsyncOp payload = AsyncOp::NONE;  // Release: source holder's last REAL
                                     // access payload (carried through
                                     // re-anchoring — spec §5.1)
+  std::optional<int64_t> stageOffset; // SYNC-authored ASP slot offset
   Node *sat = nullptr;              // Release -> the ONE Acquire it satisfies
                                     // (an Acquire has count-many incoming)
   SmallVector<Crossing, 1> crossings; // For/If only, filled at stage 3:
@@ -629,14 +635,19 @@ pass behave):
 
 Real-op anchors are recorded as node facts at stage 3 (SYNC-DAG); the cache
 is part of the deterministic render walk. Input access ops already carry
-the attrs (set by the TritonGPU **loop scheduler**, upstream of this pass —
-e.g. meta_fa_fwd :302 `loop.cluster = 4, loop.stage = 0`; the NVWS
-`AssignStagePhase` pass is a different thing: it runs *after* insert-semas
-and assigns the stage/phase *operands* on acquire/buffer/release, which is
-why emitting them bare is legal); this pass only ever copies, never
-derives a schedule. The post-emit verifier checks: every emitted
-acquire/buffer/release inside a pipelined loop whose anchor access carries
-stage/cluster carries it too — a miss is a hard diagnostic.
+attrs set by the TritonGPU loop scheduler. Before rendering, SYNC-DAG treats
+every release-to-satisfied-acquire pair as a first-class pipeline dependency.
+It computes the physical-slot recurrence distance from the backing depth and
+the same fresh-write stage advances used by `AssignStagePhase`. Static
+`loop.stage` assignments remain fixed: positive stage slack needs no repair,
+zero slack raises the destination access wave's `loop.cluster` (including its
+semaphore and SSA dependants), and negative slack or a cyclic ordering is a
+hard diagnostic. The depth fact includes `LowerSemaphore`'s later automatic
+multibuffering of descriptor-fed local buffers; an explicit `buffer.copy`
+continues to override it. After that legalization, acquire/buffer/release
+stamping is mechanical as specified above. `AssignStagePhase` still runs
+after insert-semas and assigns the dynamic stage/phase operands; it does not
+repair static schedule order.
 
 **Keystone walkthrough (meta_fa_fwd, buffer.id=4).** Members: qk `[0,128)`
 f32 (in WS loop), p `[0,64)` f16 (sourceful, in inner loop), alpha
@@ -811,6 +822,16 @@ to this commit). Dump: member/piece table +
 access tree with per-piece effects on `FOR`/`IF` rows. Verify by eye on the set; meta_fa_fwd's ten groups (4 TMEM —
 buffer.id 2/3/4/5 — plus 6 synthetic-id locals) are the acid test.
 
+Each Access row records both its direct `op` and its ownership
+`completionAnchor`, which defaults to `op`. For a managed `local_load`,
+ACCESS-DAG recognizes only the closed forwarding shapes
+`local_load -> descriptor_store` and
+`local_load -> convert_layout -> descriptor_store`. The unique terminal
+descriptor store becomes `completionAnchor` only when it follows the load in
+the same block and has the same effective owner. The row remains the original
+local-load R touch with `<none>` payload. Ambiguous fan-out or a matching store
+across control flow is a diagnostic; later stages never rediscover this fact.
+
 ### Commit 2 — OWNER-DAG (creates `InsertSemasOwnerDag.h`)
 Clone; `Enter`/`Exit` per region; the **owner half** of `pieceInfo` by the
 deterministic rules (spec §4: loop carried owner = first toucher per piece;
@@ -887,6 +908,20 @@ inject `Acquire`/`Release` nodes with recorded owner/payload/count; entry
 acquires per component (spec §5.3 — the regain is the carried owner's last
 acquire in the body's own chain, child chains excluded), `isEntry` in the
 SemaTable.
+
+For a non-circular local group with at least two members whose offset, extent,
+and type are identical, and with semaphore depth greater than one, stage 3 also
+computes the direct ownership-loop slot schedule. Fresh writes advance the
+shared ASP cursor and reads keep the latest produced ordinal. Every Release
+gets a `stageOffset` targeting the Acquire it satisfies: a forward handoff uses
+`(dstOrdinal - srcOrdinal) mod depth`; a loop-closing handoff keeps offset zero
+when the destination reaches the source slot within one cursor orbit, otherwise
+it targets the next iteration's destination slot. If any release shifts, every
+Acquire in the group gets an explicit zero offset. This is a SYNC-DAG fact,
+never an emitter inference. If no release shifts, the provisional zero offsets
+are discarded and ordinary token-stage propagation remains active. Circular
+groups and TMEM groups are excluded; non-direct or incomplete exact-alias
+local schedules diagnose.
 
 Also computed here, read-only (ground rule 5):
 - **BackingPlan**: `computeBackingStages` per group in discovery order with
@@ -967,8 +1002,9 @@ Strict order — pre-process, apply frozen plans, render, post-process:
 4. **Render**: one traversal per SYNC-DAG, one action per node kind (spec §6
    table), all ops via `createInto` with stage/cluster stamped per contract
    I (real-op anchors from node facts; virtual-row anchors from the
-   per-partition last-seen cache); `{P}`-owned sync ops outside a WS loop
-   also get the loop's tag. Threading recipe modeled on
+   per-partition last-seen cache); authored `stageOffset` values are copied
+   directly to Acquire/Release stage operands; `{P}`-owned sync ops outside a
+   WS loop also get the loop's tag. Threading recipe modeled on
    InsertTmemSemaphore: For (cf. :992–1024) — init operand := carrier,
    body carrier := iter_arg, yield operand := body-final carrier, after :=
    loop result; If (cf. :1043–1087) — branch walks on copies, **assert**
@@ -979,10 +1015,13 @@ Strict order — pre-process, apply frozen plans, render, post-process:
    the yield's existing `ttg.partition` ids and add the token owners,
    never overwrite (mining gap 5)), carrier := if
    result; no-crossing regions
-   balance locally (cf. :964–977). Access nodes: retarget memdesc operands
-   through the recorded alias chain onto the member's view; sourceful
-   allocs → explicit store (contract D); descriptor destinations retargeted
-   only (contract G). Region ops' `ttg.partition` arrays are extended to
+   balance locally (cf. :964–977). Access nodes: retarget the direct `op`'s
+   memdesc operands through the recorded alias chain onto the member's view;
+   sourceful allocs → explicit store (contract D); descriptor destinations
+   retargeted only (contract G). The row endpoint is then its precomputed
+   `completionAnchor`, so a following Release is inserted after that endpoint
+   without searching for or moving emitted operations. Region ops'
+   `ttg.partition` arrays are extended to
    their node's recorded `requiredParts` (the stage-3 fact rendered as
    `parts{…}` — the C10 rule as transcription: the region skeleton must
    exist in every listed partition's stream for partition-loops routing),

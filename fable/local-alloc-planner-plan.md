@@ -1,6 +1,12 @@
 # NVWS local_alloc memory planner port plan
 
-Status: PLAN ONLY (16jun26).
+Status: HISTORICAL PORT PLAN (16jun26), policy superseded 29jun26 by
+`fable/nvws-memory-planner-meta-parity.md`.
+
+The channel and downstream-annotation requirements in this document remain
+applicable. Its independent allocation and circular-grouping heuristics are no
+longer authoritative: Meta-AWS phase ordering and decisions are now the source
+of truth, with only the adaptations enumerated in the parity contract.
 
 Scope: `triton-solid-01.git`, NVWS path only. This plan ports the remaining
 SMEM/local allocation planning functionality from the original Meta

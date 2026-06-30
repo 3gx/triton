@@ -105,7 +105,9 @@ struct Node {
     Acquire, Release          // sync nodes, injected by the SYNC stage
   };
   Kind kind;
-  Operation *op;              // IR anchor for Func/For/If/Access; null otherwise
+  Operation *op;              // direct IR access/retargeting anchor
+  Operation *completionAnchor;// Access ownership-completion endpoint;
+                              // defaults to op (section 6.1)
 
   // Structure — identical in all three snapshots.
   Node *parent;               // enclosing Func/For/If node
@@ -124,6 +126,7 @@ struct Node {
   SemaId sema;                // which semaphore
   unsigned count;             // acquire pending count (releases are always 1)
   AsyncOp payload;            // release payload, from the source access
+  std::optional<int64_t> stageOffset; // SYNC-authored ASP slot offset
   Node *sat;                  // Release: the ONE Acquire it satisfies (forward
                               // link; an Acquire has count-many incoming)
 };
@@ -925,10 +928,10 @@ the terminator) holds by construction:
 |---|---|
 | `Func`/`For`/`If` | recurse; thread the live carrier tokens through `iter_args` / if-results — one slot per live component *(REVISED — Addendum B.2.4: slots exist only for carrier-bearing components — gated boundary devices and merged wrap holds; ungated point-of-use tokens die in the body, so their For rows thread nothing)*; the slot's owner and its final-carrier row are **stage-3 ThreadingPlan facts** (then/body yields the recorded final carrier's token; else/skip yields the incoming carrier unchanged — an SSA pass-through, which is why bare else brackets need no record). **Liveness (If rows)**: an If crossing exists only if the carrier is consumed after the If — a later row for the component in the enclosing chain, or the enclosing chain is a For body (recurrence), or, recursively, the enclosing If branch is itself live. A component whose last activity is inside the branch yields nothing (gate-2 evidence 10jun26: threading a dead token through a non-WS guard if trips AssignStagePhase's hasPartition assert). For rows always cross (recurrence) |
 | `Enter`/`Exit` | insertion-point markers only |
-| `Acquire` | emit `nvws.semaphore.acquire`; its token becomes the owner's carrier. Buffer VIEWS are NOT emitted here: `nvws.semaphore.buffer` is materialized lazily at each consuming access, in that access's region, stamped with that access's owner and stage/cluster; the view cache clears at every acquire and at every region boundary (a carried token gets a fresh view per region); one buffer op yields all member views of a multi-member semaphore |
+| `Acquire` | emit `nvws.semaphore.acquire`; transcribe `stageOffset` when present; its token becomes the owner's carrier. Buffer VIEWS are NOT emitted here: `nvws.semaphore.buffer` is materialized lazily at each consuming access, in that access's region, stamped with that access's owner and stage/cluster; the view cache clears at every acquire and at every region boundary (a carried token gets a fresh view per region); one buffer op yields all member views of a multi-member semaphore |
 | `Access` | retarget the op's memdesc operands onto the view (via the recorded alias chain); erase its original async-token plumbing. **Row independence (gate-2 evidence 10jun26):** a sourceful alloc's replacement RAUW must EXCLUDE the group's other access-row ops — each row retargets itself with its own owner's view (else a reader is left on the writer-partition's view: a cross-partition SSA edge partition-loops rejects); the original alloc's erase is deferred to final cleanup, after every row has retargeted |
 | *(post-nuke)* | the token nuke leaves dead token-typed **signature slots** (a `scf.for` iter_arg whose region arg and result are both unused; a `scf.if` result that is unused); these are erased to a fixpoint before any semaphore IR is emitted — dropping the matching init/yield operands and `ttg.partition.outputs` entries. Gate-1 evidence (automatic-warp-specialization.mlir): surviving poison-husk slots change region signatures and break the downstream loop scheduler |
-| `Release` | emit `nvws.semaphore.release` with the node's recorded payload, consuming the owner's carrier token |
+| `Release` | emit `nvws.semaphore.release` with the node's recorded payload and `stageOffset` when present, consuming the owner's carrier token |
 
 Plus the mechanical stamping rules: INSIDE the WS loop every sync op
 carries exactly its node's owner partition (mandatory — partition-loops
@@ -976,6 +979,55 @@ covering backing; and, last, the **loop-scheduler workaround** — the
 token plumbing for the downstream loop scheduler (critical for
 `automatic-warp-specialization.mlir`); it makes no placement or
 synchronization decisions.
+
+### 6.1 Access completion anchors
+
+An Access row distinguishes its direct memory touch (`op`) from its physical
+ownership-completion endpoint (`completionAnchor`). They are identical unless
+a later lowering is known to reuse the managed allocation beyond the direct
+touch.
+
+For a managed local read, stage 1 recognizes the closed shapes
+`local_load -> descriptor_store` and
+`local_load -> convert_layout -> descriptor_store`. The unique descriptor
+store becomes `completionAnchor` when it follows the load in the same block
+and has the same effective owner. The row remains an R touch with the
+local-load `<none>` payload.
+
+Stage 3 uses the completion anchor for release scheduling. Stage 4 retargets
+the local load and mechanically treats the recorded completion anchor as the
+row endpoint, so the following Release is inserted after the descriptor store.
+No emitted operation is searched for or moved. Ambiguous fan-out or a matching
+descriptor store across control flow is a hard diagnostic.
+
+### 6.2 Exact-alias staged local handoffs
+
+For a non-circular local group with at least two exact-alias members and
+semaphore depth greater than one, stage 3 derives the physical slot ordinal of
+every direct access in the ownership loop. Fresh writes advance the shared ASP
+cursor; reads retain the most recently produced ordinal.
+
+Each Release then receives the offset needed by the Acquire it satisfies. A
+same-iteration edge targets the destination ordinal. A loop-closing edge keeps
+the source slot when a future destination acquire visits that slot within one
+cursor orbit; otherwise it targets the next iteration's destination ordinal.
+For the depth-two chain
+
+```text
+W m0 -> R m0 -> W m1 -> R m1
+```
+
+the access ordinals are `0,0,1,1`, the authored release offsets are
+`0,1,0,1`, and the release target slots are `0,1,1,0`.
+
+If any release needs a nonzero offset, stage 3 also authors zero offsets on all
+Acquire nodes in the group. That makes the explicit protocol visible to
+AssignStagePhase, which uses multiphase parity. Stage 4 only materializes the
+recorded constants. If every release offset is zero, stage 3 discards the
+provisional offsets and retains ordinary token-stage propagation. Circular
+groups, TMEM groups, nested accesses, and an
+incomplete slot schedule do not use this rule; unsupported exact-alias local
+shapes are diagnosed instead of inferred during emission.
 
 ---
 
