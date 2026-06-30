@@ -5,7 +5,7 @@ Last accuracy audit: 2026-06-30
 Pre-fix revision investigated: `373438659ba0a462978831891ea742deff2c1241`
 Current-branch equivalent pre-fix revision: `bcf4079a91`
 Fix implementation revision: `bcd3da75c1`
-Final verification: implementation worktree on 2026-06-29
+Final verification: parity implementation worktree on 2026-06-30
 
 The historical pre-fix revision and `bcf4079a91` have identical trees. The
 latter is the reachable current-branch name after the source/documentation
@@ -295,6 +295,26 @@ The focused lit test does not separately check the post-TMA order for the
 both config-0 H128 persistent tests, with `SUBTILING=False/True`, passed in the
 final NVWS run.
 
+### 4.8 Current parity-port shape
+
+The historical evidence above describes the failure and its direct
+InsertSemas fix. The final 30jun26 Meta-parity scheduler produces a simpler
+config-0 epilogue in the fresh dump: dV/dK are loaded from TMEM into tensors
+and passed directly to `descriptor_store`; there is no independently
+scheduled managed-SMEM source channel in that path.
+
+After generic TMA lowering, each descriptor store receives a private
+sourceful `ttg.local_alloc`, then executes
+`async_tma_copy_local_to_global -> async_tma_store_wait`. The preceding TMEM
+empty arrival therefore cannot authorize another partition to overwrite the
+TMA source. This current shape is visible in
+`/tmp/nvws-parity-config0-20260630.mlir:287644-287696` before TMA lowering and
+`:288663-288743` after TMA lowering.
+
+The completion-frontier implementation and focused lit test remain required
+for other legal NVWS schedules that do create a managed-SMEM descriptor-store
+channel; the fresh config-0 runtime no longer depends on that fallback.
+
 ## 5. Config 1: eight aliases become an unbudgeted eight-slot ring
 
 ### 5.1 Runtime symptom
@@ -308,7 +328,7 @@ Required: 248408, Hardware limit: 232448
 See
 `logs/06-29jun26-recurrence-regression/meta-vs-nvws-config1/nvws/stdout.log:30-39`.
 
-### 5.2 Final NVWS plan
+### 5.2 Historical pre-fix final NVWS plan
 
 After NVWS MemoryPlanner, all eight epilogue subtiles have one `buffer.id`,
 eight copies, and distinct circular starts:
@@ -421,9 +441,10 @@ The implemented NVWS MemoryPlanner now follows Meta's phase order:
 6. Validate common depth and circular starts before emitting NVWS downstream
    attributes.
 
-The phase transcription is in `MemoryPlanner.cpp:1329-1478`, P2 fusion and
-growth are at `MemoryPlanner.cpp:1568-1620`, and the downstream group
-postconditions are checked at `MemoryPlanner.cpp:1645-1695`.
+The copied phase transcription is in `MemoryPlanner.cpp:1300-1571`: P2 fusion
+is at lines 1192-1226, P2 growth is at lines 1229-1289, and phase invocation is
+at lines 1393-1560. NVWS-only circular/start emission and downstream group
+postconditions are isolated in `MemoryPlannerNVWSAdapter.cpp:684-799`.
 
 For the historical failure, preserving two physical epilogue groups instead
 of one eight-member circular ring removes the unbudgeted 65536-byte shape.
@@ -445,6 +466,18 @@ check the documented large-budget versus tight-budget local-buffer copy depths.
 That final-depth SMEM assertion remains a focused lit coverage gap.
 
 Both config-1 H128 persistent runtime tests passed in the final NVWS run.
+
+### 5.8 Current parity-port shape
+
+The fresh 30jun26 config-1 dump does not contain the historical eight local
+epilogue allocations. Immediately after MemoryPlanner, its local allocations
+are K, V, Q, DO, and dsT with ids 0 through 4; none carries
+`buffer.circular`. See
+`/tmp/nvws-parity-config1-20260630.mlir:259158-259164`.
+
+The final module reports `ttg.shared = 222632`, below the 232448-byte hardware
+limit. This confirms in current IR, independently of the passing runtime, that
+the unbudgeted eight-slot shape was not recreated.
 
 ## 6. Config 2: one physical TMEM id contains two logical ring depths
 
@@ -600,6 +633,13 @@ logical ring and ppT as a two-slot logical ring on the same `buffer.id`, then
 checks independent synchronization plus one coalesced physical backing. That
 synthetic mixed-depth adapter regression remains to be added.
 
+The fresh 30jun26 config-2 dump independently reconfirms the required logical
+plan after MemoryPlanner: qkT is physical id 2/copy 1 and sourceful P/dV is
+physical id 2/copy 2. After `TritonGPUPipeline`, qkT, dpT, dV, dQ, and dK MMA
+families all remain present. See
+`/tmp/nvws-parity-config2-20260630.mlir:217875-217926` and
+`:225277-225442`.
+
 ## 7. Final config-2 hang: fused SMEM releases addressed the wrong slots
 
 ### 7.1 Exact ownership shape
@@ -707,12 +747,29 @@ The implemented sequence is:
 
 No generic TMA lowering or tutorial source was changed by this implementation.
 
-The 30jun26 clean-port follow-up also forwards the hardware SMEM budget through
+The 30jun26 parity follow-up also forwards the hardware SMEM budget through
 AutomaticWarpSpecialization and restores Meta's false partition-scheduler
-defaults. The existing NVWS data-partition and partition-scheduler algorithms
-were audited against their Meta sources; their remaining deltas are NVWS IR
-coverage, cp.async avoidance, annotation finalization, and transactional pass
-wrapping, not missing Meta scheduling branches.
+defaults. It removes the NVWS-only forced circular-reuse default: Meta's false
+default now reaches the copied planner unchanged.
+
+The three Meta algorithm bodies are now kept recognizable in their NVWS
+counterparts:
+
+1. `MemoryPlanner.cpp` contains Meta allocation policy; channel discovery and
+   downstream `buffer.circular`, `buffer.start`, and TMEM offset annotations
+   are in `MemoryPlannerNVWSAdapter.{h,cpp}`.
+2. `PartitionSchedulingMeta.cpp` contains Meta categorization and schedule
+   construction; NVWS annotation finalization, result tagging, and verification
+   are in `PartitionSchedulingNVWSAdapter.inc`. A loop for which Meta returns
+   no schedule is a successful no-op.
+3. `WSDataPartition.cpp` contains Meta data partitioning; Blackwell/NVWS op
+   slicing and cloning support is in `WSDataPartitionNVWSAdapter.inc`.
+
+Meta's regular-load schedule is no longer overridden by pulling a
+`tt.load`/`ttg.local_alloc` producer into the MMA partition.
+`NVWSInsertAllocas` instead represents that cross-partition result with an
+explicit `ttg.local_store` into the managed semaphore buffer while retaining
+the original load.
 
 ## 9. Verification results
 
@@ -734,16 +791,32 @@ Verified on 2026-06-29:
 5. Final full Meta-AWS control rerun: `28 passed, 20 skipped` in 23.07 seconds.
 6. Fresh post-pipeline config-2 IR retains all five MMA families.
 
-Clean-port follow-up on 2026-06-30:
+Final parity follow-up on 2026-06-30:
 
 1. `ninja triton triton-opt` passed.
 2. Combined `test/NVWS`, `test/Hopper/WarpSpecialization`, and
-   `test/TritonGPU/automatic-warp-specialization.mlir` lit run discovered 156
-   tests: 155 passed and the existing Hopper planner test remained expectedly
+   `test/TritonGPU/automatic-warp-specialization.mlir` lit run discovered 157
+   tests: 156 passed and the existing Hopper planner test remained expectedly
    failed.
-3. The clean-port follow-up did not rerun pytest, GPU runtime, performance, or
-   fresh IR capture; items 3-6 above refer to the 2026-06-29 implementation
-   state.
+3. `test/NVWS/MetaAutoWS` passed all 53 tests.
+4. The full NVWS-AWS tutorial matrix passed: `28 passed, 20 skipped, 1 warning`
+   in 21.89 seconds.
+5. The full Meta-AWS control matrix passed: `28 passed, 20 skipped, 1 warning`
+   in 24.29 seconds.
+6. Fresh selected config-0, config-1, and config-2 runs passed and wrote the
+   `/tmp/nvws-parity-config{0,1,2}-20260630.mlir` dumps.
+7. Fresh config 1 has no post-planner `buffer.circular` attributes and reports
+   `ttg.shared = 222632`, below the 232448-byte hardware limit.
+8. Fresh config 2 preserves qkT as physical id 2/copy 1 and sourceful P as
+   physical id 2/copy 2. Its post-pipeline IR retains qkT, dpT, dV, dQ, and dK
+   MMA families.
+
+No performance claim is made by this parity follow-up.
+
+An independent read-only source audit returned GO. It classified every
+remaining delta as NVWS channel discovery, conservative representability
+handling, annotation/finalization, pass wrapping, or downstream buffer
+representation; it found no remaining Meta policy gap.
 
 ## 10. Rejected fixes
 

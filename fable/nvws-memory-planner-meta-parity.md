@@ -1,6 +1,7 @@
-# NVWS MemoryPlanner Meta-AWS parity contract
+# NVWS Meta-AWS algorithm parity contract
 
-Status: CLEAN PORT IMPLEMENTED AND LIT-VERIFIED (30jun26).
+Status: SOURCE PARITY IMPLEMENTED; LIT, RUNTIME, AND FRESH IR VERIFIED
+(30jun26).
 
 The root-cause evidence, final IR correlations, and executed validation matrix
 are recorded in `plans/root-case-pytest-failures-and-proposed-fix.md`.
@@ -47,9 +48,26 @@ This keeps the two implementations link-distinct without rewriting Meta's
 allocation data structures.
 
 The automatic Blackwell pipeline forwards the target hardware SMEM budget to
-NVWS MemoryPlanner. Partition-scheduler options now start from the same false
-defaults as Meta; per-loop `tt.merge_*` and `tt.separate_epilogue_store`
-attributes select non-default behavior.
+NVWS MemoryPlanner. It does not force `smemCircularReuse`; the Meta default is
+false and only an explicit pass or loop option enables that policy.
+
+The same source-layout rule is applied to partition scheduling and data
+partitioning:
+
+```text
+PartitionSchedulingMeta.cpp
+PartitionSchedulingNVWSAdapter.inc
+WSDataPartition.cpp
+WSDataPartitionNVWSAdapter.inc
+```
+
+The two `.cpp` files retain Meta's categorization, partition construction,
+propagation, scheduling, and slicing algorithms in source order. The `.inc`
+files contain the NVWS operation coverage, partition-annotation finalization,
+verification, and result-tagging required by downstream NVWS passes.
+Partition-scheduler options start from the same false defaults as Meta;
+per-loop `tt.merge_*` and `tt.separate_epilogue_store` attributes select
+non-default behavior.
 
 ## 2. Meta policy copied into NVWS
 
@@ -172,11 +190,14 @@ P2 epilogue fusion is not circular and receives no `buffer.circular` or
 
 Algorithm 0's Meta policy deliberately assigns every compatible innermost
 record to one shared-id pool and then raises `buffer.copy` to at least the
-number of records. NVWS represents that already-selected pool as circular:
-all records receive `buffer.circular`, and `buffer.start` is their distinct
-zero-based position in planner program order. This metadata does not change
-the Meta id assignment or copy depth; it exposes Meta's logical pool to
-InsertSemas and allocation lowering.
+number of records. NVWS represents a physically foldable already-selected pool
+as circular: all members receive `buffer.circular`, and `buffer.start` is their
+distinct zero-based position in producer program order. If exact memdesc types
+or one-block producer ordering cannot establish that physical fold, the Meta
+id and copy depth remain unchanged but no circular metadata is emitted. The
+metadata never changes the Meta decision; it exposes a legal physical pool to
+InsertSemas and allocation lowering. Producer order is required because the
+allocation declarations may precede their writes in a different order.
 
 ### 3.5 Mixed-depth TMEM reuse groups
 
@@ -232,6 +253,29 @@ Their alternating-reuse proof requires the completed Access and Owner DAGs, so
 it runs in InsertSemas before schedule legalization or physical coalescing, as
 specified in section 3.5. A local postcondition violation is a planner
 diagnostic; InsertSemas repeats the local checks as defense in depth.
+
+### 3.7 Scheduling and data-partition adapters
+
+Meta returns no schedule when a marked loop has no schedulable load or MMA.
+NVWS preserves that as a successful no-op: it does not finalize, tag, or
+verify such a loop. Only loops for which Meta produced a schedule enter the
+NVWS annotation adapter.
+
+Meta may place a regular `tt.load` plus its `ttg.local_alloc` producer in the
+load partition while its MMA consumers remain in the GEMM partition. NVWS
+does not change that schedule. `NVWSInsertAllocas` materializes the channel as:
+
+```text
+tt.load -> ttg.local_store managed_semaphore_buffer -> GEMM local_load
+```
+
+The original load remains the producer; only the stale sourceful
+`ttg.local_alloc` is removed. This is the NVWS channel representation of the
+Meta schedule, not a scheduling exception and not a cp.async implementation.
+
+The data-partition adapter contains the Blackwell/NVWS operation-specific
+slice and clone cases. It does not add a second partitioning policy or omit a
+Meta partitioning branch.
 
 ## 4. InsertSemas completion frontier
 
@@ -347,8 +391,9 @@ reused mbarrier.
 5. Existing MetaAutoWS planner tests remain green.
 6. The scaled-epilogue regression inserts the NVWS `arith.mulf` shape and checks
    that both split SMEM destinations still receive one fused Meta ID.
-7. An incompatible algorithm-1 circular pair diagnoses in MemoryPlanner before
-   InsertSemas.
+7. An unlike-type algorithm-1 pair keeps Meta's planner id and copy depth but
+   receives no `buffer.circular` or `buffer.start`, matching Meta's physical
+   SMEM-folding fallback.
 
 ### 6.2 InsertSemas
 
@@ -375,9 +420,10 @@ reused mbarrier.
    remain present, so a runtime pass cannot be attributed to disabled MMA
    pipelining.
 
-## 8. Clean-port verification (30jun26)
+## 8. Final parity verification (30jun26)
 
-Executed after the clean port:
+The final source state was built before every lit run, as required by
+`AGENTS.md`.
 
 ```text
 ninja triton triton-opt
@@ -385,10 +431,50 @@ ninja triton triton-opt
 
 llvm-lit -v test/NVWS test/Hopper/WarpSpecialization \
   test/TritonGPU/automatic-warp-specialization.mlir
-  156 discovered: 155 passed, 1 expected failure
+  157 discovered: 156 passed, 1 expected failure
+
+llvm-lit -v test/NVWS/MetaAutoWS
+  53 passed
+
+full NVWS-AWS tutorial pytest matrix
+  28 passed, 20 skipped, 1 warning in 21.89s
+
+full Meta-AWS tutorial pytest control matrix
+  28 passed, 20 skipped, 1 warning in 24.29s
 ```
 
-The new regressions cover the NVWS scaled-epilogue provenance adapter and the
-algorithm-1 circular-type postcondition. No pytest, GPU runtime, performance,
-or fresh IR-dump claim is added by the clean-port run; the older executed
-runtime matrix remains recorded separately in the root-cause report.
+The expected failure is the pre-existing Hopper planner XFAIL. The tutorial
+source was not changed by this implementation.
+
+Fresh selected dumps were captured at:
+
+```text
+/tmp/nvws-parity-config0-20260630.mlir
+/tmp/nvws-parity-config1-20260630.mlir
+/tmp/nvws-parity-config2-20260630.mlir
+```
+
+They prove the following current shapes:
+
+1. Config 0 has no managed cross-partition SMEM source between its dV/dK TMEM
+   loads and descriptor stores. After generic TMA lowering, each store uses a
+   private `ttg.local_alloc`, followed by
+   `async_tma_copy_local_to_global` and `async_tma_store_wait`.
+2. Config 1 has no `buffer.circular` annotation after MemoryPlanner and ends at
+   `ttg.shared = 222632`, below the 232448-byte hardware budget. It does not
+   recreate the historical eight-slot epilogue ring.
+3. Config 2 preserves the intentional physical alias with independent logical
+   depths: qkT is `buffer.id = 2, buffer.copy = 1`, while sourceful P/dV is
+   `buffer.id = 2, buffer.copy = 2`.
+4. Config 2 after `TritonGPUPipeline` still contains qkT, dpT, dV, dQ, and dK
+   `tc_gen5_mma` operations, including pipelined prologue/body instances.
+
+The new lit regressions additionally cover the default-disabled circular
+policy, producer-ordered circular starts, unlike-type physical-fold fallback,
+Meta's no-schedule no-op, and the regular-load channel through the complete
+automatic-warp-specialization pipeline. Performance was not rerun as part of
+this parity verification.
+
+An independent read-only source audit compared all three NVWS algorithm bodies
+and their adapters against the Meta sources and returned GO: no remaining
+difference changes Meta allocation, data-partition, or scheduling policy.
