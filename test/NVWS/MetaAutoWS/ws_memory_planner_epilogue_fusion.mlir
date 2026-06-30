@@ -1,11 +1,16 @@
 // RUN: triton-opt %s -split-input-file --nvws-memory-planner=num-buffers=3 | FileCheck %s
 
 // Test: Two SMEM buffers in the outer persistent loop (not the innermost loop)
-// both originate from the same tmem_load via split → truncf → convert_layout →
-// local_store. Since they are used sequentially with disjoint liveness, the
-// memory planner should fuse them into the same buffer.id.
+// both originate from the same tmem_load via the NVWS dK scale multiply,
+// split, truncf, convert_layout, and local_store. Since they are used
+// sequentially with disjoint liveness, the memory planner should fuse them
+// into the same buffer.id.
 
 // CHECK-LABEL: @epilogue_split_buffers_fused
+// CHECK: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[INNER:[0-9]+]] : i32}
+// CHECK-NEXT: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[INNER]] : i32}
+// CHECK-NEXT: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[EPILOGUE:[0-9]+]] : i32}
+// CHECK-NEXT: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[EPILOGUE]] : i32}
 // CHECK: ttng.tmem_alloc {{.*}}buffer.copy = 2 : i32, buffer.id = {{[0-9]+}} : i32, buffer.offset = 0 : i32
 // CHECK: ttng.tmem_store {{.*}}tmem.start
 // CHECK: ttng.tc_gen5_mma {{.*}}tmem.start
@@ -40,6 +45,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %c64 = arith.constant {async_task_id = array<i32: 0, 1, 2>} 64 : i32
     %c128 = arith.constant {async_task_id = array<i32: 0, 1, 2>} 128 : i32
     %cst = arith.constant {async_task_id = array<i32: 0>} dense<0.000000e+00> : tensor<128x256xf32, #blocked>
+    %scale = arith.constant {async_task_id = array<i32: 2>} dense<0.500000e+00> : tensor<128x256xf32, #blocked>
     // Outer persistent loop.
     %0 = scf.for %iv = %c0 to %c10 step %c1 iter_args(%arg0 = %c0) -> (i32) : i32 {
       %init = ttng.tmem_store %cst, %result[%token], %true {async_task_id = array<i32: 0>} : tensor<128x256xf32, #blocked> -> !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>
@@ -52,9 +58,10 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %mma = ttng.tc_gen5_mma %A_smem, %B_smem, %result[%acc_tok], %acc_flag, %true {async_task_id = array<i32: 0>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x256xf16, #shared, #smem, mutable>, !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>
         scf.yield {async_task_id = array<i32: 0, 1>} %true, %mma : i1, !ttg.async.token
       } {async_task_id = array<i32: 0, 1>}
-      // Epilogue: tmem_load → reshape → trans → split → truncf → local_store.
+      // Epilogue: tmem_load → scale → reshape → trans → split → truncf → local_store.
       %res, %res_tok = ttng.tmem_load %result[%1#1] {async_task_id = array<i32: 2>} : !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x256xf32, #blocked>
-      %reshaped = tt.reshape %res {async_task_id = array<i32: 2>} : tensor<128x256xf32, #blocked> -> tensor<128x2x128xf32, #blocked3>
+      %scaled = arith.mulf %res, %scale {async_task_id = array<i32: 2>} : tensor<128x256xf32, #blocked>
+      %reshaped = tt.reshape %scaled {async_task_id = array<i32: 2>} : tensor<128x256xf32, #blocked> -> tensor<128x2x128xf32, #blocked3>
       %transposed = tt.trans %reshaped {async_task_id = array<i32: 2>, order = array<i32: 0, 2, 1>} : tensor<128x2x128xf32, #blocked3> -> tensor<128x128x2xf32, #blocked4>
       %lhs, %rhs = tt.split %transposed {async_task_id = array<i32: 2>} : tensor<128x128x2xf32, #blocked4> -> tensor<128x128xf32, #blocked5>
       // First sub-tile: truncf → convert_layout → local_store to C0_smem.
