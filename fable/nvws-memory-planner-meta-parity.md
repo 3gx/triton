@@ -51,23 +51,14 @@ The automatic Blackwell pipeline forwards the target hardware SMEM budget to
 NVWS MemoryPlanner. It does not force `smemCircularReuse`; the Meta default is
 false and only an explicit pass or loop option enables that policy.
 
-The same source-layout rule is applied to partition scheduling and data
-partitioning:
-
-```text
-PartitionSchedulingMeta.cpp
-PartitionSchedulingNVWSAdapter.inc
-WSDataPartition.cpp
-WSDataPartitionNVWSAdapter.inc
-```
-
-The two `.cpp` files retain Meta's categorization, partition construction,
-propagation, scheduling, and slicing algorithms in source order. The `.inc`
-files contain the NVWS operation coverage, partition-annotation finalization,
-verification, and result-tagging required by downstream NVWS passes.
-Partition-scheduler options start from the same false defaults as Meta;
-per-loop `tt.merge_*` and `tt.separate_epilogue_store` attributes select
-non-default behavior.
+The same source-layout rule is applied inside `PartitionSchedulingMeta.cpp`
+and `WSDataPartition.cpp`. Both files retain Meta's categorization, partition
+construction, propagation, scheduling, and slicing algorithms in source
+order. Private static helpers in those translation units provide the NVWS
+operation coverage, partition-annotation finalization, verification, and
+result-tagging required by downstream NVWS passes. Partition-scheduler options
+start from the same false defaults as Meta; per-loop `tt.merge_*` and
+`tt.separate_epilogue_store` attributes select non-default behavior.
 
 ## 2. Meta policy copied into NVWS
 

@@ -760,10 +760,11 @@ counterparts:
    are in `MemoryPlannerNVWSAdapter.{h,cpp}`.
 2. `PartitionSchedulingMeta.cpp` contains Meta categorization and schedule
    construction; NVWS annotation finalization, result tagging, and verification
-   are in `PartitionSchedulingNVWSAdapter.inc`. A loop for which Meta returns
-   no schedule is a successful no-op.
+   are private static helpers in the same translation unit. A loop for which
+   Meta returns no schedule is a successful no-op.
 3. `WSDataPartition.cpp` contains Meta data partitioning; Blackwell/NVWS op
-   slicing and cloning support is in `WSDataPartitionNVWSAdapter.inc`.
+   slicing and cloning support is implemented by private static helpers in the
+   same translation unit.
 
 Meta's regular-load schedule is no longer overridden by pulling a
 `tt.load`/`ttg.local_alloc` producer into the MMA partition.
