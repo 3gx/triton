@@ -131,7 +131,9 @@ def TritonGPUAutomaticWarpSpecialization : Pass<"tritongpu-automatic-warp-specia
            "number of warp groups for NVWS data partitioning">,
     Option<"useMetaPartitioner", "use-meta-partitioner", "bool",
            /*default*/"false",
-           "use NVWS data partitioning and Meta partition scheduling">
+           "use NVWS data partitioning and Meta partition scheduling">,
+    Option<"smemBudget", "smem-budget", "int32_t", /*default*/"0",
+           "SMEM budget in bytes for NVWS memory planning">
   ];
 }
 

@@ -101,8 +101,6 @@ void AutomaticWarpSpecialization::runOnOperation() {
 
   if (useMetaPartitioner) {
     NVWSPartitionSchedulingMetaOptions options;
-    options.mergeEpilogue = true;
-    options.separateEpilogueStore = true;
     pm.nest<FuncOp>().addPass(createNVWSPartitionSchedulingMeta(options));
     pm.nest<FuncOp>().addPass(createNVWSStripPartitionAttrsOutsideWS());
     pm.addPass(createVerifyWarpSpecializationPartitionsPass());
@@ -115,6 +113,9 @@ void AutomaticWarpSpecialization::runOnOperation() {
   if (useMetaPartitioner) {
     NVWSMemoryPlannerOptions memoryPlannerOptions;
     memoryPlannerOptions.numBuffers = numStages;
+    memoryPlannerOptions.smemBudget = smemBudget;
+    // NVWS exposes Meta-selected shared-id pools as circular rings consumed by
+    // InsertSemas; per-loop planner attributes still override this default.
     memoryPlannerOptions.smemCircularReuse = true;
     addPassWithPartitionVerifier(createNVWSMemoryPlanner(memoryPlannerOptions));
   }

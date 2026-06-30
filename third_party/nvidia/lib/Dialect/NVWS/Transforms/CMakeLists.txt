@@ -17,6 +17,7 @@ add_triton_library(NVWSTransforms
   PartitionSchedulingMeta.cpp
   StripPartitionAttrsOutsideWS.cpp
   MemoryPlanner.cpp
+  MemoryPlannerNVWSAdapter.cpp
 
   DEPENDS
   NVWSTransformsIncGen
