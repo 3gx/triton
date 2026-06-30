@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -split-input-file --nvws-memory-planner=num-buffers=3 | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvws-memory-planner="num-buffers=3 smem-alloc-algo=1 smem-budget=232448 smem-circular-reuse=true" | FileCheck %s --check-prefix=PARITY
 
 // Test: Persistent GEMM with data_partition_factor=2 produces two separate
 // tmem_loads, each with a 4-way split epilogue. The 4 epilogue SMEM buffers
@@ -12,6 +13,19 @@
 // CHECK: ttng.tmem_store {{.*}}tmem.start
 // CHECK: ttng.tc_gen5_mma {{.*}}tmem.start
 // CHECK: ttng.tmem_load {{.*}}tmem.end
+
+// Algorithm 1 preserves the two physical four-member epilogue groups. They
+// remain copy-1 and never acquire circular metadata after budget accounting.
+// PARITY-LABEL: @matmul_kernel_tma_persistent
+// PARITY: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[E0:[0-9]+]] : i32}
+// PARITY-NEXT: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[E1:[0-9]+]] : i32}
+// PARITY-NEXT: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[E0]] : i32}
+// PARITY-NEXT: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[E1]] : i32}
+// PARITY-NEXT: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[E0]] : i32}
+// PARITY-NEXT: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[E1]] : i32}
+// PARITY-NEXT: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[E0]] : i32}
+// PARITY-NEXT: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[E1]] : i32}
+// PARITY-NOT: buffer.circular
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 256], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>

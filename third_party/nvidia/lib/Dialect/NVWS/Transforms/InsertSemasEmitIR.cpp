@@ -106,6 +106,8 @@ static ArrayAttr asyncOpsAttr(MLIRContext *ctx, const Node *rel) {
   return ArrayAttr::get(ctx, elems);
 }
 
+static Value materializeI32Before(Operation *op, int64_t value);
+
 // ---------------------------------------------------------------------------
 // Step 1 — token-nuke pre-process (contract E).
 // ---------------------------------------------------------------------------
@@ -317,6 +319,8 @@ static void emitEntryAcquires(EmitCtx &ctx, GroupDag &g,
         auto acq = emitInto<nvws::SemaphoreAcquireOp>(
             b, before ? before->getLoc() : ctx.func.getLoc(), Owner(),
             sc, s.create, ctx.tokenType);
+        if (n->stageOffset)
+          acq.setStage(materializeI32Before(acq, *n->stageOffset));
         emitted[n] = acq.getToken();
       }
     }
@@ -653,9 +657,9 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
                                  RenderState &rs,
                                  DenseMap<Node *, Value> &emitted);
 
-// `anchor` reports the op that anchors this row in the emitted IR: the
-// original access op, or the synthesized store replacing a sourceful
-// alloc (the original is erased; its pointer must not be touched again).
+// `anchor` reports the precomputed ownership endpoint for this row. The
+// direct access op remains the retargeting point; sourceful allocs instead
+// report their synthesized store because the original op is erased.
 static LogicalResult renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
                                   RenderState &rs, Operation *&anchor) {
   Operation *op = n->op;
@@ -725,6 +729,8 @@ static LogicalResult renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
       if (o.get() == t.accessValue)
         o.set(view);
   }
+  if (n->completionAnchor)
+    anchor = n->completionAnchor;
   return success();
 }
 
@@ -861,6 +867,8 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
       auto acq = emitInto<nvws::SemaphoreAcquireOp>(
           b, before ? before->getLoc() : ctx.func.getLoc(), n->owner,
           n->stageCluster, g.semaTable.semas[n->sema].create, ctx.tokenType);
+      if (n->stageOffset)
+        acq.setStage(materializeI32Before(acq, *n->stageOffset));
       emitted[n] = acq.getToken();
       n->emittedOp = acq;
       rs.carrier[comp] = acq.getToken();
@@ -885,6 +893,8 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
           b, lastReal ? lastReal->getLoc() : ctx.func.getLoc(), n->owner,
           n->stageCluster, g.semaTable.semas[n->sema].create,
           tok, asyncOpsAttr(b.getContext(), n));
+      if (n->stageOffset)
+        rel.setStage(materializeI32Before(rel, *n->stageOffset));
       // First-class arrive multiplicity: transcribe the DAG fact (r S(n));
       // the lowering passes it to the mbarrier arrive.
       rel.setArriveCountAttr(b.getI32IntegerAttr(n->count));
@@ -975,6 +985,100 @@ static void coalesceBackings(GroupDag &g) {
     alloc->erase();
     g.backingPlan.backing[i] = repl;
   }
+}
+
+static FailureOr<Value> createMixedDepthTmemView(Value ownerBacking,
+                                                 Value reuserBacking,
+                                                 int64_t offset) {
+  auto ownerType = cast<gpu::MemDescType>(ownerBacking.getType());
+  auto reuserType = cast<gpu::MemDescType>(reuserBacking.getType());
+  ArrayRef<int64_t> ownerShape = ownerType.getShape();
+  ArrayRef<int64_t> reuserShape = reuserType.getShape();
+  Operation *reuserAlloc = reuserBacking.getDefiningOp();
+  if (ownerShape.empty() || reuserShape.empty())
+    return reuserAlloc->emitError(
+        "nvws-insert-semas: mixed-depth TMEM backing has empty shape");
+
+  int64_t ownerBlockN = ownerShape.back();
+  int64_t reuserBlockN = reuserShape.back();
+  if (ownerBlockN < reuserBlockN || ownerBlockN % reuserBlockN != 0 ||
+      offset < 0 || offset + reuserBlockN > ownerBlockN)
+    return reuserAlloc->emitError(
+        "nvws-insert-semas: mixed-depth TMEM reuser is outside its physical "
+        "owner");
+
+  unsigned ownerWidth = ownerType.getElementTypeBitWidth();
+  unsigned reuserWidth = reuserType.getElementTypeBitWidth();
+  int64_t sliceN = 0;
+  if (ownerWidth == reuserWidth)
+    sliceN = reuserBlockN;
+  else if (ownerWidth == 2 * reuserWidth)
+    sliceN = reuserBlockN / 2;
+  else
+    return reuserAlloc->emitError(
+        "nvws-insert-semas: unsupported mixed-depth TMEM element-width "
+        "reinterpretation");
+  if (sliceN <= 0)
+    return reuserAlloc->emitError(
+        "nvws-insert-semas: invalid mixed-depth TMEM subslice width");
+
+  // This is the NVWS form of Meta's sliceAndReinterpretMDTMEM: retain the
+  // representative allocation, take the checked physical column slice, and
+  // reinterpret it as the reuser's independently buffered logical type.
+  OpBuilder b(ownerBacking.getContext());
+  b.setInsertionPointAfterValue(ownerBacking);
+  auto sub = nvidia_gpu::TMEMSubSliceOp::create(
+      b, reuserAlloc->getLoc(), ownerBacking, static_cast<int32_t>(offset),
+      static_cast<int32_t>(sliceN));
+  auto reinterpreted = gpu::MemDescReinterpretOp::create(
+      b, reuserAlloc->getLoc(), reuserType, sub.getResult());
+  return reinterpreted.getResult();
+}
+
+static LogicalResult
+coalesceMixedDepthTmemBackings(MutableArrayRef<GroupDag> groups) {
+  llvm::MapVector<int64_t, SmallVector<GroupDag *, 2>> sets;
+  for (GroupDag &group : groups)
+    if (group.mixedDepthPhysicalAlias && !group.semaTable.semas.empty())
+      sets[group.bufferId].push_back(&group);
+
+  for (auto &[bufferId, set] : sets) {
+    (void)bufferId;
+    if (set.size() != 2)
+      return set.front()->pieceTable.members.front().allocOp->emitError(
+          "nvws-insert-semas: mixed-depth TMEM reuse requires exactly two "
+          "logical channels");
+    bool firstOwns = canOwnMixedDepthTmem(*set[0], *set[1]);
+    bool secondOwns = canOwnMixedDepthTmem(*set[1], *set[0]);
+    if (firstOwns == secondOwns)
+      return set.front()->pieceTable.members.front().allocOp->emitError(
+          "nvws-insert-semas: mixed-depth TMEM reuse has no unique physical "
+          "owner by span and element width");
+    GroupDag *owner = firstOwns ? set[0] : set[1];
+    GroupDag *reuser = firstOwns ? set[1] : set[0];
+
+    Value ownerBacking = owner->backingPlan.backing.front();
+    Operation *ownerAlloc = ownerBacking.getDefiningOp();
+    Value oldBacking = reuser->backingPlan.backing.front();
+    Operation *oldAlloc = oldBacking.getDefiningOp();
+    if (ownerAlloc->getBlock() != oldAlloc->getBlock() ||
+        !ownerAlloc->isBeforeInBlock(oldAlloc))
+      return oldAlloc->emitError(
+          "nvws-insert-semas: mixed-depth TMEM physical owner does not "
+          "dominate its reuser");
+    int64_t offset =
+        reuser->pieceTable.members.front().offset -
+        owner->pieceTable.members.front().offset;
+    FailureOr<Value> view =
+        createMixedDepthTmemView(ownerBacking, oldBacking, offset);
+    if (failed(view))
+      return failure();
+    oldBacking.replaceAllUsesWith(*view);
+    reuser->backingPlan.backing.front() = *view;
+    if (oldAlloc->use_empty())
+      oldAlloc->erase();
+  }
+  return success();
 }
 
 // ---------------------------------------------------------------------------
@@ -1856,6 +1960,8 @@ LogicalResult emitIR(triton::FuncOp funcOp,
   // Step 6.
   for (GroupDag &g : groups)
     coalesceBackings(g);
+  if (failed(coalesceMixedDepthTmemBackings(groups)))
+    return failure();
   // Step 7.
   {
     if (failed(workaroundLoopScheduler(ctx)))

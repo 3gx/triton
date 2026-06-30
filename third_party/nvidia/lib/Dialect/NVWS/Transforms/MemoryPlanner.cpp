@@ -134,11 +134,10 @@ struct TmemBuffer {
   TmemBuffer *reuseOwner = nullptr;
 };
 
-enum class SmemBufferPriority {
-  Lowest = 0,
-  HostToDevice = 1,
-  CrossStage = 2,
-  Epilogue = 3,
+enum class WSBufferPriority {
+  P0_InnermostTMA = 0,
+  P1_InnermostNonTMA,
+  P2_Other,
 };
 
 struct LocalBuffer {
@@ -154,7 +153,7 @@ struct LocalBuffer {
   bool isCrossStage = false;
   bool isCircular = false;
   unsigned circularStart = 0;
-  SmemBufferPriority priority = SmemBufferPriority::Lowest;
+  WSBufferPriority priority = WSBufferPriority::P2_Other;
   Interval<size_t> liveness = Interval<size_t>(0, 0);
 };
 
@@ -1110,17 +1109,11 @@ static unsigned getLocalAllocSizeBytes(ttg::LocalAllocOp alloc) {
                                8);
 }
 
-static bool hasLoopStage(Operation *op) {
+static int getLoopStage(Operation *op) {
   if (!op)
-    return false;
-  if (op->getAttrOfType<IntegerAttr>("loop.stage"))
-    return true;
-  if (auto alloc = dyn_cast<ttg::LocalAllocOp>(op))
-    if (Value src = alloc.getSrc())
-      return hasLoopStage(src.getDefiningOp());
-  if (auto store = dyn_cast<ttg::LocalStoreOp>(op))
-    return hasLoopStage(store.getSrc().getDefiningOp());
-  return false;
+    return -1;
+  auto attr = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+  return attr ? attr.getValue().getSExtValue() : -1;
 }
 
 static bool isDescriptorLoadProducer(Operation *op) {
@@ -1137,26 +1130,36 @@ static bool isDescriptorLoadProducer(Operation *op) {
   return false;
 }
 
-static Operation *findOriginalLoadOp(Value value, DenseSet<Value> &visited) {
-  if (!value || !visited.insert(value).second)
-    return nullptr;
-  Operation *def = value.getDefiningOp();
-  if (!def)
-    return nullptr;
-  if (isa<ttng::TMEMLoadOp>(def))
-    return def;
-  for (Value operand : def->getOperands()) {
-    if (isa<ttg::MemDescType>(operand.getType()))
-      continue;
-    if (Operation *load = findOriginalLoadOp(operand, visited))
-      return load;
-  }
-  return nullptr;
-}
-
 static Operation *findOriginalLoadOp(Value value) {
-  DenseSet<Value> visited;
-  return findOriginalLoadOp(value, visited);
+  Operation *op = value.getDefiningOp();
+  while (op && !isa<ttng::TMEMLoadOp>(op)) {
+    // NVWS materializes the backward dK scale multiply before its split
+    // results enter SMEM channels. Accept it only when all traceable operands
+    // identify one unique TMEM load; two distinct loads are not one group.
+    if (isa<arith::MulFOp>(op)) {
+      Operation *root = nullptr;
+      for (Value operand : op->getOperands()) {
+        Operation *candidate = findOriginalLoadOp(operand);
+        if (!candidate)
+          continue;
+        if (root && root != candidate)
+          return nullptr;
+        root = candidate;
+      }
+      return root;
+    }
+    // Keep this list identical to Meta-AWS: provenance is accepted only
+    // through operations that preserve the underlying epilogue data.
+    if (isa<tt::SplitOp, tt::ReshapeOp, tt::TransOp, ttg::ConvertLayoutOp,
+            arith::TruncFOp, arith::ExtFOp, arith::SIToFPOp, arith::FPToSIOp,
+            arith::UIToFPOp, arith::FPToUIOp, arith::TruncIOp,
+            arith::ExtSIOp, arith::ExtUIOp, arith::BitcastOp>(op)) {
+      op = op->getOperand(0).getDefiningOp();
+    } else {
+      op = nullptr;
+    }
+  }
+  return op;
 }
 
 static Operation *findOriginalLoadOp(LocalDataChannelPost *channel) {
@@ -1189,6 +1192,31 @@ static bool usersInInnermostLoop(LocalDataChannelPost *channel) {
   return parentLoop && isInnermostLoop(parentLoop);
 }
 
+static bool hasAtLeastTwoNonTrivialDims(ttg::LocalAllocOp alloc) {
+  return llvm::count_if(alloc.getType().getShape(),
+                        [](int64_t dim) { return dim > 1; }) >= 2;
+}
+
+static bool isSmemCrossStage(LocalDataChannelPost *channel) {
+  if (!channel || getLoopStage(channel->getSrcOp()) < 0)
+    return false;
+
+  SmallVector<Operation *> consumers;
+  channel->getDstOps(consumers);
+  int firstConsumerStage = -1;
+  for (Operation *consumer : consumers) {
+    int stage = getLoopStage(consumer);
+    if (stage < 0)
+      continue;
+    if (firstConsumerStage < 0) {
+      firstConsumerStage = stage;
+    } else if (stage != firstConsumerStage) {
+      return true;
+    }
+  }
+  return false;
+}
+
 class LocalSmemAllocator {
 public:
   LocalSmemAllocator(FuncOp funcOp,
@@ -1214,11 +1242,14 @@ public:
       if (smemBudget == 0)
         return funcOp.emitError("NVWS memory planner requires smem-budget for "
                                 "smem-alloc-algo=1");
-      runWSBufferPlan(nextBufferId);
+      if (failed(runWSBufferPlan(nextBufferId)))
+        return failure();
     } else {
       runLegacyPlan(nextBufferId);
     }
 
+    if (failed(validatePlan()))
+      return failure();
     emitAttrs();
     return success();
   }
@@ -1232,28 +1263,32 @@ private:
       buffer->alloc = alloc;
       buffer->channel = findChannelForAlloc(alloc.getOperation(), channels);
       buffer->sizeInBytes = getLocalAllocSizeBytes(alloc);
-      buffer->isInnermost = usersInInnermostLoop(buffer->channel);
-      buffer->isTMA = isDescriptorLoadProducer(
-          buffer->channel ? buffer->channel->getSrcOp() : alloc.getOperation());
-      buffer->isCrossStage =
-          hasLoopStage(buffer->channel ? buffer->channel->getSrcOp()
+      // Match Meta's isInnermostSmemChannel predicate: loop placement alone
+      // is insufficient; only allocations with two non-trivial dimensions
+      // participate in the P0/P1 multi-buffering phases.
+      buffer->isInnermost = usersInInnermostLoop(buffer->channel) &&
+                            hasAtLeastTwoNonTrivialDims(alloc);
+      buffer->isTMA =
+          buffer->isInnermost &&
+          isDescriptorLoadProducer(buffer->channel
+                                       ? buffer->channel->getSrcOp()
                                        : alloc.getOperation());
+      buffer->isCrossStage = isSmemCrossStage(buffer->channel);
       buffer->liveness =
           intervalFromOps(livenessForLocalAlloc(alloc, channels), operationId);
       buffers.push_back(std::move(buffer));
     });
   }
 
-  bool isTwoDimensional(ttg::LocalAllocOp alloc) {
-    return alloc.getType().getShape().size() >= 2;
-  }
-
   void runLegacyPlan(unsigned &nextBufferId) {
-    DenseMap<Type, unsigned> innermostBufferIds;
+    int innermostBufferId = -1;
+    DenseMap<int, Type> idTypes;
     for (auto &bufferPtr : buffers) {
       LocalBuffer &buffer = *bufferPtr;
       buffer.pinned = false;
       buffer.offset = 0;
+      buffer.isCircular = false;
+      buffer.circularStart = 0;
 
       auto annIt = smemAnnotations.find(buffer.alloc.getOperation());
       if (annIt != smemAnnotations.end()) {
@@ -1265,69 +1300,191 @@ private:
         continue;
       }
 
-      if (buffer.isInnermost && isTwoDimensional(buffer.alloc)) {
+      if (buffer.isInnermost && hasAtLeastTwoNonTrivialDims(buffer.alloc)) {
         Type elementType = buffer.alloc.getType().getElementType();
-        auto it = innermostBufferIds.find(elementType);
-        if (it == innermostBufferIds.end()) {
-          it = innermostBufferIds.insert({elementType, nextBufferId++}).first;
+        if (innermostBufferId < 0)
+          innermostBufferId = nextBufferId++;
+        if (!idTypes.count(innermostBufferId))
+          idTypes[innermostBufferId] = elementType;
+        if (idTypes[innermostBufferId] != elementType) {
+          innermostBufferId = nextBufferId++;
+          idTypes[innermostBufferId] = elementType;
         }
-        buffer.bufferId = it->second;
+        buffer.bufferId = innermostBufferId;
         buffer.numCopies = numBuffers;
         buffer.isCircular = smemCircularReuse;
       } else {
+        idTypes.try_emplace(nextBufferId,
+                            buffer.alloc.getType().getElementType());
         buffer.bufferId = nextBufferId++;
         buffer.numCopies = 1;
       }
     }
 
-    enforceMinCopyForSharedIds(/*cyclicOnly=*/false);
-    fuseEpilogueBuffers();
+    enforceMinCopyForSharedIds();
+    fuseLegacyEpilogueBuffers();
+    assignLegacyCircularStarts();
   }
 
-  void runWSBufferPlan(unsigned &nextBufferId) {
+  LogicalResult runWSBufferPlan(unsigned &nextBufferId) {
+    // Phases 1-4.5 below intentionally mirror Meta-AWS
+    // allocateSmemBuffers. NVWS-only circular attributes are attached after
+    // Meta's odd/even reuse decision; they never influence that decision.
     for (auto &bufferPtr : buffers) {
       LocalBuffer &buffer = *bufferPtr;
       buffer.offset = 0;
+      buffer.pinned = false;
+      buffer.bufferId = nextBufferId++;
+      buffer.numCopies = 1;
+      buffer.isCircular = false;
+      buffer.circularStart = 0;
+      buffer.priority = WSBufferPriority::P2_Other;
+
       auto annIt = smemAnnotations.find(buffer.alloc.getOperation());
       if (annIt != smemAnnotations.end()) {
         const ChannelAnnotation &ann = annIt->second;
         buffer.pinned = true;
         buffer.bufferId = ann.bufferId;
         buffer.numCopies = std::max(1u, ann.numCopies);
-        nextBufferId = std::max(nextBufferId, ann.bufferId + 1);
-      } else {
-        buffer.pinned = false;
-        buffer.bufferId = nextBufferId++;
-        buffer.numCopies = 1;
       }
-      buffer.priority = classifyPriority(buffer);
     }
+    for (const auto &bufferPtr : buffers)
+      if (bufferPtr->pinned)
+        nextBufferId = std::max(nextBufferId, bufferPtr->bufferId + 1);
 
-    fuseEpilogueBuffers();
-
+    // Phase 2: apply Meta's budget-aware cross-stage minimum.
     for (auto &bufferPtr : buffers) {
       LocalBuffer &buffer = *bufferPtr;
       if (buffer.pinned)
         continue;
-      unsigned targetCopies = buffer.priority == SmemBufferPriority::Lowest
-                                  ? 1
-                                  : numBuffers;
-      growCopiesWithinBudget(buffer, targetCopies);
+      if (!buffer.isCrossStage || numBuffers < 2)
+        continue;
+
+      unsigned saved = buffer.numCopies;
+      buffer.numCopies = 2;
+      if (computeTotalSmem() > smemBudget)
+        buffer.numCopies = saved;
     }
 
-    if (smemCircularReuse)
-      coalesceCircularReuseCandidates();
-    enforceMinCopyForSharedIds(/*cyclicOnly=*/true);
+    // Phase 3: classify only unpinned records.
+    for (auto &bufferPtr : buffers) {
+      LocalBuffer &buffer = *bufferPtr;
+      if (buffer.pinned)
+        continue;
+      buffer.priority = classifyPriority(buffer);
+    }
+
+    // Phase 3.5: Meta fuses compatible P2 epilogue records by provenance.
+    fuseWSEpilogueBuffers();
+
+    // Phase 4: process P0 and P1 in priority order.
+    for (WSBufferPriority priority : {WSBufferPriority::P0_InnermostTMA,
+                                      WSBufferPriority::P1_InnermostNonTMA}) {
+      SmallVector<unsigned> candidateIndices;
+      for (auto [idx, bufferPtr] : llvm::enumerate(buffers)) {
+        if (!bufferPtr->pinned && bufferPtr->priority == priority)
+          candidateIndices.push_back(static_cast<unsigned>(idx));
+      }
+      if (candidateIndices.empty())
+        continue;
+
+      bool isReuseGroup = false;
+      if (smemCircularReuse && candidateIndices.size() == 2) {
+        isReuseGroup = true;
+        LocalBuffer &a = *buffers[candidateIndices[0]];
+        LocalBuffer &b = *buffers[candidateIndices[1]];
+        b.bufferId = a.bufferId;
+
+        unsigned crossStageMin = (a.isCrossStage || b.isCrossStage) ? 2 : 1;
+        unsigned groupStart =
+            crossStageMin >= 2 ? crossStageMin * 2 - 1 : 1;
+        groupStart = std::min(groupStart, numBuffers);
+        a.numCopies = groupStart;
+        b.numCopies = groupStart;
+      }
+
+      unsigned currentGroupCopies = numBuffers;
+      if (isReuseGroup) {
+        currentGroupCopies = buffers[candidateIndices[0]]->numCopies;
+      } else {
+        for (unsigned idx : candidateIndices)
+          currentGroupCopies =
+              std::min(currentGroupCopies, buffers[idx]->numCopies);
+      }
+
+      while (currentGroupCopies <= numBuffers) {
+        if (isReuseGroup) {
+          LocalBuffer &a = *buffers[candidateIndices[0]];
+          LocalBuffer &b = *buffers[candidateIndices[1]];
+          unsigned savedA = a.numCopies;
+          unsigned savedB = b.numCopies;
+          a.numCopies = currentGroupCopies;
+          b.numCopies = currentGroupCopies;
+          if (computeTotalSmem() <= smemBudget) {
+            ++currentGroupCopies;
+          } else {
+            a.numCopies = savedA;
+            b.numCopies = savedB;
+            break;
+          }
+          continue;
+        }
+
+        SmallVector<unsigned> pending;
+        for (unsigned idx : candidateIndices)
+          if (buffers[idx]->numCopies < currentGroupCopies)
+            pending.push_back(idx);
+        if (pending.empty()) {
+          ++currentGroupCopies;
+          continue;
+        }
+
+        bool advancedAny = false;
+        for (unsigned idx : pending) {
+          LocalBuffer &buffer = *buffers[idx];
+          unsigned saved = buffer.numCopies;
+          buffer.numCopies = currentGroupCopies;
+          if (computeTotalSmem() <= smemBudget) {
+            advancedAny = true;
+          } else {
+            buffer.numCopies = saved;
+          }
+        }
+        if (!advancedAny)
+          break;
+        ++currentGroupCopies;
+      }
+
+      // Meta splits an even-depth reuse result into two independent pools.
+      // An odd result remains a two-record circular group in NVWS metadata.
+      if (isReuseGroup) {
+        LocalBuffer &a = *buffers[candidateIndices[0]];
+        LocalBuffer &b = *buffers[candidateIndices[1]];
+        if (a.numCopies % 2 == 0) {
+          unsigned half = a.numCopies / 2;
+          a.numCopies = half;
+          b.numCopies = half;
+          b.bufferId = nextBufferId++;
+        } else {
+          a.isCircular = true;
+          b.isCircular = true;
+          a.circularStart = 0;
+          b.circularStart = 1;
+        }
+      }
+    }
+
+    // Phase 4.5: grow each fused P2 group uniformly under the final budget.
+    increaseFusedEpilogueCopies();
+    return success();
   }
 
-  SmemBufferPriority classifyPriority(const LocalBuffer &buffer) const {
-    if (findOriginalLoadOp(buffer.channel))
-      return SmemBufferPriority::Epilogue;
-    if (buffer.isCrossStage)
-      return SmemBufferPriority::CrossStage;
-    if (buffer.isInnermost || buffer.isTMA)
-      return SmemBufferPriority::HostToDevice;
-    return SmemBufferPriority::Lowest;
+  WSBufferPriority classifyPriority(const LocalBuffer &buffer) const {
+    if (buffer.isInnermost && buffer.isTMA)
+      return WSBufferPriority::P0_InnermostTMA;
+    if (buffer.isInnermost)
+      return WSBufferPriority::P1_InnermostNonTMA;
+    return WSBufferPriority::P2_Other;
   }
 
   unsigned computeTotalSmem() const {
@@ -1349,24 +1506,10 @@ private:
     return total;
   }
 
-  void growCopiesWithinBudget(LocalBuffer &buffer, unsigned targetCopies) {
-    while (buffer.numCopies < targetCopies) {
-      unsigned oldCopies = buffer.numCopies;
-      ++buffer.numCopies;
-      if (computeTotalSmem() <= smemBudget)
-        continue;
-      buffer.numCopies = oldCopies;
-      break;
-    }
-  }
-
-  void enforceMinCopyForSharedIds(bool cyclicOnly) {
+  void enforceMinCopyForSharedIds() {
     DenseMap<unsigned, unsigned> idToCount;
-    for (const auto &bufferPtr : buffers) {
-      const LocalBuffer &buffer = *bufferPtr;
-      if (!cyclicOnly || buffer.isInnermost || buffer.isCrossStage)
-        ++idToCount[buffer.bufferId];
-    }
+    for (const auto &bufferPtr : buffers)
+      ++idToCount[bufferPtr->bufferId];
 
     for (auto &bufferPtr : buffers) {
       LocalBuffer &buffer = *bufferPtr;
@@ -1384,59 +1527,101 @@ private:
            a.sizeInBytes == b.sizeInBytes;
   }
 
-  void fuseEpilogueBuffers() {
-    DenseMap<Operation *, LocalBuffer *> originalLoadToOwner;
+  bool allCompatible(ArrayRef<LocalBuffer *> group) const {
+    if (group.empty())
+      return true;
+    return llvm::all_of(llvm::drop_begin(group), [&](LocalBuffer *buffer) {
+      return compatibleForReuse(*group.front(), *buffer);
+    });
+  }
+
+  bool pairwiseDisjoint(ArrayRef<LocalBuffer *> group) const {
+    for (unsigned i = 0; i < group.size(); ++i)
+      for (unsigned j = i + 1; j < group.size(); ++j)
+        if (group[i]->liveness.intersects(group[j]->liveness))
+          return false;
+    return true;
+  }
+
+  void fuseLegacyEpilogueBuffers() {
+    DenseMap<Operation *, SmallVector<LocalBuffer *>> loadGroups;
     for (auto &bufferPtr : buffers) {
       LocalBuffer &buffer = *bufferPtr;
+      if (buffer.pinned || buffer.isInnermost)
+        continue;
       Operation *originalLoad = findOriginalLoadOp(buffer.channel);
       if (!originalLoad)
         continue;
-      auto it = originalLoadToOwner.find(originalLoad);
-      if (it == originalLoadToOwner.end()) {
-        originalLoadToOwner[originalLoad] = &buffer;
-        continue;
-      }
+      loadGroups[originalLoad].push_back(&buffer);
+    }
 
-      LocalBuffer *owner = it->second;
-      if (!compatibleForReuse(*owner, buffer))
+    for (auto &[load, group] : loadGroups) {
+      if (group.size() < 2 || !allCompatible(group) ||
+          !pairwiseDisjoint(group))
         continue;
-      if (owner->liveness.intersects(buffer.liveness))
-        continue;
-      buffer.bufferId = owner->bufferId;
-      buffer.numCopies = std::max(buffer.numCopies, owner->numCopies);
+      unsigned sharedId = group.front()->bufferId;
+      for (LocalBuffer *buffer : llvm::drop_begin(group))
+        buffer->bufferId = sharedId;
     }
   }
 
-  void coalesceCircularReuseCandidates() {
-    for (size_t i = 0; i < buffers.size(); ++i) {
-      LocalBuffer &owner = *buffers[i];
-      if (owner.pinned || owner.priority == SmemBufferPriority::Lowest)
+  void fuseWSEpilogueBuffers() {
+    DenseMap<Operation *, SmallVector<LocalBuffer *>> loadGroups;
+    for (auto &bufferPtr : buffers) {
+      LocalBuffer &buffer = *bufferPtr;
+      if (buffer.pinned || buffer.priority != WSBufferPriority::P2_Other)
         continue;
-      for (size_t j = i + 1; j < buffers.size(); ++j) {
-        LocalBuffer &candidate = *buffers[j];
-        if (candidate.pinned || candidate.priority != owner.priority)
-          continue;
-        if (!compatibleForReuse(owner, candidate))
-          continue;
-        if (owner.liveness.intersects(candidate.liveness))
-          continue;
+      Operation *originalLoad = findOriginalLoadOp(buffer.channel);
+      if (!originalLoad)
+        continue;
+      loadGroups[originalLoad].push_back(&buffer);
+    }
 
-        unsigned oldId = candidate.bufferId;
-        candidate.bufferId = owner.bufferId;
-        unsigned oldCopies = candidate.numCopies;
-        candidate.numCopies = std::max(candidate.numCopies, owner.numCopies);
-        if (computeTotalSmem() <= smemBudget) {
-          owner.isCircular = true;
-          candidate.isCircular = true;
+    for (auto &[load, group] : loadGroups) {
+      if (group.size() < 2 || !allCompatible(group))
+        continue;
+      unsigned sharedId = group.front()->bufferId;
+      for (LocalBuffer *buffer : llvm::drop_begin(group))
+        buffer->bufferId = sharedId;
+    }
+  }
+
+  void increaseFusedEpilogueCopies() {
+    DenseMap<unsigned, SmallVector<LocalBuffer *>> epilogueGroups;
+    for (auto &bufferPtr : buffers) {
+      LocalBuffer &buffer = *bufferPtr;
+      if (!buffer.pinned && buffer.priority == WSBufferPriority::P2_Other)
+        epilogueGroups[buffer.bufferId].push_back(&buffer);
+    }
+
+    for (auto &[bufferId, group] : epilogueGroups) {
+      if (group.size() < 2)
+        continue;
+
+      unsigned currentCopies = 1;
+      for (LocalBuffer *buffer : group)
+        currentCopies = std::max(currentCopies, buffer->numCopies);
+
+      // A physical id has one depth. Normalizing members to Meta's maximum
+      // does not change computeTotalSmem(), but makes that physical decision
+      // explicit for InsertSemas.
+      for (LocalBuffer *buffer : group)
+        buffer->numCopies = currentCopies;
+
+      for (unsigned tryCopies = currentCopies + 1; tryCopies <= numBuffers;
+           ++tryCopies) {
+        for (LocalBuffer *buffer : group)
+          buffer->numCopies = tryCopies;
+        if (computeTotalSmem() <= smemBudget)
           continue;
-        }
-        candidate.bufferId = oldId;
-        candidate.numCopies = oldCopies;
+        for (LocalBuffer *buffer : group)
+          buffer->numCopies = tryCopies - 1;
+        break;
       }
     }
   }
 
-  void assignCircularStarts() {
+  void assignLegacyCircularStarts() {
     llvm::MapVector<unsigned, SmallVector<LocalBuffer *>> groups;
     for (auto &bufferPtr : buffers) {
       LocalBuffer &buffer = *bufferPtr;
@@ -1452,18 +1637,73 @@ private:
         group.front()->circularStart = 0;
         continue;
       }
-
-      unsigned requiredCopies = static_cast<unsigned>(group.size());
-      for (LocalBuffer *buffer : group)
-        buffer->numCopies = std::max(buffer->numCopies, requiredCopies);
-
       for (auto [idx, buffer] : llvm::enumerate(group))
         buffer->circularStart = static_cast<unsigned>(idx);
     }
   }
 
+  LogicalResult validatePlan() {
+    DenseMap<unsigned, SmallVector<LocalBuffer *>> groups;
+    for (const auto &bufferPtr : buffers)
+      groups[bufferPtr->bufferId].push_back(bufferPtr.get());
+
+    for (const auto &[bufferId, group] : groups) {
+      unsigned copies = group.front()->numCopies;
+      for (LocalBuffer *buffer : group) {
+        if (buffer->numCopies != copies) {
+          buffer->alloc.emitError()
+              << "NVWS memory planner assigned inconsistent buffer.copy "
+                 "values to buffer.id "
+              << bufferId;
+          return failure();
+        }
+      }
+
+      SmallVector<LocalBuffer *> circular;
+      for (LocalBuffer *buffer : group)
+        if (buffer->isCircular)
+          circular.push_back(buffer);
+      if (circular.empty())
+        continue;
+      if (circular.size() != group.size()) {
+        circular.front()->alloc.emitError()
+            << "NVWS memory planner partially marked circular buffer.id "
+            << bufferId;
+        return failure();
+      }
+
+      DenseSet<unsigned> starts;
+      for (LocalBuffer *buffer : circular)
+        starts.insert(buffer->circularStart);
+      if (starts.size() != circular.size()) {
+        circular.front()->alloc.emitError()
+            << "NVWS memory planner assigned duplicate buffer.start values "
+               "to buffer.id "
+            << bufferId;
+        return failure();
+      }
+
+      if (smemAllocAlgo == 1) {
+        if (circular.size() != 2 ||
+            !compatibleForReuse(*circular[0], *circular[1]) ||
+            !starts.contains(0) || !starts.contains(1)) {
+          circular.front()->alloc.emitError()
+              << "NVWS algorithm-1 circular buffer.id " << bufferId
+              << " is not a compatible two-record group with starts 0 and 1";
+          return failure();
+        }
+      } else if (copies < circular.size()) {
+        circular.front()->alloc.emitError()
+            << "NVWS algorithm-0 circular buffer.id " << bufferId
+            << " has fewer copies than members";
+        return failure();
+      }
+    }
+
+    return success();
+  }
+
   void emitAttrs() {
-    assignCircularStarts();
     for (auto &bufferPtr : buffers) {
       LocalBuffer &buffer = *bufferPtr;
       eraseAttr(buffer.alloc, "buffer.id");
@@ -2096,10 +2336,16 @@ private:
   }
 
   bool hasLoopCarriedAccToken(ttng::TMEMAllocOp alloc, scf::ForOp forOp) {
-    for (Operation *user : alloc.getResult().getUsers()) {
-      auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(skipIdxOp(user));
+    for (Operation *directUser : alloc.getResult().getUsers()) {
+      Operation *user = skipIdxOp(directUser);
+      auto mmaOp = dyn_cast_or_null<ttng::MMAv5OpInterface>(user);
       if (!mmaOp || !forOp->isProperAncestor(mmaOp))
         continue;
+
+      // Match Meta's direct-user rule. A sourceful TMEM allocation used as an
+      // MMA operand intentionally follows that MMA's loop-carried accumulator
+      // token and may therefore receive multiple logical copies. skipIdxOp is
+      // only an adapter for NVWS's explicit memdesc_index representation.
       Value accDep = mmaOp.getAccDep();
       auto blockArg = dyn_cast_or_null<BlockArgument>(accDep);
       if (!blockArg || blockArg.getOwner() != forOp.getBody())

@@ -246,6 +246,13 @@ struct AssignStagePhase {
     if (virtualStage == 0)
       return false;
 
+    // Single-phase toggles only when an acquire addresses slot zero.  If the
+    // per-iteration advance and depth are not coprime, some semaphore sites
+    // stay in a slot orbit that never reaches zero, so their reused mbarrier
+    // parity would never toggle.  Multiphase tracks one bit per physical slot.
+    if (std::gcd(static_cast<int>(getDepth()), virtualStage) != 1)
+      return false;
+
     return true;
   }
 

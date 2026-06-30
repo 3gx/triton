@@ -181,7 +181,10 @@ struct Crossing {
 struct Node {
   enum Kind { Func, For, If, Enter, Exit, Access, Acquire, Release };
   Kind kind = Access;
-  Operation *op = nullptr;     // For/If/Access anchor; null otherwise
+  Operation *op = nullptr;     // direct For/If/Access anchor; null otherwise
+  // Access ownership may extend through a known asynchronous consumer even
+  // though retargeting remains anchored at op. Stage 1 owns this fact.
+  Operation *completionAnchor = nullptr;
   Operation *emittedOp = nullptr; // emitted protocol/access anchor, if any
   Node *parent = nullptr;
   Node *prev = nullptr, *next = nullptr;
@@ -202,6 +205,10 @@ struct Node {
                                     // as the release's async_ops array)
   gpu::StageCluster stageCluster;   // Acquire/Release schedule fact, finalized
                                     // after all group SYNC-DAGs are built
+  // Signed offset consumed by AssignStagePhase before it replaces the operand
+  // with a physical slot.  SYNC-DAG authors this only when a staged handoff
+  // must signal a slot different from the current carrier's data slot.
+  std::optional<int64_t> stageOffset;
   Node *sat = nullptr;             // Release -> the ONE Acquire it satisfies
   // Scheduling provenance for a generated handoff.  A Release retains the
   // real row that completed ownership, and its satisfied Acquire retains the
@@ -307,6 +314,11 @@ struct GroupDag {
   unsigned groupIdx = 0;
   int64_t bufferId = 0;   // buffer.id attr value, or synthetic (negative)
   bool synthetic = false; // no buffer.id attr on the alloc
+  // Meta may assign different logical copy depths to TMEM channels that
+  // share one physical buffer.id (for example, qkT=1 and ppT=2). Such
+  // channels keep independent ownership DAGs and are coalesced physically
+  // only after emission.
+  bool mixedDepthPhysicalAlias = false;
   MemKind memory = MemKind::Tmem;
   bool circular = false;
   PieceTable pieceTable;
@@ -335,10 +347,30 @@ struct GroupDag {
     Node *n = nodes.back().get();
     n->kind = k;
     n->op = op;
+    n->completionAnchor = op;
     n->parent = parent;
     return n;
   }
 };
+
+inline bool canOwnMixedDepthTmem(const GroupDag &owner,
+                                const GroupDag &reuser) {
+  if (!owner.isTmem() || !reuser.isTmem() ||
+      owner.pieceTable.members.size() != 1 ||
+      reuser.pieceTable.members.size() != 1)
+    return false;
+  const Member &ownerMember = owner.pieceTable.members.front();
+  const Member &reuserMember = reuser.pieceTable.members.front();
+  unsigned ownerWidth = ownerMember.type.getElementTypeBitWidth();
+  unsigned reuserWidth = reuserMember.type.getElementTypeBitWidth();
+  if (ownerWidth != reuserWidth && ownerWidth != 2 * reuserWidth)
+    return false;
+
+  int64_t ownerSpan = ownerMember.extent * owner.backingPlan.numStages;
+  int64_t reuserSpan = reuserMember.extent * reuser.backingPlan.numStages;
+  return reuserMember.offset >= ownerMember.offset &&
+         reuserMember.offset + reuserSpan <= ownerMember.offset + ownerSpan;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers re-derived from the spec (section 1.1) — not copied from the old

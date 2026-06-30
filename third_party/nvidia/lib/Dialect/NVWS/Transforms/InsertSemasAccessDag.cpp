@@ -73,12 +73,14 @@ FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp) {
 
   SmallVector<GroupDag, 0> groups;
   auto makeGroup = [&](MemKind memory, int64_t id,
-                       ArrayRef<Operation *> allocs, bool circular = false) {
+                       ArrayRef<Operation *> allocs, bool circular = false,
+                       bool mixedDepthPhysicalAlias = false) {
     groups.emplace_back();
     GroupDag &g = groups.back();
     g.groupIdx = static_cast<unsigned>(groups.size() - 1);
     g.bufferId = id;
     g.synthetic = syntheticIds.contains(id);
+    g.mixedDepthPhysicalAlias = mixedDepthPhysicalAlias;
     g.memory = memory;
     g.circular = circular;
     for (Operation *allocOp : allocs) {
@@ -95,8 +97,37 @@ FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp) {
                             std::make_pair(idx, SmallVector<AliasStep, 2>()));
     }
   };
-  for (auto &[id, allocs] : tmemBuckets)
-    makeGroup(MemKind::Tmem, id, allocs);
+  for (auto &[id, allocs] : tmemBuckets) {
+    std::optional<int64_t> firstCopy;
+    bool allAuthored = true;
+    bool mixedCopies = false;
+    for (Operation *alloc : allocs) {
+      std::optional<int64_t> copy = getI64Attr(alloc, kBufferCopyAttrName);
+      if (!copy) {
+        allAuthored = false;
+        break;
+      }
+      if (!firstCopy)
+        firstCopy = *copy;
+      else if (*firstCopy != *copy)
+        mixedCopies = true;
+    }
+
+    if (!allAuthored || !mixedCopies) {
+      makeGroup(MemKind::Tmem, id, allocs);
+      continue;
+    }
+
+    // A mixed-depth TMEM reuse id denotes independent logical channels over
+    // one physical allocation. Keeping them in one ownership DAG would erase
+    // the per-channel ring depths. Physical compatibility and alternating
+    // ownership are verified globally after all logical DAGs are built.
+    for (Operation *alloc : allocs) {
+      SmallVector<Operation *, 1> logicalMember{alloc};
+      makeGroup(MemKind::Tmem, id, logicalMember,
+                /*circular=*/false, /*mixedDepthPhysicalAlias=*/true);
+    }
+  }
   for (auto &[id, allocs] : localBuckets)
     makeGroup(MemKind::Local, id, allocs);
   for (Operation *allocOp : circularLocals)
@@ -317,6 +348,87 @@ static void appendNode(Node *parent, Node *&head, Node *&tail, Node *n) {
   tail = n;
 }
 
+static SmallVector<Operation *> directUsers(Value value) {
+  SmallVector<Operation *> users;
+  users.append(value.getUsers().begin(), value.getUsers().end());
+  return users;
+}
+
+// A descriptor store may keep reading a managed local buffer after the
+// synchronous local_load has produced its tensor. Record that physical
+// ownership frontier in ACCESS-DAG; later stages only consume this fact.
+static LogicalResult deriveCompletionAnchor(Node *access) {
+  auto load = dyn_cast<gpu::LocalLoadOp>(access->op);
+  if (!load)
+    return success();
+
+  struct Candidate {
+    Operation *forward = nullptr;
+    Operation *store = nullptr;
+  };
+  SmallVector<Candidate, 2> candidates;
+  for (Operation *user : load.getResult().getUsers()) {
+    if (isa<triton::DescriptorStoreOp>(user)) {
+      candidates.push_back({nullptr, user});
+      continue;
+    }
+    auto convert = dyn_cast<gpu::ConvertLayoutOp>(user);
+    if (!convert)
+      continue;
+    for (Operation *convertUser : convert.getResult().getUsers())
+      if (isa<triton::DescriptorStoreOp>(convertUser))
+        candidates.push_back({user, convertUser});
+  }
+
+  if (candidates.empty())
+    return success();
+  if (candidates.size() != 1)
+    return load.emitError(
+        "nvws-insert-semas: managed local_load reaches multiple descriptor "
+        "stores; ownership completion is ambiguous");
+
+  Candidate candidate = candidates.front();
+  SmallVector<Operation *> loadUsers = directUsers(load.getResult());
+  Operation *expectedLoadUser =
+      candidate.forward ? candidate.forward : candidate.store;
+  if (loadUsers.size() != 1 || loadUsers.front() != expectedLoadUser)
+    return load.emitError(
+        "nvws-insert-semas: descriptor-store local_load path has fan-out");
+
+  if (candidate.forward) {
+    auto convert = cast<gpu::ConvertLayoutOp>(candidate.forward);
+    SmallVector<Operation *> convertUsers = directUsers(convert.getResult());
+    if (convertUsers.size() != 1 ||
+        convertUsers.front() != candidate.store)
+      return load.emitError(
+          "nvws-insert-semas: descriptor-store convert_layout path has "
+          "fan-out");
+  }
+
+  Block *block = load->getBlock();
+  if (candidate.store->getBlock() != block ||
+      (candidate.forward && candidate.forward->getBlock() != block)) {
+    InFlightDiagnostic diag = load.emitError(
+        "nvws-insert-semas: descriptor-store completion crosses control "
+        "flow");
+    diag.attachNote(candidate.store->getLoc()) << "descriptor store is here";
+    return failure();
+  }
+  if (!load->isBeforeInBlock(candidate.store))
+    return load.emitError(
+        "nvws-insert-semas: descriptor store must follow managed local_load");
+  if (!sameOwner(access->owner, resolveOwner(candidate.store))) {
+    InFlightDiagnostic diag = load.emitError(
+        "nvws-insert-semas: descriptor-store completion owner differs from "
+        "managed local_load owner");
+    diag.attachNote(candidate.store->getLoc()) << "descriptor store is here";
+    return failure();
+  }
+
+  access->completionAnchor = candidate.store;
+  return success();
+}
+
 static FailureOr<Node *> buildChainForBlock(GroupDag &g, Block &block,
                                             Node *parent) {
   Node *head = nullptr, *tail = nullptr;
@@ -379,6 +491,8 @@ static FailureOr<Node *> buildChainForBlock(GroupDag &g, Block &block,
     Node *access = g.newNode(Node::Access, &op, parent);
     access->owner = resolveOwner(&op);
     access->touches = std::move(touches);
+    if (failed(deriveCompletionAnchor(access)))
+      return failure();
     appendNode(parent, head, tail, access);
   }
   return head;
@@ -489,8 +603,12 @@ static void dumpAccessChain(GroupDag &g, const Node *head, unsigned depth) {
     for (const Touch &t : n->touches) {
       os << treePrefix(depth) << "|- "
          << (t.effect == Effect::W ? "W" : "R") << "  m" << t.member << "  "
-         << n->op->getName().getStringRef() << " " << ownerStr(n->op, n->owner)
-         << "\n";
+         << n->op->getName().getStringRef() << " "
+         << ownerStr(n->op, n->owner);
+      if (n->completionAnchor && n->completionAnchor != n->op)
+        os << " complete="
+           << n->completionAnchor->getName().getStringRef();
+      os << "\n";
     }
   }
 }
