@@ -1582,7 +1582,7 @@ for HEAD_DIM in [128]:  #64, 128]:
                     #line_vals=["triton-fp8"] + (["flash"] if HAS_FLASH else []),
                     #line_names=["Triton [FP8]"] + (["Flash-2"] if HAS_FLASH else []),
                     line_vals=["triton-fp16", "triton-fp8"],
-                    line_names=["Triton [FP16]", "triton-fp8"],
+                    line_names=["Triton [FP16]", "Triton [FP8]"],
                     styles=[("red", "-"), ("blue", "-"), ("green", "-")],
                     ylabel="TFLOPS",
                     plot_name=f"fused-attention-{baseVariant}-{mode}-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
