@@ -1,8 +1,15 @@
 # Root Cause of the NVWS-AWS Pytest Failures and Verified Structural Fixes
 
 Date: 2026-06-29
-Base revision investigated: `373438659ba0a462978831891ea742deff2c1241`
+Last accuracy audit: 2026-06-30
+Pre-fix revision investigated: `373438659ba0a462978831891ea742deff2c1241`
+Current-branch equivalent pre-fix revision: `bcf4079a91`
+Fix implementation revision: `bcd3da75c1`
 Final verification: implementation worktree on 2026-06-29
+
+The historical pre-fix revision and `bcf4079a91` have identical trees. The
+latter is the reachable current-branch name after the source/documentation
+commit split.
 
 ## 1. Executive conclusion
 
@@ -14,7 +21,7 @@ that had previously been hidden by the compile-time rejection:
 |---|---:|---|---|---|
 | 0, H128, persistent | 2 | `dV` corruption, 67.3% mismatched elements in the representative case | InsertSemas releases the epilogue SMEM channel after `local_load`; TMA lowering then reuses that SMEM as the asynchronous store source, so the empty arrival occurs before the TMA read and wait | Extend the ACCESS-DAG ownership endpoint to the descriptor-store completion anchor |
 | 1, H128, persistent | 2 | 248408 bytes required vs. 232448 bytes available | NVWS MemoryPlanner turns eight logical members from two four-member epilogue alias groups into eight circular slots, after checking the budget at a smaller depth | Transcribe Meta's planning phases and account by physical `buffer.id` groups |
-| 2, H64, persistent and nonpersistent | 4 | InsertSemas rejects inconsistent `buffer.copy` values in one reuse group | InsertSemas assumes one logical ring per physical TMEM id, but Meta deliberately assigns qkT copy 1 and ppT copy 2 to one physical id | Preserve independent logical rings and coalesce only the physical backing |
+| 2, H64, persistent and nonpersistent | 4 | InsertSemas rejects inconsistent `buffer.copy` values in one reuse group | InsertSemas assumes one logical ring per physical TMEM id, but Meta's pre-code-partition plan gives qkT logical depth 1 and ppT logical depth 2 before coalescing both into one physical QK backing | Preserve independent logical rings and coalesce only the physical backing |
 | 2, H64, after the preceding fixes | hang | All warp groups block on a barrier cycle | A fused two-member SMEM epilogue group advances slots `0,0,1,1`, but releases signal `0,0,1,1` instead of successor handoff slots `0,1,1,0`; ASP also selected scalar single-phase parity for two advances at depth 2 | Author release-slot offsets in SYNC-DAG and force multiphase when the stage orbit does not cover the ring |
 
 The original baseline and final verified result are:
@@ -247,56 +254,46 @@ Sources:
 
 ### 4.6 Structural fix
 
-The fix belongs in the NVWS synchronization model, before emission:
+The implemented fix belongs in the NVWS synchronization model, before
+emission:
 
-1. During ACCESS-DAG discovery, detect a managed `local_load` whose tensor
-   result reaches `tt.descriptor_store` through only ownership-preserving
-   register operations such as `convert_layout`.
+1. During ACCESS-DAG discovery, accept exactly one of the two closed paths
+   `local_load -> descriptor_store` or
+   `local_load -> convert_layout -> descriptor_store`.
 2. Keep `local_load` as the real memory touch and retargeting point.
-3. Record a separate `completionAnchor` on that Access row, or a lifetime-only
-   row with `retarget = false`, anchored on the terminal descriptor store.
+3. Record the unique terminal descriptor store as `completionAnchor` on that
+   Access row.
 4. Build the release edge from that completion anchor. EMIT-IR still renders
    the SYNC-DAG mechanically; it does not search for or move the release.
-5. After TMA lowering, require the concrete order:
+5. Require one direct load user, one direct conversion user when present, the
+   same block and owner for the complete path, and the store after the load.
+   Ambiguous stores, fan-out, control-flow escape, or owner mismatch diagnose.
+6. After TMA lowering, require the concrete order:
 
 ```text
 wait full -> TMA copy from channel -> TMA store wait -> arrive empty
 ```
 
-Do not classify every tensor user as a channel touch. The trace must be a
-closed, explicit set of forwarding operations ending in a descriptor store;
-unsupported fan-out or control-flow escape should diagnose rather than guess.
+The plan and specification now distinguish the direct memory touch from the
+physical ownership-completion endpoint at
+`fable/new-insert-semas-plan-2.md:826-839` and
+`fable/semas-report3.md:983-1001`. A post-hoc emitter move remains forbidden.
 
-This requires a plan/spec amendment before implementation. The current spec
-says:
+### 4.7 Implemented regression coverage
 
-- one Access node per terminal memory access,
-  `fable/semas-report3.md:172-178`;
-- `local_load` is a synchronous reader with `<none>` completion,
-  `fable/semas-report3.md:72-80`;
-- releases are placed immediately after their source row and may not be moved
-  post-emission, `fable/semas-report3.md:918-931,963-967`.
+`test/NVWS/insert_semas_descriptor_store_completion.mlir` covers both accepted
+ACCESS-DAG paths:
 
-The amendment must distinguish the direct memory touch from the physical
-ownership-completion anchor. A post-hoc emitter move would violate the plan
-and should not be used.
+- The direct path checks that InsertSemas places Release after
+  `descriptor_store`, and that LowerSemaphore plus TMA lowering places the
+  empty arrival after `async_tma_store_wait`.
+- The `convert_layout` path checks that InsertSemas places Release after the
+  terminal `descriptor_store`.
 
-### 4.7 Required regression test
-
-Add a synthetic NVWS lit test with this exact shape:
-
-```text
-P4: local_store channel
-P2: local_load channel -> convert_layout -> descriptor_store
-```
-
-Check both boundaries:
-
-- After InsertSemas, the consumer-side release is after `descriptor_store`.
-- After LowerSemaphore plus TMA lowering, `arrive empty` is after
-  `async_tma_store_wait`.
-
-Then run both config-0 H128 persistent tests with `SUBTILING=False/True`.
+The focused lit test does not separately check the post-TMA order for the
+`convert_layout` variant. The full runtime matrix covers that production path:
+both config-0 H128 persistent tests, with `SUBTILING=False/True`, passed in the
+final NVWS run.
 
 ## 5. Config 1: eight aliases become an unbudgeted eight-slot ring
 
@@ -433,26 +430,29 @@ of one eight-member circular ring removes the unbudgeted 65536-byte shape.
 Their final copy depth is whatever Meta phase 4.5 accepts; it is not assumed to
 remain one.
 
-### 5.7 Required regression tests
+### 5.7 Implemented regression coverage
 
-Add a planner lit test with:
+`test/NVWS/MetaAutoWS/ws_memory_planner_epilogue_fusion_dp.mlir` supplies four
+disjoint subtiles from each of two original TMEM loads. With circular reuse and
+the production budget, it checks that the eight logical members remain two
+physical four-member groups at copy 1 and that no circular metadata is emitted.
 
-- four disjoint subtiles derived from one original load;
-- four disjoint subtiles derived from a second original load;
-- circular reuse enabled;
-- a budget that exposes any post-check copy-depth expansion.
+`test/NVWS/MetaAutoWS/ws_memory_planner_meta_parity.mlir` separately checks
+Meta's odd/even circular finalization. The existing
+`ws_memory_planner_epilogue_multicopy.mlir` fixture exercises provenance through
+an arithmetic operation, but its current FileCheck assertions do not directly
+check the documented large-budget versus tight-budget local-buffer copy depths.
+That final-depth SMEM assertion remains a focused lit coverage gap.
 
-Check that each four-member alias set remains one physical group, no
-eight-member circular ring is emitted, and every optional final depth is
-accepted using Meta's physical-group budget equation. Then run both config-1
-H128 persistent tests.
+Both config-1 H128 persistent runtime tests passed in the final NVWS run.
 
 ## 6. Config 2: one physical TMEM id contains two logical ring depths
 
 Correction: the earlier diagnosis that `ppT` was incorrectly grown because it
-is MMA operand A is revoked. Meta-AWS intentionally produces the same mixed
-depth. The defect was NVWS InsertSemas treating a physical `buffer.id` as if it
-implied one logical semaphore ring.
+is MMA operand A is revoked. Meta's memory-planning policy intentionally gives
+QK and P different logical depths before code partitioning coalesces their
+physical backing. The defect was NVWS InsertSemas treating a physical
+`buffer.id` as if it implied one logical semaphore ring.
 
 ### 6.1 Compile-time symptom
 
@@ -471,7 +471,10 @@ That assumption was the defect. Uniform depth remains required for local groups
 and ordinary same-depth TMEM groups, but a proved mixed-depth TMEM alias must be
 split into independent logical DAGs before the uniform-depth check.
 
-### 6.2 The mixed depths are intentional
+### 6.2 The mixed logical depths are intentional
+
+The following pair is NVWS's explicit representation of the logical plan. It
+is not the final Meta IR representation.
 
 The qk accumulator is copy 1 at physical `buffer.id = 2`:
 
@@ -506,9 +509,13 @@ their physical storage aliases.
 
 ### 6.3 Source-level mechanism
 
-Meta's round-robin TMEM policy deliberately increases the sourceful ppT
-channel when it feeds the loop-carried dV MMA. NVWS MemoryPlanner must preserve
-that decision.
+Inside Meta's monolithic WS pass, the round-robin TMEM policy deliberately
+increases the sourceful ppT channel when it feeds the loop-carried dV MMA. That
+logical copy decision is made in
+`third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSMemoryPlanner.cpp:2059-2112`.
+Code partitioning subsequently coalesces the physical TMEM backing at
+`WSCodePartition.cpp:2481-2613`. NVWS MemoryPlanner preserves the logical
+decision explicitly until InsertSemas builds its independent channel rings.
 
 The failure occurred later in `collectGroups()`: all allocations with one TMEM
 `buffer.id` were placed into one `GroupDag`, and `getPlannedBufferCopy()` then
@@ -552,6 +559,12 @@ This is the same physical shape represented in NVWS planning as `qkT copy=1`,
 generated IR therefore proves that the mixed logical depth is reference
 behavior, not evidence of a planner error.
 
+Consequently, the final Meta dump does not contain a surviving sourceful ppT
+allocation carrying `buffer.copy = 2, buffer.id = 2`. That logical depth is
+visible through the two-slot FP16 view and its channel barriers after the ppT
+backing has been replaced. NVWS retains the two logical allocation records
+until InsertSemas, so its pre-InsertSemas dump exposes both copy attributes.
+
 ### 6.5 Structural fix
 
 For one physical TMEM id with distinct authored depths:
@@ -575,12 +588,17 @@ The implementation splits mixed-depth buckets at
 `InsertSemasSyncDag.cpp:2554-2682`, and coalesces only the physical backing at
 `InsertSemasEmitIR.cpp:990-1082`.
 
-### 6.6 Required regression tests
+### 6.6 Runtime verification and remaining lit gap
 
-Check that qkT remains a one-slot logical ring, ppT remains a two-slot logical
-ring, both lower to one physical TMEM allocation, and their alternating
-handoffs remain pipeline-legal. Then run all four config-2 H64 tests, covering
-persistent/nonpersistent and both SUBTILING values.
+All four config-2 H64 runtime tests passed in the final NVWS run, covering
+persistent/nonpersistent and both `SUBTILING` values. The final physical IR has
+one QK backing reinterpreted for P, and the post-pipeline dump retains the dV
+MMA that consumes P as operand A.
+
+There is currently no focused NVWS lit test that constructs qkT as a one-slot
+logical ring and ppT as a two-slot logical ring on the same `buffer.id`, then
+checks independent synchronization plus one coalesced physical backing. That
+synthetic mixed-depth adapter regression remains to be added.
 
 ## 7. Final config-2 hang: fused SMEM releases addressed the wrong slots
 
@@ -640,8 +658,8 @@ the slot-0 event where scalar single-phase toggles parity.
 
 ### 7.3 Structural correction
 
-SYNC-DAG now computes the access ordinal and authors a signed stage offset on
-every release of an exact-alias, multistage local group:
+SYNC-DAG now computes the access ordinal and authors a normalized nonnegative
+stage offset on every release of an exact-alias, multistage local group:
 
 1. Same-iteration handoffs target the satisfied acquire's ordinal.
 2. A loop-closing release keeps its source slot when that slot occurs in the
@@ -705,8 +723,8 @@ Verified on 2026-06-29:
 2. All 103 tests under build-tree `test/NVWS` passed.
 3. The previously hanging config-2 selector passed in 14.46 seconds with a
    fresh 43 MiB MLIR dump.
-4. Final full NVWS tutorial rerun: `28 passed, 20 skipped` in 30.23 seconds.
-5. Final full Meta-AWS control rerun: `28 passed, 20 skipped` in 23.19 seconds.
+4. Final full NVWS tutorial rerun: `28 passed, 20 skipped` in 30.20 seconds.
+5. Final full Meta-AWS control rerun: `28 passed, 20 skipped` in 23.07 seconds.
 6. Fresh post-pipeline config-2 IR retains all five MMA families.
 
 ## 10. Rejected fixes
@@ -714,11 +732,13 @@ Verified on 2026-06-29:
 The evidence rules out these approaches:
 
 - Do not change generic TMA lowering for this matrix. Both paths use it, and
-  Meta supplies a valid lifetime while NVWS supplies an invalid one.
+  Meta supplied a valid lifetime while pre-fix NVWS supplied an invalid one.
 - Do not move releases in an InsertSemas post-pass or in EMIT-IR. Protocol
   decisions must be represented in the ACCESS/OWNER/SYNC DAGs.
-- Do not increase the hardware SMEM limit, reduce the kernel shape, or silently
-  accept a planner plan over budget.
+- Do not increase the hardware SMEM limit or reduce the kernel shape to mask
+  this failure, and do not keep optional copy-depth growth whose final
+  physical-group cost exceeds `smemBudget`. Copy-1 baseline and pinned records
+  retain the contract stated in section 5.6.
 - Do not assign each epilogue alias a separate circular slot.
 - Do not repair mixed-depth TMEM groups by setting every member to the maximum
   copy depth. That destroys Meta's distinct qkT/ppT logical rings.
@@ -732,8 +752,10 @@ The complete failure set came from four NVWS invariants that were missing:
 
 1. A shared-memory source is not returned to its producer until its final
    asynchronous consumer has completed.
-2. Memory budget and circular depth are computed over physical reuse units,
-   not logical alias count, and are checked at the emitted depth.
+2. Optional copy-depth growth is costed over physical reuse units, not logical
+   alias count, and each candidate final depth is checked before it is kept.
+   The heuristic budget is not a hard cap on the copy-1 baseline or pinned
+   annotations; the physical allocator enforces hardware capacity.
 3. One physical TMEM id may contain independent logical channels with distinct
    copy depths; synchronization depth is not inferred from physical identity.
 4. A release signals the physical slot consumed by its satisfied acquire, and
