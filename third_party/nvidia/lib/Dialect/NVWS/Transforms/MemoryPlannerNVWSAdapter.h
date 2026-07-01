@@ -16,6 +16,7 @@ namespace mlir::triton::nvws::planner {
 
 enum class DataChannelKind { SMEMPost, TMEMPost };
 
+// Port and adapter boundaries: sema-docs/meta-ports.md#memory-planning.
 // This interface intentionally mirrors Meta-AWS ChannelPost. MemoryPlanner.cpp
 // can therefore retain Meta's algorithms while channel discovery remains an
 // NVWS representation adapter over ttg.partition annotations.
@@ -70,13 +71,11 @@ struct TmemDataChannelPost final : Channel {
   TmemDataChannelPost(int producer, ArrayRef<int> consumers,
                       Operation *allocOp, Operation *srcOp,
                       ArrayRef<Operation *> dstOps, bool isOperandD,
-                      bool isOperandDNoAcc, bool isPlannerOnly,
-                      unsigned uniqID)
+                      bool isOperandDNoAcc, unsigned uniqID)
       : Channel(producer, consumers, allocOp, uniqID,
                 DataChannelKind::TMEMPost),
         explicitSrcOp(srcOp), explicitDstOps(dstOps.begin(), dstOps.end()),
-        isOperandD(isOperandD), isOperandDNoAcc(isOperandDNoAcc),
-        isPlannerOnly(isPlannerOnly) {}
+        isOperandD(isOperandD), isOperandDNoAcc(isOperandDNoAcc) {}
 
   Operation *getSrcOp() const override;
   Operation *getDstOp() const override;
@@ -87,7 +86,6 @@ struct TmemDataChannelPost final : Channel {
   bool isOperandD;
   bool isOperandDNoAcc;
   bool isSameIterGuard = false;
-  bool isPlannerOnly = false;
 };
 
 LogicalResult collectPostChannels(

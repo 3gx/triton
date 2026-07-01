@@ -33,6 +33,9 @@
 #include <algorithm>
 #include <memory>
 
+// NVWS channel discovery and Meta-policy boundary:
+// sema-docs/meta-ports.md#memory-planning.
+
 #define DEBUG_TYPE "nvws-memory-planner"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
@@ -505,7 +508,7 @@ createTmemChannelPost(ttng::TMEMAllocOp alloc,
     channels.push_back(std::make_unique<TmemDataChannelPost>(
         producerIds.front(), consumerTaskIds, alloc.getOperation(),
         alloc.getOperation(), consumers, false /*isOperandD*/,
-        false /*isOperandDNoAcc*/, true /*isPlannerOnly*/, channels.size()));
+        false /*isOperandDNoAcc*/, channels.size()));
     return success();
   }
 
@@ -542,7 +545,7 @@ createTmemChannelPost(ttng::TMEMAllocOp alloc,
     channels.push_back(std::make_unique<TmemDataChannelPost>(
         producerId, consumerTaskIds, alloc.getOperation(), producerOp,
         consumers, false /*isOperandD*/, isOperandDNoAcc,
-        true /*isPlannerOnly*/, channels.size()));
+        channels.size()));
   }
 
   return success();
