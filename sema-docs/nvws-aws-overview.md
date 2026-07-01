@@ -9,7 +9,7 @@ are selected.
 | Step | Default NVWS | Meta-NVWS (`TRITON_NVWS_USE_META=1`) |
 |---|---|---|
 | Data partition | Hopper `WSDataPartition` pass | NVWS port of Meta `WSDataPartition` |
-| Loop pre-schedule | Standard latency schedule | Meta-aware latency schedule |
+| Loop pre-schedule | Standard latency schedule (`scheduleKeyOpsUpstream`) | Meta-aware latency schedule (`scheduleKeyOpsMetaWS`) |
 | Partition schedule inside AWS | `TritonGPUPartitionScheduling` | NVWS port of `PartitionSchedulingMeta` |
 | NVWS memory planner | Not run | NVWS port of Meta `WSMemoryPlanner` |
 | Buffer materialization | `NVWSInsertAllocas` | `NVWSInsertAllocas` |
@@ -19,61 +19,112 @@ are selected.
 `TRITON_USE_META_WS=1` selects Meta AutoWS itself and takes precedence over
 `TRITON_NVWS_USE_META`; it is not an NVWS-AWS path.
 
+Setting `TRITON_USE_MODULO_SCHEDULE` inserts a modulo-scheduling pass before
+data partitioning on both NVWS paths. It writes `tt.autows` annotations on
+MMA operations — a JSON string whose `stage` and `order` keys feed
+`loop.stage` and `loop.cluster` — and the loop pre-schedule honors those
+annotations instead of either latency schedule in the table above (both
+latency schedulers live in `ScheduleLoops.cpp`).
+
 ## Terminology
 
-- **Backing**: a mutable SMEM or TMEM allocation guarded by a semaphore.
-- **Backing group**: semaphores whose first backing is the same SSA value. They
-  share one current-slot value across all participating partitions; there is
-  not a separate current-slot value per partition.
-- **Depth**: the number of buffered copies in a backing.
-- **Slot**: an integer in `[0, depth)` selecting one backing copy and the
-  mbarrier with the same index.
-- **Current slot**: the slot most recently selected for the backing group. A
-  fresh write advances it to the next slot modulo `depth`; a read leaves it
-  unchanged.
-- **Slot offset**: a signed integer that `InsertSemas` supplies for one
-  semaphore operation. Because the current slot is shared across partitions,
-  an operation may need an offset to select a different buffered copy. Its
-  final slot is
-  `(current slot + slot offset) modulo depth`.
-- **Phase**: the mbarrier parity expected by an acquire's wait.
-- **Static pipeline schedule**: `loop.stage` and `loop.cluster`, which determine
-  when an operation executes. They do not select a backing copy or mbarrier.
-- **Memory-planner channel**: a private liveness record connecting an allocation
-  to its producer and consumers. It is not a semaphore.
-- **Modeled TMEM allocation**: a TMEM allocation for which channel traversal
-  finds producer/consumer operations and a bounded live interval.
-- **Unmodeled TMEM allocation**: a TMEM allocation for which channel traversal
-  finds no live operations, so its lifetime is unknown.
+Pipeline-wide terms, each with the code name it comes from. The InsertSemas
+model objects (group, piece, component, node, owner, and so on) are defined in
+the [InsertSemas overview](insert-semas/overview.md#core-objects). Every other
+document uses these terms with exactly these meanings.
 
-These documents reserve *slot* for the dynamic backing/mbarrier selector and
-*stage* for static `loop.stage`. Current IR and C++ still name the slot value
-`stage`, including the semaphore `stage` operand, `State::stage`, and
-`getStage`/`setStage`. Renaming those symbols and `AssignStagePhase` is deferred.
+- **Backing**: a mutable SMEM or TMEM allocation guarded by a semaphore
+  (`GroupDag::backing` in `InsertSemas.h`).
+- **Depth**: the number of buffered copies of a backing. The memory planner
+  records it as `buffer.copy`. Without a planner, depth is 1, except that
+  `LowerSemaphore` widens TMA-load-fed SMEM backings to the `num-stages` pass
+  option and the default path may double-buffer TMEM accumulators (see
+  [SYNC-DAG, backing depth](insert-semas/sync-dag.md#backing-depth)). These
+  documents use only this one word for that count.
+- **Buffer stage**: an integer in `[0, depth)` selecting one backing copy and
+  the mbarrier with the same index. In the IR it is the `stage` operand of the
+  `nvws.semaphore.*` operations; `AssignStagePhase` tracks it as
+  `State::stage`.
+- **Current buffer stage**: the buffer stage most recently selected for a
+  semaphore group. A fresh write advances it to the next copy modulo depth; a
+  read leaves it unchanged. All partitions that use the group share this one
+  value; there is no per-partition copy.
+- **Fresh write**: an acquire whose first reachable buffer access writes the
+  backing instead of reading it (`isFirstUseFreshWriteAfterAcquire` in
+  `AssignStagePhase.cpp`). Only fresh writes advance the current buffer stage.
+- **Stage offset**: a signed integer that `InsertSemas` may place in one
+  semaphore operation's `stage` operand (`Node::stageOffset`). Because the
+  current buffer stage is shared, an operation sometimes needs a different
+  copy; its final buffer stage is
+  `(current buffer stage + stage offset) mod depth`.
+- **Phase**: the mbarrier parity an acquire's wait expects.
+- **Pipeline stage**: the software pipeliner's static schedule, `loop.stage`
+  together with `loop.cluster`. It determines when an operation executes; it
+  never selects a backing copy or mbarrier.
+- **Semaphore group**: the `nvws.semaphore.create` operations whose first
+  buffer operand is the same allocation (`getSemaGroups` in `LowerAref.cpp`).
+  A semaphore group shares one current buffer stage.
+- **Channel**: a private memory-planner record connecting an allocation to its
+  producer and consumers. It bounds the allocation's lifetime; it is not a
+  semaphore, and `InsertSemas` never reads it. These documents use *channel*
+  only in this sense.
+- **Modeled / unmodeled TMEM allocation**: a TMEM allocation for which channel
+  traversal does / does not find producer and consumer operations. An
+  unmodeled allocation has an unknown lifetime.
+- **Sourceful allocation**: a `ttg.local_alloc` or `ttng.tmem_alloc` with an
+  initial-value operand.
+- **WS tag**: the `ttg.warp_specialize.tag` integer identifying one
+  warp-specialized loop scope.
+- **Root**: the owner of an access with no WS tag on itself or any enclosing
+  `scf.for` (`Owner == std::nullopt` in `InsertSemas.h`, printed as `root`).
 
-For example, consider a depth-2 circular backing shared by logical buffers A
-and B, with `buffer.start = 0` for A and `buffer.start = 1` for B. The current
-slot starts at `depth - 1`, which is 1. Producers and consumers in every
-partition use this same current-slot value:
+The bare word *stage* is never used alone in these documents: it is always
+*buffer stage* or *pipeline stage*. In the IR and C++ the semaphore operand,
+`State::stage`, and `getStage`/`setStage` all say `stage` and mean the buffer
+stage; `loop.stage` means the pipeline stage.
 
-| Operation | Current-slot action | Slot offset | Final slot |
+### Worked example
+
+Consider a depth-2 circular backing shared by two allocations A and B — a
+planner-selected reuse group, where `buffer.circular` marks the group and
+`buffer.start` is each allocation's starting copy (see
+[meta-ports](meta-ports.md#output-representation)) — with `buffer.start = 0`
+for A and 1 for B. The current buffer stage starts at `depth - 1`, which is
+1. Every partition uses this same shared
+value:
+
+| Operation | Current-buffer-stage action | Stage offset | Final buffer stage |
 |---|---|---:|---:|
 | write A | advance `1 -> 0` | 0 | 0 |
 | write B | advance `0 -> 1` | 0 | 1 |
 | read A | keep 1 | -1 | 0 |
 | read B | keep 1 | 0 | 1 |
 
-The `-1` offset makes the read of A select slot 0 after the shared current slot
-has advanced to 1 for B. Ordinary groups use the current slot directly.
-`InsertSemas` currently authors slot offsets for circular reuse and exact-alias
-multi-slot SMEM handoffs.
+The `-1` offset lets the read of A select copy 0 after the shared current
+buffer stage has advanced to 1 for B. Ordinary groups use the current buffer
+stage directly; `InsertSemas` assigns stage offsets only for circular reuse
+and for exact-alias SMEM handoffs across multiple copies.
+
+### For readers coming from Meta AutoWS
+
+| Meta AutoWS | NVWS |
+|---|---|
+| `Channel` (producer-to-consumer dependency record) | channel inside the ported memory planner (Meta-NVWS only) |
+| token with `producer_acquire` / `producer_commit` / `consumer_wait` / `consumer_release` | one `nvws.semaphore` per ownership transfer; `acquire` returns a token, `release` consumes it |
+| `bufferFull` / `bufferEmpty` mbarrier arrays | one mbarrier per buffer stage of each semaphore, allocated by `LowerSemaphore` |
+| `accumCnt`, `bufferIdx = accumCnt % numBuffers` | buffer stage, tracked by `AssignStagePhase` |
+| `phase = (accumCnt / numBuffers) & 1` | phase, computed by `AssignStagePhase` |
+| `numBuffers` / multi-buffering | depth (`buffer.copy` or `num-stages`) |
+| reuse group (allocations sharing `buffer.id`) | planner group sharing `buffer.id`; a semaphore group after lowering |
+| `async_task_id` | `ttg.partition` plus the WS tag |
 
 ## Pass order
 
 The relevant Blackwell pipeline is:
 
 ```text
-data partition
+modulo schedule                       [only with TRITON_USE_MODULO_SCHEDULE]
+-> data partition
 -> assign latencies and schedule loops
 -> automatic warp specialization
      -> partition scheduling             [default / Meta-NVWS variants]
@@ -83,21 +134,34 @@ data partition
      -> MemoryPlanner                    [Meta-NVWS only]
      -> InsertSemas
      -> LowerSemaphore
+          -> multi-buffer TMA-load-fed SMEM backings to depth num-stages
           -> AssignStagePhase
           -> lower semaphore IR to barriers
      -> partition loops
      -> lower warp groups
-     -> schedule loops
+     -> schedule loops                   [default / Meta-NVWS variants]
      -> multi-buffer TMA descriptors
      -> clear internal WS metadata
 -> software pipeline
 ```
 
-Partition verification wraps the AWS passes from partition scheduling through
-`LowerSemaphore`; it does not run after the terminal partition/lowering/
-scheduling trio. The software pipeliner sees concrete partitions, barriers,
-multi-buffered descriptors, and the finalized `loop.stage`/`loop.cluster`
-schedule.
+`LowerSemaphore`'s first step (`multiBufferSemaphore` in `LowerAref.cpp`)
+widens backings the planner did not size: a semaphore group whose release is
+fed by a TMA load and whose SMEM backings carry no `buffer.copy` is rewritten
+from one copy to `num-stages` copies before `AssignStagePhase` computes buffer
+stages. `InsertSemas` already analyzes such groups at that final depth (see
+[SYNC-DAG, backing depth](insert-semas/sync-dag.md#backing-depth)).
+
+The terminal `schedule loops` run also differs per path: the AWS driver passes
+it a Meta flag (`useMetaWS` in `AutomaticWarpSpecialization.cpp`), selecting
+the same standard/Meta-aware split as the pre-schedule.
+
+A partition verifier (`VerifyWarpSpecializationPartitions`, which the AWS
+driver runs after each wrapped pass) checks the passes from partition
+scheduling through `LowerSemaphore`; it does not run after `partition loops`,
+`lower warp groups`, or the terminal `schedule loops`. The software pipeliner sees
+concrete partitions, barriers, multi-buffered descriptors, and the finalized
+`loop.stage`/`loop.cluster` schedule.
 
 ## Contracts between passes
 
@@ -112,19 +176,23 @@ MemoryPlanner (Meta-NVWS)
   buffer.id/copy/offset and optional circular metadata
 
 InsertSemas
-  ownership protocol and carrier threading,
-  optional slot offsets because partitions sharing one backing also share one
-  current-slot value; an offset can select another copy, for example when a
-  circular-buffer read must select an earlier backing copy,
-  pipeline-legal static loop.stage/loop.cluster annotations
-
-AssignStagePhase
-  final slot for each semaphore acquire/buffer/release and wait phase for acquire:
-  slot selects one copy of the multi-buffered backing and its mbarrier;
-  phase is the mbarrier parity expected by the wait
+  semaphore create/acquire/buffer/release operations and token threading
+  through structured control flow,
+  optional stage offsets (partitions share one current buffer stage, so an
+  operation may need an offset to select another copy, for example a
+  circular-buffer read of an earlier copy),
+  pipeline-legal loop.stage/loop.cluster annotations
 
 LowerSemaphore
-  mbarrier allocation, wait, arrive/commit, and concrete buffer views
+  first widens TMA-load-fed SMEM backings without buffer.copy to num-stages
+  copies, then:
+
+  AssignStagePhase
+    final buffer stage for each acquire/buffer/release and wait phase for
+    each acquire
+
+  barrier lowering
+    mbarrier allocation, wait, arrive/commit, and concrete buffer views
 ```
 
 ## Code map

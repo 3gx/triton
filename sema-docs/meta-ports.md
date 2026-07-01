@@ -2,7 +2,8 @@
 
 Meta-NVWS reuses Meta policy where NVWS needs the same decision before its own
 code partitioning and semaphore pipeline. The Meta algorithm is the baseline;
-NVWS adapters translate representation and materialize metadata.
+NVWS adapters translate representation and materialize metadata. Terms used
+here are defined in the [NVWS-AWS terminology](nvws-aws-overview.md#terminology).
 
 ## Data partition
 
@@ -27,11 +28,21 @@ The port keeps Meta's operation categories, initial partition layout,
 propagation, schedule optimization, and data-partitioned `scf.if` splitting.
 If Meta finds no schedulable load or MMA, NVWS also leaves the loop unchanged.
 
-Meta hands an internal schedule to its code partitioner. NVWS instead closes the
-selected schedule over structural and scalar/address operations, writes
-`ttg.partition` and `ttg.partition.outputs`, assigns WS tags, and verifies the
-metadata required by `PartitionLoops` and `InsertSemas`. The pass is
-transactional: failure discards the cloned function.
+The initial partition layout is configurable exactly as in Meta: the five
+scheduling options (`merge-epilogue`, `merge-epilogue-to-computation`,
+`merge-correction`, `merge-reduction`, `separate-epilogue-store`) default to
+off, and all but `merge-reduction` can be set per loop through `tl.range`
+keywords that lower to `tt.merge_*`/`tt.separate_epilogue_store` loop
+attributes the pass reads. Meta's own knob documentation
+([`PartitionSchedulingMeta.md`](../third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/docs/PartitionSchedulingMeta.md))
+describes what each knob merges or splits.
+
+Meta hands an internal schedule to its code partitioner. NVWS instead extends
+the selected schedule to the structural and scalar/address operations each
+partition needs, writes `ttg.partition` and `ttg.partition.outputs`, assigns
+WS tags, and verifies the metadata required by `PartitionLoops` and
+`InsertSemas`. The pass is transactional: failure discards the cloned
+function.
 
 Immediately afterward, Meta-NVWS strips `ttg.partition`,
 `ttg.partition.outputs`, `ttg.partition.stages`, and the WS tag from operations
@@ -48,7 +59,7 @@ Sources:
 ## Memory planning
 
 `MemoryPlanner.cpp` keeps Meta's channel ordering, SMEM allocation, TMEM reuse,
-copy-depth growth, and budget accounting. `MemoryPlannerNVWSAdapter` translates
+depth growth, and budget accounting. `MemoryPlannerNVWSAdapter` translates
 NVWS IR into planner input and publishes the result. It does not add reuse
 policy.
 
@@ -64,9 +75,9 @@ them from the explicit memory operations produced by `InsertAllocas` and their
 
 | Input case | Meta | NVWS extension |
 |---|---|---|
-| Sourceful `ttng.tmem_alloc` | Skips the channel | Uses the allocation as producer when it has one producer partition and consumers |
+| Sourceful `ttng.tmem_alloc` (alloc with an initial-value operand) | Skips the channel | Uses the allocation as producer when it has one producer partition and consumers |
 | Same-partition TMEM producer/consumer | Skips the channel because no cross-partition communication exists | Keeps a synthetic channel so the planner sees the lifetime |
-| Operand-D TMEM | Uses Meta's representation | Reconstructs the lifecycle from stores, MMA updates, loads, partitions, and transparent views |
+| Operand-D TMEM (the MMA accumulator) | Uses Meta's representation | Reconstructs the lifecycle from stores, MMA updates, loads, partitions, and the memdesc views between them |
 
 The synthetic channels carry explicit source and destination operations. They
 only expose liveness to the planner; `InsertSemas` derives synchronization from
@@ -93,14 +104,15 @@ unknown or otherwise unassigned lifetime conservatively:
 
 ### Output representation
 
-After Meta policy selects IDs and depths, NVWS publishes:
+After Meta policy selects IDs and depths, NVWS publishes five attributes on
+the allocation:
 
 ```text
-buffer.id
-buffer.copy
-buffer.offset
-buffer.circular
-buffer.start
+buffer.id       physical buffer identity; allocations sharing an id share storage
+buffer.copy     depth assigned to the allocation
+buffer.offset   TMEM column offset within the shared buffer (TMEM-only)
+buffer.circular marks a circular reuse group selected by Meta policy
+buffer.start    the allocation's starting copy within a circular group
 ```
 
 The circular attributes describe reuse already selected by Meta policy; they
