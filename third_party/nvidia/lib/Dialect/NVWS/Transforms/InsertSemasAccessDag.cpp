@@ -1,27 +1,14 @@
-// Stage 1 — ACCESS-DAG (spec fable/semas-report3.md section 3; plan
-// fable/new-insert-semas-plan-2.md commit 1). Pure analysis: discovery of
-// buffer groups, cut-point pieces/footprints, access events with R/W
-// touches, region effect summaries, and the ACCESS-DAG dump. No IR mutation.
+// ACCESS analysis; see sema-docs/insert-semas/access-dag.md.
+#include "InsertSemas.h"
 
-// ---------------------------------------------------------------------------
-// Discovery: bucket allocs by buffer.id (synthetic id when absent), uniform
-// over TMEM and local. TMEM = every ttng.tmem_alloc; local = every
-// mutable-memdesc ttg.local_alloc.
-// ---------------------------------------------------------------------------
-#include "InsertSemasAccessDag.h"
-
-namespace mlir {
-namespace triton {
-namespace nvws_semas {
+namespace mlir::triton::nvws_semas {
 
 FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp) {
-  llvm::MapVector<int64_t, SmallVector<Operation *, 2>> tmemBuckets,
-      localBuckets;
+  llvm::MapVector<int64_t, SmallVector<Operation *, 2>> tmemBuckets, localBuckets;
   SmallVector<Operation *, 4> circularLocals;
   llvm::DenseSet<int64_t> syntheticIds; // negative keys = synthetic
   int64_t nextSynthetic = -1;
   LogicalResult result = success();
-
   funcOp.walk([&](Operation *op) {
     if (auto alloc = dyn_cast<nvidia_gpu::TMEMAllocOp>(op)) {
       std::optional<int64_t> id = getI64Attr(op, kBufferIdAttrName);
@@ -38,24 +25,16 @@ FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp) {
       std::optional<int64_t> id = getI64Attr(op, kBufferIdAttrName);
       if (op->hasAttr(kBufferCircularAttrName)) {
         if (!id) {
-          result = op->emitError(
-              "nvws-insert-semas: circular local alloc requires buffer.id");
+          result = semaError(op) << "circular local alloc requires buffer.id";
           return;
         }
-        if (!op->hasAttr(kBufferCopyAttrName)) {
-          result = op->emitError(
-              "nvws-insert-semas: circular local alloc requires buffer.copy");
-          return;
-        }
-        if (!op->hasAttr(kBufferStartAttrName)) {
-          result = op->emitError(
-              "nvws-insert-semas: circular local alloc requires buffer.start");
-          return;
-        }
+        for (StringRef name : {kBufferCopyAttrName, kBufferStartAttrName})
+          if (!op->hasAttr(name)) {
+            result = semaError(op) << "circular local alloc requires " << name;
+            return;
+          }
         if (op->hasAttr(kBufferOffsetAttrName)) {
-          result = op->emitError(
-              "nvws-insert-semas: circular local alloc must not carry "
-              "buffer.offset");
+          result = semaError(op) << "circular local alloc must not carry buffer.offset";
           return;
         }
         circularLocals.push_back(op);
@@ -70,14 +49,11 @@ FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp) {
   });
   if (failed(result))
     return failure();
-
   SmallVector<GroupDag, 0> groups;
-  auto makeGroup = [&](MemKind memory, int64_t id,
-                       ArrayRef<Operation *> allocs, bool circular = false,
+  auto makeGroup = [&](MemKind memory, int64_t id, ArrayRef<Operation *> allocs, bool circular = false,
                        bool mixedDepthPhysicalAlias = false) {
     groups.emplace_back();
     GroupDag &g = groups.back();
-    g.groupIdx = static_cast<unsigned>(groups.size() - 1);
     g.bufferId = id;
     g.synthetic = syntheticIds.contains(id);
     g.mixedDepthPhysicalAlias = mixedDepthPhysicalAlias;
@@ -87,14 +63,13 @@ FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp) {
       Member m;
       m.allocOp = allocOp;
       m.type = cast<gpu::MemDescType>(allocOp->getResult(0).getType());
-      m.circular = circular;
       m.circularStart = getI64Attr(allocOp, kBufferStartAttrName).value_or(0);
       m.offset = circular ? 0 : getI64Attr(allocOp, kBufferOffsetAttrName).value_or(0);
-      m.extent = memberExtent(memory, m.type);
+      m.extent = memory == MemKind::Tmem ? static_cast<int64_t>(mlir::triton::getMemDescSize(m.type))
+                     : (m.type.getShape().empty() ? 1 : m.type.getShape().front());
       MemberId idx = static_cast<MemberId>(g.pieceTable.members.size());
       g.pieceTable.members.push_back(m);
-      g.aliases.try_emplace(allocOp->getResult(0),
-                            std::make_pair(idx, SmallVector<AliasStep, 2>()));
+      g.aliases.try_emplace(allocOp->getResult(0), std::make_pair(idx, SmallVector<AliasStep, 2>()));
     }
   };
   for (auto &[id, allocs] : tmemBuckets) {
@@ -112,20 +87,13 @@ FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp) {
       else if (*firstCopy != *copy)
         mixedCopies = true;
     }
-
     if (!allAuthored || !mixedCopies) {
       makeGroup(MemKind::Tmem, id, allocs);
       continue;
     }
-
-    // A mixed-depth TMEM reuse id denotes independent logical channels over
-    // one physical allocation. Keeping them in one ownership DAG would erase
-    // the per-channel ring depths. Physical compatibility and alternating
-    // ownership are verified globally after all logical DAGs are built.
     for (Operation *alloc : allocs) {
       SmallVector<Operation *, 1> logicalMember{alloc};
-      makeGroup(MemKind::Tmem, id, logicalMember,
-                /*circular=*/false, /*mixedDepthPhysicalAlias=*/true);
+      makeGroup(MemKind::Tmem, id, logicalMember, /*circular=*/false, /*mixedDepthPhysicalAlias=*/true);
     }
   }
   for (auto &[id, allocs] : localBuckets)
@@ -136,10 +104,6 @@ FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp) {
   return groups;
 }
 
-// ---------------------------------------------------------------------------
-// Pieces: the cut-point construction (spec section 3 item 2). Invariant:
-// two members overlap <=> their footprints intersect.
-// ---------------------------------------------------------------------------
 static void buildPieces(PieceTable &pt) {
   SmallVector<int64_t, 8> cuts;
   for (const Member &m : pt.members) {
@@ -148,8 +112,6 @@ static void buildPieces(PieceTable &pt) {
   }
   llvm::sort(cuts);
   cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
-
-  // Candidate intervals between adjacent cuts; cover sets by containment.
   SmallVector<Piece, 4> raw;
   for (size_t i = 0; i + 1 < cuts.size(); ++i) {
     Piece p;
@@ -161,21 +123,17 @@ static void buildPieces(PieceTable &pt) {
     if (!p.cover.empty())
       raw.push_back(std::move(p));
   }
-  // Merge adjacent intervals with identical cover (coarsest valid partition).
   for (Piece &p : raw) {
-    if (!pt.pieces.empty() && pt.pieces.back().hi == p.lo &&
-        pt.pieces.back().cover == p.cover) {
+    if (!pt.pieces.empty() && pt.pieces.back().hi == p.lo && pt.pieces.back().cover == p.cover) {
       pt.pieces.back().hi = p.hi;
       continue;
     }
     pt.pieces.push_back(std::move(p));
   }
-  // Invert to footprints.
   pt.footprint.assign(pt.members.size(), {});
   for (auto [pIdx, piece] : llvm::enumerate(pt.pieces))
     for (MemberId m : piece.cover)
       pt.footprint[m].push_back(static_cast<PieceId>(pIdx));
-  // Connected components: pieces sharing a member are one token game.
   SmallVector<unsigned, 4> parent(pt.pieces.size());
   for (auto [i, _] : llvm::enumerate(parent))
     parent[i] = i;
@@ -187,7 +145,6 @@ static void buildPieces(PieceTable &pt) {
   for (const auto &fp : pt.footprint)
     for (size_t i = 1; i < fp.size(); ++i)
       parent[find(fp[i])] = find(fp[0]);
-  // Renumber components in ascending first-piece order (determinism).
   pt.pieceComp.assign(pt.pieces.size(), 0);
   DenseMap<unsigned, CompId> compId; // lookup-only
   CompId next = 0;
@@ -199,44 +156,32 @@ static void buildPieces(PieceTable &pt) {
     pt.pieceComp[pIdx] = it->second;
   }
 }
-
-// ---------------------------------------------------------------------------
-// Access-event collection + node-tree construction. One recursive pass in
-// program order: alias chains extend as they are encountered; every access
-// becomes an Access node with per-member touches classified per spec
-// section 1.1.
-// ---------------------------------------------------------------------------
-
 static bool isStructuralOp(Operation *op) {
-  return isa<scf::ForOp, scf::IfOp, scf::YieldOp, triton::FuncOp,
-             triton::ReturnOp>(op);
+  return isa<scf::ForOp, scf::IfOp, scf::YieldOp, triton::FuncOp, triton::ReturnOp>(op);
 }
-
-// Try to extend the alias map through `op`. Returns: failure on an
-// unsupported forward of a tracked memdesc; aliased=true if `op` was
-// consumed as a view step (then it is not an access event).
+static LogicalResult rejectAliasOperands(GroupDag &g, Operation *op) {
+  for (Value operand : op->getOperands())
+    if (g.aliases.contains(operand))
+      return semaError(op) << "unsupported memdesc flow through control-flow op " << op->getName();
+  return success();
+}
 static FailureOr<bool> tryExtendAlias(GroupDag &g, Operation *op) {
-  if (op->getNumResults() != 1 ||
-      !isa<gpu::MemDescType>(op->getResult(0).getType()))
+  if (op->getNumResults() != 1 || !isa<gpu::MemDescType>(op->getResult(0).getType()))
     return false;
   for (auto [idx, operand] : llvm::enumerate(op->getOperands())) {
     auto it = g.aliases.find(operand);
     if (it == g.aliases.end())
       continue;
     if (!isSupportedAliasOp(op))
-      return op->emitError("nvws-insert-semas: unsupported memdesc alias use ")
-             << op->getName();
+      return semaError(op) << "unsupported memdesc alias use " << op->getName();
     auto chain = it->second; // copy {member, steps}
-    chain.second.push_back(
-        {op, static_cast<unsigned>(idx), op->getResult(0).getType()});
+    chain.second.push_back({op, static_cast<unsigned>(idx), op->getResult(0).getType()});
     g.aliases.try_emplace(op->getResult(0), std::move(chain));
     return true;
   }
   return false;
 }
-
-static void addTouch(GroupDag &g, SmallVectorImpl<Touch> &touches, Value v,
-                     Effect effect) {
+static void addTouch(GroupDag &g, SmallVectorImpl<Touch> &touches, Value v, Effect effect) {
   auto it = g.aliases.find(v);
   if (it == g.aliases.end())
     return;
@@ -248,11 +193,11 @@ static void addTouch(GroupDag &g, SmallVectorImpl<Touch> &touches, Value v,
   t.alias = it->second.second;
   touches.push_back(std::move(t));
 }
-
-// Classify `op`'s touches on this group's buffers (spec section 1.1 table).
-static LogicalResult collectTouches(GroupDag &g, Operation *op,
-                                    SmallVectorImpl<Touch> &touches) {
-  // Sourceful allocs act as a store of their source into the new buffer.
+static LogicalResult collectTouches(GroupDag &g, Operation *op, SmallVectorImpl<Touch> &touches) {
+  auto touch = [&](Value value, Effect effect) {
+    addTouch(g, touches, value, effect);
+    return success();
+  };
   if (auto tmemAlloc = dyn_cast<nvidia_gpu::TMEMAllocOp>(op)) {
     if (tmemAlloc.getSrc())
       addTouch(g, touches, tmemAlloc.getResult(), Effect::W);
@@ -260,12 +205,6 @@ static LogicalResult collectTouches(GroupDag &g, Operation *op,
   }
   if (auto localAlloc = dyn_cast<gpu::LocalAllocOp>(op)) {
     if (Value src = localAlloc.getSrc()) {
-      // Pipeline invariant (plan contract D, mining gap 6): a MANAGED
-      // descriptor-fed buffer never reaches this pass in tt form —
-      // nvws-insert-allocas converts cross-partition pairs upstream. A
-      // tt-form pair here must be same-partition (it will produce no
-      // semaphores and stay untouched); if it ever turns out managed,
-      // fail loudly rather than silently emit a register round-trip.
       if (Operation *def = src.getDefiningOp())
         if (isa<triton::DescriptorLoadOp, triton::DescriptorGatherOp>(def) &&
             g.aliases.count(localAlloc.getResult())) // member of THIS group
@@ -274,33 +213,22 @@ static LogicalResult collectTouches(GroupDag &g, Operation *op,
     }
     return success();
   }
-  if (auto load = dyn_cast<nvidia_gpu::TMEMLoadOp>(op)) {
-    addTouch(g, touches, load.getSrc(), Effect::R);
-    return success();
-  }
-  if (auto store = dyn_cast<nvidia_gpu::TMEMStoreOp>(op)) {
-    addTouch(g, touches, store.getDst(), Effect::W);
-    return success();
-  }
-  if (auto load = dyn_cast<gpu::LocalLoadOp>(op)) {
-    addTouch(g, touches, load.getSrc(), Effect::R);
-    return success();
-  }
-  if (auto store = dyn_cast<gpu::LocalStoreOp>(op)) {
-    addTouch(g, touches, store.getDst(), Effect::W);
-    return success();
-  }
-  if (auto descLoad = dyn_cast<nvws::DescriptorLoadOp>(op)) {
-    addTouch(g, touches, descLoad.getResult(), Effect::W);
-    return success();
-  }
-  if (auto descGather = dyn_cast<nvws::DescriptorGatherOp>(op)) {
-    addTouch(g, touches, descGather.getResult(), Effect::W);
-    return success();
-  }
+  Value read, write;
+  if (auto x = dyn_cast<nvidia_gpu::TMEMLoadOp>(op))
+    read = x.getSrc();
+  else if (auto x = dyn_cast<gpu::LocalLoadOp>(op))
+    read = x.getSrc();
+  else if (auto x = dyn_cast<nvidia_gpu::TMEMStoreOp>(op))
+    write = x.getDst();
+  else if (auto x = dyn_cast<gpu::LocalStoreOp>(op))
+    write = x.getDst();
+  else if (auto x = dyn_cast<nvws::DescriptorLoadOp>(op))
+    write = x.getResult();
+  else if (auto x = dyn_cast<nvws::DescriptorGatherOp>(op))
+    write = x.getResult();
+  if (read || write)
+    return touch(read ? read : write, read ? Effect::R : Effect::W);
   if (auto mma = dyn_cast<nvidia_gpu::MMAv5OpInterface>(op)) {
-    // MMA: accumulator touch is W; A/B operand touches are R (whether the
-    // operand lives in SMEM or TMEM). Spec section 1.1 — no special cases.
     Value acc = mma.getAccumulator();
     bool accTouched = false;
     for (Value operand : op->getOperands()) {
@@ -314,30 +242,16 @@ static LogicalResult collectTouches(GroupDag &g, Operation *op,
     }
     return success();
   }
-  // Tracked memdesc flowing into structured control flow (loop init args,
-  // yields, ...) is unsupported: hard diagnostic, never a silent skip.
   if (isStructuralOp(op)) {
-    for (Value operand : op->getOperands())
-      if (g.aliases.contains(operand))
-        return op->emitError("nvws-insert-semas: unsupported memdesc flow "
-                             "through control-flow op ")
-               << op->getName();
-    return success();
+    return rejectAliasOperands(g, op);
   }
-  // Everything else touching a tracked memdesc: not provably load-only,
-  // classified W (spec section 1.1: R is the closed list above).
   for (Value operand : op->getOperands())
     if (g.aliases.contains(operand))
       addTouch(g, touches, operand, Effect::W);
   return success();
 }
 
-// Build the chain of `block` under `parent`; returns the head via out-param.
-// Structural For/If nodes are created only when their subtree contains
-// accesses of this group (spec section 3 item 3).
-static FailureOr<Node *> buildChainForBlock(GroupDag &g, Block &block,
-                                            Node *parent);
-
+static FailureOr<Node *> buildChainForBlock(GroupDag &g, Block &block, Node *parent);
 static void appendNode(Node *parent, Node *&head, Node *&tail, Node *n) {
   n->parent = parent;
   n->prev = tail;
@@ -347,21 +261,16 @@ static void appendNode(Node *parent, Node *&head, Node *&tail, Node *n) {
     head = n;
   tail = n;
 }
-
 static SmallVector<Operation *> directUsers(Value value) {
   SmallVector<Operation *> users;
   users.append(value.getUsers().begin(), value.getUsers().end());
   return users;
 }
 
-// A descriptor store may keep reading a managed local buffer after the
-// synchronous local_load has produced its tensor. Record that physical
-// ownership frontier in ACCESS-DAG; later stages only consume this fact.
 static LogicalResult deriveCompletionAnchor(Node *access) {
   auto load = dyn_cast<gpu::LocalLoadOp>(access->op);
   if (!load)
     return success();
-
   struct Candidate {
     Operation *forward = nullptr;
     Operation *store = nullptr;
@@ -379,67 +288,46 @@ static LogicalResult deriveCompletionAnchor(Node *access) {
       if (isa<triton::DescriptorStoreOp>(convertUser))
         candidates.push_back({user, convertUser});
   }
-
   if (candidates.empty())
     return success();
   if (candidates.size() != 1)
-    return load.emitError(
-        "nvws-insert-semas: managed local_load reaches multiple descriptor "
-        "stores; ownership completion is ambiguous");
-
+    return semaError(load) << "managed local_load reaches multiple descriptor "
+                              "stores; ownership completion is ambiguous";
   Candidate candidate = candidates.front();
   SmallVector<Operation *> loadUsers = directUsers(load.getResult());
-  Operation *expectedLoadUser =
-      candidate.forward ? candidate.forward : candidate.store;
+  Operation *expectedLoadUser = candidate.forward ? candidate.forward : candidate.store;
   if (loadUsers.size() != 1 || loadUsers.front() != expectedLoadUser)
-    return load.emitError(
-        "nvws-insert-semas: descriptor-store local_load path has fan-out");
-
+    return semaError(load) << "descriptor-store local_load path has fan-out";
   if (candidate.forward) {
     auto convert = cast<gpu::ConvertLayoutOp>(candidate.forward);
     SmallVector<Operation *> convertUsers = directUsers(convert.getResult());
-    if (convertUsers.size() != 1 ||
-        convertUsers.front() != candidate.store)
-      return load.emitError(
-          "nvws-insert-semas: descriptor-store convert_layout path has "
-          "fan-out");
+    if (convertUsers.size() != 1 || convertUsers.front() != candidate.store)
+      return semaError(load) << "descriptor-store convert_layout path has fan-out";
   }
-
   Block *block = load->getBlock();
-  if (candidate.store->getBlock() != block ||
-      (candidate.forward && candidate.forward->getBlock() != block)) {
-    InFlightDiagnostic diag = load.emitError(
-        "nvws-insert-semas: descriptor-store completion crosses control "
-        "flow");
+  if (candidate.store->getBlock() != block || (candidate.forward && candidate.forward->getBlock() != block)) {
+    InFlightDiagnostic diag = semaError(load) << "descriptor-store completion crosses control flow";
     diag.attachNote(candidate.store->getLoc()) << "descriptor store is here";
     return failure();
   }
   if (!load->isBeforeInBlock(candidate.store))
-    return load.emitError(
-        "nvws-insert-semas: descriptor store must follow managed local_load");
+    return semaError(load) << "descriptor store must follow managed local_load";
   if (!sameOwner(access->owner, resolveOwner(candidate.store))) {
-    InFlightDiagnostic diag = load.emitError(
-        "nvws-insert-semas: descriptor-store completion owner differs from "
-        "managed local_load owner");
+    InFlightDiagnostic diag = semaError(load) << "descriptor-store completion owner differs "
+                                 "from managed local_load owner";
     diag.attachNote(candidate.store->getLoc()) << "descriptor store is here";
     return failure();
   }
-
   access->completionAnchor = candidate.store;
   return success();
 }
 
-static FailureOr<Node *> buildChainForBlock(GroupDag &g, Block &block,
-                                            Node *parent) {
+static FailureOr<Node *> buildChainForBlock(GroupDag &g, Block &block, Node *parent) {
   Node *head = nullptr, *tail = nullptr;
   for (Operation &op : block) {
     if (auto forOp = dyn_cast<scf::ForOp>(&op)) {
-      // Tracked memdesc as loop operand is unsupported (hard diagnostic).
-      for (Value operand : op.getOperands())
-        if (g.aliases.contains(operand))
-          return op.emitError("nvws-insert-semas: unsupported memdesc flow "
-                              "through control-flow op ")
-                 << op.getName();
+      if (failed(rejectAliasOperands(g, &op)))
+        return failure();
       Node *forNode = g.newNode(Node::For, &op, parent);
       auto body = buildChainForBlock(g, *forOp.getBody(), forNode);
       if (failed(body))
@@ -453,11 +341,8 @@ static FailureOr<Node *> buildChainForBlock(GroupDag &g, Block &block,
       continue;
     }
     if (auto ifOp = dyn_cast<scf::IfOp>(&op)) {
-      for (Value operand : op.getOperands())
-        if (g.aliases.contains(operand))
-          return op.emitError("nvws-insert-semas: unsupported memdesc flow "
-                              "through control-flow op ")
-                 << op.getName();
+      if (failed(rejectAliasOperands(g, &op)))
+        return failure();
       Node *ifNode = g.newNode(Node::If, &op, parent);
       auto thenChain = buildChainForBlock(g, *ifOp.thenBlock(), ifNode);
       if (failed(thenChain))
@@ -477,7 +362,6 @@ static FailureOr<Node *> buildChainForBlock(GroupDag &g, Block &block,
       appendNode(parent, head, tail, ifNode);
       continue;
     }
-    // Alias steps are consumed by the chain, not access events.
     auto aliased = tryExtendAlias(g, &op);
     if (failed(aliased))
       return failure();
@@ -497,40 +381,22 @@ static FailureOr<Node *> buildChainForBlock(GroupDag &g, Block &block,
   }
   return head;
 }
-
-// Region effect summaries (spec section 3 item 4): per For/If node, the
-// per-piece OR of subtree touch effects. Presence in the map IS the
-// region's footprint.
-static void computeEffectSummary(GroupDag &g, Node *n,
-                                 DenseMap<PieceId, Effect> &out) {
+static void computeEffectSummary(GroupDag &g, Node *n, DenseMap<PieceId, Effect> &out) {
   if (n->kind == Node::Access) {
-    for (const Touch &t : n->touches)
-      for (PieceId p : g.pieceTable.footprint[t.member]) {
-        auto it = out.find(p);
-        if (it == out.end())
-          out.try_emplace(p, t.effect);
-        else
-          it->second = joinEffect(it->second, t.effect);
-      }
+    forEachTouchedPiece(g, n, [&](PieceId p, Effect e) { mergeEffect(out, p, e); });
     return;
   }
   DenseMap<PieceId, Effect> sub;
   for (Node *childHead : n->children)
     for (Node *c = childHead; c; c = c->next)
       computeEffectSummary(g, c, sub);
-  if (n->kind == Node::For || n->kind == Node::If)
+  if (n->isRegion())
     for (const auto &[p, e] : sub)
       n->pieceInfo[p] = PieceInfo{std::nullopt, e};
-  for (const auto &[p, e] : sub) {
-    auto it = out.find(p);
-    if (it == out.end())
-      out.try_emplace(p, e);
-    else
-      it->second = joinEffect(it->second, e);
-  }
+  for (const auto &[p, e] : sub)
+    mergeEffect(out, p, e);
 }
 
-// Stage-1 entry point for one group.
 LogicalResult buildAccessDag(GroupDag &g, triton::FuncOp funcOp) {
   buildPieces(g.pieceTable);
   Node *func = g.newNode(Node::Func, funcOp, nullptr);
@@ -545,74 +411,6 @@ LogicalResult buildAccessDag(GroupDag &g, triton::FuncOp funcOp) {
   return success();
 }
 
-// ---------------------------------------------------------------------------
-// ACCESS-DAG dump (format: spec section 3 dump + section 5.5 conventions;
-// FOR/IF rows annotated with per-piece effects).
-// ---------------------------------------------------------------------------
-static void printEffects(llvm::raw_ostream &os, const Node *n) {
-  if (n->pieceInfo.empty())
-    return;
-  os << " effects{";
-  bool first = true;
-  for (const auto &[p, info] : sortedPieceInfo(n)) {
-    if (!first)
-      os << ",";
-    first = false;
-    os << "P" << p << ":" << (info.effect == Effect::W ? "W" : "R");
-  }
-  os << "}";
-}
-
-static void dumpAccessChain(GroupDag &g, const Node *head, unsigned depth) {
-  auto &os = llvm::errs();
-  for (const Node *n = head; n; n = n->next) {
-    // The ACCESS view filters later-stage rows (the tree is extended in
-    // place; each stage's dump shows only the kinds it owns).
-    if (n->kind == Node::Enter || n->kind == Node::Exit ||
-        n->kind == Node::Acquire || n->kind == Node::Release)
-      continue;
-    if (n->kind == Node::For) {
-      os << treePrefix(depth) << "|- scf.for";
-      if (gpu::hasWarpSpecializeTag(n->op))
-        os << " (WS, tag=" << *gpu::getWarpSpecializeTag(n->op) << ")";
-      printEffects(os, n);
-      os << "\n";
-      dumpAccessChain(g, n->children[0], depth + 1);
-      continue;
-    }
-    if (n->kind == Node::If) {
-      // Faithful rendering (spec section 3): `then` always renders (an
-      // scf.if always has a then region), even when empty; `else` renders
-      // iff the IR op has an else region — the VIRTUAL else enters the DAG
-      // only at stage 2 and belongs to the OWNER view. Empty branches are
-      // bare labels: absence means absent from the DAG, nothing else.
-      os << treePrefix(depth) << "|- scf.if";
-      printEffects(os, n);
-      os << "\n";
-      os << treePrefix(depth + 1) << "|- then\n";
-      if (n->children[0])
-        dumpAccessChain(g, n->children[0], depth + 2);
-      if (cast<scf::IfOp>(n->op).elseBlock()) {
-        os << treePrefix(depth + 1) << "|- else\n";
-        if (n->children.size() > 1 && n->children[1])
-          dumpAccessChain(g, n->children[1], depth + 2);
-      }
-      continue;
-    }
-    assert(n->kind == Node::Access);
-    for (const Touch &t : n->touches) {
-      os << treePrefix(depth) << "|- "
-         << (t.effect == Effect::W ? "W" : "R") << "  m" << t.member << "  "
-         << n->op->getName().getStringRef() << " "
-         << ownerStr(n->op, n->owner);
-      if (n->completionAnchor && n->completionAnchor != n->op)
-        os << " complete="
-           << n->completionAnchor->getName().getStringRef();
-      os << "\n";
-    }
-  }
-}
-
 void dumpGroupAccessDag(GroupDag &g, triton::FuncOp funcOp) {
   auto &os = llvm::errs();
   os << "GROUP ";
@@ -620,32 +418,24 @@ void dumpGroupAccessDag(GroupDag &g, triton::FuncOp funcOp) {
     os << "buffer.id=none#" << -g.bufferId;
   else
     os << "buffer.id=" << g.bufferId;
-  os << " memory=" << (g.isTmem() ? "tmem" : "local")
-     << " members=" << g.pieceTable.members.size() << "\n";
+  os << " memory=" << (g.isTmem() ? "tmem" : "local") << " members=" << g.pieceTable.members.size() << "\n";
   os << "  members:";
   for (auto [idx, m] : llvm::enumerate(g.pieceTable.members))
-    os << " m" << idx << "[" << m.offset << "," << (m.offset + m.extent)
-       << ")";
+    os << " m" << idx << "[" << m.offset << "," << (m.offset + m.extent) << ")";
   os << "\n  pieces:";
   for (auto [idx, p] : llvm::enumerate(g.pieceTable.pieces)) {
     os << " P" << idx << "=[" << p.lo << "," << p.hi << "){";
-    for (auto [k, m] : llvm::enumerate(p.cover))
-      os << (k ? "," : "") << "m" << m;
+    llvm::interleaveComma(p.cover, os, [&](MemberId m) { os << "m" << m; });
     os << "}c" << g.pieceTable.pieceComp[idx];
   }
   os << "\n  footprints:";
   for (auto [idx, fp] : llvm::enumerate(g.pieceTable.footprint)) {
     os << " m" << idx << "={";
-    for (auto [k, p] : llvm::enumerate(fp))
-      os << (k ? "," : "") << "P" << p;
+    llvm::interleaveComma(fp, os, [&](PieceId p) { os << "P" << p; });
     os << "}";
   }
   os << "\nACCESS-DAG\n";
   os << "|- func @" << funcOp.getName() << "\n";
-  if (!g.root->children.empty())
-    dumpAccessChain(g, g.root->children[0], 1);
+  dumpDagTree(g, DumpStage::Access);
 }
-
-} // namespace nvws_semas
-} // namespace triton
-} // namespace mlir
+} // namespace mlir::triton::nvws_semas
