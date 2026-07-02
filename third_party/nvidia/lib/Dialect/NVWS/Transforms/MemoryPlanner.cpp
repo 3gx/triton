@@ -2015,7 +2015,13 @@ public:
           LDBG("TMEM pre-assign: reuser buffer.id="
                << bid << " colOffset=" << nextColOffset
                << " size=" << reuserBuf->rowSize << "x" << reuserBuf->colSize);
-          nextColOffset += reuserBuf->colSize;
+          // Do not advance the column offset (matches the Meta baseline,
+          // WSMemoryPlanner.cpp). Advancing it lets stacked reusers exceed
+          // the owner's width, which splits the buffer.id group into
+          // multiple components; InsertSemas requires one component per
+          // group. Reusers here are temporally exclusive, so sharing the
+          // owner's columns is safe.
+          nextColOffset += 0; // reuserBuf->colSize;
         }
       }
 

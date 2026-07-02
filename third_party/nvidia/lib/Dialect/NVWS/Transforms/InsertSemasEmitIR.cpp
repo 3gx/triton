@@ -9,15 +9,14 @@ struct EmitCtx {
   Type tokenType;
   struct Slot {
     GroupDag *g;
-    CompId comp;
     unsigned index; // absolute result / iter_arg index in the NEW op
   };
   llvm::MapVector<Operation *, SmallVector<Slot, 2>> slots;
 };
 
 struct RenderState {
-  DenseMap<CompId, Value> carrier;          // current carrier token per comp
-  DenseMap<CompId, Value> carrierSema;      // the create of that carrier's
+  Value carrier;                            // current carrier token (per group)
+  Value carrierSema;                        // the create of that carrier's semaphore
   DenseMap<MemberId, Value> view;           // member view cache
   void clearViews() { view.clear(); }
   RenderState nested() const {
@@ -331,7 +330,6 @@ static bool eraseDeadTokenSlots(EmitCtx &ctx, MutableArrayRef<GroupDag> groups) 
 static void rewriteSignatures(EmitCtx &ctx, MutableArrayRef<GroupDag> groups) {
   struct Want {
     GroupDag *g;
-    CompId comp;
     Owner owner;
   };
   llvm::MapVector<Operation *, SmallVector<Want, 2>> wanted;
@@ -341,7 +339,7 @@ static void rewriteSignatures(EmitCtx &ctx, MutableArrayRef<GroupDag> groups) {
         for (const Crossing &c : n->crossings) {
           if (n->kind == Node::For && !c.hold.materializesCarrier())
             continue;
-          wanted[n->op].push_back(Want{&g, c.comp, c.slotOwner});
+          wanted[n->op].push_back(Want{&g, c.slotOwner});
         }
     });
   }
@@ -417,12 +415,12 @@ static void rewriteSignatures(EmitCtx &ctx, MutableArrayRef<GroupDag> groups) {
     fixupAnchors(groups, op, newOp);
     auto &rec = ctx.slots[newOp];
     for (auto [i, w] : llvm::enumerate(list))
-      rec.push_back(EmitCtx::Slot{w.g, w.comp, base + static_cast<unsigned>(i)});
+      rec.push_back(EmitCtx::Slot{w.g, base + static_cast<unsigned>(i)});
   }
 }
-static unsigned slotIndexFor(EmitCtx &ctx, Operation *op, GroupDag *g, CompId comp) {
+static unsigned slotIndexFor(EmitCtx &ctx, Operation *op, GroupDag *g) {
   for (const EmitCtx::Slot &s : ctx.slots[op])
-    if (s.g == g && s.comp == comp)
+    if (s.g == g)
       return s.index;
   llvm_unreachable("missing slot");
 }
@@ -442,18 +440,16 @@ static Value getView(GroupDag &g, RenderState &rs, Node *node, const Touch &t, O
       else
         types.push_back(localViewType(g, static_cast<MemberId>(mi), {&t}, bt));
     }
-    CompId comp = compOfMember(g, t.member);
-    Value tok = rs.carrier.lookup(comp);
+    Value tok = rs.carrier;
     assert(tok && "no carrier for view");
-    Value semaVal = rs.carrierSema.lookup(comp);
+    Value semaVal = rs.carrierSema;
     assert(semaVal && "no semaphore for carrier");
     auto buf = emitInto<nvws::SemaphoreBufferOp>(
         b, accessOp->getLoc(), owner, gpu::getStageCluster(accessOp), semaVal, TypeRange(types), tok);
     if (node->bufferStageOffset)
       buf.setStage(materializeI32Before(buf, *node->bufferStageOffset));
     for (auto [mi, v] : llvm::enumerate(buf.getBuffers()))
-      if (compOfMember(g, static_cast<MemberId>(mi)) == comp)
-        rs.view[static_cast<MemberId>(mi)] = v;
+      rs.view[static_cast<MemberId>(mi)] = v;
     base = rs.view[t.member];
   }
   Value cur = base;
@@ -532,10 +528,10 @@ static void renderRegion(EmitCtx &ctx, GroupDag &g, Node *n, RenderState &rs,
   for (const Crossing &c : n->crossings) {
     if (n->kind == Node::For && !c.hold.materializesCarrier())
       continue; // native point-of-use: no slot (plan M2)
-    unsigned idx = slotIndexFor(ctx, n->op, &g, c.comp);
-    Value incoming = rs.carrier.lookup(c.comp);
+    unsigned idx = slotIndexFor(ctx, n->op, &g);
+    Value incoming = rs.carrier;
     if (!incoming)
-      incoming = ctx.poison; // component starts inside this region
+      incoming = ctx.poison; // group starts inside this region
     if (auto forOp = dyn_cast<scf::ForOp>(n->op))
       forOp.getInitsMutable()[idx].assign(incoming);
   }
@@ -551,22 +547,22 @@ static void renderRegion(EmitCtx &ctx, GroupDag &g, Node *n, RenderState &rs,
     RenderState body = rs.nested();
     for (const Crossing &c : n->crossings) {
       if (!c.hold.materializesCarrier()) {
-        body.carrier.erase(c.comp);
+        body.carrier = Value();
         continue;
       }
-      unsigned idx = slotIndexFor(ctx, n->op, &g, c.comp);
-      body.carrier[c.comp] = forOp.getRegionIterArg(idx);
+      unsigned idx = slotIndexFor(ctx, n->op, &g);
+      body.carrier = forOp.getRegionIterArg(idx);
     }
     renderChain(ctx, g, n->children[0], body, emitted);
     auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
     for (const Crossing &c : n->crossings) {
       if (!c.hold.materializesCarrier()) {
-        rs.carrier.erase(c.comp); // token died in the body; nothing flows out
+        rs.carrier = Value(); // token died in the body; nothing flows out
         continue;
       }
-      unsigned idx = slotIndexFor(ctx, n->op, &g, c.comp);
-      yield->setOperand(idx, body.carrier.lookup(c.comp));
-      rs.carrier[c.comp] = forOp.getResult(idx);
+      unsigned idx = slotIndexFor(ctx, n->op, &g);
+      yield->setOperand(idx, body.carrier);
+      rs.carrier = forOp.getResult(idx);
     }
     rs.clearViews();
     return;
@@ -577,17 +573,17 @@ static void renderRegion(EmitCtx &ctx, GroupDag &g, Node *n, RenderState &rs,
   if (n->children.size() > 1 && n->children[1])
     renderChain(ctx, g, n->children[1], elseSt, emitted);
   for (const Crossing &c : n->crossings) {
-    unsigned idx = slotIndexFor(ctx, n->op, &g, c.comp);
-    Value incoming = rs.carrier.lookup(c.comp);
+    unsigned idx = slotIndexFor(ctx, n->op, &g);
+    Value incoming = rs.carrier;
     if (!incoming)
       incoming = ctx.poison;
-    Value thenV = c.finals[0] ? thenSt.carrier.lookup(c.comp) : incoming;
-    Value elseV = (c.finals.size() > 1 && c.finals[1]) ? elseSt.carrier.lookup(c.comp) : incoming;
+    Value thenV = c.finals[0] ? thenSt.carrier : incoming;
+    Value elseV = (c.finals.size() > 1 && c.finals[1]) ? elseSt.carrier : incoming;
     auto thenYield = cast<scf::YieldOp>(ifOp.thenBlock()->getTerminator());
     thenYield->setOperand(idx, thenV);
     auto elseYield = cast<scf::YieldOp>(ifOp.elseBlock()->getTerminator());
     elseYield->setOperand(idx, elseV);
-    rs.carrier[c.comp] = ifOp.getResult(idx);
+    rs.carrier = ifOp.getResult(idx);
   }
   rs.clearViews();
 }
@@ -601,10 +597,9 @@ static void renderChain(EmitCtx &ctx, GroupDag &g, Node *head, RenderState &rs,
     case Node::Exit:
       break; // markers; yield wiring is the parent's job
     case Node::Acquire: {
-      CompId comp = getSema(g, n).component;
       if (Value v = emitted.lookup(n)) { // pre-rendered entry instance
-        rs.carrier[comp] = v;
-        rs.carrierSema[comp] = getSema(g, n).create;
+        rs.carrier = v;
+        rs.carrierSema = getSema(g, n).create;
         rs.clearViews();
         break;
       }
@@ -626,15 +621,14 @@ static void renderChain(EmitCtx &ctx, GroupDag &g, Node *head, RenderState &rs,
       if (n->stageOffset)
         acq.setStage(materializeI32Before(acq, *n->stageOffset));
       emitted[n] = acq.getToken();
-      rs.carrier[comp] = acq.getToken();
-      rs.carrierSema[comp] = getSema(g, n).create;
+      rs.carrier = acq.getToken();
+      rs.carrierSema = getSema(g, n).create;
       rs.clearViews();
       lastReal = acq;
       break;
     }
     case Node::Release: {
-      CompId comp = getSema(g, n).component;
-      Value tok = rs.carrier.lookup(comp);
+      Value tok = rs.carrier;
       assert(tok && "release without carrier");
       OpBuilder b(ctx.func);
       if (lastReal)
@@ -1277,9 +1271,8 @@ LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups) {
     RenderState rs;
     for (Node *n = g.root->children[0]; n; n = n->next)
       if (n->kind == Node::Acquire && emitted.count(n)) {
-        CompId comp = getSema(g, n).component;
-        rs.carrier[comp] = emitted.lookup(n);
-        rs.carrierSema[comp] = getSema(g, n).create;
+        rs.carrier = emitted.lookup(n);
+        rs.carrierSema = getSema(g, n).create;
       }
     renderChain(ctx, g, g.root->children[0], rs, emitted);
   }

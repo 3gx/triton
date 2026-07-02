@@ -123,11 +123,10 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SmallVector<EdgeRec> &edges, 
     Node *lastRow = nullptr;
     SmallVector<AsyncOp, 1> pay;
   };
-  std::map<CompId, WaveSt> wave;
-  auto compOf = [&](PieceId p) { return g.pieceTable.pieceComp[p]; };
+  WaveSt wave;
   if (head->kind == Node::Enter)
     for (auto &[p, pi] : sortedPieceInfo(head)) {
-      WaveSt &w = wave[compOf(p)];
+      WaveSt &w = wave;
       if (!w.lastRow) {
         w.owner = pi.owner;
         w.valid = true;
@@ -146,7 +145,7 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SmallVector<EdgeRec> &edges, 
       for (auto &[p, e] : eff) {
         SmallVector<AsyncOp, 1> pay;
         pay.push_back(asyncPayloadOf(n->op));
-        WaveSt &w = wave[compOf(p)];
+        WaveSt &w = wave;
         bool force = w.valid && n->owner.has_value() && w.owner.has_value() && !sameOwner(w.owner, n->owner);
         applyTouch(st, p, n->owner, e, n, pay, edges, /*wsAdopt=*/false, force, w.lastRow, w.owner, w.pay);
         if (n->owner.has_value()) {
@@ -211,21 +210,24 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SmallVector<EdgeRec> &edges, 
         }
       }
       {
-        std::map<CompId, std::pair<Owner, bool>> ro; // owner, uniform
+        Owner roOwner;
+        bool roFresh = true, roUniform = true;
         for (auto &[p, pi] : infos) {
-          auto [it, fresh] = ro.try_emplace(compOf(p), std::make_pair(pi.owner, true));
-          if (!fresh && !sameOwner(it->second.first, pi.owner))
-            it->second.second = false;
+          if (roFresh) {
+            roOwner = pi.owner;
+            roFresh = false;
+          } else if (!sameOwner(roOwner, pi.owner)) {
+            roUniform = false;
+          }
         }
-        for (auto &[c, ou] : ro) {
-          WaveSt &w = wave[c];
-          if (ou.second && ou.first.has_value()) {
-            w.owner = ou.first;
-            w.valid = true;
-            w.lastRow = n;
-            w.pay.assign(1, AsyncOp::NONE);
+        if (!roFresh) {
+          if (roUniform && roOwner.has_value()) {
+            wave.owner = roOwner;
+            wave.valid = true;
+            wave.lastRow = n;
+            wave.pay.assign(1, AsyncOp::NONE);
           } else {
-            w.valid = false;
+            wave.valid = false;
           }
         }
       }
@@ -338,14 +340,11 @@ static LogicalResult sweepChain(GroupDag &g, Node *head, ChainIndex &ci,
     });
   std::map<int64_t, SyncVec> behind;
   DenseMap<Node *, SyncVec> snapAtRow; // source snapshots
-  std::map<CompId, int64_t> waveOf;
+  std::optional<int64_t> waveOf;
   if (head->kind == Node::Enter)
     for (auto &[pc, pi] : sortedPieceInfo(head))
       if (pi.owner)
-        waveOf[g.pieceTable.pieceComp[pc]] = ownerKey(pi.owner);
-  auto compOfEdge = [&](const EdgeRec &e) {
-    return g.pieceTable.pieceComp[e.pieces.front()];
-  };
+        waveOf = ownerKey(pi.owner);
   auto ownerOfRow = [&](Node *n) -> Owner {
     return n->kind == Node::Exit ? Owner() : n->owner;
   };
@@ -359,14 +358,14 @@ static LogicalResult sweepChain(GroupDag &g, Node *head, ChainIndex &ci,
         int64_t sk = ownerKey(e.srcOwner), dk = ownerKey(e.dstOwner);
         unsigned srcIdx = ci.idx.lookup(e.src);
         bool implied = covers(behind[dk], sk, srcIdx);
-        bool waveOpen = waveOf.count(compOfEdge(e)) && waveOf[compOfEdge(e)] == dk;
+        bool waveOpen = waveOf.has_value() && *waveOf == dk;
         if (reduce && !drop[ei] && implied && waveOpen && e.dst->kind == Node::Access) {
           drop[ei] = true;
           continue;
         }
         if (drop[ei])
           continue;
-        waveOf[compOfEdge(e)] = dk; // kept acquire opens Q's wave
+        waveOf = dk; // kept acquire opens Q's wave
         SyncVec &dv = behind[dk];
         auto snap = snapAtRow.find(e.src);
         if (snap != snapAtRow.end())
@@ -582,24 +581,21 @@ static SmallVector<EdgeRec> mergeEdges(ArrayRef<EdgeRec> edges, KeyFn key, bool 
 static LogicalResult buildEdgesAndSemas(GroupDag &g, SmallVector<EdgeRec> &edges) {
   if (failed(reduceEdges(g, edges)))
     return failure();
-  auto edgeComp = [&](const EdgeRec &e) -> CompId {
-    return g.pieceTable.pieceComp[e.pieces.front()];
-  };
   auto deduped = mergeEdges(edges, [&](const EdgeRec &edge) {
-    return std::make_tuple(edge.src, edge.dst, ownerKey(edge.srcOwner), edgeComp(edge));
+    return std::make_tuple(edge.src, edge.dst, ownerKey(edge.srcOwner));
   }, false);
   auto collapsed = mergeEdges(deduped, [&](const EdgeRec &edge) {
-    return std::make_tuple(edge.dst, ownerKey(edge.srcOwner), edgeComp(edge));
+    return std::make_tuple(edge.dst, ownerKey(edge.srcOwner));
   }, true);
   struct DstGroup {
     Node *dst;
     SmallVector<unsigned, 2> idxs;
     int sema = -1;
   };
-  llvm::MapVector<std::tuple<Node *, int64_t, CompId>, unsigned> dstIndex;
+  llvm::MapVector<std::tuple<Node *, int64_t>, unsigned> dstIndex;
   SmallVector<DstGroup> groups;
   for (auto [i, e] : llvm::enumerate(collapsed)) {
-    auto key = std::make_tuple(e.dst, ownerKey(e.dstOwner), edgeComp(e));
+    auto key = std::make_tuple(e.dst, ownerKey(e.dstOwner));
     auto it = dstIndex.find(key);
     if (it == dstIndex.end()) {
       dstIndex.try_emplace(key, groups.size());
@@ -608,21 +604,16 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SmallVector<EdgeRec> &edges
       groups[it->second].idxs.push_back(i);
     }
   }
-  auto groupComp = [&](const DstGroup &grp) {
-    return g.pieceTable.pieceComp[collapsed[grp.idxs.front()].pieces.front()];
-  };
   auto groupAcquirer = [&](const DstGroup &grp) {
     return collapsed[grp.idxs.front()].dstOwner;
   };
-  auto findRegainGroup = [&](Node *forRow, const Owner &acq, CompId comp) -> int {
+  auto findRegainGroup = [&](Node *forRow, const Owner &acq) -> int {
     int best = -1;
     for (Node *m = forRow->children[0]; m; m = m->next) {
-      auto it = dstIndex.find(std::make_tuple(m, ownerKey(acq), comp));
+      auto it = dstIndex.find(std::make_tuple(m, ownerKey(acq)));
       if (it == dstIndex.end())
         continue;
-      DstGroup &cand = groups[it->second];
-      if (groupComp(cand) == comp)
-        best = static_cast<int>(it->second);
+      best = static_cast<int>(it->second);
     }
     return best;
   };
@@ -636,11 +627,6 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SmallVector<EdgeRec> &edges
         if (!llvm::is_contained(s.pieces, p))
           s.pieces.push_back(p);
     llvm::sort(s.pieces);
-    s.component = g.pieceTable.pieceComp[s.pieces.front()];
-    for (PieceId p : s.pieces)
-      if (g.pieceTable.pieceComp[p] != s.component)
-        return semaError(grp.dst->op ? grp.dst->op : g.root->op)
-               << "one destination joins pieces of different components";
     grp.sema = static_cast<int>(sid);
     g.semas.push_back(std::move(s));
     return success();
@@ -654,7 +640,7 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SmallVector<EdgeRec> &edges
           return semaError(grp.dst->op ? grp.dst->op : g.root->op)
                  << "fan-in sources share a partition — not expressible as one semaphore";
     if (grp.dst->kind == Node::For) {
-      int t = findRegainGroup(grp.dst, groupAcquirer(grp), groupComp(grp));
+      int t = findRegainGroup(grp.dst, groupAcquirer(grp));
       if (t >= 0) {
         if (groups[t].sema == -1)
           if (failed(createSema(groups[t])))
@@ -722,27 +708,25 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SmallVector<EdgeRec> &edges
   }
   return success();
 }
-static bool nodeInvolvesComp(GroupDag &g, Node *n, CompId comp) {
+static bool nodeInvolvesComp(GroupDag &g, Node *n) {
   if (n->kind == Node::Access)
-    return touchesComponent(g, n, comp);
+    return nodeTouchesGroup(g, n);
   if (n->isRegion())
-    for (auto &[p, pi] : n->pieceInfo)
-      if (g.pieceTable.pieceComp[p] == comp)
-        return true;
+    return !n->pieceInfo.empty();
   return false;
 }
-static Node *lastAcquireOfCompInChain(GroupDag &g, Node *head, CompId comp) {
+static Node *lastAcquireOfCompInChain(GroupDag &g, Node *head) {
   Node *found = nullptr;
   forEachNode(head, [&](Node *n) {
-    if (n->kind == Node::Acquire && getSema(g, n).component == comp)
+    if (n->kind == Node::Acquire)
       found = n;
   });
   return found;
 }
-static Owner firstAccessOwnerOfComp(GroupDag &g, Node *head, CompId comp, bool &found) {
+static Owner firstAccessOwnerOfComp(GroupDag &g, Node *head, bool &found) {
   Owner owner;
   forEachNode(head, [&](Node *n) {
-    if (!found && n->kind == Node::Access && touchesComponent(g, n, comp)) {
+    if (!found && n->kind == Node::Access && nodeTouchesGroup(g, n)) {
       found = true;
       owner = n->owner;
     }
@@ -751,23 +735,18 @@ static Owner firstAccessOwnerOfComp(GroupDag &g, Node *head, CompId comp, bool &
 }
 
 static LogicalResult insertEntryAcquires(GroupDag &g) {
-  unsigned numComps = numComponents(g);
   Node *top = g.root->children.empty() ? nullptr : g.root->children[0];
   if (!top)
     return success();
-  for (CompId comp = 0; comp < numComps; ++comp) {
-    bool hasSync = false;
-    for (const Sema &s : g.semas)
-      if (s.component == comp)
-        hasSync = true;
-    if (!hasSync)
-      continue;
+  {
+    if (g.semas.empty())
+      return success();
     Node *chainHead = top;
     SmallVector<Node *, 4> rows;
     auto collectRows = [&](Node *head) {
       rows.clear();
       for (Node *n = head; n; n = n->next)
-        if (nodeInvolvesComp(g, n, comp))
+        if (nodeInvolvesComp(g, n))
           rows.push_back(n);
     };
     collectRows(chainHead);
@@ -777,7 +756,7 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
       for (Node *child : rows[0]->children) {
         bool involves = false;
         for (Node *n = child; n; n = n->next)
-          if (nodeInvolvesComp(g, n, comp))
+          if (nodeInvolvesComp(g, n))
             involves = true;
         if (involves) {
           onlyChild = child;
@@ -790,15 +769,15 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
       collectRows(chainHead);
     }
     if (rows.empty())
-      return semaError(g.root->op) << "component with sync but no placement rows";
+      return semaError(g.root->op) << "group with sync but no placement rows";
     bool fhFound = false;
-    Owner firstHolder = firstAccessOwnerOfComp(g, top, comp, fhFound);
+    Owner firstHolder = firstAccessOwnerOfComp(g, top, fhFound);
     if (!fhFound)
-      return semaError(g.root->op) << "component has no access rows";
+      return semaError(g.root->op) << "group has no access rows";
     Node *regain = nullptr;
     for (Node *row : llvm::reverse(rows))
       if (row->kind == Node::For) {
-        regain = lastAcquireOfCompInChain(g, row->children[0], comp);
+        regain = lastAcquireOfCompInChain(g, row->children[0]);
         if (regain)
           break;
       }
@@ -813,10 +792,8 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
       SemaId sid = g.semas.size();
       Sema s;
       s.name = "E" + std::to_string(sid);
-      s.component = comp;
-      for (auto [p, c] : llvm::enumerate(g.pieceTable.pieceComp))
-        if (c == comp)
-          s.pieces.push_back(p);
+      for (auto [p, piece] : llvm::enumerate(g.pieceTable.pieces))
+        s.pieces.push_back(static_cast<PieceId>(p));
       s.count = 1;
       s.isEntry = true;
       s.expectedReleases = 1; // the terminal release
@@ -837,67 +814,55 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
   }
   return success();
 }
-static Node *chainFinalForComp(GroupDag &g, Node *head, CompId comp) {
+static Node *chainFinalForComp(GroupDag &g, Node *head) {
   Node *final = nullptr;
   for (Node *n = head; n; n = n->next) {
-    if (n->kind == Node::Acquire && getSema(g, n).component == comp)
+    if (n->kind == Node::Acquire)
       final = n;
-    if (n->isRegion())
-      for (const Crossing &c : n->crossings)
-        if (c.comp == comp)
-          final = n;
+    if (n->isRegion() && !n->crossings.empty())
+      final = n;
   }
   return final;
 }
-static Owner finalOwner(GroupDag &g, Node *final, CompId comp) {
+static Owner finalOwner(GroupDag &g, Node *final) {
   if (final->kind == Node::Acquire)
     return final->owner;
-  for (const Crossing &c : final->crossings)
-    if (c.comp == comp)
-      return c.slotOwner;
+  if (!final->crossings.empty())
+    return final->crossings.front().slotOwner;
   return std::nullopt;
 }
 
-static void computeCrossings(GroupDag &g, Node *head, unsigned numComps) {
+static void computeCrossings(GroupDag &g, Node *head) {
   forEachRegionPostOrder(head, [&](Node *n) {
-    for (CompId comp = 0; comp < numComps; ++comp) {
-      Crossing cr;
-      cr.comp = comp;
-      bool any = false;
-      for (Node *child : n->children) {
-        Node *f = chainFinalForComp(g, child, comp);
-        cr.finals.push_back(f);
-        if (f) {
-          any = true;
-          cr.slotOwner = finalOwner(g, f, comp);
-        }
+    Crossing cr;
+    bool any = false;
+    for (Node *child : n->children) {
+      Node *f = chainFinalForComp(g, child);
+      cr.finals.push_back(f);
+      if (f) {
+        any = true;
+        cr.slotOwner = finalOwner(g, f);
       }
-      if (any)
-        n->crossings.push_back(std::move(cr));
     }
+    if (any)
+      n->crossings.push_back(std::move(cr));
   });
 }
-static bool carrierConsumedAfter(GroupDag &g, Node *start, CompId comp) {
+static bool carrierConsumedAfter(GroupDag &g, Node *start) {
   for (Node *n = start; n; n = n->next) {
     switch (n->kind) {
     case Node::Acquire:
-      if (getSema(g, n).component == comp)
-        return false; // fresh carrier supersedes the escaped one
-      break;
+      return false; // fresh carrier supersedes the escaped one
     case Node::Release:
-      if (getSema(g, n).component == comp)
-        return true;
-      break;
+      return true;
     case Node::Access:
-      for (const Touch &t : n->touches)
-        if (compOfMember(g, t.member) == comp)
-          return true;
+      if (nodeTouchesGroup(g, n))
+        return true;
       break;
     case Node::For:
     case Node::If:
-      for (const Crossing &c : n->crossings)
-        if (c.comp == comp)
-          return true;
+      if (!n->crossings.empty())
+        return true;
       break;
     default:
       break;
@@ -905,13 +870,10 @@ static bool carrierConsumedAfter(GroupDag &g, Node *start, CompId comp) {
   }
   return false;
 }
-static bool regionLiveFor(const Node *region, CompId comp) {
+static bool regionLiveFor(const Node *region) {
   if (!region)
     return false; // function chain
-  for (const Crossing &c : region->crossings)
-    if (c.comp == comp)
-      return true;
-  return false;
+  return !region->crossings.empty();
 }
 
 static void pruneDeadIfCrossings(GroupDag &g, Node *head, Node *region) {
@@ -921,7 +883,7 @@ static void pruneDeadIfCrossings(GroupDag &g, Node *head, Node *region) {
   for (Node *n : llvm::reverse(rows))
     if (n->kind == Node::If)
       llvm::erase_if(n->crossings, [&](const Crossing &c) {
-        return !carrierConsumedAfter(g, n->next, c.comp) && !regionLiveFor(region, c.comp);
+        return !carrierConsumedAfter(g, n->next) && !regionLiveFor(region);
       });
   for (Node *n : rows)
     if (n->isRegion())
@@ -936,15 +898,12 @@ static void collectParts(Node *head, SmallVector<int, 4> &parts) {
         parts.push_back(n->owner->first);
   });
 }
-static bool crossesComp(const Node *n, CompId comp) {
-  return llvm::any_of(n->crossings, [&](const Crossing &x) { return x.comp == comp; });
+static bool crossesComp(const Node *n) {
+  return !n->crossings.empty();
 }
 static scf::ForOp outerWSLoop(scf::ForOp loop);
-static const Crossing *findCrossing(const Node *n, CompId comp) {
-  for (const Crossing &c : n->crossings)
-    if (c.comp == comp)
-      return &c;
-  return nullptr;
+static const Crossing *findCrossing(const Node *n) {
+  return n->crossings.empty() ? nullptr : &n->crossings.front();
 }
 static bool allEnclosersCanDrop(const Node *F) {
   if (F->op && gpu::hasWarpSpecializeTag(F->op))
@@ -961,23 +920,23 @@ static bool allEnclosersCanDrop(const Node *F) {
   }
   return true;
 }
-static bool regionResultConsumedAfter(GroupDag &g, Node *region, CompId comp) {
+static bool regionResultConsumedAfter(GroupDag &g, Node *region) {
   for (Node *m = region->next; m; m = m->next) {
-    if (m->kind == Node::Acquire && getSema(g, m).component == comp)
+    if (m->kind == Node::Acquire)
       return false;
-    if (m->kind == Node::Release && getSema(g, m).component == comp)
+    if (m->kind == Node::Release)
       return true;
-    if (m->kind == Node::Access && nodeInvolvesComp(g, m, comp))
+    if (m->kind == Node::Access && nodeInvolvesComp(g, m))
       return true;
-    if (m->isRegion() && crossesComp(m, comp))
+    if (m->isRegion() && crossesComp(m))
       return true;
   }
   Node *p = region->parent;
   if (!p || !p->isRegion())
     return false;
   for (const Crossing &x : p->crossings)
-    if (x.comp == comp && llvm::any_of(x.finals, [&](Node *f) { return f == region; }))
-      return regionResultConsumedAfter(g, p, comp);
+    if (llvm::any_of(x.finals, [&](Node *f) { return f == region; }))
+      return regionResultConsumedAfter(g, p);
   return false;
 }
 static bool prefixRowIsSingleBufferView(Node *F, Node *bufRow) {
@@ -988,24 +947,24 @@ static bool prefixRowIsSingleBufferView(Node *F, Node *bufRow) {
   auto alloc = dyn_cast<nvidia_gpu::TMEMAllocOp>(bufRow->op);
   return !alloc || !alloc.getSrc();
 }
-static bool isAcquireForComp(GroupDag &g, const Node *n, CompId comp) {
-  return n->kind == Node::Acquire && getSema(g, n).component == comp;
+static bool isAcquireForComp(GroupDag &g, const Node *n) {
+  return n->kind == Node::Acquire;
 }
-static bool isReleaseForComp(GroupDag &g, const Node *n, CompId comp) {
-  return n->kind == Node::Release && getSema(g, n).component == comp;
+static bool isReleaseForComp(GroupDag &g, const Node *n) {
+  return n->kind == Node::Release;
 }
-static bool isAccessForComp(GroupDag &g, Node *n, CompId comp) {
-  return n->kind == Node::Access && nodeInvolvesComp(g, n, comp);
+static bool isAccessForComp(GroupDag &g, Node *n) {
+  return n->kind == Node::Access && nodeInvolvesComp(g, n);
 }
-static bool isRegionCrossingForComp(const Node *n, CompId comp) {
-  return n && n->isRegion() && crossesComp(n, comp);
+static bool isRegionCrossingForComp(const Node *n) {
+  return n && n->isRegion() && crossesComp(n);
 }
-static bool rowHasCompEvent(GroupDag &g, Node *n, CompId comp) {
-  return isAcquireForComp(g, n, comp) || isReleaseForComp(g, n, comp) || nodeInvolvesComp(g, n, comp);
+static bool rowHasCompEvent(GroupDag &g, Node *n) {
+  return isAcquireForComp(g, n) || isReleaseForComp(g, n) || nodeInvolvesComp(g, n);
 }
-static bool isCarrierEvent(GroupDag &g, Node *n, CompId comp) {
-  return isAcquireForComp(g, n, comp) || isReleaseForComp(g, n, comp) ||
-         isAccessForComp(g, n, comp) || isRegionCrossingForComp(n, comp);
+static bool isCarrierEvent(GroupDag &g, Node *n) {
+  return isAcquireForComp(g, n) || isReleaseForComp(g, n) ||
+         isAccessForComp(g, n) || isRegionCrossingForComp(n);
 }
 static bool precedesInChain(Node *src, Node *dst) {
   for (Node *n = src->next; n; n = n->next)
@@ -1013,11 +972,9 @@ static bool precedesInChain(Node *src, Node *dst) {
       return true;
   return false;
 }
-static bool regionEntryOwner(GroupDag &g, Node *region, CompId comp, Owner &owner) {
+static bool regionEntryOwner(GroupDag &g, Node *region, Owner &owner) {
   bool found = false;
   for (auto &[p, pi] : sortedPieceInfo(region)) {
-    if (g.pieceTable.pieceComp[p] != comp)
-      continue;
     if (!found) {
       owner = pi.owner;
       found = true;
@@ -1028,31 +985,31 @@ static bool regionEntryOwner(GroupDag &g, Node *region, CompId comp, Owner &owne
   }
   return found;
 }
-static bool chainHasCompEvent(GroupDag &g, Node *head, CompId comp) {
+static bool chainHasCompEvent(GroupDag &g, Node *head) {
   for (Node *n = head; n; n = n->next)
-    if (rowHasCompEvent(g, n, comp))
+    if (rowHasCompEvent(g, n))
       return true;
   return false;
 }
-static Owner returnedOwnerForFinal(GroupDag &g, Node *final, CompId comp, Owner incoming) {
+static Owner returnedOwnerForFinal(GroupDag &g, Node *final, Owner incoming) {
   if (!final)
     return incoming;
   if (final->kind == Node::Acquire)
     return final->owner;
   if (final->isRegion())
-    if (const Crossing *c = findCrossing(final, comp))
+    if (const Crossing *c = findCrossing(final))
       return c->slotOwner;
   return std::nullopt;
 }
 static std::optional<SemaId>
-returnedSemaForFinal(GroupDag &g, Node *final, CompId comp, SemaId incoming) {
+returnedSemaForFinal(GroupDag &g, Node *final, SemaId incoming) {
   if (!final)
     return incoming;
   if (final->kind == Node::Acquire)
     return final->sema;
   if (!final->isRegion())
     return std::nullopt;
-  const Crossing *c = findCrossing(final, comp);
+  const Crossing *c = findCrossing(final);
   if (!c)
     return std::nullopt;
   std::optional<SemaId> common;
@@ -1060,7 +1017,7 @@ returnedSemaForFinal(GroupDag &g, Node *final, CompId comp, SemaId incoming) {
     common = incoming; // zero-trip path.
   for (unsigned i = 0, e = final->children.size(); i < e; ++i) {
     Node *childFinal = i < c->finals.size() ? c->finals[i] : nullptr;
-    std::optional<SemaId> child = returnedSemaForFinal(g, childFinal, comp, incoming);
+    std::optional<SemaId> child = returnedSemaForFinal(g, childFinal, incoming);
     if (!child)
       return std::nullopt;
     if (!common)
@@ -1070,22 +1027,22 @@ returnedSemaForFinal(GroupDag &g, Node *final, CompId comp, SemaId incoming) {
   }
   return common;
 }
-static bool isHoldTransparentRegion(GroupDag &g, Node *region, CompId comp, Owner holdOwner) {
-  const Crossing *rc = findCrossing(region, comp);
+static bool isHoldTransparentRegion(GroupDag &g, Node *region, Owner holdOwner) {
+  const Crossing *rc = findCrossing(region);
   if (!rc)
     return false;
   Owner entryOwner;
-  if (!regionEntryOwner(g, region, comp, entryOwner) || !sameOwner(entryOwner, holdOwner))
+  if (!regionEntryOwner(g, region, entryOwner) || !sameOwner(entryOwner, holdOwner))
     return false;
   if (rc->finals.size() > region->children.size())
     return false;
   for (unsigned i = 0, e = region->children.size(); i < e; ++i) {
     Node *childFinal = i < rc->finals.size() ? rc->finals[i] : nullptr;
-    if (!childFinal && chainHasCompEvent(g, region->children[i], comp))
+    if (!childFinal && chainHasCompEvent(g, region->children[i]))
       return false;
-    if (childFinal && chainHasCompEvent(g, childFinal->next, comp))
+    if (childFinal && chainHasCompEvent(g, childFinal->next))
       return false;
-    Owner returned = returnedOwnerForFinal(g, childFinal, comp, entryOwner);
+    Owner returned = returnedOwnerForFinal(g, childFinal, entryOwner);
     if (!sameOwner(returned, holdOwner))
       return false;
   }
@@ -1123,24 +1080,24 @@ static Hold pointOfUseHold(Node *firstToucher, Node *entryAcquire, Node *closing
   h.regionTail = regionTail;
   return h;
 }
-static bool childOwnsCarrier(const Node *region, CompId comp) {
-  if (const Crossing *child = findCrossing(region, comp))
+static bool childOwnsCarrier(const Node *region) {
+  if (const Crossing *child = findCrossing(region))
     return !child->hold.materializesCarrier();
   return false;
 }
-static bool hasTrailingCompUse(GroupDag &g, Node *regain, CompId comp) {
+static bool hasTrailingCompUse(GroupDag &g, Node *regain) {
   for (Node *m = regain->next; m; m = m->next)
-    if (isAccessForComp(g, m, comp) || isRegionCrossingForComp(m, comp) || isReleaseForComp(g, m, comp))
+    if (isAccessForComp(g, m) || isRegionCrossingForComp(m) || isReleaseForComp(g, m))
       return true;
   return false;
 }
-static Node *findBridgeAcquireAfter(GroupDag &g, Node *F, SemaId feedSema, CompId comp, Owner owner,
+static Node *findBridgeAcquireAfter(GroupDag &g, Node *F, SemaId feedSema, Owner owner,
                                     Node *existingBridgeRelease) {
   for (Node *m = F->next; m; m = m->next) {
-    if (!isAcquireForComp(g, m, comp) || m->sema != feedSema || !sameOwner(m->owner, owner))
+    if (!isAcquireForComp(g, m) || m->sema != feedSema || !sameOwner(m->owner, owner))
       continue;
     for (Node *tail = m->next; tail; tail = tail->next)
-      if (isCarrierEvent(g, tail, comp) && tail != existingBridgeRelease)
+      if (isCarrierEvent(g, tail) && tail != existingBridgeRelease)
         return nullptr;
     return m;
   }
@@ -1151,16 +1108,16 @@ struct HoldFeed {
   Node *acquire = nullptr;
   const char *rejectReason = nullptr;
 };
-static HoldFeed findHoldFeedAcquire(GroupDag &g, Node *F, CompId comp) {
+static HoldFeed findHoldFeedAcquire(GroupDag &g, Node *F) {
   for (Node *cur = F;; cur = cur->parent) {
     for (Node *m = cur->prev; m; m = m->prev) {
-      if (isAcquireForComp(g, m, comp))
+      if (isAcquireForComp(g, m))
         return {m, nullptr};
-      if (isAccessForComp(g, m, comp))
+      if (isAccessForComp(g, m))
         return {nullptr, "entry-consumed"};
-      if (isRegionCrossingForComp(m, comp))
+      if (isRegionCrossingForComp(m))
         return {nullptr, "region-feed"};
-      if (isReleaseForComp(g, m, comp))
+      if (isReleaseForComp(g, m))
         return {nullptr, "release-feed"};
     }
     if (!cur->parent || !cur->parent->isRegion())
@@ -1176,34 +1133,34 @@ struct HoldPrefix {
   bool releaseBeforeFirstToucher = false;
   const char *rejectReason = nullptr;
 };
-static HoldPrefix analyzeHoldPrefix(GroupDag &g, Node *F, CompId comp,
+static HoldPrefix analyzeHoldPrefix(GroupDag &g, Node *F,
                                     Owner slotOwner, Node *regain, bool regionTail) {
   HoldPrefix p;
   for (Node *m = F->children[0]; m; m = m->next) {
     if (regionTail && m == regain)
       break;
-    if (isAcquireForComp(g, m, comp))
+    if (isAcquireForComp(g, m))
       break;
-    if (isRegionCrossingForComp(m, comp)) {
+    if (isRegionCrossingForComp(m)) {
       if (!p.firstToucher) {
         p.rejectReason = "region-crossing";
         return p;
       }
-      if (!isHoldTransparentRegion(g, m, comp, slotOwner)) {
+      if (!isHoldTransparentRegion(g, m, slotOwner)) {
         p.rejectReason = "region-not-transparent";
         return p;
       }
       p.rows.push_back(m);
       continue;
     }
-    if (isAccessForComp(g, m, comp)) {
+    if (isAccessForComp(g, m)) {
       if (!p.firstToucher) {
         p.firstToucher = m;
         p.releaseBeforeFirstToucher = p.releases != 0;
       }
       p.rows.push_back(m);
     }
-    if (isReleaseForComp(g, m, comp)) {
+    if (isReleaseForComp(g, m)) {
       p.releases += std::max(1u, m->count);
       if (!p.closingRelease)
         p.closingRelease = m;
@@ -1225,30 +1182,29 @@ static Hold buildUniformHold(GroupDag &g, Node *F, const Crossing &c) {
     return carrierHold("non-ws-scope");
   if (!allEnclosersCanDrop(F))
     return carrierHold("if-encloser");
-  CompId comp = c.comp;
   Node *regain = c.finals.empty() ? nullptr : c.finals[0];
   bool regionTail = false;
   if (!regain)
     return carrierHold("no-final");
   if (regain->finalPermissionAcquire)
     return carrierHold("final-permission", regain);
-  if (regain->kind == Node::For && childOwnsCarrier(regain, comp))
+  if (regain->kind == Node::For && childOwnsCarrier(regain))
     return childOwnsHold(regain);
   if (regain->isRegion()) {
-    if (!isHoldTransparentRegion(g, regain, comp, c.slotOwner))
+    if (!isHoldTransparentRegion(g, regain, c.slotOwner))
       return carrierHold("region-not-transparent", regain);
     regionTail = true;
   } else if (regain->kind != Node::Acquire) {
     return carrierHold("region-not-transparent", regain);
   }
-  if (hasTrailingCompUse(g, regain, comp))
+  if (hasTrailingCompUse(g, regain))
     return carrierHold("trailing-use", regain);
-  HoldFeed feed = findHoldFeedAcquire(g, F, comp);
+  HoldFeed feed = findHoldFeedAcquire(g, F);
   if (!feed.acquire)
     return carrierHold(feed.rejectReason, regain);
-  std::optional<SemaId> regainSema = regionTail ? returnedSemaForFinal(g, regain, comp, feed.acquire->sema)
+  std::optional<SemaId> regainSema = regionTail ? returnedSemaForFinal(g, regain, feed.acquire->sema)
                  : std::optional<SemaId>(regain->sema);
-  bool parentConsumesResult = regionResultConsumedAfter(g, F, comp);
+  bool parentConsumesResult = regionResultConsumedAfter(g, F);
   bool needsFinalAcquire = c.hold.finalAcquire || parentConsumesResult;
   if (!regainSema)
     return carrierHold("entry-sema-mismatch", regain);
@@ -1261,11 +1217,11 @@ static Hold buildUniformHold(GroupDag &g, Node *F, const Crossing &c) {
     Owner feedOwner = feed.acquire->owner ? feed.acquire->owner : feedSema.inheritStamp;
     if (!bridgeAcquire)
       bridgeAcquire = findBridgeAcquireAfter(
-          g, F, feed.acquire->sema, comp, c.slotOwner, c.hold.bridgeRelease);
+          g, F, feed.acquire->sema, c.slotOwner, c.hold.bridgeRelease);
     if (regionTail || !needsFinalAcquire || !sameOwner(feedOwner, c.slotOwner) || !bridgeAcquire)
       return carrierHold("entry-sema-mismatch", regain);
   }
-  HoldPrefix prefix = analyzeHoldPrefix(g, F, comp, c.slotOwner, regain, regionTail);
+  HoldPrefix prefix = analyzeHoldPrefix(g, F, c.slotOwner, regain, regionTail);
   if (prefix.rejectReason)
     return carrierHold(prefix.rejectReason, regain);
   if (!prefixRowIsSingleBufferView(F, prefix.firstToucher))
@@ -1346,10 +1302,10 @@ static void refreshCrossingFinals(GroupDag &g, Node *head) {
     for (Crossing &c : n->crossings) {
       c.finals.clear();
       for (Node *child : n->children) {
-        Node *final = chainFinalForComp(g, child, c.comp);
+        Node *final = chainFinalForComp(g, child);
         c.finals.push_back(final);
         if (final)
-          c.slotOwner = finalOwner(g, final, c.comp);
+          c.slotOwner = finalOwner(g, final);
       }
     }
   });
@@ -1491,15 +1447,13 @@ LogicalResult computeBackingPlan(GroupDag &g, bool useMetaPartitioner, int lower
 }
 
 static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
-  std::map<CompId, Owner> carrier; // tracked comps only
+  std::optional<Owner> carrier; // present == tracked; value is the held owner
   auto seedFromPieces = [&](Node *n) {
     for (auto &[p, pi] : sortedPieceInfo(n)) {
-      CompId c = g.pieceTable.pieceComp[p];
-      auto it = carrier.find(c);
-      if (it == carrier.end())
-        carrier.emplace(c, pi.owner);
-      else if (!sameOwner(it->second, pi.owner))
-        carrier.erase(it); // mixed: untracked
+      if (!carrier.has_value())
+        carrier = pi.owner;
+      else if (!sameOwner(*carrier, pi.owner))
+        carrier.reset(); // mixed: untracked
     }
   };
   if (head->kind == Node::Enter)
@@ -1508,28 +1462,23 @@ static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
     switch (n->kind) {
     case Node::Acquire: {
       const Sema &sm = getSema(g, n);
-      carrier[sm.component] = sm.isEntry && !n->owner ? sm.inheritStamp : n->owner;
+      carrier = sm.isEntry && !n->owner ? sm.inheritStamp : n->owner;
       break;
     }
     case Node::Release: {
-      const Sema &sm = getSema(g, n);
-      auto it = carrier.find(sm.component);
-      if (n->owner && it != carrier.end() && it->second && !sameOwner(it->second, n->owner))
+      if (n->owner && carrier.has_value() && *carrier && !sameOwner(*carrier, n->owner))
         return semaError(n->sat && n->sat->op ? n->sat->op : g.root->op)
                << "wave-locality violation: release owned by partition "
-               << n->owner->first << " consumes a carrier held by partition " << it->second->first;
+               << n->owner->first << " consumes a carrier held by partition " << (*carrier)->first;
       break;
     }
     case Node::Access: {
       if (!n->owner)
         break; // root rows: outside partition discipline
-      for (const Touch &t : n->touches) {
-        CompId c = compOfMember(g, t.member);
-        auto it = carrier.find(c);
-        if (it != carrier.end() && it->second && !sameOwner(it->second, n->owner))
-          return semaError(n->op) << "wave-locality violation: access owned by partition "
-                 << n->owner->first << " touches a carrier held by partition " << it->second->first;
-      }
+      if (nodeTouchesGroup(g, n) && carrier.has_value() && *carrier &&
+          !sameOwner(*carrier, n->owner))
+        return semaError(n->op) << "wave-locality violation: access owned by partition "
+               << n->owner->first << " touches a carrier held by partition " << (*carrier)->first;
       break;
     }
     case Node::For:
@@ -1545,27 +1494,25 @@ static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
     }
   }
   if (head->parent && head->parent->kind == Node::For) {
-    auto carrierConsumed = [&](CompId comp) {
+    auto carrierConsumed = [&]() {
       for (Node *n = head; n; n = n->next) {
-        if (n->isProtocol() && getSema(g, n).component == comp)
+        if (n->isProtocol())
           return n->kind == Node::Release;
-        if ((n->kind == Node::Access && touchesComponent(g, n, comp)) ||
-            (n->isRegion() && crossesComp(n, comp)))
+        if ((n->kind == Node::Access && nodeTouchesGroup(g, n)) ||
+            (n->isRegion() && crossesComp(n)))
           return true;
       }
       return false;
     };
-    DenseSet<CompId> checked;
+    bool checked = false;
     for (const Crossing &c : head->parent->crossings)
-      if (c.hold.materializesCarrier() && carrierConsumed(c.comp))
-        checked.insert(c.comp);
+      if (c.hold.materializesCarrier() && carrierConsumed())
+        checked = true;
     auto rowCarried = [&](Node *n) {
       if (n->isProtocol())
-        return checked.contains(getSema(g, n).component);
+        return checked;
       if (n->kind == Node::Access)
-        for (const Touch &t : n->touches)
-          if (checked.contains(compOfMember(g, t.member)))
-            return true;
+        return checked && nodeTouchesGroup(g, n);
       return false;
     };
     std::function<Owner(Node *)> firstWaveOf = [&](Node *h) -> Owner {
@@ -1601,11 +1548,11 @@ static LogicalResult verifyPointOfUseTransparency(GroupDag &g, Node *F, const Cr
   if (pointAcquire->next != h.firstToucher)
     return errorAt(F) << "point-of-use acquire is not adjacent to its first buffer use";
   for (Node *m = F->children[0]; m && m != pointAcquire; m = m->next) {
-    if (isCarrierEvent(g, m, c.comp))
+    if (isCarrierEvent(g, m))
       return errorAt(m) << "carrier event before point-of-use acquire";
   }
   auto verifyTransparentRegion = [&](Node *region) -> LogicalResult {
-    if (!isHoldTransparentRegion(g, region, c.comp, c.slotOwner))
+    if (!isHoldTransparentRegion(g, region, c.slotOwner))
       return errorAt(region) << "non-transparent region reached point-of-use hold";
     return success();
   };
@@ -1613,9 +1560,9 @@ static LogicalResult verifyPointOfUseTransparency(GroupDag &g, Node *F, const Cr
   for (Node *row : h.rows) {
     if (row == h.firstToucher)
       sawFirstToucher = true;
-    if (isAccessForComp(g, row, c.comp))
+    if (isAccessForComp(g, row))
       continue;
-    if (isRegionCrossingForComp(row, c.comp)) {
+    if (isRegionCrossingForComp(row)) {
       if (failed(verifyTransparentRegion(row)))
         return failure();
       continue;
@@ -1629,7 +1576,7 @@ static LogicalResult verifyPointOfUseTransparency(GroupDag &g, Node *F, const Cr
       return failure();
   if (h.regionTail) {
     Node *closing = h.regain->next;
-    if (!closing || closing->kind != Node::Release || getSema(g, closing).component != c.comp ||
+    if (!closing || closing->kind != Node::Release ||
         closing->sema != h.entryAcquire->sema || closing != h.closingRelease)
       return errorAt(F) << "regionTail point-of-use lacks closing release after region result";
   } else if (!h.closingRelease || std::max(1u, h.closingRelease->count) != 1) {
@@ -1649,8 +1596,8 @@ static LogicalResult verifyPointOfUseTransparency(GroupDag &g, Node *F, const Cr
         reachedFinalAcquire = true;
         break;
       }
-      if (isCarrierEvent(g, m, c.comp))
-        return errorAt(m) << "component use precedes its final-permission acquire";
+      if (isCarrierEvent(g, m))
+        return errorAt(m) << "group use precedes its final-permission acquire";
     }
     if (!reachedFinalAcquire)
       return errorAt(F) << "final-permission acquire is not after its loop";
@@ -1683,10 +1630,7 @@ static LogicalResult verifySyncDag(GroupDag &g) {
   auto verifyHold = [&](Node *n) -> LogicalResult {
     if (!n->isRegion())
       return success();
-    DenseSet<CompId> seen;
     for (const Crossing &c : n->crossings) {
-      if (!seen.insert(c.comp).second)
-        return semaError(n->op) << "duplicate carrier slot for component " << c.comp;
       if (c.hold.materializesCarrier())
         continue;
       if (c.hold.isPointOfUse()) {
@@ -1704,7 +1648,7 @@ static LogicalResult verifySyncDag(GroupDag &g) {
       if (c.finals.empty() || !c.finals[0] ||
           c.finals[0]->kind != Node::For || c.hold.firstToucher || c.hold.entryAcquire)
         return semaError(n->op) << "malformed child-owned hold crossing";
-      const Crossing *child = findCrossing(c.finals[0], c.comp);
+      const Crossing *child = findCrossing(c.finals[0]);
       if (!child || child->hold.materializesCarrier())
         return semaError(n->op) << "child-owned hold without native child";
     }
@@ -2397,9 +2341,8 @@ LogicalResult buildSyncDag(GroupDag &g, bool useMetaPartitioner, int lowerSemaph
     return failure();
   if (failed(insertEntryAcquires(g)))
     return failure();
-  unsigned numComps = numComponents(g);
   if (!g.root->children.empty()) {
-    computeCrossings(g, g.root->children[0], numComps);
+    computeCrossings(g, g.root->children[0]);
     pruneDeadIfCrossings(g, g.root->children[0], /*region=*/nullptr);
     if (failed(computeHoldRules(g, g.root->children[0])))
       return failure();
@@ -2457,14 +2400,13 @@ static void printThreadInfo(llvm::raw_ostream &os, GroupDag &g, const Node *n) {
   if (!n->crossings.empty()) {
     os << " thread{";
     llvm::interleaveComma(n->crossings, os, [&](const Crossing &c) {
-      os << "c" << c.comp << ":" << ownerStr(n->op, c.slotOwner);
+      os << ownerStr(n->op, c.slotOwner);
     });
     os << "}";
   }
   if (n->kind == Node::For && !n->crossings.empty()) {
     os << " holdrule{";
     llvm::interleaveComma(n->crossings, os, [&](const Crossing &c) {
-      os << "c" << c.comp << ":";
       if (c.hold.outcome == Hold::Outcome::CARRIER)
         os << "gated(" << c.hold.reason << ")";
       else if (c.hold.outcome == Hold::Outcome::POINT_OF_USE) {
@@ -2491,7 +2433,6 @@ static void printYieldInfo(llvm::raw_ostream &os, GroupDag &g, const Node *exit,
     return;
   os << " yield{";
   llvm::interleaveComma(region->crossings, os, [&](const Crossing &c) {
-    os << "c" << c.comp << ": ";
     if (!c.hold.materializesCarrier()) { // native/child-owned: no slot
       os << (c.hold.isChildOwns() ? "drop" : "native");
       return;
@@ -2609,13 +2550,11 @@ void dumpGroupSyncDag(GroupDag &g, triton::FuncOp funcOp) {
   os << "SYNC-DAG\n";
   os << "|- func @" << funcOp.getName() << "\n";
   dumpDagTree(g, DumpStage::Sync);
-  for (CompId comp = 0; comp < numComponents(g); ++comp) {
+  {
     std::string line;
     llvm::raw_string_ostream ls(line);
     bool any = false;
     for (const Sema &s : g.semas) {
-      if (s.component != comp)
-        continue;
       if (any)
         ls << " ";
       any = true;
@@ -2625,7 +2564,7 @@ void dumpGroupSyncDag(GroupDag &g, triton::FuncOp funcOp) {
       ls << "}";
     }
     if (any)
-      os << "  SEMAS c" << comp << ": " << ls.str() << "\n";
+      os << "  SEMAS: " << ls.str() << "\n";
   }
   if (g.semas.empty()) {
     os << "  BACKING: untouched (no semaphores)\n";

@@ -34,7 +34,6 @@ namespace nvws = triton::nvws;
 using MemberId = unsigned;
 using PieceId = unsigned;
 using SemaId = unsigned;
-using CompId = unsigned;
 using PartitionId = std::pair<int /*ttg.partition*/, int /*ws tag*/>;
 using Owner = std::optional<PartitionId>;
 inline int64_t ownerKey(const Owner &o) {
@@ -86,7 +85,6 @@ struct Hold {
 };
 
 struct Crossing {
-  CompId comp = 0;
   Owner slotOwner;
   SmallVector<Node *, 2> finals;
   Hold hold;
@@ -140,12 +138,10 @@ struct PieceTable {
   SmallVector<Member> members;
   SmallVector<Piece> pieces;
   SmallVector<SmallVector<PieceId, 2>> footprint;
-  SmallVector<CompId> pieceComp;
 };
 
 struct Sema {
   std::string name;
-  CompId component = 0;
   SmallVector<PieceId, 2> pieces;
   unsigned count = 0, expectedReleases = 0;
   bool isEntry = false;
@@ -326,18 +322,10 @@ inline bool touchesPiece(const GroupDag &g, const Node *node, PieceId piece) {
   forEachTouchedPiece(g, node, [&](PieceId p, Effect) { found |= p == piece; });
   return found;
 }
-inline bool touchesComponent(const GroupDag &g, const Node *node, CompId comp) {
+inline bool nodeTouchesGroup(const GroupDag &g, const Node *node) {
   bool found = false;
-  forEachTouchedPiece(g, node, [&](PieceId p, Effect) {
-    found |= g.pieceTable.pieceComp[p] == comp;
-  });
+  forEachTouchedPiece(g, node, [&](PieceId, Effect) { found = true; });
   return found;
-}
-inline CompId compOfMember(const GroupDag &g, MemberId member) {
-  return g.pieceTable.pieceComp[g.pieceTable.footprint[member].front()];
-}
-inline unsigned numComponents(const GroupDag &g) {
-  return g.pieceTable.pieceComp.empty() ? 0 : *llvm::max_element(g.pieceTable.pieceComp) + 1;
 }
 template <typename Map>
 inline void mergeEffect(Map &effects, PieceId piece, Effect effect) {
