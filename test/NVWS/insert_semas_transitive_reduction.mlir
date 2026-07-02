@@ -19,49 +19,51 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
   // CHECK-LABEL: @serialized_ring_reduces
   tt.func @serialized_ring_reduces(%lb: i32, %ub: i32, %step: i32) {
     %c0 = arith.constant 0 : i32
-    %cst0 = arith.constant {ttg.partition = array<i32: 0>} dense<0.0> : tensor<128x128xf16, #blocked>
+    %cst0 = arith.constant {ttg.partition = array<i32: 0>} dense<0.0> : tensor<256x128xf16, #blocked>
     %cst1 = arith.constant {ttg.partition = array<i32: 2>} dense<1.0> : tensor<128x128xf16, #blocked>
-    // The two overlapping pieces (offset 0 and 64) of buffer.id 500 are
-    // co-allocated into one semaphore set. One EMPTY (true) and three FULL
-    // (false) handoff semaphores serialize the {0}->{1}->{2}->{0} chain.
-    // CHECK: [[A:%.*]] = ttg.local_alloc {buffer.id = 500 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
+    // Containment shape (the planner-realistic layout): the offset-0 owner
+    // m0 spans [0,256) and the offset-64 reuser m1[64,192) nests inside it.
+    // Both members of buffer.id 500 are co-allocated into one semaphore
+    // set. One EMPTY (true) and three FULL (false) handoff semaphores
+    // serialize the {0}->{1}->{2}->{0} chain.
+    // CHECK: [[A:%.*]] = ttg.local_alloc {buffer.id = 500 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>
     // CHECK: [[B:%.*]] = ttg.local_alloc {buffer.id = 500 : i32, buffer.offset = 64 : i32} : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[A]], [[B]] true {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
-    // CHECK: [[F01:%.*]] = nvws.semaphore.create [[A]], [[B]] false {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
-    // CHECK: [[F12:%.*]] = nvws.semaphore.create [[A]], [[B]] false {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
-    // CHECK: [[F20:%.*]] = nvws.semaphore.create [[A]], [[B]] false {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
-    // Overlapping pair (offset 0 and 64 of one buffer.id): {0} writes a,
-    // {1} reads a, {2} writes b (overlaps a), {0} reads b. The W-after-R
-    // edge {0}->{2} for the overlap piece is implied via {0}->{1}->{2}.
-    // The minimal serialized chain survives: three handoffs plus the
-    // carrier close — four releases. The implied {0}->{2} fan-in arm
-    // (phase A) and the {2} regain whose ordering the following
-    // traversal already implies (phase B, traversal closure) are gone.
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[A]], [[B]] true {pending_count = 1 : i32} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    // CHECK: [[F01:%.*]] = nvws.semaphore.create [[A]], [[B]] false {pending_count = 1 : i32} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    // CHECK: [[F12:%.*]] = nvws.semaphore.create [[A]], [[B]] false {pending_count = 1 : i32} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    // CHECK: [[F20:%.*]] = nvws.semaphore.create [[A]], [[B]] false {pending_count = 1 : i32} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    // Owner/reuser pair of one buffer.id: {0} writes a (the spanning
+    // owner), {1} reads a, {2} writes b (nested inside a), {0} reads b.
+    // The W-after-R edge {0}->{2} for the overlap piece is implied via
+    // {0}->{1}->{2} and dropped (in-chain sweep). The minimal serialized
+    // chain survives: three handoffs plus the carrier close — four
+    // releases. No piece is reuser-only, so every EXIT carries owner {0}
+    // and no {2} regain edge is raised at all.
     %r = scf.for %iv = %lb to %ub step %step iter_args(%i = %c0) -> (i32) : i32 {
       // {0} acquires EMPTY, writes a, releases FULL for {1}.
-      // CHECK: [[T0:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
-      // CHECK: [[BUF0:%.*]]:2 = nvws.semaphore.buffer [[EMPTY]], [[T0]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable, 1x128x128>
-      // CHECK: ttg.local_store %{{.*}}, [[BUF0]]#0 {ttg.partition = array<i32: 0>} : tensor<128x128xf16, #blocked> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-      // CHECK: nvws.semaphore.release [[F01]], [[T0]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
-      %a = ttg.local_alloc %cst0 {buffer.id = 500 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      // CHECK: [[T0:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
+      // CHECK: [[BUF0:%.*]]:2 = nvws.semaphore.buffer [[EMPTY]], [[T0]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable, 1x128x128>
+      // CHECK: ttg.local_store %{{.*}}, [[BUF0]]#0 {ttg.partition = array<i32: 0>} : tensor<256x128xf16, #blocked> -> !ttg.memdesc<256x128xf16, #shared, #smem, mutable>
+      // CHECK: nvws.semaphore.release [[F01]], [[T0]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
+      %a = ttg.local_alloc %cst0 {buffer.id = 500 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : (tensor<256x128xf16, #blocked>) -> !ttg.memdesc<256x128xf16, #shared, #smem, mutable>
       // {1} acquires FULL, reads a, releases FULL for {2} and EMPTY back.
-      // CHECK: [[T1:%.*]] = nvws.semaphore.acquire [[F01]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
-      // CHECK: [[BUF1:%.*]]:2 = nvws.semaphore.buffer [[F01]], [[T1]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable, 1x128x128>
-      // CHECK: ttg.local_load [[BUF1]]#0 {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #blocked>
-      // CHECK: nvws.semaphore.release [[F12]], [[T1]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
-      // CHECK: nvws.semaphore.release [[EMPTY]], [[T1]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
-      %va = ttg.local_load %a {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #blocked>
-      "use"(%va) {ttg.partition = array<i32: 1>} : (tensor<128x128xf16, #blocked>) -> ()
+      // CHECK: [[T1:%.*]] = nvws.semaphore.acquire [[F01]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
+      // CHECK: [[BUF1:%.*]]:2 = nvws.semaphore.buffer [[F01]], [[T1]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable, 1x128x128>
+      // CHECK: ttg.local_load [[BUF1]]#0 {ttg.partition = array<i32: 1>} : !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> tensor<256x128xf16, #blocked>
+      // CHECK: nvws.semaphore.release [[F12]], [[T1]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
+      // CHECK: nvws.semaphore.release [[EMPTY]], [[T1]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
+      %va = ttg.local_load %a {ttg.partition = array<i32: 1>} : !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> tensor<256x128xf16, #blocked>
+      "use"(%va) {ttg.partition = array<i32: 1>} : (tensor<256x128xf16, #blocked>) -> ()
       // {2} acquires FULL, writes b, releases FULL for {0}.
-      // CHECK: [[T2:%.*]] = nvws.semaphore.acquire [[F12]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
-      // CHECK: [[BUF2:%.*]]:2 = nvws.semaphore.buffer [[F12]], [[T2]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable, 1x128x128>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      // CHECK: [[T2:%.*]] = nvws.semaphore.acquire [[F12]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
+      // CHECK: [[BUF2:%.*]]:2 = nvws.semaphore.buffer [[F12]], [[T2]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<256x128xf16, #shared, #smem, mutable, 1x256x128>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       // CHECK: ttg.local_store %{{.*}}, [[BUF2]]#1 {ttg.partition = array<i32: 2>} : tensor<128x128xf16, #blocked> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-      // CHECK: nvws.semaphore.release [[F20]], [[T2]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
+      // CHECK: nvws.semaphore.release [[F20]], [[T2]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
       %b = ttg.local_alloc %cst1 {buffer.id = 500 : i32, buffer.offset = 64 : i32, ttg.partition = array<i32: 2>} : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-      // {0} acquires FULL, reads b. No re-release: the implied {2} regain
-      // is dropped by transitive reduction (traversal closure).
-      // CHECK: [[T3:%.*]] = nvws.semaphore.acquire [[F20]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
-      // CHECK: [[BUF3:%.*]]:2 = nvws.semaphore.buffer [[F20]], [[T3]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable, 1x128x128>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      // {0} acquires FULL, reads b. No re-release: every piece's EXIT
+      // carries owner {0}, so no {2} regain edge exists to close here.
+      // CHECK: [[T3:%.*]] = nvws.semaphore.acquire [[F20]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
+      // CHECK: [[BUF3:%.*]]:2 = nvws.semaphore.buffer [[F20]], [[T3]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<256x128xf16, #shared, #smem, mutable, 1x256x128>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       // CHECK: ttg.local_load [[BUF3]]#1 {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #blocked>
       %vb = ttg.local_load %b {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #blocked>
       "use"(%vb) {ttg.partition = array<i32: 0>} : (tensor<128x128xf16, #blocked>) -> ()
