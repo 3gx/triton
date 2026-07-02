@@ -2391,6 +2391,7 @@ void splitDataPartitionedIfOps(scf::ForOp loop, PartitionSet &schedule) {
   }
 }
 
+// Port map: sema-docs/meta-ports.md#partition-scheduling.
 // NVWS extension: Meta's scheduler records the selected schedule for its code
 // partitioner. NVWS PartitionLoops instead consumes explicit attributes on
 // every region and scalar/address glue operation. The helpers below close an

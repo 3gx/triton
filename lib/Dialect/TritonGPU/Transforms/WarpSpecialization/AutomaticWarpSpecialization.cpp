@@ -93,6 +93,8 @@ std::unique_ptr<Pass> createVerifyWarpSpecializationPartitionsPass() {
 } // namespace
 
 void AutomaticWarpSpecialization::runOnOperation() {
+  // The default and Meta-NVWS sub-pipelines, including each pass handoff, are
+  // documented in sema-docs/nvws-aws-overview.md.
   OpPassManager pm;
   auto addPassWithPartitionVerifier = [&](std::unique_ptr<Pass> pass) {
     pm.addPass(std::move(pass));

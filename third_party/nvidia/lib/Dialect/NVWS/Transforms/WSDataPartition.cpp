@@ -241,12 +241,13 @@ static bool needToSlice(Value v, unsigned dim, int size) {
   return shape.size() > dim && shape[dim] > size;
 }
 
+// Port map: sema-docs/meta-ports.md#data-partition.
 // NVWS extension map for Meta readers: the copied algorithm below keeps
-// Meta's partition-dimension search and slice-closure policy. NVWS adds only
-// representation support needed by the Blackwell pipeline: legal sliced TMEM
-// encodings, descriptor-gather coordinates, generic regionless operations,
-// and SMEM memdesc function-argument views. These helpers extend what can be
-// sliced; they do not choose which dimension or operation partition to use.
+// Meta's partition-dimension search order and slice-closure policy. NVWS adds
+// Blackwell representation support and legality checks for sliced TMEM,
+// descriptor gathers, generic regionless operations, and SMEM memdesc function
+// arguments. A failed legality check can reject a candidate and expose Meta's
+// next fallback candidate; it does not change the search order.
 
 static std::optional<Attribute> getSlicedTensorMemoryEncoding(
     MLIRContext *ctx, nvidia_gpu::TensorMemoryEncodingAttr tmem,

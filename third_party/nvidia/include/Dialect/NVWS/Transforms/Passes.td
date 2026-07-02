@@ -44,6 +44,7 @@ def NVWSLowerWarpGroup : Pass<"nvws-lower-warp-group", "mlir::ModuleOp"> {
 }
 
 def NVWSAssignStagePhase : Pass<"nvws-assign-stage-phase", "mlir::ModuleOp"> {
+  // See sema-docs/assign-stage-phase-and-lower-semaphores.md.
   let summary = "Assign buffer stage to nvws.semaphore.*.";
 
   let description = [{
@@ -63,6 +64,7 @@ def NVWSAssignStagePhase : Pass<"nvws-assign-stage-phase", "mlir::ModuleOp"> {
 }
 
 def NVWSLowerSemaphore : Pass<"nvws-lower-semaphore", "mlir::ModuleOp"> {
+  // See sema-docs/assign-stage-phase-and-lower-semaphores.md.
   let summary = "Convert nvws.semaphore.* to ttng.*barrier* ops.";
 
   let description = [{
@@ -107,6 +109,7 @@ def NVWSInsertSemaphore: Pass<"nvws-insert-semaphore", "mlir::ModuleOp"> {
 }
 
 def NVWSInsertAllocas: Pass<"nvws-insert-allocas", "mlir::ModuleOp"> {
+  // See sema-docs/insert-allocas.md.
   let summary = "Materialize NVWS communication allocations and accesses.";
 
   let description = [{
@@ -140,11 +143,12 @@ def NVWSInsertTmemSemaphore: Pass<"nvws-insert-tmem-semaphore", "mlir::ModuleOp"
 }
 
 def NVWSInsertSemas: Pass<"nvws-insert-semas", "mlir::ModuleOp"> {
+  // See sema-docs/insert-semas/overview.md.
   let summary = "Insert semaphore ops for ownership transfer.";
 
   let description = [{
-    Access-DAG-driven TMEM semaphore insertion for ownership transfer between
-    warp-specialized partitions.
+    Access-DAG-driven SMEM/TMEM semaphore insertion for ownership transfer
+    between warp-specialized partitions.
   }];
 
   let dependentDialects = [
@@ -220,6 +224,7 @@ def NVWSHoistTmemStore: Pass<"nvws-hoist-tmem-store", "mlir::ModuleOp"> {
 }
 
 def NVWSWSDataPartition : Pass<"nvws-ws-data-partition", "mlir::ModuleOp"> {
+  // See sema-docs/meta-ports.md#data-partition.
   let summary = "NVWS warp specialization data partition";
 
   let description = [{
@@ -242,6 +247,7 @@ def NVWSWSDataPartition : Pass<"nvws-ws-data-partition", "mlir::ModuleOp"> {
 
 def NVWSPartitionSchedulingMeta
     : Pass<"nvws-partition-scheduling-meta", "mlir::triton::FuncOp"> {
+  // See sema-docs/meta-ports.md#partition-scheduling.
   let summary = "NVWS Meta warp specialization partitioning pass";
 
   let description = [{
@@ -292,6 +298,7 @@ def NVWSStripPartitionAttrsOutsideWS
 }
 
 def NVWSMemoryPlanner : Pass<"nvws-memory-planner", "mlir::ModuleOp"> {
+  // See sema-docs/meta-ports.md#memory-planning.
   let summary = "NVWS SMEM/TMEM memory planner";
 
   let description = [{

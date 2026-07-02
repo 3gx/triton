@@ -702,7 +702,7 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SmallVector<EdgeRec> &edges
       }
       if (firstWaveOwner && !sameOwner(firstWaveOwner, acq->owner) && firstTouch) {
         dstAnchor = firstTouch;
-        s.isEntry = true; // initial permit; no pre-loop entry instance
+        s.isEntry = true; // initially released; no pre-loop entry instance
         s.inheritStamp = acq->owner;
       }
     }
