@@ -30,6 +30,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LLVM.h"
@@ -64,6 +65,8 @@ namespace triton {
 
 namespace {
 
+// Lowering contract and the egx/nvws-semaphore delta:
+// sema-docs/assign-stage-phase-and-lower-semaphores.md.
 // ----------------------------------------------------------------------------
 
 struct PartitionWsTagIds {
@@ -186,12 +189,39 @@ void createTMAGather(triton::nvws::DescriptorGatherOp op,
                      rewriter);
 }
 
-void lowerTMALoad(SemaphoreReleaseOp op, PatternRewriter &rewriter,
-                  Value mbars) {
+FailureOr<Value> rematerializeStageBefore(Value stage,
+                                          Operation *insertionPoint,
+                                          PatternRewriter &rewriter) {
+  if (!stage)
+    return failure();
+  rewriter.setInsertionPoint(insertionPoint);
+  DominanceInfo domInfo;
+  if (domInfo.properlyDominates(stage, insertionPoint))
+    return stage;
+
+  // AssignStagePhase materializes authored release offsets immediately before
+  // the release. TMA lowering moves the barrier view to the earlier descriptor
+  // load, so reproduce the pure scalar stage computation there as well.
+  SetVector<Operation *> slice;
+  auto canRematerialize = [](Operation *op) {
+    return op->getNumRegions() == 0 && isPureScalarOp(op);
+  };
+  if (!getDominatingValueSetOpsToHoist(domInfo, insertionPoint, {stage}, slice,
+                                       canRematerialize))
+    return failure();
+
+  IRMapping mapping;
+  for (Operation *sliceOp : topologicalSort(slice))
+    rewriter.clone(*sliceOp, mapping);
+  return mapping.lookupOrDefault(stage);
+}
+
+LogicalResult lowerTMALoad(SemaphoreReleaseOp op,
+                           PatternRewriter &rewriter, Value mbars) {
   auto kinds = castAsyncOpAttrs(op.getAsyncOps());
   if (!llvm::any_of(kinds,
                     [](AsyncOp kind) { return kind == AsyncOp::TMALoad; }))
-    return;
+    return success();
 
   auto loc = op.getLoc();
   int txCount = 0;
@@ -215,7 +245,7 @@ void lowerTMALoad(SemaphoreReleaseOp op, PatternRewriter &rewriter,
       loadOps.size() <=
       op.getSemaphore().getDefiningOp<SemaphoreCreateOp>().getBuffers().size());
   if (loadOps.empty())
-    return;
+    return success();
 
   auto topo = topologicalSort({loadOps.begin(), loadOps.end()});
   loadOps.assign(topo.begin(), topo.end());
@@ -223,8 +253,12 @@ void lowerTMALoad(SemaphoreReleaseOp op, PatternRewriter &rewriter,
   auto partitionWsTagIds = getPartitionWsTagIds(op);
   auto stageCluster = getStageCluster(op);
 
-  rewriter.setInsertionPoint(loadOps.front());
-  auto fullBarrier = createSingleBufferView(rewriter, mbars, op.getStage());
+  auto stageOr =
+      rematerializeStageBefore(op.getStage(), loadOps.front(), rewriter);
+  if (failed(stageOr))
+    return op.emitError("cannot rematerialize TMA release stage before its "
+                        "descriptor load");
+  auto fullBarrier = createSingleBufferView(rewriter, mbars, *stageOr);
   assignStageCluster(fullBarrier.getDefiningOp(), partitionWsTagIds,
                      stageCluster, rewriter);
 
@@ -246,16 +280,19 @@ void lowerTMALoad(SemaphoreReleaseOp op, PatternRewriter &rewriter,
     }
     loadOp->erase();
   }
+  return success();
 }
 
-void lowerTMALoads(SemaphoreCreateOp op, PatternRewriter &rewriter,
-                   Value mbars) {
+LogicalResult lowerTMALoads(SemaphoreCreateOp op, PatternRewriter &rewriter,
+                            Value mbars) {
   for (auto user : op->getUsers()) {
     auto releaseOp = dyn_cast<SemaphoreReleaseOp>(user);
     if (!releaseOp)
       continue;
-    lowerTMALoad(releaseOp, rewriter, mbars);
+    if (failed(lowerTMALoad(releaseOp, rewriter, mbars)))
+      return failure();
   }
+  return success();
 }
 
 void rewriteAcquire(SemaphoreAcquireOp op, PatternRewriter &rewriter,
@@ -470,7 +507,8 @@ public:
     SmallVector<Value> buffers(op.getBuffers().begin(), op.getBuffers().end());
 
     // Load TMA loads before erasing/rewriting semaphore users.
-    lowerTMALoads(op, rewriter, mbars);
+    if (failed(lowerTMALoads(op, rewriter, mbars)))
+      return failure();
 
     SetVector<Operation *> opToDelete;
     opToDelete.insert(op.getOperation());

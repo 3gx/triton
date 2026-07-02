@@ -21,6 +21,7 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include "InsertSemas.h"
 #include "Utilities.h"
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -58,6 +59,10 @@ namespace triton {
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h.inc"
 namespace {
 
+// Stage/phase algorithm. Doc section references below point into
+// sema-docs/assign-stage-phase-and-lower-semaphores.md.
+// Doc:
+// assign-stage-phase-and-lower-semaphores.md#the-state-carried-by-assignstagephase
 struct AssignStagePhase {
   enum class AccessKind { Store, Read };
   struct PhaseKey {
@@ -84,6 +89,7 @@ struct AssignStagePhase {
     }
   };
   using OrderedPhaseKeys = std::set<PhaseKey>;
+  using StageKey = std::pair<int, int>;
 
   struct PhaseShiftUse {
     Operation *op;
@@ -93,28 +99,30 @@ struct AssignStagePhase {
 
   struct State {
     Value stage;                      // shared stage index (per buffer group)
-    std::map<PhaseKey, Value> phases; // phase values by (pid, sema)
+    std::map<StageKey, Value> localStages;
+    std::map<PhaseKey, Value> phases; // multiphase bitmasks by PhaseKey
     Value token;                      // token used for stage propagation
   };
 
   SetVector<Value> groupSemaphores;
-  bool useSinglePhaseForGroup = false;
   SetVector<int> allGroupPartitionIds;  // all partition IDs across all acquires
+  DenseMap<std::pair<Value, int>, SetVector<int>> sharedPhaseLanePartitionIds;
   DenseMap<Value, Value> initialPhases; // initial phase by semaphore
   DenseMap<std::pair<Operation *, Value>, int> tokToStagePosMap;
   DenseMap<Value, Value> tokenLogicalStage;
   bool authoredStageOffsets = false;
   std::map<PhaseKey, SmallVector<int>> stageLanesByBaseKey;
   SmallVector<PhaseShiftUse> phaseShiftUses;
-  bool multiStagePhaseFailure = false;
+  bool phaseLegalityFailure = false;
+  SmallVector<StageKey> stageKeys;
+  scf::ForOp stageCloneLoop;
+  DenseSet<Operation *> usesLocalStage;
 
   int getDepth() const {
     assert(!groupSemaphores.empty());
     return cast<SemaphoreType>(groupSemaphores.front().getType())
         .getNumStages();
   }
-
-  // --- Single-phase eligibility analysis ------------------------------------
 
   bool computeAuthoredStageOffsets() const {
     for (Value sema : groupSemaphores) {
@@ -128,133 +136,6 @@ struct AssignStagePhase {
   }
 
   bool hasAuthoredStageOffsets() const { return authoredStageOffsets; }
-
-  // Recursively walks the warp-specialized loop and simulates one iteration of
-  // the release/acquire ring.
-  //
-  // Proof idea:
-  //   Single-phase is safe only if, within one logical loop iteration, we
-  //   never revisit the same semaphore in the same partition at the same
-  //   virtual stage. A duplicate means two acquires would alias the same
-  //   single-phase slot without an intervening stage advance, so we must fall
-  //   back to multiphase.
-  //
-  // State we track:
-  //   - `virtualStage`: logical stage number. It advances only when an acquire
-  //     is immediately followed by a fresh write, because that is the case
-  //     where the ring moves to the next stage.
-  //   - `seen`: keys `(semaphore, partition, virtualStage)` already visited in
-  //     this simulated iteration.
-  bool walkBlockForEligibility(Block *block, int &virtualStage,
-                               DenseSet<std::tuple<Value, int, int>> &seen) {
-    for (auto &op : *block) {
-      if (auto acquireOp = dyn_cast<SemaphoreAcquireOp>(&op)) {
-        if (!groupSemaphores.contains(acquireOp.getSemaphore()))
-          continue;
-        if (isFirstUseFreshWriteAfterAcquire(acquireOp))
-          virtualStage++;
-        // Two acquires of the same semaphore at same vs but different
-        // partitions are concurrent (one mbarrier wait) → not a dup.
-        // Acquires inside the warp-specialized loop are expected to carry a
-        // single partition id. Unannotated acquires are treated separately
-        // with pid=-1.
-        int pid = -1;
-        if (hasPartition(&op)) {
-          auto partitionIds = getPartitionIds(&op);
-          assert(partitionIds.size() == 1 &&
-                 "expected acquire in ttg.ws to have exactly one partition");
-          pid = partitionIds.front();
-        }
-        if (!seen.insert({acquireOp.getSemaphore(), pid, virtualStage}).second)
-          return false; // duplicate → multiphase
-      } else if (auto forOp = dyn_cast<scf::ForOp>(&op)) {
-        if (!walkBlockForEligibility(forOp.getBody(), virtualStage, seen))
-          return false;
-      } else if (auto ifOp = dyn_cast<scf::IfOp>(&op)) {
-        // Check both branches. An acquire in either branch counts.
-        int stageBeforeIf = virtualStage;
-        auto seenBeforeIf = seen;
-        if (!walkBlockForEligibility(ifOp.thenBlock(), virtualStage, seen))
-          return false;
-        if (ifOp.elseBlock()) {
-          int stageAfterThen = virtualStage;
-          auto seenAfterThen = seen;
-          virtualStage = stageBeforeIf;
-          seen = seenBeforeIf;
-          if (!walkBlockForEligibility(ifOp.elseBlock(), virtualStage, seen))
-            return false;
-          // Merge: conservative (max) virtual_stage, union of seen.
-          virtualStage = std::max(stageAfterThen, virtualStage);
-          seen.insert(seenAfterThen.begin(), seenAfterThen.end());
-        }
-      }
-    }
-    return true;
-  }
-
-  // Returns true if the whole semaphore group can use single-phase.
-  //
-  // We prove this by finding the warp-specialized loop that drives the group
-  // and running `walkBlockForEligibility` on its body. That walk tracks the
-  // logical stage progression and rejects any path that revisits the same
-  // `(semaphore, partition, virtualStage)` triple.
-  //
-  // This decision is group-wide, not per semaphore: all semaphores in the
-  // group participate in the same release/acquire ring, so they must all use
-  // the same phase scheme.
-  bool computeSinglePhaseEligibility() {
-    // depth==1 → always single-phase (one stage, nothing to cycle).
-    if (getDepth() == 1)
-      return true;
-
-    // A preexisting stage operand is an authored offset. Keep the first
-    // implementation conservative: use multiphase instead of trying to prove
-    // single-phase eligibility over shifted virtual stages.
-    if (hasAuthoredStageOffsets())
-      return false;
-
-    // Find the first group acquire inside a warp-specialized loop.
-    scf::ForOp wsLoop;
-    for (Value sema : groupSemaphores) {
-      for (Operation *user : sema.getDefiningOp()->getUsers()) {
-        auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user);
-        if (!acquireOp)
-          continue;
-        auto forOp = acquireOp->getParentOfType<scf::ForOp>();
-        if (!forOp)
-          continue;
-        wsLoop = getOuterWSLoop(forOp);
-        if (wsLoop)
-          break;
-      }
-      if (wsLoop)
-        break;
-    }
-
-    // No warp-specialized loop → conservative, use multiphase.
-    if (!wsLoop)
-      return false;
-
-    // Walk loop body recursively, tracking virtual_stage.
-    // Key: (semaphore, partition_id, virtual_stage).
-    DenseSet<std::tuple<Value, int, int>> seen;
-    int virtualStage = 0;
-    if (!walkBlockForEligibility(wsLoop.getBody(), virtualStage, seen))
-      return false;
-
-    // Must have at least one advance per iteration.
-    if (virtualStage == 0)
-      return false;
-
-    // Single-phase toggles only when an acquire addresses slot zero.  If the
-    // per-iteration advance and depth are not coprime, some semaphore sites
-    // stay in a slot orbit that never reaches zero, so their reused mbarrier
-    // parity would never toggle.  Multiphase tracks one bit per physical slot.
-    if (std::gcd(static_cast<int>(getDepth()), virtualStage) != 1)
-      return false;
-
-    return true;
-  }
 
   AssignStagePhase(ArrayRef<SemaphoreCreateOp> semaOps) {
     std::set<int> sortedPartitionIds;
@@ -273,6 +154,9 @@ struct AssignStagePhase {
       allGroupPartitionIds.insert(0);
     authoredStageOffsets = computeAuthoredStageOffsets();
     computeMultiStagePhaseLanes();
+    computeSharedPhaseLanePartitions();
+    validateCircularPartitionSlotOwnership();
+    analyzeStageCopies(semaOps.front());
   }
 
   unsigned getSemaphoreOrder(Value semaphore) const {
@@ -283,8 +167,23 @@ struct AssignStagePhase {
 
   PhaseKey getPhaseKey(int partitionId, Value semaphore,
                        int stageLane = -1) const {
+    auto sharedIt =
+        sharedPhaseLanePartitionIds.find({semaphore, stageLane});
+    if (sharedIt != sharedPhaseLanePartitionIds.end() &&
+        sharedIt->second.contains(partitionId))
+      partitionId = sharedIt->second.front();
     return PhaseKey{partitionId, getSemaphoreOrder(semaphore), semaphore,
                     stageLane};
+  }
+
+  SetVector<int> getPhasePartitionIds(PhaseKey key) const {
+    auto it =
+        sharedPhaseLanePartitionIds.find({key.semaphore, key.stageLane});
+    if (it != sharedPhaseLanePartitionIds.end())
+      return it->second;
+    SetVector<int> ids;
+    ids.insert(key.partitionId);
+    return ids;
   }
 
   SmallVector<PhaseKey> getPhaseKeys(int partitionId, Value semaphore) const {
@@ -311,20 +210,11 @@ struct AssignStagePhase {
                        stageCluster->first);
   }
 
-  bool hasAffectedPhaseKeys() const { return !stageLanesByBaseKey.empty(); }
-  bool hasMultiStagePhaseFailure() const { return multiStagePhaseFailure; }
+  bool hasPhaseLegalityFailure() const { return phaseLegalityFailure; }
 
   static int64_t positiveMod(int64_t value, int64_t mod) {
     int64_t rem = value % mod;
     return rem < 0 ? rem + mod : rem;
-  }
-
-  bool acquireAppliesToKey(SemaphoreAcquireOp acquireOp, PhaseKey key) const {
-    if (acquireOp.getSemaphore() != key.semaphore)
-      return false;
-    if (!hasPartition(acquireOp))
-      return allGroupPartitionIds.contains(key.partitionId);
-    return llvm::is_contained(getPartitionIds(acquireOp), key.partitionId);
   }
 
   std::optional<int64_t>
@@ -378,22 +268,26 @@ struct AssignStagePhase {
     return loop;
   }
 
-  bool proveStageDisjointSlotOwnership(
-      PhaseKey key, ArrayRef<SemaphoreAcquireOp> candidateAcquires) {
+  // Docs:
+  // assign-stage-phase-and-lower-semaphores.md#proving-that-pipeline-stages-use-disjoint-buffer-stages
+  // assign-stage-phase-and-lower-semaphores.md#proving-that-circular-acquires-use-partition-disjoint-buffer-stages
+  template <typename GetOwner>
+  bool proveDisjointSlotOwnership(
+      ArrayRef<SemaphoreAcquireOp> candidateAcquires, StringRef proofName,
+      StringRef conflictMessage, GetOwner getOwner) {
     scf::ForOp loop = getSingleCandidateLoop(candidateAcquires);
     if (!loop) {
-      candidateAcquires.front()->emitError(
-          "multi-stage phase split requires one statically walkable loop body");
-      multiStagePhaseFailure = true;
+      candidateAcquires.front()->emitError()
+          << proofName << " requires one statically walkable loop body";
+      phaseLegalityFailure = true;
       return false;
     }
 
     SmallVector<SemaphoreAcquireOp> groupEvents;
     if (!collectDirectGroupAcquireEvents(loop, groupEvents)) {
-      candidateAcquires.front()->emitError(
-          "multi-stage phase split requires path-invariant group acquire "
-          "sequence");
-      multiStagePhaseFailure = true;
+      candidateAcquires.front()->emitError()
+          << proofName << " requires path-invariant group acquire sequence";
+      phaseLegalityFailure = true;
       return false;
     }
 
@@ -406,54 +300,63 @@ struct AssignStagePhase {
     }
 
     if (advanceCount == 0) {
-      candidateAcquires.front()->emitError(
-          "multi-stage phase split requires at least one State.stage advance");
-      multiStagePhaseFailure = true;
+      candidateAcquires.front()->emitError()
+          << proofName << " requires at least one State.stage advance";
+      phaseLegalityFailure = true;
       return false;
     }
 
-    int64_t gcd = std::gcd(static_cast<int64_t>(getDepth()), advanceCount);
-    assert(gcd > 0 && "expected positive slot-class gcd");
+    int64_t modulus =
+        std::gcd(static_cast<int64_t>(getDepth()), advanceCount);
+    assert(modulus > 0 && "expected positive slot-class gcd");
 
-    std::map<int64_t, std::set<int>> stagesBySlotClass;
-    for (SemaphoreAcquireOp acquireOp : groupEvents) {
-      if (!acquireAppliesToKey(acquireOp, key))
-        continue;
-
-      auto stageCluster = getStageCluster(acquireOp);
-      if (!stageCluster) {
-        acquireOp->emitError(
-            "multi-stage phase split requires static loop.stage");
-        multiStagePhaseFailure = true;
+    std::map<int64_t, std::set<int>> ownersBySlotClass;
+    for (SemaphoreAcquireOp acquireOp : candidateAcquires) {
+      FailureOr<int> owner = getOwner(acquireOp);
+      if (failed(owner)) {
+        phaseLegalityFailure = true;
         return false;
       }
-
       std::optional<int64_t> authoredOffset =
           getAuthoredStageOffset(acquireOp);
       if (!authoredOffset) {
-        acquireOp->emitError(
-            "multi-stage phase split requires constant authored stage offset");
-        multiStagePhaseFailure = true;
+        acquireOp->emitError()
+            << proofName << " requires constant authored stage offset";
+        phaseLegalityFailure = true;
         return false;
       }
-
       int64_t classOffset =
           advancePositionByAcquire.lookup(acquireOp.getOperation()) +
           *authoredOffset;
-      int64_t slotClass = positiveMod(classOffset, gcd);
-      stagesBySlotClass[slotClass].insert(stageCluster->first);
+      ownersBySlotClass[positiveMod(classOffset, modulus)].insert(*owner);
     }
 
-    for (auto &[slotClass, stages] : stagesBySlotClass) {
-      if (stages.size() <= 1)
-        continue;
-      candidateAcquires.front()->emitError(
-          "multi-stage phase split cannot prove disjoint stage-owned slots");
-      multiStagePhaseFailure = true;
+    if (llvm::any_of(ownersBySlotClass,
+                     [](auto &entry) { return entry.second.size() > 1; })) {
+      candidateAcquires.front()->emitError(conflictMessage);
+      phaseLegalityFailure = true;
       return false;
     }
-
     return true;
+  }
+
+  // Docs:
+  // assign-stage-phase-and-lower-semaphores.md#why-clone-a-phase-value-for-each-loopstage
+  //       assign-stage-phase-and-lower-semaphores.md#proving-that-pipeline-stages-use-disjoint-buffer-stages
+  bool proveStageDisjointSlotOwnership(
+      ArrayRef<SemaphoreAcquireOp> candidateAcquires) {
+    return proveDisjointSlotOwnership(
+        candidateAcquires, "multi-stage phase split",
+        "multi-stage phase split cannot prove disjoint stage-owned slots",
+        [](SemaphoreAcquireOp acquireOp) -> FailureOr<int> {
+          auto stageCluster = getStageCluster(acquireOp);
+          if (!stageCluster) {
+            acquireOp->emitError(
+                "multi-stage phase split requires static loop.stage");
+            return failure();
+          }
+          return stageCluster->first;
+        });
   }
 
   void computeMultiStagePhaseLanes() {
@@ -490,11 +393,11 @@ struct AssignStagePhase {
       if (keysWithMissingStage.count(key)) {
         acquires.front()->emitError(
             "multi-stage phase split requires static loop.stage");
-        multiStagePhaseFailure = true;
+        phaseLegalityFailure = true;
         continue;
       }
 
-      if (!proveStageDisjointSlotOwnership(key, acquires))
+      if (!proveStageDisjointSlotOwnership(acquires))
         continue;
 
       stageLanesByBaseKey[key] =
@@ -502,8 +405,250 @@ struct AssignStagePhase {
     }
   }
 
+  // Doc:
+  // assign-stage-phase-and-lower-semaphores.md#proving-that-circular-acquires-use-partition-disjoint-buffer-stages
+  bool provePartitionDisjointSlotOwnership(
+      ArrayRef<SemaphoreAcquireOp> candidateAcquires) {
+    return proveDisjointSlotOwnership(
+        candidateAcquires, "circular partition ownership check",
+        "circular semaphore has overlapping cross-partition physical-slot "
+        "ownership",
+        [](SemaphoreAcquireOp acquireOp) -> FailureOr<int> {
+          if (!hasPartition(acquireOp) ||
+              getPartitionIds(acquireOp).size() != 1) {
+            acquireOp->emitError(
+                "circular partition ownership check requires exactly one "
+                "partition per acquire");
+            return failure();
+          }
+          return getPartitionIds(acquireOp).front();
+        });
+  }
+
+  // Doc:
+  // assign-stage-phase-and-lower-semaphores.md#cloning-a-split-phase-value-into-multiple-partitions
+  void computeSharedPhaseLanePartitions() {
+    SmallVector<std::pair<PhaseKey, int>> lanesToAdd;
+    for (auto &[baseKey, lanes] : stageLanesByBaseKey) {
+      for (int lane : lanes) {
+        auto laneKey = std::make_pair(baseKey.semaphore, lane);
+        if (sharedPhaseLanePartitionIds.contains(laneKey))
+          continue;
+        std::set<int> sortedPartitionIds;
+        for (Operation *user : baseKey.semaphore.getDefiningOp()->getUsers()) {
+          auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user);
+          auto stageCluster = acquireOp ? getStageCluster(acquireOp)
+                                        : StageCluster{};
+          if (!stageCluster || stageCluster->first != lane ||
+              !hasPartition(acquireOp))
+            continue;
+          auto partitionIds = getPartitionIds(acquireOp);
+          if (partitionIds.size() == 1)
+            sortedPartitionIds.insert(partitionIds.front());
+        }
+        if (sortedPartitionIds.size() < 2)
+          continue;
+        auto &partitionIds = sharedPhaseLanePartitionIds[laneKey];
+        partitionIds.insert(sortedPartitionIds.begin(),
+                            sortedPartitionIds.end());
+        for (int pid : partitionIds)
+          lanesToAdd.push_back({getPhaseKey(pid, baseKey.semaphore), lane});
+      }
+    }
+
+    for (auto [baseKey, lane] : lanesToAdd) {
+      auto &lanes = stageLanesByBaseKey[baseKey];
+      if (!llvm::is_contained(lanes, lane)) {
+        lanes.push_back(lane);
+        llvm::sort(lanes);
+      }
+    }
+  }
+
+  // Doc:
+  // assign-stage-phase-and-lower-semaphores.md#proving-that-circular-acquires-use-partition-disjoint-buffer-stages
+  void validateCircularPartitionSlotOwnership() {
+    DenseMap<Value, SmallVector<SemaphoreAcquireOp>> baseAcquiresBySemaphore;
+    for (Value sema : groupSemaphores) {
+      auto create = sema.getDefiningOp<SemaphoreCreateOp>();
+      bool isCircular = create && llvm::any_of(create.getBuffers(), [](Value v) {
+                          Operation *def = v.getDefiningOp();
+                          return def && def->hasAttr(
+                                            nvws_semas::kBufferCircularAttrName);
+                        });
+      if (!isCircular)
+        continue;
+
+      for (Operation *user : sema.getDefiningOp()->getUsers()) {
+        auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user);
+        if (!acquireOp || !hasPartition(acquireOp))
+          continue;
+        auto stageCluster = getStageCluster(acquireOp);
+        auto partitionIds = getPartitionIds(acquireOp);
+        if (!stageCluster || partitionIds.size() != 1)
+          continue;
+
+        baseAcquiresBySemaphore[sema].push_back(acquireOp);
+      }
+    }
+
+    for (auto &entry : baseAcquiresBySemaphore) {
+      auto &acquires = entry.second;
+      std::set<int> sortedPartitionIds;
+      for (SemaphoreAcquireOp acquireOp : acquires)
+        sortedPartitionIds.insert(getPartitionIds(acquireOp).front());
+      if (sortedPartitionIds.size() < 2)
+        continue;
+      provePartitionDisjointSlotOwnership(acquires);
+    }
+  }
+
+  // Doc:
+  // assign-stage-phase-and-lower-semaphores.md#schedule-local-copies-of-statestage
+  struct ScheduledStageUse {
+    Operation *op;
+    StageKey key;
+    unsigned order;
+  };
+
+  static bool stageEdgeFitsSchedule(const ScheduledStageUse &producer,
+                                    const ScheduledStageUse &consumer,
+                                    unsigned distance) {
+    int producerStage = producer.key.first;
+    int consumerLimit = consumer.key.first + static_cast<int>(distance);
+    if (producerStage != consumerLimit)
+      return producerStage < consumerLimit;
+    if (producer.key.second != consumer.key.second)
+      return producer.key.second < consumer.key.second;
+    return producer.order <= consumer.order;
+  }
+
+  std::optional<ScheduledStageUse> getDirectStageUse(Operation *op,
+                                                     scf::ForOp loop) const {
+    if (op->getBlock() != loop.getBody())
+      return std::nullopt;
+    auto stageCluster = getStageCluster(op);
+    if (!stageCluster)
+      return std::nullopt;
+    unsigned order = 0;
+    for (Operation &bodyOp : *loop.getBody()) {
+      if (&bodyOp == op)
+        break;
+      ++order;
+    }
+    return ScheduledStageUse{op, *stageCluster, order};
+  }
+
+  // Find direct cursor consumers whose scalar SSA edge runs backward.  The
+  // repair replays the pure cursor updates at only those schedule points;
+  // phase state remains governed by proveStageDisjointSlotOwnership.
+  void analyzeStageCopies(SemaphoreCreateOp firstSemaOp) {
+    firstSemaOp->getParentOp()->walk([&](scf::ForOp loop) {
+      if (stageCloneLoop)
+        return;
+      SmallVector<SemaphoreAcquireOp> events;
+      // Local cursor replay is not threaded through nested control flow.  A
+      // loop containing a nested group acquire is therefore not a candidate.
+      if (!collectDirectGroupAcquireEvents(loop, events))
+        return;
+      for (SemaphoreAcquireOp acquireOp : events) {
+        if (!getDirectStageUse(acquireOp, loop))
+          return;
+      }
+      if (events.empty())
+        return;
+
+      SmallVector<unsigned> advances;
+      SmallVector<ScheduledStageUse> eventUses;
+      for (auto [index, acquireOp] : llvm::enumerate(events)) {
+        eventUses.push_back(*getDirectStageUse(acquireOp, loop));
+        if (isFirstUseFreshWriteAfterAcquire(acquireOp))
+          advances.push_back(index);
+      }
+      if (advances.empty())
+        return;
+
+      auto sourceBefore = [&](unsigned order) {
+        auto previous = llvm::find_if(
+            llvm::reverse(advances),
+            [&](unsigned advance) { return eventUses[advance].order < order; });
+        if (previous == advances.rend())
+          return std::make_pair(advances.back(), 1u);
+        return std::make_pair(*previous, 0u);
+      };
+
+      SmallVector<Operation *> localUses;
+      SmallVector<StageKey> localKeys;
+      bool unsupportedEdge = false;
+      for (auto [index, acquireOp] : llvm::enumerate(events)) {
+        auto [producer, distance] =
+            sourceBefore(eventUses[index].order);
+        if (!stageEdgeFitsSchedule(eventUses[producer], eventUses[index],
+                                   distance)) {
+          // A fresh acquire still has to update the canonical loop cursor;
+          // replay cannot remove that canonical dependency.
+          if (distance != 0 ||
+              isFirstUseFreshWriteAfterAcquire(acquireOp)) {
+            unsupportedEdge = true;
+            continue;
+          }
+          localUses.push_back(acquireOp);
+          localKeys.push_back(eventUses[index].key);
+        }
+      }
+      for (Value semaphore : groupSemaphores) {
+        for (Operation *user : semaphore.getDefiningOp()->getUsers()) {
+          auto stageOp = dyn_cast<SemaphoreStageInterface>(user);
+          if (!stageOp || isa<SemaphoreAcquireOp>(user) ||
+              !hasAuthoredStageOffsets() || !stageOp.getStage())
+            continue;
+          auto consumer = getDirectStageUse(user, loop);
+          if (!consumer)
+            continue;
+          auto [producer, distance] = sourceBefore(consumer->order);
+          if (!stageEdgeFitsSchedule(eventUses[producer], *consumer,
+                                     distance)) {
+            if (distance != 0) {
+              unsupportedEdge = true;
+              continue;
+            }
+            localUses.push_back(user);
+            localKeys.push_back(consumer->key);
+          }
+        }
+      }
+
+      if (unsupportedEdge || localKeys.empty())
+        return;
+
+      llvm::sort(localKeys);
+      localKeys.erase(std::unique(localKeys.begin(), localKeys.end()),
+                      localKeys.end());
+      // Local copies start from the scalar loop iter-arg.  Keep the repair
+      // narrow: if that distance-one edge is itself illegal, leave the
+      // original scalar chain for a future, loop-carried-copy transform.
+      for (StageKey key : localKeys) {
+        unsigned firstLocalOrder = eventUses[advances.front()].order;
+        for (Operation *localUse : localUses) {
+          auto use = getDirectStageUse(localUse, loop);
+          if (use && use->key == key)
+            firstLocalOrder = std::min(firstLocalOrder, use->order);
+        }
+        ScheduledStageUse firstLocal{events[advances.front()].getOperation(),
+                                     key, firstLocalOrder};
+        if (!stageEdgeFitsSchedule(eventUses[advances.back()], firstLocal, 1))
+          return;
+      }
+
+      stageCloneLoop = loop;
+      stageKeys = std::move(localKeys);
+      usesLocalStage.insert(localUses.begin(), localUses.end());
+    });
+  }
+
   // --- useD analysis --------------------------------------------------------
 
+  // Doc: assign-stage-phase-and-lower-semaphores.md#updating-statestage
   Value remapUseDThroughIf(Value useD, scf::IfOp ifOp, bool takeThen) const {
     auto result = dyn_cast<OpResult>(useD);
     if (!result || result.getOwner() != ifOp)
@@ -1053,6 +1198,8 @@ struct AssignStagePhase {
   }
 
   // --- Stage and Phase computation -----------------------------------------
+  // Doc:
+  // assign-stage-phase-and-lower-semaphores.md#structured-control-flow-metadata
   struct SemaphoreUseSummary {
     bool hasStageUse = false;
     OrderedPhaseKeys acquiredPhaseKeys;
@@ -1173,6 +1320,17 @@ struct AssignStagePhase {
     return summary;
   }
 
+  Value getStageForOp(const State &state, Operation *op) const {
+    if (!usesLocalStage.contains(op))
+      return state.stage;
+    auto stageCluster = getStageCluster(op);
+    assert(stageCluster && "local state.stage consumer has no schedule");
+    auto it = state.localStages.find(*stageCluster);
+    assert(it != state.localStages.end() &&
+           "local state.stage consumer has no replayed cursor");
+    return it->second;
+  }
+
   Value getPhase(State &state, PhaseKey key) {
     auto [it, inserted] =
         state.phases.try_emplace(key, initialPhases.at(key.semaphore));
@@ -1208,6 +1366,8 @@ struct AssignStagePhase {
   }
 
   // Infer partition IDs for a yield argumend value.
+  // Doc:
+  // assign-stage-phase-and-lower-semaphores.md#structured-control-flow-metadata
   SetVector<int> inferPartitionIds(Value arg, int fallbackPartitionId) {
     SetVector<int> argIds;
     if (auto defOp = arg.getDefiningOp()) {
@@ -1262,6 +1422,7 @@ struct AssignStagePhase {
   }
 
   void assignStateInForOp(scf::ForOp forOp, State &state) {
+    bool cloneRoot = stageCloneLoop && forOp == stageCloneLoop;
     Value newTok;
     if (auto pos = findValuePosInRange(forOp.getInitArgs(), state.token)) {
       newTok = forOp.getRegionIterArgs()[*pos];
@@ -1293,6 +1454,8 @@ struct AssignStagePhase {
     auto forOpIds = getPartitionIds(forOp);
     auto forOpOutputsIds = getPartitionOutputs(forOp);
     forOp = addIterArgsToLoop(builder, forOp, extraIterArgs);
+    if (cloneRoot)
+      stageCloneLoop = forOp;
 
     // Make loop result partition metadata match the added iter args before
     // recursing. The body walk may widen the new stage block arg's metadata.
@@ -1300,8 +1463,7 @@ struct AssignStagePhase {
     forOpOutputsIds.push_back(SetVector<int>(allGroupPartitionIds.begin(),
                                              allGroupPartitionIds.end()));
     for (PhaseKey key : summary.acquiredPhaseKeys) {
-      SetVector<int> argIds;
-      argIds.insert(key.partitionId);
+      SetVector<int> argIds = getPhasePartitionIds(key);
       forOpIds.insert(argIds.begin(), argIds.end());
       forOpOutputsIds.push_back(argIds);
     }
@@ -1309,6 +1471,9 @@ struct AssignStagePhase {
     setPartitionOutputs(forOp, forOpOutputsIds);
 
     state.stage = forOp.getRegionIterArgs()[nArgs];
+    if (cloneRoot)
+      for (StageKey key : stageKeys)
+        state.localStages[key] = state.stage;
     for (auto [i, key] : llvm::enumerate(summary.acquiredPhaseKeys))
       state.phases[key] = forOp.getRegionIterArgs()[nArgs + 1 + i];
     recordForInputTokenStageMappings(forOp, nArgs, nArgs);
@@ -1340,6 +1505,8 @@ struct AssignStagePhase {
     // Replace provisional phase result IDs with IDs inferred from final values.
     for (auto [i, key] : llvm::enumerate(summary.acquiredPhaseKeys)) {
       auto argIds = inferPartitionIds(extraYieldArgs[1 + i], key.partitionId);
+      auto phaseIds = getPhasePartitionIds(key);
+      argIds.insert(phaseIds.begin(), phaseIds.end());
       forOpIds.insert(argIds.begin(), argIds.end());
       forOpOutputsIds[nArgs + 1 + i] = argIds;
     }
@@ -1347,6 +1514,8 @@ struct AssignStagePhase {
     setPartitionOutputs(forOp, forOpOutputsIds);
 
     state.stage = forOp.getResult(nArgs);
+    if (cloneRoot)
+      state.localStages.clear();
     for (auto [i, key] : llvm::enumerate(summary.acquiredPhaseKeys))
       state.phases[key] = forOp.getResult(nArgs + 1 + i);
     for (auto [idx, tokenRef] : tokenRefs)
@@ -1416,7 +1585,7 @@ struct AssignStagePhase {
                                             allGroupPartitionIds.end()));
     // Phase: per-key partition IDs.
     for (PhaseKey key : thenSummary.acquiredPhaseKeys) {
-      SetVector<int> phaseIds;
+      SetVector<int> phaseIds = getPhasePartitionIds(key);
       for (Value arg : {getPhase(thenState, key), getPhase(elseState, key)}) {
         auto ids = inferPartitionIds(arg, key.partitionId);
         phaseIds.insert(ids.begin(), ids.end());
@@ -1434,6 +1603,8 @@ struct AssignStagePhase {
       *tokenRef = newIfOp.getResult(idx);
   }
 
+  // Docs: assign-stage-phase-and-lower-semaphores.md#updating-statestage
+  //       assign-stage-phase-and-lower-semaphores.md#updating-statephases
   State assignStateInBlock(Block *block, State state) {
     for (auto &op : llvm::make_early_inc_range(*block)) {
       if (auto acquireOp = getAcquireOp(&op)) {
@@ -1470,22 +1641,27 @@ struct AssignStagePhase {
           return createInto(stagePids, opTy,
                             std::forward<decltype(args)>(args)...);
         };
+        auto createIntoLocalStage = [&](StageKey key, auto opTy,
+                                        auto... args) {
+          return createIntoAt(stagePids, key, opTy,
+                              std::forward<decltype(args)>(args)...);
+        };
         auto createIntoPhase = [&](auto opTy, auto... args) {
           return createInto(phasePids, opTy,
                             std::forward<decltype(args)>(args)...);
         };
         auto createIntoPhaseForKey = [&](PhaseKey key, auto opTy,
                                          auto... args) {
-          if (!key.hasStageLane())
+          auto phaseIds = getPhasePartitionIds(key);
+          bool sharedPhase = phaseIds.size() > 1;
+          if (!key.hasStageLane() && !sharedPhase)
             return createIntoPhase(opTy,
                                    std::forward<decltype(args)>(args)...);
 
-          std::optional<SetVector<int>> keyPids;
-          keyPids.emplace();
-          keyPids->insert(key.partitionId);
+          std::optional<SetVector<int>> keyPids(std::move(phaseIds));
 
           StageCluster keyStageCluster = stageCluster;
-          if (keyStageCluster)
+          if (keyStageCluster && key.hasStageLane())
             keyStageCluster->first = key.stageLane;
 
           return createIntoAt(keyPids, keyStageCluster, opTy,
@@ -1518,7 +1694,8 @@ struct AssignStagePhase {
                                  remStage);
         };
 
-        // Stage update.
+        // Keep the scalar cursor unchanged.  When analysis found a backward
+        // consumer, replay the same pure advances at that consumer's schedule.
         Value rawStage = state.stage;
         Value baseStage = rawStage;
         bool advanceStage = isFirstUseFreshWriteAfterAcquire(acquireOp);
@@ -1530,20 +1707,36 @@ struct AssignStagePhase {
               arith::CmpIOp{}, arith::CmpIPredicate::eq, nextStage,
               createIntoStage(arith::ConstantIntOp{}, getDepth(), 32));
           auto zero = createIntoStage(arith::ConstantIntOp{}, 0, 32);
-          auto wrappedStage =
+          baseStage =
               createIntoStage(arith::SelectOp{}, stageWrapped, zero, nextStage);
-          baseStage = wrappedStage;
+
+          for (auto &[key, localStage] : state.localStages) {
+            auto localNext = createIntoLocalStage(
+                key, arith::AddIOp{}, localStage,
+                createIntoLocalStage(key, arith::ConstantIntOp{}, 1, 32));
+            auto localWrapped = createIntoLocalStage(
+                key, arith::CmpIOp{}, arith::CmpIPredicate::eq, localNext,
+                createIntoLocalStage(key, arith::ConstantIntOp{}, getDepth(),
+                                     32));
+            auto localZero = createIntoLocalStage(
+                key, arith::ConstantIntOp{}, 0, 32);
+            localStage = createIntoLocalStage(
+                key, arith::SelectOp{}, localWrapped, localZero, localNext);
+          }
         }
+        state.stage = baseStage;
+        baseStage = getStageForOp(state, &op);
         Value authoredOffset =
             acquireOp.getPhase() ? Value() : acquireOp.getStage();
         Value acquireStage =
             authoredOffset ? applyStageOffset(baseStage, authoredOffset)
                            : baseStage;
-        state.stage = baseStage;
         acquireOp.getStageMutable().assign(acquireStage);
         state.token = acquireOp.getToken();
         tokenLogicalStage[acquireOp.getToken()] = baseStage;
 
+        // Doc:
+        // assign-stage-phase-and-lower-semaphores.md#updating-statephases
         // Phase update. Internal phase state stays group-specific, but the
         // acquire itself always receives the final parity bit consumed by
         // mbarrier.wait.
@@ -1553,34 +1746,19 @@ struct AssignStagePhase {
             continue;
           PhaseKey key = getSelectedPhaseKey(pid, acquireOp);
           Value phaseState = getPhase(state, key);
-          Value acquirePhase = phaseState;
-          if (useSinglePhaseForGroup) {
-            auto nextPhase = createIntoPhaseForKey(
-                key, arith::XOrIOp{}, phaseState,
-                createIntoPhaseForKey(key, arith::ConstantIntOp{}, 1, 32));
-            auto zero = createIntoPhaseForKey(key, arith::ConstantIntOp{}, 0, 32);
-            auto phaseWrapped = createIntoPhaseForKey(
-                key,
-                arith::CmpIOp{}, arith::CmpIPredicate::eq, acquireStage, zero);
-            phaseState = createIntoPhaseForKey(
-                key, arith::SelectOp{}, phaseWrapped, nextPhase, phaseState);
-            acquirePhase = phaseState;
-          } else {
-            auto phaseBit = createIntoPhaseForKey(
-                key, arith::ShLIOp{},
-                createIntoPhaseForKey(key, arith::ConstantIntOp{}, 1, 32),
-                acquireStage);
-            recordPhaseShiftUse(phaseBit.getOperation(), key, acquireStage);
-            phaseState =
-                createIntoPhaseForKey(key, arith::XOrIOp{}, phaseState, phaseBit);
-            auto shiftedPhase = createIntoPhaseForKey(
-                key, arith::ShRUIOp{}, phaseState, acquireStage);
-            acquirePhase = shiftedPhase;
-            recordPhaseShiftUse(shiftedPhase.getOperation(), key, acquireStage);
-            acquirePhase = createIntoPhaseForKey(
-                key, arith::AndIOp{}, acquirePhase,
-                createIntoPhaseForKey(key, arith::ConstantIntOp{}, 1, 32));
-          }
+          auto phaseBit = createIntoPhaseForKey(
+              key, arith::ShLIOp{},
+              createIntoPhaseForKey(key, arith::ConstantIntOp{}, 1, 32),
+              acquireStage);
+          recordPhaseShiftUse(phaseBit.getOperation(), key, acquireStage);
+          phaseState =
+              createIntoPhaseForKey(key, arith::XOrIOp{}, phaseState, phaseBit);
+          Value acquirePhase = createIntoPhaseForKey(
+              key, arith::ShRUIOp{}, phaseState, acquireStage);
+          recordPhaseShiftUse(acquirePhase.getDefiningOp(), key, acquireStage);
+          acquirePhase = createIntoPhaseForKey(
+              key, arith::AndIOp{}, acquirePhase,
+              createIntoPhaseForKey(key, arith::ConstantIntOp{}, 1, 32));
           state.phases[key] = phaseState;
           acquireOp.getPhaseMutable().assign(acquirePhase);
         }
@@ -1620,8 +1798,9 @@ struct AssignStagePhase {
           return createIntoStage(arith::SelectOp{}, isNegative, wrappedStage,
                                  remStage);
         };
-        widenStageBlockArgUse(stageOp, state.stage);
-        stageOp.setStage(applyStageOffset(state.stage, stageOp.getStage()));
+        Value baseStage = getStageForOp(state, &op);
+        widenStageBlockArgUse(stageOp, baseStage);
+        stageOp.setStage(applyStageOffset(baseStage, stageOp.getStage()));
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
         assignStateInForOp(forOp, state);
       } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
@@ -1632,6 +1811,7 @@ struct AssignStagePhase {
     return state;
   }
 
+  // Doc: assign-stage-phase-and-lower-semaphores.md#updating-statestage
   void propagateStage(Value token, Value stage,
                       DenseSet<Operation *> &visited) {
     for (auto &tokUse : token.getUses()) {
@@ -1659,34 +1839,34 @@ struct AssignStagePhase {
     }
   }
 
+  // Doc:
+  // assign-stage-phase-and-lower-semaphores.md#the-state-carried-by-assignstagephase
   static LogicalResult run(ArrayRef<SemaphoreCreateOp> semaOps) {
     if (semaOps.empty())
       return success();
 
-    // Compute single-phase eligibility per buffer group.
-    AssignStagePhase impl(semaOps);
-    if (impl.hasMultiStagePhaseFailure())
+    auto firstSemaOp = semaOps.front();
+    int depth = cast<SemaphoreType>(firstSemaOp.getType()).getNumStages();
+    if (depth > 32) {
+      firstSemaOp.emitError()
+          << "multiphase bitmask supports at most 32 buffer stages, got "
+          << depth;
       return failure();
-    bool finalUseSinglePhase =
-        !impl.hasAffectedPhaseKeys() && impl.computeSinglePhaseEligibility();
-    impl.useSinglePhaseForGroup = finalUseSinglePhase;
+    }
+
+    AssignStagePhase impl(semaOps);
+    if (impl.hasPhaseLegalityFailure())
+      return failure();
 
     // Insert after the last semaOp so all semaphores are defined.
     ImplicitLocOpBuilder b(semaOps.back()->getLoc(), semaOps.back());
     b.setInsertionPointAfter(semaOps.back());
 
     State initState;
-    auto firstSemaOp = semaOps.front();
-    int depth = cast<SemaphoreType>(firstSemaOp.getType()).getNumStages();
     initState.stage = arith::ConstantIntOp::create(b, depth - 1, 32);
-    // Per-semaphore initial phases:
-    // single-phase:  isReleased=true  -> 0, isReleased=false -> 1
-    // multiphase:    isReleased=true  -> 0, isReleased=false -> -1
+    // Each bit is the initial phase for one physical buffer stage.
     for (auto semaOp : semaOps) {
       uint32_t initPhase = semaOp.getIsReleased() ? 0x00000000u : 0xFFFFFFFFu;
-      if (finalUseSinglePhase) {
-        initPhase = semaOp.getIsReleased() ? 0x00000000u : 0x00000001u;
-      }
       impl.initialPhases[semaOp.getResult()] =
           arith::ConstantIntOp::create(b, static_cast<int64_t>(initPhase), 32);
     }
@@ -1727,6 +1907,8 @@ struct AssignStagePhase {
   }
 };
 
+// Doc:
+// assign-stage-phase-and-lower-semaphores.md#structured-control-flow-metadata
 void updateOutputWithDefaultPartition(Operation *op, int pos) {
   auto opIds = getPartitionIds(op);
   opIds.insert(0);
@@ -1787,6 +1969,8 @@ void visitBackwardSlice(scf::ForOp wsLoop, Value value,
 // the init value and rebuild the loop without those iter_args. Only clean up
 // loops that are part of a warp-specialized region: the root
 // `tt.warp_specialize` loop itself and any nested loops beneath it.
+// Doc:
+// assign-stage-phase-and-lower-semaphores.md#structured-control-flow-metadata
 void removeLoopInvariantIterArgs(triton::FuncOp funcOp) {
   SmallVector<scf::ForOp> loops;
   funcOp.walk([&](scf::ForOp forOp) {
@@ -1860,6 +2044,7 @@ void removeLoopInvariantIterArgs(triton::FuncOp funcOp) {
   }
 }
 
+// Doc: assign-stage-phase-and-lower-semaphores.md#division-of-responsibility
 LogicalResult assignStagePhase(triton::FuncOp funcOp) {
   SmallVector<SemaphoreCreateOp> semaOps;
   funcOp.walk([&](SemaphoreCreateOp op) { semaOps.push_back(op); });

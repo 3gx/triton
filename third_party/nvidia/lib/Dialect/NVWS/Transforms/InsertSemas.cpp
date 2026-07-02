@@ -1,4 +1,4 @@
-// Four-stage dispatcher; see sema-docs/insert-semas/overview.md.
+// Four-step dispatcher; see sema-docs/insert-semas/overview.md.
 #include "InsertSemas.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"

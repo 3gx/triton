@@ -28,6 +28,7 @@
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/Debug.h"
 #include <algorithm>
@@ -121,6 +122,15 @@ static SmallVector<int> getUniqueTaskIds(ArrayRef<Operation *> ops) {
     }
   }
   return taskIds;
+}
+
+static bool isInsideWarpSpecializeLoop(Operation *op) {
+  for (auto loop = op->getParentOfType<scf::ForOp>(); loop;
+       loop = loop->getParentOfType<scf::ForOp>()) {
+    if (loop->hasAttr(tt::kWarpSpecializeAttrName))
+      return true;
+  }
+  return false;
 }
 
 static void setTmemChannelAttr(Operation *op, int channelId,
@@ -488,11 +498,14 @@ createTmemChannelPost(ttng::TMEMAllocOp alloc,
       return success();
 
     SmallVector<int> producerIds = getTaskIds(alloc.getOperation());
+    SmallVector<int> consumerTaskIds = getUniqueTaskIds(consumers);
+    if (producerIds.empty() && consumerTaskIds.empty() &&
+        !isInsideWarpSpecializeLoop(alloc.getOperation()))
+      return success();
     if (producerIds.size() != 1)
       return alloc.emitError("NVWS memory planner expected sourceful "
                              "ttng.tmem_alloc to have exactly one partition");
 
-    SmallVector<int> consumerTaskIds = getUniqueTaskIds(consumers);
     consumerTaskIds.erase(std::remove(consumerTaskIds.begin(),
                                       consumerTaskIds.end(),
                                       producerIds.front()),
@@ -703,12 +716,24 @@ LogicalResult emitSmemPlanAnnotations(
   auto i32Type = IntegerType::get(funcOp.getContext(), 32);
   for (auto &[bufferId, group] : groups) {
     (void)bufferId;
-    if (group.size() < 2)
+    SmallVector<ttg::LocalAllocOp> circularCandidates;
+    if (smemAllocAlgo == 0) {
+      // Meta's algorithm-0 pool may also contain sourceful immutable views.
+      // InsertSemas ignores those views, so do not let one suppress circular
+      // staging for the compatible mutable members of the same pool.
+      for (ttg::LocalAllocOp alloc : group)
+        if (cast<ttg::MemDescType>(alloc.getType()).getMutableMemory())
+          circularCandidates.push_back(alloc);
+    } else {
+      circularCandidates.append(group.begin(), group.end());
+    }
+    if (circularCandidates.size() < 2)
       continue;
 
-    bool selectedReuseGroup = llvm::all_of(group, [&](ttg::LocalAllocOp alloc) {
-      return eligibleAllocs.contains(alloc.getOperation());
-    });
+    bool selectedReuseGroup =
+        llvm::all_of(circularCandidates, [&](ttg::LocalAllocOp alloc) {
+          return eligibleAllocs.contains(alloc.getOperation());
+        });
     if (smemAllocAlgo == 1)
       selectedReuseGroup &= group.size() == 2;
     if (!selectedReuseGroup)
@@ -716,10 +741,10 @@ LogicalResult emitSmemPlanAnnotations(
 
     // Meta skips physical SMEM folding for unlike memdesc types. Preserve the
     // planner id but leave that fallback group non-circular.
-    Type groupType = group.front().getType();
+    Type groupType = circularCandidates.front().getType();
     SmallVector<std::pair<Operation *, ttg::LocalAllocOp>> ordered;
     Block *producerBlock = nullptr;
-    for (ttg::LocalAllocOp alloc : group) {
+    for (ttg::LocalAllocOp alloc : circularCandidates) {
       if (alloc.getType() != groupType) {
         ordered.clear();
         break;
@@ -740,7 +765,7 @@ LogicalResult emitSmemPlanAnnotations(
       producerBlock = producer->getBlock();
       ordered.emplace_back(producer, alloc);
     }
-    if (ordered.size() != group.size())
+    if (ordered.size() != circularCandidates.size())
       continue;
 
     llvm::sort(ordered, [](const auto &lhs, const auto &rhs) {
@@ -783,9 +808,16 @@ LogicalResult emitSmemPlanAnnotations(
 
     if (circular.empty())
       continue;
-    if (circular.size() != group.size())
-      return circular.front().emitError(
-          "NVWS memory planner partially marked a local group circular");
+    if (circular.size() != group.size()) {
+      bool isAlgorithm0MutableSubset =
+          smemAllocAlgo == 0 && llvm::all_of(group, [](ttg::LocalAllocOp alloc) {
+            return alloc->hasAttr("buffer.circular") ||
+                   !cast<ttg::MemDescType>(alloc.getType()).getMutableMemory();
+          });
+      if (!isAlgorithm0MutableSubset)
+        return circular.front().emitError(
+            "NVWS memory planner partially marked a local group circular");
+    }
     if (smemAllocAlgo == 1 &&
         (circular.size() != 2 || !starts.contains(0) || !starts.contains(1)))
       return circular.front().emitError(

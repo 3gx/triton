@@ -735,6 +735,8 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         elif capability // 10 >= 10:
             smem_budget = _max_shared_mem_for_capability(capability)
+            # NVWS default/Meta-port pipeline map and pass contracts:
+            # sema-docs/nvws-aws-overview.md
             use_nvws_meta = knobs.nvidia.use_nvws_meta and not knobs.nvidia.use_meta_ws
             if not knobs.nvidia.use_modulo_schedule:
                 passes.ttgpuir.add_fuse_nested_loops(pm)

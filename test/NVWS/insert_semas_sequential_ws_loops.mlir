@@ -7,7 +7,7 @@
 // What this pins (native hold-rule emission, plan M2; verified 12jun26):
 // CONTINUATION on the shared full semaphore (V2 below) with one
 // seam-conversion release — no fresh boundary semaphore for the seam
-// itself. Loop A's component is GATED (holdrule: entry-sema-mismatch),
+// itself. Loop A's component is GATED (holdrule: gated),
 // so A keeps the rotated shape (entry acquire + carried token + bottom
 // re-acquire) and its loop result is consumed by the seam release
 // `release V2, <loopA result>`, which converts A's held token back into

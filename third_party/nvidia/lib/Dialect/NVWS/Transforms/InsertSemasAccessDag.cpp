@@ -134,6 +134,15 @@ static void buildPieces(PieceTable &pt) {
   for (auto [pIdx, piece] : llvm::enumerate(pt.pieces))
     for (MemberId m : piece.cover)
       pt.footprint[m].push_back(static_cast<PieceId>(pIdx));
+}
+// True when every piece connects (through shared members) into a single
+// component. InsertSemas relies on this (one group, one synchronization
+// unit). The memory planner keeps a buffer.id group single-component by
+// stacking reusers within their owner's columns, so no reuser is
+// disjoint from the rest.
+static bool piecesSingleComponent(const PieceTable &pt) {
+  if (pt.pieces.size() <= 1)
+    return true;
   SmallVector<unsigned, 4> parent(pt.pieces.size());
   for (auto [i, _] : llvm::enumerate(parent))
     parent[i] = i;
@@ -145,16 +154,11 @@ static void buildPieces(PieceTable &pt) {
   for (const auto &fp : pt.footprint)
     for (size_t i = 1; i < fp.size(); ++i)
       parent[find(fp[i])] = find(fp[0]);
-  pt.pieceComp.assign(pt.pieces.size(), 0);
-  DenseMap<unsigned, CompId> compId; // lookup-only
-  CompId next = 0;
-  for (auto [pIdx, _] : llvm::enumerate(pt.pieces)) {
-    unsigned rep = find(static_cast<unsigned>(pIdx));
-    auto it = compId.find(rep);
-    if (it == compId.end())
-      it = compId.try_emplace(rep, next++).first;
-    pt.pieceComp[pIdx] = it->second;
-  }
+  unsigned rep0 = find(0);
+  for (size_t i = 1; i < pt.pieces.size(); ++i)
+    if (find(static_cast<unsigned>(i)) != rep0)
+      return false;
+  return true;
 }
 static bool isStructuralOp(Operation *op) {
   return isa<scf::ForOp, scf::IfOp, scf::YieldOp, triton::FuncOp, triton::ReturnOp>(op);
@@ -399,6 +403,19 @@ static void computeEffectSummary(GroupDag &g, Node *n, DenseMap<PieceId, Effect>
 
 LogicalResult buildAccessDag(GroupDag &g, triton::FuncOp funcOp) {
   buildPieces(g.pieceTable);
+  // Single-component invariant: every buffer.id group's pieces connect
+  // (through shared members) into one component -- the memory planner keeps
+  // reusers stacked within their owner's columns. The rest of InsertSemas
+  // relies on this (one group == one synchronization unit); reject anything
+  // that violates it rather than mis-synchronizing.
+  if (!piecesSingleComponent(g.pieceTable)) {
+    Operation *at = g.pieceTable.members.empty()
+                        ? funcOp.getOperation()
+                        : g.pieceTable.members.front().allocOp;
+    return semaError(at) << "buffer.id group has disjoint pieces (more than "
+                            "one connected component); InsertSemas requires "
+                            "one component per group";
+  }
   Node *func = g.newNode(Node::Func, funcOp, nullptr);
   auto chain = buildChainForBlock(g, funcOp.getBody().front(), func);
   if (failed(chain))
@@ -426,7 +443,7 @@ void dumpGroupAccessDag(GroupDag &g, triton::FuncOp funcOp) {
   for (auto [idx, p] : llvm::enumerate(g.pieceTable.pieces)) {
     os << " P" << idx << "=[" << p.lo << "," << p.hi << "){";
     llvm::interleaveComma(p.cover, os, [&](MemberId m) { os << "m" << m; });
-    os << "}c" << g.pieceTable.pieceComp[idx];
+    os << "}";
   }
   os << "\n  footprints:";
   for (auto [idx, fp] : llvm::enumerate(g.pieceTable.footprint)) {

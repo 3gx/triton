@@ -6,10 +6,11 @@
 #smem = #ttg.shared_memory
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  // This is the one-slot Q shape from attention backward.  The final read in
-  // stage 1 releases the slot consumed by the stage-0 producer in a future
-  // iteration.  Because the recurrence distance is one, stage terms cancel;
-  // the producer and its first consumer must be ordered after the final read.
+  // This is the one-slot Q shape from attention backward. The final read at
+  // loop.stage 1 releases the slot reused by the loop.stage 0 store in a future
+  // iteration. Because the loop-carried dependency distance is one, the final
+  // read and next store execute in the same pipelined iteration; loop.cluster
+  // must order the store and its first consumer after the final read.
   // CHECK-LABEL: @one_slot_recurrence
   // PIPE-LABEL: @one_slot_recurrence
   // PIPE: partition0
@@ -42,6 +43,43 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       "consume_last"(%last) {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : (tensor<128x64xf16, #blocked>) -> ()
       // CHECK: nvws.semaphore.release {{.*}} [#nvws.async_op<none>] {arrive_count = 1 : i32, loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>}
     } {tt.scheduled_max_stage = 1 : i32, tt.warp_specialize, ttg.partition = array<i32: 1, 3>, ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // This is the same ownership cycle shifted across the two partitions. The
+  // EMPTY handoff requires owner delay +1 and the FULL handoff contributes -1,
+  // so the cycle is feasible but both handoffs meet in the same retimed wave.
+  // Cluster legalization must still put the final read before the next write.
+  // CHECK-LABEL: @retimed_zero_delay_cycle
+  // CHECK: nvws.semaphore.acquire {{.*}} {loop.cluster = 3 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>}
+  // CHECK: ttg.local_store {{.*}} {loop.cluster = 3 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>}
+  // CHECK: nvws.semaphore.acquire {{.*}} {loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>}
+  // CHECK: ttg.local_load {{.*}} {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 1>}
+  // CHECK: nvws.semaphore.release {{.*}} [#nvws.async_op<none>] {arrive_count = 1 : i32, loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 1>}
+  // PIPE-LABEL: @retimed_zero_delay_cycle
+  // PIPE: partition0
+  // PIPE: ttg.local_load
+  // PIPE: "consume_first"
+  // PIPE: scf.for
+  // PIPE: ttg.local_load
+  // PIPE: ttng.arrive_barrier
+  // PIPE: "consume_last"
+  // PIPE: ttng.wait_barrier
+  // PIPE: ttg.local_load
+  // PIPE: "consume_first"
+  tt.func @retimed_zero_delay_cycle(%lb: i32, %ub: i32, %step: i32) {
+    %alloc = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 423 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+
+    scf.for %iv = %lb to %ub step %step : i32 {
+      %value = "producer"() {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : () -> tensor<128x64xf16, #blocked>
+      ttg.local_store %value, %alloc {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+
+      %first = ttg.local_load %alloc {loop.cluster = 1 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      "consume_first"(%first) {loop.cluster = 1 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : (tensor<128x64xf16, #blocked>) -> ()
+
+      %last = ttg.local_load %alloc {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      "consume_last"(%last) {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 1>} : (tensor<128x64xf16, #blocked>) -> ()
+    } {tt.scheduled_max_stage = 2 : i32, tt.warp_specialize, ttg.partition = array<i32: 1, 3>, ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 1 : i32}
     tt.return
   }
 }

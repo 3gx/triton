@@ -375,6 +375,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK: [[FS:%.*]] = ttg.memdesc_index [[FULL3]]
     // CHECK: ttng.init_barrier [[FS]], 1
     %sem_full = nvws.semaphore.create %buf false {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]>
+    // CHECK: scf.for {{.*}} iter_args([[STAGE3_IN:%.*]] = {{%.*}}, [[PHASE3_P_IN:%.*]] = {{%.*}}, [[PHASE3_C1_IN:%.*]] = {{%.*}}, [[PHASE3_C2_IN:%.*]] = {{%.*}}, [[PHASE3_C3_IN:%.*]] = {{%.*}}) -> (i32, i32, i32, i32, i32)
     scf.for %i = %arg0 to %arg1 step %arg2 : i32 {
       %val = "op_a"() {ttg.partition = array<i32: 0>} : () -> !elt
       // Producer
@@ -382,9 +383,12 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // CHECK: addi
       // CHECK: cmpi
       // CHECK: [[STAGE3:%.*]] = arith.select
-      // CHECK: xori
-      // CHECK: cmpi
-      // CHECK: [[PHASE3_P:%.*]] = arith.select
+      // CHECK: [[PHASE3_P_ONE:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+      // CHECK: [[PHASE3_P_SHIFT:%.*]] = arith.shli [[PHASE3_P_ONE]], [[STAGE3]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[PHASE3_P_WORD:%.*]] = arith.xori [[PHASE3_P_IN]], [[PHASE3_P_SHIFT]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[PHASE3_P_SHR:%.*]] = arith.shrui [[PHASE3_P_WORD]], [[STAGE3]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[PHASE3_P_MASK:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+      // CHECK: [[PHASE3_P:%.*]] = arith.andi [[PHASE3_P_SHR]], [[PHASE3_P_MASK]] {ttg.partition = array<i32: 0>} : i32
       // CHECK-NEXT: [[EMPTY3_WAIT:%.*]] = ttg.memdesc_index [[EMPTY3]][[[STAGE3]]] {ttg.partition = array<i32: 0>}
       // CHECK-NEXT: ttng.wait_barrier [[EMPTY3_WAIT]], [[PHASE3_P]] {ttg.partition = array<i32: 0>}
       // CHECK: ttg.local_store {{%.*}}, {{%.*}} {ttg.partition = array<i32: 0>}
@@ -395,9 +399,12 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       ttg.local_store %val, %pbuf {ttg.partition = array<i32: 0>} : !elt -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
       nvws.semaphore.release %sem_full[%c0_i32], %ptok [#nvws.async_op<none>] {ttg.partition = array<i32: 0>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
       // Consumer 1
-      // CHECK: xori
-      // CHECK: cmpi
-      // CHECK: [[PHASE3_C1:%.*]] = arith.select
+      // CHECK: [[PHASE3_C1_ONE:%.*]] = arith.constant {ttg.partition = array<i32: 1>} 1 : i32
+      // CHECK: [[PHASE3_C1_SHIFT:%.*]] = arith.shli [[PHASE3_C1_ONE]], [[STAGE3]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[PHASE3_C1_WORD:%.*]] = arith.xori [[PHASE3_C1_IN]], [[PHASE3_C1_SHIFT]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[PHASE3_C1_SHR:%.*]] = arith.shrui [[PHASE3_C1_WORD]], [[STAGE3]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[PHASE3_C1_MASK:%.*]] = arith.constant {ttg.partition = array<i32: 1>} 1 : i32
+      // CHECK: [[PHASE3_C1:%.*]] = arith.andi [[PHASE3_C1_SHR]], [[PHASE3_C1_MASK]] {ttg.partition = array<i32: 1>} : i32
       // CHECK-NEXT: [[FULL3_C1:%.*]] = ttg.memdesc_index [[FULL3]][[[STAGE3]]] {ttg.partition = array<i32: 1>}
       // CHECK-NEXT: ttng.wait_barrier [[FULL3_C1]], [[PHASE3_C1]] {ttg.partition = array<i32: 1>}
       // CHECK: ttg.local_load {{%.*}} {ttg.partition = array<i32: 1>}
@@ -409,9 +416,12 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       nvws.semaphore.release %sem_empty[%c0_i32], %g1 [#nvws.async_op<none>] {ttg.partition = array<i32: 1>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
       "op_b"(%v1) {ttg.partition = array<i32: 1>} : (!elt) -> ()
       // Consumer 2
-      // CHECK: xori
-      // CHECK: cmpi
-      // CHECK: [[PHASE3_C2:%.*]] = arith.select
+      // CHECK: [[PHASE3_C2_ONE:%.*]] = arith.constant {ttg.partition = array<i32: 2>} 1 : i32
+      // CHECK: [[PHASE3_C2_SHIFT:%.*]] = arith.shli [[PHASE3_C2_ONE]], [[STAGE3]] {ttg.partition = array<i32: 2>} : i32
+      // CHECK: [[PHASE3_C2_WORD:%.*]] = arith.xori [[PHASE3_C2_IN]], [[PHASE3_C2_SHIFT]] {ttg.partition = array<i32: 2>} : i32
+      // CHECK: [[PHASE3_C2_SHR:%.*]] = arith.shrui [[PHASE3_C2_WORD]], [[STAGE3]] {ttg.partition = array<i32: 2>} : i32
+      // CHECK: [[PHASE3_C2_MASK:%.*]] = arith.constant {ttg.partition = array<i32: 2>} 1 : i32
+      // CHECK: [[PHASE3_C2:%.*]] = arith.andi [[PHASE3_C2_SHR]], [[PHASE3_C2_MASK]] {ttg.partition = array<i32: 2>} : i32
       // CHECK-NEXT: [[FULL3_C2:%.*]] = ttg.memdesc_index [[FULL3]][[[STAGE3]]] {ttg.partition = array<i32: 2>}
       // CHECK-NEXT: ttng.wait_barrier [[FULL3_C2]], [[PHASE3_C2]] {ttg.partition = array<i32: 2>}
       // CHECK: ttg.local_load {{%.*}} {ttg.partition = array<i32: 2>}
@@ -423,9 +433,12 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       nvws.semaphore.release %sem_empty[%c0_i32], %g2 [#nvws.async_op<none>] {ttg.partition = array<i32: 2>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
       "op_c"(%v2) {ttg.partition = array<i32: 2>} : (!elt) -> ()
       // Consumer 3
-      // CHECK: xori
-      // CHECK: cmpi
-      // CHECK: [[PHASE3_C3:%.*]] = arith.select
+      // CHECK: [[PHASE3_C3_ONE:%.*]] = arith.constant {ttg.partition = array<i32: 3>} 1 : i32
+      // CHECK: [[PHASE3_C3_SHIFT:%.*]] = arith.shli [[PHASE3_C3_ONE]], [[STAGE3]] {ttg.partition = array<i32: 3>} : i32
+      // CHECK: [[PHASE3_C3_WORD:%.*]] = arith.xori [[PHASE3_C3_IN]], [[PHASE3_C3_SHIFT]] {ttg.partition = array<i32: 3>} : i32
+      // CHECK: [[PHASE3_C3_SHR:%.*]] = arith.shrui [[PHASE3_C3_WORD]], [[STAGE3]] {ttg.partition = array<i32: 3>} : i32
+      // CHECK: [[PHASE3_C3_MASK:%.*]] = arith.constant {ttg.partition = array<i32: 3>} 1 : i32
+      // CHECK: [[PHASE3_C3:%.*]] = arith.andi [[PHASE3_C3_SHR]], [[PHASE3_C3_MASK]] {ttg.partition = array<i32: 3>} : i32
       // CHECK-NEXT: [[FULL3_C3:%.*]] = ttg.memdesc_index [[FULL3]][[[STAGE3]]] {ttg.partition = array<i32: 3>}
       // CHECK-NEXT: ttng.wait_barrier [[FULL3_C3]], [[PHASE3_C3]] {ttg.partition = array<i32: 3>}
       // CHECK: ttg.local_load {{%.*}} {ttg.partition = array<i32: 3>}
@@ -436,6 +449,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       %v3 = ttg.local_load %b3 {ttg.partition = array<i32: 3>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !elt
       nvws.semaphore.release %sem_empty[%c0_i32], %g3 [#nvws.async_op<none>] {ttg.partition = array<i32: 3>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
       "op_e"(%v3) {ttg.partition = array<i32: 3>} : (!elt) -> ()
+      // CHECK: scf.yield {ttg.partition = array<i32: 0, 1, 2, 3>} [[STAGE3]], [[PHASE3_P_WORD]], [[PHASE3_C1_WORD]], [[PHASE3_C2_WORD]], [[PHASE3_C3_WORD]]
     } {tt.warp_specialize, ttg.partition.stages = [0 : i32, 2 : i32, 2 : i32, 3 : i32], ttg.warp_specialize.tag = 0 : i32, ttg.partition = array<i32: 0, 1, 2, 3>}
     // Cleanup: 3 inval per mbar alloc
     // CHECK: [[E3I0:%.*]] = ttg.memdesc_index [[EMPTY3]]
@@ -462,8 +476,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 #tmem_base = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 #tmem_f16_view = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 2>
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  // CHECK-DAG: #[[$TMEM_F16_VIEW:.*]] = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 2>
-  // CHECK-LABEL: @coalesce_same_buffer_id_tmem_allocs
+  // CHECK-DAG: #[[TMEM_F16_VIEW:[a-zA-Z0-9_]+]] = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 2>
+  // CHECK: tt.func @coalesce_same_buffer_id_tmem_allocs
   tt.func @coalesce_same_buffer_id_tmem_allocs() {
     // CHECK: [[BASE:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32,
     %base = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 42 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32, #tmem_base, #ttng.tensor_memory, mutable>
@@ -471,10 +485,10 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK: [[SUB:%.*]] = ttng.tmem_subslice [[BASE]] {N = 0 : i32}
     // CHECK-SAME: -> !ttg.memdesc<1x128x64xf32,
     // CHECK-NEXT: [[VIEW:%.*]] = ttg.memdesc_reinterpret [[SUB]]
-    // CHECK-SAME: -> !ttg.memdesc<1x128x128xf16, #[[$TMEM_F16_VIEW]], #ttng.tensor_memory, mutable>
+    // CHECK-SAME: -> !ttg.memdesc<1x128x128xf16, #[[TMEM_F16_VIEW]], #ttng.tensor_memory, mutable>
     %alias = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 42 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf16, #tmem_base, #ttng.tensor_memory, mutable>
     "use_base"(%base) : (!ttg.memdesc<1x128x128xf32, #tmem_base, #ttng.tensor_memory, mutable>) -> ()
-    // CHECK: "use_alias"([[VIEW]]) : (!ttg.memdesc<1x128x128xf16, #[[$TMEM_F16_VIEW]], #ttng.tensor_memory, mutable>) -> ()
+    // CHECK: "use_alias"([[VIEW]]) : (!ttg.memdesc<1x128x128xf16, #[[TMEM_F16_VIEW]], #ttng.tensor_memory, mutable>) -> ()
     "use_alias"(%alias) : (!ttg.memdesc<1x128x128xf16, #tmem_base, #ttng.tensor_memory, mutable>) -> ()
     tt.return
   }
@@ -504,15 +518,18 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK: ttng.init_barrier [[FSLICE]], 1
     %empty = nvws.semaphore.create %alloc true {pending_count = 2 : i32} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>]>
     %full = nvws.semaphore.create %alloc false {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>]>
-    // CHECK: scf.for {{.*}} iter_args({{.*}}) -> (tensor<1xi32, #blocked{{.*}}>, i32, i32, i32, i32)
+    // CHECK: scf.for {{.*}} iter_args([[VALUE_RA_IN:%.*]] = {{%.*}}, [[STAGE_RA_IN:%.*]] = {{%.*}}, [[PHASE_RA_P_IN:%.*]] = {{%.*}}, [[PHASE_RA_C1_IN:%.*]] = {{%.*}}, [[PHASE_RA_C2_IN:%.*]] = {{%.*}}) -> (tensor<1xi32, #blocked{{.*}}>, i32, i32, i32, i32)
     scf.for %arg3 = %arg0 to %arg1 step %arg2 iter_args(%arg5 = %cst) -> (!elt4) : i32 {
       // Producer (partition 0): wait EMPTY, local_store, arrive FULL
       // CHECK: addi
       // CHECK: cmpi
       // CHECK: [[STAGE_RA:%.*]] = arith.select
-      // CHECK: xori
-      // CHECK: cmpi
-      // CHECK: [[PHASE_RA_P:%.*]] = arith.select
+      // CHECK: [[PHASE_RA_P_ONE:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+      // CHECK: [[PHASE_RA_P_SHIFT:%.*]] = arith.shli [[PHASE_RA_P_ONE]], [[STAGE_RA]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[PHASE_RA_P_WORD:%.*]] = arith.xori [[PHASE_RA_P_IN]], [[PHASE_RA_P_SHIFT]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[PHASE_RA_P_SHR:%.*]] = arith.shrui [[PHASE_RA_P_WORD]], [[STAGE_RA]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[PHASE_RA_P_MASK:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+      // CHECK: [[PHASE_RA_P:%.*]] = arith.andi [[PHASE_RA_P_SHR]], [[PHASE_RA_P_MASK]] {ttg.partition = array<i32: 0>} : i32
       // CHECK: [[EMPTYBAR1:%.*]] = ttg.memdesc_index [[MBAR_E]][[[STAGE_RA]]] {ttg.partition = array<i32: 0>}
       // CHECK: ttng.wait_barrier [[EMPTYBAR1]], [[PHASE_RA_P]] {ttg.partition = array<i32: 0>}
       // CHECK: [[PBUF:%.*]] = ttg.memdesc_index [[BUF]][[[STAGE_RA]]] {ttg.partition = array<i32: 0>}
@@ -526,9 +543,12 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       nvws.semaphore.release %full, %ptok [#nvws.async_op<none>] {ttg.partition = array<i32: 0>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>]>, !ttg.async.token
       %5 = "op_a"() {ttg.partition = array<i32: 0>} : () -> !elt4
       // Consumer 1 (partition 1): wait FULL, local_load, arrive EMPTY
-      // CHECK: xori
-      // CHECK: cmpi
-      // CHECK: [[PHASE_RA_C1:%.*]] = arith.select
+      // CHECK: [[PHASE_RA_C1_ONE:%.*]] = arith.constant {ttg.partition = array<i32: 1>} 1 : i32
+      // CHECK: [[PHASE_RA_C1_SHIFT:%.*]] = arith.shli [[PHASE_RA_C1_ONE]], [[STAGE_RA]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[PHASE_RA_C1_WORD:%.*]] = arith.xori [[PHASE_RA_C1_IN]], [[PHASE_RA_C1_SHIFT]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[PHASE_RA_C1_SHR:%.*]] = arith.shrui [[PHASE_RA_C1_WORD]], [[STAGE_RA]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[PHASE_RA_C1_MASK:%.*]] = arith.constant {ttg.partition = array<i32: 1>} 1 : i32
+      // CHECK: [[PHASE_RA_C1:%.*]] = arith.andi [[PHASE_RA_C1_SHR]], [[PHASE_RA_C1_MASK]] {ttg.partition = array<i32: 1>} : i32
       // CHECK: [[FULLMBAR1:%.*]] = ttg.memdesc_index [[MBAR_F]][[[STAGE_RA]]] {ttg.partition = array<i32: 1>}
       // CHECK-NEXT: ttng.wait_barrier [[FULLMBAR1]], [[PHASE_RA_C1]] {ttg.partition = array<i32: 1>}
       // CHECK: [[CBUF1:%.*]] = ttg.memdesc_index [[BUF]][[[STAGE_RA]]] {ttg.partition = array<i32: 1>}
@@ -542,9 +562,12 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       nvws.semaphore.release %empty, %gtok1 [#nvws.async_op<none>] {ttg.partition = array<i32: 1>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>]>, !ttg.async.token
       "op_d"(%8) {ttg.partition = array<i32: 1>} : (!elt4) -> ()
       // Consumer 2 (partition 2): wait FULL, local_load, arrive EMPTY
-      // CHECK: xori
-      // CHECK: cmpi
-      // CHECK: [[PHASE_RA_C2:%.*]] = arith.select
+      // CHECK: [[PHASE_RA_C2_ONE:%.*]] = arith.constant {ttg.partition = array<i32: 2>} 1 : i32
+      // CHECK: [[PHASE_RA_C2_SHIFT:%.*]] = arith.shli [[PHASE_RA_C2_ONE]], [[STAGE_RA]] {ttg.partition = array<i32: 2>} : i32
+      // CHECK: [[PHASE_RA_C2_WORD:%.*]] = arith.xori [[PHASE_RA_C2_IN]], [[PHASE_RA_C2_SHIFT]] {ttg.partition = array<i32: 2>} : i32
+      // CHECK: [[PHASE_RA_C2_SHR:%.*]] = arith.shrui [[PHASE_RA_C2_WORD]], [[STAGE_RA]] {ttg.partition = array<i32: 2>} : i32
+      // CHECK: [[PHASE_RA_C2_MASK:%.*]] = arith.constant {ttg.partition = array<i32: 2>} 1 : i32
+      // CHECK: [[PHASE_RA_C2:%.*]] = arith.andi [[PHASE_RA_C2_SHR]], [[PHASE_RA_C2_MASK]] {ttg.partition = array<i32: 2>} : i32
       // CHECK: [[FULLMBAR2:%.*]] = ttg.memdesc_index [[MBAR_F]][[[STAGE_RA]]] {ttg.partition = array<i32: 2>}
       // CHECK-NEXT: ttng.wait_barrier [[FULLMBAR2]], [[PHASE_RA_C2]] {ttg.partition = array<i32: 2>}
       // CHECK: [[CBUF2:%.*]] = ttg.memdesc_index [[BUF]][[[STAGE_RA]]] {ttg.partition = array<i32: 2>}
@@ -557,6 +580,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       %11 = ttg.local_load %gbuf2 {ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi32, #shared4, #smem4, mutable> -> !elt4
       nvws.semaphore.release %empty, %gtok2 [#nvws.async_op<none>] {ttg.partition = array<i32: 2>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared4, #smem4, mutable>]>, !ttg.async.token
       "op_d"(%11) {ttg.partition = array<i32: 2>} : (!elt4) -> ()
+      // CHECK: scf.yield {ttg.partition = array<i32: 0, 1, 2>} {{%.*}}, [[STAGE_RA]], [[PHASE_RA_P_WORD]], [[PHASE_RA_C1_WORD]], [[PHASE_RA_C2_WORD]]
       scf.yield %5 : !elt4
     } {ttg.partition.stages = [1 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.outputs = [array<i32: 0>], tt.warp_specialize}
     // Cleanup
@@ -598,14 +622,18 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK-COUNT-3: ttng.init_barrier {{.*}}, 1
     // CHECK: [[B_FULL:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<3x1xi64,
     // CHECK-COUNT-3: ttng.init_barrier {{.*}}, 1
+    // CHECK: scf.for {{.*}} iter_args([[ACC_IN:%.*]] = {{%.*}}, [[A_STAGE_IN:%.*]] = {{%.*}}, [[A_PHASE_P_IN:%.*]] = {{%.*}}, [[A_PHASE_C_IN:%.*]] = {{%.*}}, [[B_STAGE_IN:%.*]] = {{%.*}}, [[B_PHASE_P_IN:%.*]] = {{%.*}}, [[B_PHASE_C_IN:%.*]] = {{%.*}}) -> (!ttg.async.token, i32, i32, i32, i32, i32, i32)
     %0 = scf.for %iv = %lb to %ub step %step iter_args(%acc = %token) -> (!ttg.async.token) : i32 {
       // Per pair: stage/phase advance, wait its EMPTY, TMA into its FULL
       // CHECK: addi
       // CHECK: cmpi
       // CHECK: [[A_STAGE:%.*]] = arith.select
-      // CHECK: xori
-      // CHECK: cmpi
-      // CHECK: [[A_PHASE_P:%.*]] = arith.select
+      // CHECK: [[A_PHASE_P_ONE:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+      // CHECK: [[A_PHASE_P_SHIFT:%.*]] = arith.shli [[A_PHASE_P_ONE]], [[A_STAGE]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[A_PHASE_P_WORD:%.*]] = arith.xori [[A_PHASE_P_IN]], [[A_PHASE_P_SHIFT]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[A_PHASE_P_SHR:%.*]] = arith.shrui [[A_PHASE_P_WORD]], [[A_STAGE]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[A_PHASE_P_MASK:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+      // CHECK: [[A_PHASE_P:%.*]] = arith.andi [[A_PHASE_P_SHR]], [[A_PHASE_P_MASK]] {ttg.partition = array<i32: 0>} : i32
       // CHECK: [[A_EMPTY_WAIT:%.*]] = ttg.memdesc_index [[A_EMPTY]][[[A_STAGE]]] {ttg.partition = array<i32: 0>}
       // CHECK: ttng.wait_barrier [[A_EMPTY_WAIT]], [[A_PHASE_P]] {ttg.partition = array<i32: 0>}
       // CHECK: [[BUF_A_SLICE:%.*]] = ttg.memdesc_index [[BUF_A]][[[A_STAGE]]] {ttg.partition = array<i32: 0>}
@@ -615,9 +643,12 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // CHECK: addi
       // CHECK: cmpi
       // CHECK: [[B_STAGE:%.*]] = arith.select
-      // CHECK: xori
-      // CHECK: cmpi
-      // CHECK: [[B_PHASE_P:%.*]] = arith.select
+      // CHECK: [[B_PHASE_P_ONE:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+      // CHECK: [[B_PHASE_P_SHIFT:%.*]] = arith.shli [[B_PHASE_P_ONE]], [[B_STAGE]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[B_PHASE_P_WORD:%.*]] = arith.xori [[B_PHASE_P_IN]], [[B_PHASE_P_SHIFT]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[B_PHASE_P_SHR:%.*]] = arith.shrui [[B_PHASE_P_WORD]], [[B_STAGE]] {ttg.partition = array<i32: 0>} : i32
+      // CHECK: [[B_PHASE_P_MASK:%.*]] = arith.constant {ttg.partition = array<i32: 0>} 1 : i32
+      // CHECK: [[B_PHASE_P:%.*]] = arith.andi [[B_PHASE_P_SHR]], [[B_PHASE_P_MASK]] {ttg.partition = array<i32: 0>} : i32
       // CHECK: [[B_EMPTY_WAIT:%.*]] = ttg.memdesc_index [[B_EMPTY]][[[B_STAGE]]] {ttg.partition = array<i32: 0>}
       // CHECK: ttng.wait_barrier [[B_EMPTY_WAIT]], [[B_PHASE_P]] {ttg.partition = array<i32: 0>}
       // CHECK: [[BUF_B_SLICE:%.*]] = ttg.memdesc_index [[BUF_B]][[[B_STAGE]]] {ttg.partition = array<i32: 0>}
@@ -633,15 +664,21 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       nvws.descriptor_load %desc_b[%iv, %iv] 16384 %buf_b {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16, #shared_ws_port>>, i32, i32, !ttg.memdesc<128x64xf16, #shared_ws_port, #smem_ws_port, mutable>
       nvws.semaphore.release %full_b, %tok_b [#nvws.async_op<tma_load>] {ttg.partition = array<i32: 0>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_ws_port, #smem_ws_port, mutable>]>, !ttg.async.token
       // Consumer: wait each pair's FULL, MMA, commit each pair's EMPTY
-      // CHECK: xori
-      // CHECK: cmpi
-      // CHECK: [[A_PHASE_C:%.*]] = arith.select
+      // CHECK: [[A_PHASE_C_ONE:%.*]] = arith.constant {ttg.partition = array<i32: 1>} 1 : i32
+      // CHECK: [[A_PHASE_C_SHIFT:%.*]] = arith.shli [[A_PHASE_C_ONE]], [[A_STAGE]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[A_PHASE_C_WORD:%.*]] = arith.xori [[A_PHASE_C_IN]], [[A_PHASE_C_SHIFT]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[A_PHASE_C_SHR:%.*]] = arith.shrui [[A_PHASE_C_WORD]], [[A_STAGE]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[A_PHASE_C_MASK:%.*]] = arith.constant {ttg.partition = array<i32: 1>} 1 : i32
+      // CHECK: [[A_PHASE_C:%.*]] = arith.andi [[A_PHASE_C_SHR]], [[A_PHASE_C_MASK]] {ttg.partition = array<i32: 1>} : i32
       // CHECK: [[A_FULL_WAIT:%.*]] = ttg.memdesc_index [[A_FULL]][[[A_STAGE]]] {ttg.partition = array<i32: 1>}
       // CHECK: ttng.wait_barrier [[A_FULL_WAIT]], [[A_PHASE_C]] {ttg.partition = array<i32: 1>}
       // CHECK: [[BUF_A_SLICE_C:%.*]] = ttg.memdesc_index [[BUF_A]][[[A_STAGE]]] {ttg.partition = array<i32: 1>}
-      // CHECK: xori
-      // CHECK: cmpi
-      // CHECK: [[B_PHASE_C:%.*]] = arith.select
+      // CHECK: [[B_PHASE_C_ONE:%.*]] = arith.constant {ttg.partition = array<i32: 1>} 1 : i32
+      // CHECK: [[B_PHASE_C_SHIFT:%.*]] = arith.shli [[B_PHASE_C_ONE]], [[B_STAGE]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[B_PHASE_C_WORD:%.*]] = arith.xori [[B_PHASE_C_IN]], [[B_PHASE_C_SHIFT]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[B_PHASE_C_SHR:%.*]] = arith.shrui [[B_PHASE_C_WORD]], [[B_STAGE]] {ttg.partition = array<i32: 1>} : i32
+      // CHECK: [[B_PHASE_C_MASK:%.*]] = arith.constant {ttg.partition = array<i32: 1>} 1 : i32
+      // CHECK: [[B_PHASE_C:%.*]] = arith.andi [[B_PHASE_C_SHR]], [[B_PHASE_C_MASK]] {ttg.partition = array<i32: 1>} : i32
       // CHECK: [[B_FULL_WAIT:%.*]] = ttg.memdesc_index [[B_FULL]][[[B_STAGE]]] {ttg.partition = array<i32: 1>}
       // CHECK: ttng.wait_barrier [[B_FULL_WAIT]], [[B_PHASE_C]] {ttg.partition = array<i32: 1>}
       // CHECK: [[BUF_B_SLICE_C:%.*]] = ttg.memdesc_index [[BUF_B]][[[B_STAGE]]] {ttg.partition = array<i32: 1>}
@@ -659,6 +696,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       %mma = ttng.tc_gen5_mma %cbuf_a, %rhs, %result[%acc], %true, %true {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared_ws_port, #smem_ws_port, mutable>, !ttg.memdesc<64x128xf16, #shared_ws_port_t, #smem_ws_port, mutable>, !ttg.memdesc<128x128xf32, #tmem_ws_port, #ttng.tensor_memory, mutable>
       nvws.semaphore.release %empty_a, %tok_ca [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_ws_port, #smem_ws_port, mutable>]>, !ttg.async.token
       nvws.semaphore.release %empty_b, %tok_cb [#nvws.async_op<tc5mma>] {ttg.partition = array<i32: 1>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_ws_port, #smem_ws_port, mutable>]>, !ttg.async.token
+      // CHECK: scf.yield {ttg.partition = array<i32: 0, 1>} {{%.*}}, [[A_STAGE]], [[A_PHASE_P_WORD]], [[A_PHASE_C_WORD]], [[B_STAGE]], [[B_PHASE_P_WORD]], [[B_PHASE_C_WORD]]
       scf.yield {ttg.partition = array<i32: 0, 1>} %mma : !ttg.async.token
     } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 1>], tt.warp_specialize}
     tt.return

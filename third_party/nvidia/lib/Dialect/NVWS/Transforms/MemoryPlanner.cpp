@@ -2015,7 +2015,13 @@ public:
           LDBG("TMEM pre-assign: reuser buffer.id="
                << bid << " colOffset=" << nextColOffset
                << " size=" << reuserBuf->rowSize << "x" << reuserBuf->colSize);
-          nextColOffset += reuserBuf->colSize;
+          // Do not advance the column offset (matches the Meta baseline,
+          // WSMemoryPlanner.cpp). Advancing it lets stacked reusers exceed
+          // the owner's width, which splits the buffer.id group into
+          // multiple components; InsertSemas requires one component per
+          // group. Reusers here are temporally exclusive, so sharing the
+          // owner's columns is safe.
+          nextColOffset += 0; // reuserBuf->colSize;
         }
       }
 
@@ -3048,9 +3054,11 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               int smemAllocAlgo = 0, unsigned smemBudget = 0,
                               bool smemCircularReuse = false) {
 
+  // Port and adapter boundaries: sema-docs/meta-ports.md#memory-planning.
   // NVWS extension: translate partition-annotated NVWS IR into the Channel
-  // model consumed by the copied Meta planner. This changes channel discovery,
-  // not allocation policy, ID selection, copy growth, or budget accounting.
+  // model consumed by the copied Meta planner. The adapter adds conservative
+  // liveness/final-allocation fallbacks for explicit NVWS allocations; Meta's
+  // reuse policy, ID selection, copy growth, and budget accounting remain.
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
   if (failed(collectPostChannels(channelsOrigin, funcOp)))

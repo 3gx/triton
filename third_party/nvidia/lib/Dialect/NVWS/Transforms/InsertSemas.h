@@ -34,7 +34,6 @@ namespace nvws = triton::nvws;
 using MemberId = unsigned;
 using PieceId = unsigned;
 using SemaId = unsigned;
-using CompId = unsigned;
 using PartitionId = std::pair<int /*ttg.partition*/, int /*ws tag*/>;
 using Owner = std::optional<PartitionId>;
 inline int64_t ownerKey(const Owner &o) {
@@ -70,26 +69,26 @@ struct Touch {
 struct Node;
 
 struct Hold {
-  enum class Outcome { CARRIER, POINT_OF_USE, CHILD_OWNS };
-  Outcome outcome = Outcome::CARRIER;
-  const char *reason = "";
-  SmallVector<Node *, 4> rows;
+  enum class Outcome { THREADED, POINT_OF_USE, CHILD_OWNS };
+  enum class Blocker { NONE, TRAILING_USE, RESULT_CONSUMED };
+  Outcome outcome = Outcome::THREADED;
+  Blocker blocker = Blocker::NONE;
+  SmallVector<Node *, 4> nodes;
   Node *entryAcquire = nullptr, *closingRelease = nullptr;
   Node *regain = nullptr, *firstToucher = nullptr;
-  Node *finalAcquire = nullptr, *bridgeAcquire = nullptr;
-  Node *bridgeRelease = nullptr;
-  bool needsFinalAcquire = false, keepsEntryAcquire = false;
+  Node *bridgeAcquire = nullptr;
+  bool needsPostLoopAcquire = false, keepsEntryAcquire = false;
   bool regionTail = false;
-  bool materializesCarrier() const { return outcome == Outcome::CARRIER; }
+  bool threadsToken() const { return outcome == Outcome::THREADED; }
   bool isPointOfUse() const { return outcome == Outcome::POINT_OF_USE; }
   bool isChildOwns() const { return outcome == Outcome::CHILD_OWNS; }
 };
 
 struct Crossing {
-  CompId comp = 0;
-  Owner slotOwner;
+  Owner tokenOwner;
   SmallVector<Node *, 2> finals;
   Hold hold;
+  Node *postLoopAcquire = nullptr, *bridgeAcquire = nullptr, *bridgeRelease = nullptr;
 };
 
 struct Node {
@@ -104,11 +103,15 @@ struct Node {
   DenseMap<PieceId, PieceInfo> pieceInfo;
   SemaId sema = 0;
   unsigned count = 0;
-  bool finalPermissionAcquire = false;
+  bool postLoopAcquire = false;
   SmallVector<AsyncOp, 1> payloads;
   gpu::StageCluster stageCluster;
   std::optional<int64_t> stageOffset;
   std::optional<int64_t> bufferStageOffset;
+  // The SYNC-DAG proved that this node can reuse its owner's earlier token in
+  // the same chain without a fresh handoff. EmitIR renders this fact; it does
+  // not infer token-reuse eligibility on its own.
+  std::optional<int64_t> reuseTokenOwner;
   Node *sat = nullptr;
   Node *scheduleAnchor = nullptr;
   SmallVector<Crossing, 1> crossings;
@@ -116,11 +119,36 @@ struct Node {
   bool isRegion() const { return kind == For || kind == If; }
   bool isProtocol() const { return kind == Acquire || kind == Release; }
 };
+inline void markTokenReuse(Node *n, const Owner &owner) {
+  assert(owner && n->owner && sameOwner(n->owner, owner));
+  n->reuseTokenOwner = ownerKey(owner);
+}
+inline bool nodeReusesToken(const Node *n, const Owner &owner) {
+  return owner && n->reuseTokenOwner &&
+         *n->reuseTokenOwner == ownerKey(owner);
+}
 inline SmallVector<std::pair<PieceId, PieceInfo>, 4>
 sortedPieceInfo(const Node *n) {
   SmallVector<std::pair<PieceId, PieceInfo>, 4> v(n->pieceInfo.begin(), n->pieceInfo.end());
   llvm::sort(v, [](const auto &a, const auto &b) { return a.first < b.first; });
   return v;
+}
+// Outer optional: the node has one uniform owner. Inner Owner may still be
+// root; an empty outer optional means no pieces or mixed owners.
+inline std::optional<Owner> uniformPieceOwner(const Node *n) {
+  bool fresh = true;
+  Owner owner;
+  for (auto &[p, pi] : sortedPieceInfo(n)) {
+    if (fresh) {
+      owner = pi.owner;
+      fresh = false;
+    } else if (!sameOwner(owner, pi.owner)) {
+      return std::nullopt;
+    }
+  }
+  if (fresh)
+    return std::nullopt;
+  return std::optional<Owner>(std::in_place, owner);
 }
 
 struct Member {
@@ -140,16 +168,13 @@ struct PieceTable {
   SmallVector<Member> members;
   SmallVector<Piece> pieces;
   SmallVector<SmallVector<PieceId, 2>> footprint;
-  SmallVector<CompId> pieceComp;
 };
 
 struct Sema {
   std::string name;
-  CompId component = 0;
-  SmallVector<PieceId, 2> pieces;
-  unsigned count = 0, expectedReleases = 0;
+  unsigned count = 0, expectedArrivals = 0;
   bool isEntry = false;
-  Owner inheritStamp;
+  Owner entryTokenOwner;
   Value create;
 };
 
@@ -165,11 +190,11 @@ struct GroupDag {
   PieceTable pieceTable;
   DenseMap<Value, std::pair<MemberId, SmallVector<AliasStep, 2>>> aliases;
   SmallVector<Operation *, 1> ttDescriptorFedMembers;
-  DenseSet<Operation *> accessRowOps;
+  DenseSet<Operation *> accessNodeOps;
   SmallVector<std::unique_ptr<Node>> nodes;
   Node *root = nullptr;
   SmallVector<Sema> semas;
-  int numStages = 1, semaphoreDepth = 1;
+  int numCopies = 1, numSemaphoreCopies = 1;
   SmallVector<Value> backing;
   bool isTmem() const { return memory == MemKind::Tmem; }
   bool isLocal() const { return memory == MemKind::Local; }
@@ -200,8 +225,8 @@ inline bool canOwnMixedDepthTmem(const GroupDag &owner, const GroupDag &reuser) 
   unsigned reuserWidth = reuserMember.type.getElementTypeBitWidth();
   if (ownerWidth != reuserWidth && ownerWidth != 2 * reuserWidth)
     return false;
-  int64_t ownerSpan = ownerMember.extent * owner.numStages;
-  int64_t reuserSpan = reuserMember.extent * reuser.numStages;
+  int64_t ownerSpan = ownerMember.extent * owner.numCopies;
+  int64_t reuserSpan = reuserMember.extent * reuser.numCopies;
   return reuserMember.offset >= ownerMember.offset &&
          reuserMember.offset + reuserSpan <= ownerMember.offset + ownerSpan;
 }
@@ -326,18 +351,10 @@ inline bool touchesPiece(const GroupDag &g, const Node *node, PieceId piece) {
   forEachTouchedPiece(g, node, [&](PieceId p, Effect) { found |= p == piece; });
   return found;
 }
-inline bool touchesComponent(const GroupDag &g, const Node *node, CompId comp) {
+inline bool nodeTouchesGroup(const GroupDag &g, const Node *node) {
   bool found = false;
-  forEachTouchedPiece(g, node, [&](PieceId p, Effect) {
-    found |= g.pieceTable.pieceComp[p] == comp;
-  });
+  forEachTouchedPiece(g, node, [&](PieceId, Effect) { found = true; });
   return found;
-}
-inline CompId compOfMember(const GroupDag &g, MemberId member) {
-  return g.pieceTable.pieceComp[g.pieceTable.footprint[member].front()];
-}
-inline unsigned numComponents(const GroupDag &g) {
-  return g.pieceTable.pieceComp.empty() ? 0 : *llvm::max_element(g.pieceTable.pieceComp) + 1;
 }
 template <typename Map>
 inline void mergeEffect(Map &effects, PieceId piece, Effect effect) {

@@ -1,5 +1,6 @@
 // Protocol materialization; see sema-docs/insert-semas/emit-ir.md.
 #include "InsertSemas.h"
+#include "mlir/Interfaces/InferTypeOpInterface.h"
 
 namespace mlir::triton::nvws_semas {
 
@@ -9,17 +10,60 @@ struct EmitCtx {
   Type tokenType;
   struct Slot {
     GroupDag *g;
-    CompId comp;
     unsigned index; // absolute result / iter_arg index in the NEW op
   };
   llvm::MapVector<Operation *, SmallVector<Slot, 2>> slots;
+  DenseSet<Operation *> reusedTokenBufferOps;
 };
 
 struct RenderState {
-  DenseMap<CompId, Value> carrier;          // current carrier token per comp
-  DenseMap<CompId, Value> carrierSema;      // the create of that carrier's
-  DenseMap<MemberId, Value> view;           // member view cache
+  struct Token {
+    Value value;
+    Value sema;
+    std::optional<int64_t> owner;
+  };
+  // One record per token known in this chain. The last record is the token
+  // used by default; owner-marked nodes may instead use their owner's record.
+  SmallVector<Token, 2> tokens;
+  DenseMap<MemberId, std::pair<Value, int64_t>> view;  // member view + owner
   void clearViews() { view.clear(); }
+  const Token *lastToken() const {
+    return tokens.empty() ? nullptr : &tokens.back();
+  }
+  Token *tokenForOwner(int64_t owner) {
+    for (Token &token : tokens)
+      if (token.owner && *token.owner == owner && token.value && token.sema)
+        return &token;
+    return nullptr;
+  }
+  void recordToken(Value value, Value sema, const Owner &owner) {
+    std::optional<int64_t> key = owner ? std::optional(ownerKey(owner))
+                                       : std::nullopt;
+    for (auto it = tokens.begin(); it != tokens.end();) {
+      if (!it->owner || it->owner == key)
+        it = tokens.erase(it);
+      else
+        ++it;
+    }
+    tokens.push_back(Token{value, sema, key});
+  }
+  void keepLastTokenFor(const Owner &owner) {
+    Token token = tokens.empty() ? Token{} : tokens.back();
+    token.owner = owner ? std::optional(ownerKey(owner)) : std::nullopt;
+    tokens.clear();
+    tokens.push_back(token);
+  }
+  void replaceLastToken(Value value, const Owner &owner) {
+    Token token = tokens.empty() ? Token{} : tokens.back();
+    token.value = value;
+    token.owner = owner ? std::optional(ownerKey(owner)) : std::nullopt;
+    tokens.clear();
+    tokens.push_back(token);
+  }
+  void clearTokens() {
+    tokens.clear();
+    clearViews();
+  }
   RenderState nested() const {
     RenderState copy = *this;
     copy.clearViews();
@@ -110,7 +154,7 @@ static gpu::MemDescType backingType(const GroupDag &g, const Member &m) {
   auto t = m.type;
   SmallVector<int64_t> shape(t.getShape());
   if (!isScalesEnc(t))
-    shape.insert(shape.begin(), g.numStages);
+    shape.insert(shape.begin(), g.numCopies);
   return gpu::MemDescType::get(shape, t.getElementType(), t.getEncoding(),
                                t.getMemorySpace(), /*mutableMemory=*/true);
 }
@@ -331,7 +375,6 @@ static bool eraseDeadTokenSlots(EmitCtx &ctx, MutableArrayRef<GroupDag> groups) 
 static void rewriteSignatures(EmitCtx &ctx, MutableArrayRef<GroupDag> groups) {
   struct Want {
     GroupDag *g;
-    CompId comp;
     Owner owner;
   };
   llvm::MapVector<Operation *, SmallVector<Want, 2>> wanted;
@@ -339,9 +382,9 @@ static void rewriteSignatures(EmitCtx &ctx, MutableArrayRef<GroupDag> groups) {
     forEachNode(g, [&](Node *n) {
       if (n->isRegion())
         for (const Crossing &c : n->crossings) {
-          if (n->kind == Node::For && !c.hold.materializesCarrier())
+          if (n->kind == Node::For && !c.hold.threadsToken())
             continue;
-          wanted[n->op].push_back(Want{&g, c.comp, c.slotOwner});
+          wanted[n->op].push_back(Want{&g, c.tokenOwner});
         }
     });
   }
@@ -417,21 +460,45 @@ static void rewriteSignatures(EmitCtx &ctx, MutableArrayRef<GroupDag> groups) {
     fixupAnchors(groups, op, newOp);
     auto &rec = ctx.slots[newOp];
     for (auto [i, w] : llvm::enumerate(list))
-      rec.push_back(EmitCtx::Slot{w.g, w.comp, base + static_cast<unsigned>(i)});
+      rec.push_back(EmitCtx::Slot{w.g, base + static_cast<unsigned>(i)});
   }
 }
-static unsigned slotIndexFor(EmitCtx &ctx, Operation *op, GroupDag *g, CompId comp) {
+static unsigned slotIndexFor(EmitCtx &ctx, Operation *op, GroupDag *g) {
   for (const EmitCtx::Slot &s : ctx.slots[op])
-    if (s.g == g && s.comp == comp)
+    if (s.g == g)
       return s.index;
   llvm_unreachable("missing slot");
 }
-static Value getView(GroupDag &g, RenderState &rs, Node *node, const Touch &t, Operation *accessOp,
+static void refreshAliasResultTypes(Operation *op, Value source) {
+  // A mapped semaphore view can carry a staged allocShape that was absent from
+  // the original alias operand. Let each alias op derive its result from the
+  // cloned operands before falling back to the old mutability-only adjustment.
+  if (auto typeInfer = dyn_cast<InferTypeOpInterface>(op)) {
+    SmallVector<Type> inferredTypes;
+    if (succeeded(typeInfer.inferReturnTypes(
+            op->getContext(), op->getLoc(), op->getOperands(),
+            op->getAttrDictionary(), op->getPropertiesStorage(),
+            op->getRegions(), inferredTypes)) &&
+        inferredTypes.size() == op->getNumResults()) {
+      for (auto [result, type] : llvm::zip(op->getResults(), inferredTypes))
+        result.setType(type);
+      return;
+    }
+  }
+  if (op->getNumResults() == 1)
+    if (auto resultType = dyn_cast<gpu::MemDescType>(op->getResult(0).getType()))
+      op->getResult(0).setType(withMutable(
+          resultType,
+          cast<gpu::MemDescType>(source.getType()).getMutableMemory()));
+}
+static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs, Node *node,
+                     const Touch &t, Operation *accessOp,
                      const Owner &owner) {
   auto it = rs.view.find(t.member);
   Value base;
-  if (it != rs.view.end()) {
-    base = it->second;
+  int64_t viewOwner = ownerKey(owner);
+  if (it != rs.view.end() && it->second.second == viewOwner) {
+    base = it->second.first;
   } else {
     OpBuilder b(accessOp);
     SmallVector<Type> types;
@@ -442,19 +509,28 @@ static Value getView(GroupDag &g, RenderState &rs, Node *node, const Touch &t, O
       else
         types.push_back(localViewType(g, static_cast<MemberId>(mi), {&t}, bt));
     }
-    CompId comp = compOfMember(g, t.member);
-    Value tok = rs.carrier.lookup(comp);
-    assert(tok && "no carrier for view");
-    Value semaVal = rs.carrierSema.lookup(comp);
-    assert(semaVal && "no semaphore for carrier");
+    const RenderState::Token *lastToken = rs.lastToken();
+    Value tok = lastToken ? lastToken->value : Value();
+    Value semaVal = lastToken ? lastToken->sema : Value();
+    bool reusesToken = nodeReusesToken(node, owner);
+    if (reusesToken &&
+        (!lastToken || !lastToken->owner || *lastToken->owner != viewOwner)) {
+      RenderState::Token *token = rs.tokenForOwner(viewOwner);
+      assert(token && "token-reuse DAG fact without token");
+      tok = token->value;
+      semaVal = token->sema;
+    }
+    assert(tok && "no token for view");
+    assert(semaVal && "no semaphore for token");
     auto buf = emitInto<nvws::SemaphoreBufferOp>(
         b, accessOp->getLoc(), owner, gpu::getStageCluster(accessOp), semaVal, TypeRange(types), tok);
+    if (reusesToken)
+      ctx.reusedTokenBufferOps.insert(buf.getOperation());
     if (node->bufferStageOffset)
       buf.setStage(materializeI32Before(buf, *node->bufferStageOffset));
     for (auto [mi, v] : llvm::enumerate(buf.getBuffers()))
-      if (compOfMember(g, static_cast<MemberId>(mi)) == comp)
-        rs.view[static_cast<MemberId>(mi)] = v;
-    base = rs.view[t.member];
+      rs.view[static_cast<MemberId>(mi)] = {v, viewOwner};
+    base = rs.view[t.member].first;
   }
   Value cur = base;
   OpBuilder b(accessOp);
@@ -468,10 +544,7 @@ static Value getView(GroupDag &g, RenderState &rs, Node *node, const Touch &t, O
       mapping.map(operand, idx == step.operandIdx ? cur : operand);
     Value source = cur;
     Operation *cloned = b.clone(*old, mapping);
-    if (cloned->getNumResults() == 1)
-      if (auto rt = dyn_cast<gpu::MemDescType>(cloned->getResult(0).getType()))
-        cloned->getResult(0).setType(withMutable(
-            rt, cast<gpu::MemDescType>(source.getType()).getMutableMemory()));
+    refreshAliasResultTypes(cloned, source);
     cur = cloned->getResult(0);
   }
   return cur;
@@ -479,11 +552,20 @@ static Value getView(GroupDag &g, RenderState &rs, Node *node, const Touch &t, O
 
 static void renderChain(EmitCtx &ctx, GroupDag &g, Node *head, RenderState &rs,
                         DenseMap<Node *, Value> &emitted);
-static Operation *renderAccess(GroupDag &g, Node *n, RenderState &rs) {
+static void seedRegionEntry(RenderState &state, Node *head) {
+  if (head->pieceInfo.empty())
+    return;
+  if (auto owner = uniformPieceOwner(head); owner && owner->has_value())
+    state.keepLastTokenFor(*owner);
+  else
+    state.keepLastTokenFor(std::nullopt);
+}
+static Operation *renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
+                               RenderState &rs) {
   Operation *op = n->op;
   Operation *anchor = op;
   for (const Touch &t : n->touches) {
-    Value view = getView(g, rs, n, t, op, n->owner);
+    Value view = getView(ctx, g, rs, n, t, op, n->owner);
     if (auto ta = dyn_cast<nvidia_gpu::TMEMAllocOp>(op)) {
       OpBuilder b(op);
       auto pidsc = std::make_pair(n->owner, gpu::getStageCluster(op));
@@ -492,7 +574,8 @@ static Operation *renderAccess(GroupDag &g, Node *n, RenderState &rs) {
                                                  Value(), ta.getSrc(), vTrue);
       ta.getResult().replaceUsesWithIf(view, [&](OpOperand &use) {
         return !isa<nvws::SemaphoreCreateOp>(use.getOwner()) &&
-               use.getOwner() != view.getDefiningOp() && !g.accessRowOps.contains(use.getOwner());
+               use.getOwner() != view.getDefiningOp() &&
+               !g.accessNodeOps.contains(use.getOwner());
       });
       return anchor;
     }
@@ -506,7 +589,8 @@ static Operation *renderAccess(GroupDag &g, Node *n, RenderState &rs) {
       }
       anchor = emitInto<gpu::LocalStoreOp>(b, op->getLoc(), n->owner, gpu::getStageCluster(op), src, view);
       la.getResult().replaceUsesWithIf(view, [&](OpOperand &use) {
-        return !isa<nvws::SemaphoreCreateOp>(use.getOwner()) && !g.accessRowOps.contains(use.getOwner());
+        return !isa<nvws::SemaphoreCreateOp>(use.getOwner()) &&
+               !g.accessNodeOps.contains(use.getOwner());
       });
       return anchor;
     }
@@ -530,12 +614,13 @@ static Operation *renderAccess(GroupDag &g, Node *n, RenderState &rs) {
 static void renderRegion(EmitCtx &ctx, GroupDag &g, Node *n, RenderState &rs,
                          DenseMap<Node *, Value> &emitted) {
   for (const Crossing &c : n->crossings) {
-    if (n->kind == Node::For && !c.hold.materializesCarrier())
+    if (n->kind == Node::For && !c.hold.threadsToken())
       continue; // native point-of-use: no slot (plan M2)
-    unsigned idx = slotIndexFor(ctx, n->op, &g, c.comp);
-    Value incoming = rs.carrier.lookup(c.comp);
+    unsigned idx = slotIndexFor(ctx, n->op, &g);
+    const RenderState::Token *lastToken = rs.lastToken();
+    Value incoming = lastToken ? lastToken->value : Value();
     if (!incoming)
-      incoming = ctx.poison; // component starts inside this region
+      incoming = ctx.poison; // group starts inside this region
     if (auto forOp = dyn_cast<scf::ForOp>(n->op))
       forOp.getInitsMutable()[idx].assign(incoming);
   }
@@ -549,45 +634,57 @@ static void renderRegion(EmitCtx &ctx, GroupDag &g, Node *n, RenderState &rs,
   }
   if (auto forOp = dyn_cast<scf::ForOp>(n->op)) {
     RenderState body = rs.nested();
+    seedRegionEntry(body, n->children[0]);
     for (const Crossing &c : n->crossings) {
-      if (!c.hold.materializesCarrier()) {
-        body.carrier.erase(c.comp);
+      if (!c.hold.threadsToken()) {
+        body.clearTokens();
         continue;
       }
-      unsigned idx = slotIndexFor(ctx, n->op, &g, c.comp);
-      body.carrier[c.comp] = forOp.getRegionIterArg(idx);
+      unsigned idx = slotIndexFor(ctx, n->op, &g);
+      body.replaceLastToken(forOp.getRegionIterArg(idx), c.tokenOwner);
     }
     renderChain(ctx, g, n->children[0], body, emitted);
     auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
     for (const Crossing &c : n->crossings) {
-      if (!c.hold.materializesCarrier()) {
-        rs.carrier.erase(c.comp); // token died in the body; nothing flows out
+      if (!c.hold.threadsToken()) {
+        rs.clearTokens(); // token died in the body; nothing flows out
         continue;
       }
-      unsigned idx = slotIndexFor(ctx, n->op, &g, c.comp);
-      yield->setOperand(idx, body.carrier.lookup(c.comp));
-      rs.carrier[c.comp] = forOp.getResult(idx);
+      unsigned idx = slotIndexFor(ctx, n->op, &g);
+      const RenderState::Token *bodyToken = body.lastToken();
+      yield->setOperand(idx, bodyToken ? bodyToken->value : Value());
+      rs.replaceLastToken(forOp.getResult(idx), c.tokenOwner);
     }
     rs.clearViews();
     return;
   }
   auto ifOp = cast<scf::IfOp>(n->op);
   RenderState thenSt = rs.nested(), elseSt = rs.nested();
+  seedRegionEntry(thenSt, n->children[0]);
+  if (n->children.size() > 1 && n->children[1])
+    seedRegionEntry(elseSt, n->children[1]);
   renderChain(ctx, g, n->children[0], thenSt, emitted);
   if (n->children.size() > 1 && n->children[1])
     renderChain(ctx, g, n->children[1], elseSt, emitted);
   for (const Crossing &c : n->crossings) {
-    unsigned idx = slotIndexFor(ctx, n->op, &g, c.comp);
-    Value incoming = rs.carrier.lookup(c.comp);
+    unsigned idx = slotIndexFor(ctx, n->op, &g);
+    const RenderState::Token *lastToken = rs.lastToken();
+    Value incoming = lastToken ? lastToken->value : Value();
     if (!incoming)
       incoming = ctx.poison;
-    Value thenV = c.finals[0] ? thenSt.carrier.lookup(c.comp) : incoming;
-    Value elseV = (c.finals.size() > 1 && c.finals[1]) ? elseSt.carrier.lookup(c.comp) : incoming;
+    const RenderState::Token *thenToken = thenSt.lastToken();
+    const RenderState::Token *elseToken = elseSt.lastToken();
+    Value thenV = c.finals[0]
+                      ? (thenToken ? thenToken->value : Value())
+                      : incoming;
+    Value elseV = (c.finals.size() > 1 && c.finals[1])
+                      ? (elseToken ? elseToken->value : Value())
+                      : incoming;
     auto thenYield = cast<scf::YieldOp>(ifOp.thenBlock()->getTerminator());
     thenYield->setOperand(idx, thenV);
     auto elseYield = cast<scf::YieldOp>(ifOp.elseBlock()->getTerminator());
     elseYield->setOperand(idx, elseV);
-    rs.carrier[c.comp] = ifOp.getResult(idx);
+    rs.replaceLastToken(ifOp.getResult(idx), c.tokenOwner);
   }
   rs.clearViews();
 }
@@ -601,10 +698,11 @@ static void renderChain(EmitCtx &ctx, GroupDag &g, Node *head, RenderState &rs,
     case Node::Exit:
       break; // markers; yield wiring is the parent's job
     case Node::Acquire: {
-      CompId comp = getSema(g, n).component;
+      const Sema &sema = getSema(g, n);
+      Owner tokenOwner =
+          sema.isEntry && !n->owner ? sema.entryTokenOwner : n->owner;
       if (Value v = emitted.lookup(n)) { // pre-rendered entry instance
-        rs.carrier[comp] = v;
-        rs.carrierSema[comp] = getSema(g, n).create;
+        rs.recordToken(v, sema.create, tokenOwner);
         rs.clearViews();
         break;
       }
@@ -622,20 +720,26 @@ static void renderChain(EmitCtx &ctx, GroupDag &g, Node *head, RenderState &rs,
       }
       auto acq = emitInto<nvws::SemaphoreAcquireOp>(
           b, before ? before->getLoc() : ctx.func.getLoc(), n->owner,
-          n->stageCluster, getSema(g, n).create, ctx.tokenType);
+          n->stageCluster, sema.create, ctx.tokenType);
       if (n->stageOffset)
         acq.setStage(materializeI32Before(acq, *n->stageOffset));
       emitted[n] = acq.getToken();
-      rs.carrier[comp] = acq.getToken();
-      rs.carrierSema[comp] = getSema(g, n).create;
+      rs.recordToken(acq.getToken(), sema.create, tokenOwner);
       rs.clearViews();
       lastReal = acq;
       break;
     }
     case Node::Release: {
-      CompId comp = getSema(g, n).component;
-      Value tok = rs.carrier.lookup(comp);
-      assert(tok && "release without carrier");
+      const RenderState::Token *lastToken = rs.lastToken();
+      Value tok = lastToken ? lastToken->value : Value();
+      if (nodeReusesToken(n, n->owner) &&
+          (!lastToken || !lastToken->owner ||
+           *lastToken->owner != ownerKey(n->owner))) {
+        RenderState::Token *token = rs.tokenForOwner(ownerKey(n->owner));
+        assert(token && "token-reuse release without token");
+        tok = token->value;
+      }
+      assert(tok && "release without token");
       OpBuilder b(ctx.func);
       if (lastReal)
         b.setInsertionPointAfter(lastReal);
@@ -654,7 +758,7 @@ static void renderChain(EmitCtx &ctx, GroupDag &g, Node *head, RenderState &rs,
       break;
     }
     case Node::Access: {
-      if (Operation *anchor = renderAccess(g, n, rs))
+      if (Operation *anchor = renderAccess(ctx, g, n, rs))
         lastReal = anchor;
       break;
     }
@@ -800,6 +904,18 @@ static LogicalResult foldCircularBackingsAndCreates(ArrayRef<GroupDag *> set) {
       break;
     }
   Value base = baseGroup->backing.front();
+  Operation *baseAlloc = base.getDefiningOp();
+  Operation *earliestAlloc = baseAlloc;
+  for (GroupDag *g : set) {
+    Operation *alloc = g->backing.front().getDefiningOp();
+    if (!alloc || alloc->getBlock() != baseAlloc->getBlock())
+      return semaError(baseAlloc)
+             << "circular folded backings must be defined in one block";
+    if (alloc->isBeforeInBlock(earliestAlloc))
+      earliestAlloc = alloc;
+  }
+  if (earliestAlloc != baseAlloc)
+    baseAlloc->moveBefore(earliestAlloc);
   for (GroupDag *g : set) {
     Value backing = g->backing.front();
     if (backing == base)
@@ -1165,8 +1281,10 @@ static LogicalResult verifyTokenLocality(triton::FuncOp func) {
   });
   return result;
 }
-static LogicalResult verifyNoUseAfterRelease(triton::FuncOp funcOp) {
-  auto checkToken = [](Value tok) -> LogicalResult {
+static LogicalResult
+verifyNoUseAfterRelease(triton::FuncOp funcOp,
+                        const DenseSet<Operation *> &reusedTokenBufferOps) {
+  auto checkToken = [&](Value tok) -> LogicalResult {
     llvm::SmallDenseMap<Block *, SmallVector<Operation *, 4>> byBlock;
     for (Operation *u : tok.getUsers())
       byBlock[u->getBlock()].push_back(u);
@@ -1178,7 +1296,8 @@ static LogicalResult verifyNoUseAfterRelease(triton::FuncOp funcOp) {
       for (Operation *u : users) {
         if (isa<nvws::SemaphoreReleaseOp>(u))
           sawRelease = true;
-        else if (sawRelease && isa<nvws::SemaphoreBufferOp>(u))
+        else if (sawRelease && isa<nvws::SemaphoreBufferOp>(u) &&
+                 !reusedTokenBufferOps.contains(u))
           return semaError(u) << "token has a buffer view after its release "
                     "(use-after-release; spec fable/semas-report3.md Addendum B.3(b))";
       }
@@ -1217,7 +1336,7 @@ static nvws::SemaphoreAcquireOp resolveAcquireThroughIfs(Value v) {
   }
   return nullptr;
 }
-static LogicalResult verifySingleCarrierPerGroup(triton::FuncOp funcOp) {
+static LogicalResult verifySingleTokenSlotPerGroup(triton::FuncOp funcOp) {
   auto res = funcOp.walk([&](scf::ForOp forOp) -> WalkResult {
     llvm::SmallDenseMap<Value, unsigned> slotsPerBacking;
     auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
@@ -1236,7 +1355,7 @@ static LogicalResult verifySingleCarrierPerGroup(triton::FuncOp funcOp) {
         if (alloc->hasAttr(kBufferCircularAttrName))
           continue;
       if (++slotsPerBacking[backing] > 1) {
-        semaError(forOp) << "two carrier token slots for one semaphore group in a single "
+        semaError(forOp) << "two token slots for one semaphore group in a single "
                "loop (spec fable/semas-report3.md Addendum B.3(a)); " "AssignStagePhase cannot thread this";
         return WalkResult::interrupt();
       }
@@ -1259,7 +1378,7 @@ LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups) {
       nukeGroupTokens(ctx, g);
       forEachNode(g, [&](Node *n) {
         if (n->kind == Node::Access && n->op)
-          g.accessRowOps.insert(n->op);
+          g.accessNodeOps.insert(n->op);
       });
     }
   while (eraseDeadTokenSlots(ctx, groups)) {
@@ -1277,9 +1396,10 @@ LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups) {
     RenderState rs;
     for (Node *n = g.root->children[0]; n; n = n->next)
       if (n->kind == Node::Acquire && emitted.count(n)) {
-        CompId comp = getSema(g, n).component;
-        rs.carrier[comp] = emitted.lookup(n);
-        rs.carrierSema[comp] = getSema(g, n).create;
+        const Sema &sema = getSema(g, n);
+        Owner owner =
+            sema.isEntry && !n->owner ? sema.entryTokenOwner : n->owner;
+        rs.recordToken(emitted.lookup(n), sema.create, owner);
       }
     renderChain(ctx, g, g.root->children[0], rs, emitted);
   }
@@ -1323,9 +1443,9 @@ LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups) {
     return failure();
   if (failed(verifyTokenLocality(funcOp)))
     return failure();
-  if (failed(verifyNoUseAfterRelease(funcOp)))
+  if (failed(verifyNoUseAfterRelease(funcOp, ctx.reusedTokenBufferOps)))
     return failure();
-  if (failed(verifySingleCarrierPerGroup(funcOp)))
+  if (failed(verifySingleTokenSlotPerGroup(funcOp)))
     return failure();
   return success();
 }
