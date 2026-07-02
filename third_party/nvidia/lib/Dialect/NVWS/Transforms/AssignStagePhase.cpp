@@ -58,6 +58,8 @@ namespace triton {
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h.inc"
 namespace {
 
+// Stage/phase algorithm and the egx/nvws-semaphore delta:
+// sema-docs/assign-stage-phase-and-lower-semaphores.md.
 struct AssignStagePhase {
   enum class AccessKind { Store, Read };
   struct PhaseKey {

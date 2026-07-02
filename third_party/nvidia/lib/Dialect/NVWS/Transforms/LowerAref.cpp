@@ -64,6 +64,8 @@ namespace triton {
 
 namespace {
 
+// Lowering contract and the egx/nvws-semaphore delta:
+// sema-docs/assign-stage-phase-and-lower-semaphores.md.
 // ----------------------------------------------------------------------------
 
 struct PartitionWsTagIds {

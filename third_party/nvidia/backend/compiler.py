@@ -398,6 +398,8 @@ class CUDABackend(BaseBackend):
                 passes.ttgpuir.add_optimize_partition_warps(pm)
         elif capability // 10 >= 10:
             smem_budget = _max_shared_mem_for_capability(capability)
+            # NVWS default/Meta-port pipeline map and pass contracts:
+            # sema-docs/nvws-aws-overview.md
             use_nvws_meta = knobs.nvidia.use_nvws_meta and not knobs.nvidia.use_meta_ws
             use_bw_meta_swp_schedule = use_meta_swp_schedule or use_nvws_meta
             passes.ttgpuir.add_fuse_nested_loops(pm)

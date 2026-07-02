@@ -30,6 +30,8 @@ namespace triton {
 
 namespace {
 
+// Algorithm and the triton-01 InsertSemaphore split:
+// sema-docs/insert-allocas.md.
 using namespace mlir;
 using namespace triton::gpu;
 using namespace triton::nvidia_gpu;
