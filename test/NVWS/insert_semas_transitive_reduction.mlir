@@ -9,7 +9,9 @@
 //   2. genuine fan-out to two reader partitions: both edges are wave
 //      openers — NOTHING is dropped;
 //   3. a returning owner with an earlier token reuses that token without
-//      adding a carrier-only handoff.
+//      adding a carrier-only handoff;
+//   4. loop-close fan-in: an earlier writer close is dropped when a later
+//      reader close already waits for that writer and feeds the same acquire.
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
@@ -74,6 +76,71 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
       scf.yield {ttg.partition = array<i32: 0, 1, 2>} %j : i32
       // CHECK: } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    "use_i32"(%r) : (i32) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
+  // The spanning member connects two otherwise-disjoint pieces. The two
+  // split paths remain independent after R m2 {1}. On the left path,
+  // W m0 {2} is ordered before R m0 {3}, so only the reader must release
+  // the recurrence semaphore for the next W m2 {0}.
+  // CHECK-LABEL: @spanning_split_parallel
+  tt.func @spanning_split_parallel(%lb: i32, %ub: i32, %step: i32) {
+    %c0 = arith.constant 0 : i32
+    %fullValue = arith.constant {ttg.partition = array<i32: 0>} dense<0.0> : tensor<256x128xf16, #blocked>
+    %leftValue = arith.constant {ttg.partition = array<i32: 2>} dense<1.0> : tensor<128x128xf16, #blocked>
+    %rightValue = arith.constant {ttg.partition = array<i32: 4>} dense<2.0> : tensor<128x128xf16, #blocked>
+    // CHECK: [[LEFT:%.*]] = ttg.local_alloc {buffer.id = 777 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
+    // CHECK: [[RIGHT:%.*]] = ttg.local_alloc {buffer.id = 777 : i32, buffer.offset = 128 : i32} : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
+    // CHECK: [[FULL:%.*]] = ttg.local_alloc {buffer.id = 777 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>
+    // CHECK: [[REGAIN:%.*]] = nvws.semaphore.create [[LEFT]], [[RIGHT]], [[FULL]] true {pending_count = 1 : i32}
+    // CHECK: [[FULL_READY:%.*]] = nvws.semaphore.create [[LEFT]], [[RIGHT]], [[FULL]] false {pending_count = 1 : i32}
+    // CHECK: [[TO_LEFT:%.*]] = nvws.semaphore.create [[LEFT]], [[RIGHT]], [[FULL]] false {pending_count = 1 : i32}
+    // CHECK: [[LEFT_DONE:%.*]] = nvws.semaphore.create [[LEFT]], [[RIGHT]], [[FULL]] false {pending_count = 1 : i32}
+    // CHECK: [[TO_RIGHT:%.*]] = nvws.semaphore.create [[LEFT]], [[RIGHT]], [[FULL]] false {pending_count = 1 : i32}
+    // CHECK: [[RIGHT_DONE:%.*]] = nvws.semaphore.create [[LEFT]], [[RIGHT]], [[FULL]] false {pending_count = 1 : i32}
+    %left = ttg.local_alloc {buffer.id = 777 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    %right = ttg.local_alloc {buffer.id = 777 : i32, buffer.offset = 128 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    %full = ttg.local_alloc {buffer.id = 777 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<256x128xf16, #shared, #smem, mutable>
+    %r = scf.for %iv = %lb to %ub step %step iter_args(%i = %c0) -> (i32) : i32 {
+      ttg.local_store %fullValue, %full {ttg.partition = array<i32: 0>} : tensor<256x128xf16, #blocked> -> !ttg.memdesc<256x128xf16, #shared, #smem, mutable>
+      %fv = ttg.local_load %full {ttg.partition = array<i32: 1>} : !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> tensor<256x128xf16, #blocked>
+      "use_full"(%fv) {ttg.partition = array<i32: 1>} : (tensor<256x128xf16, #blocked>) -> ()
+      // The writer releases only LEFT_DONE. In particular, it does not
+      // contribute an arrival to REGAIN.
+      // CHECK: [[LW_TOK:%.*]] = nvws.semaphore.acquire [[TO_LEFT]] {ttg.partition = array<i32: 2>}
+      // CHECK: [[LW_BUF:%.*]]:3 = nvws.semaphore.buffer [[TO_LEFT]], [[LW_TOK]] {ttg.partition = array<i32: 2>}
+      // CHECK: ttg.local_store %{{.*}}, [[LW_BUF]]#0 {ttg.partition = array<i32: 2>}
+      // CHECK-NOT: nvws.semaphore.release [[REGAIN]], [[LW_TOK]]
+      // CHECK: nvws.semaphore.release [[LEFT_DONE]], [[LW_TOK]] {{.*}} {arrive_count = 1 : i32, ttg.partition = array<i32: 2>}
+      // CHECK-NOT: nvws.semaphore.release [[REGAIN]], [[LW_TOK]]
+      ttg.local_store %leftValue, %left {ttg.partition = array<i32: 2>} : tensor<128x128xf16, #blocked> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      // The later reader is the sole surviving source for REGAIN.
+      // CHECK: [[LR_TOK:%.*]] = nvws.semaphore.acquire [[LEFT_DONE]] {ttg.partition = array<i32: 3>}
+      // CHECK: [[LR_BUF:%.*]]:3 = nvws.semaphore.buffer [[LEFT_DONE]], [[LR_TOK]] {ttg.partition = array<i32: 3>}
+      // CHECK: ttg.local_load [[LR_BUF]]#0 {ttg.partition = array<i32: 3>}
+      // CHECK: nvws.semaphore.release [[REGAIN]], [[LR_TOK]] {{.*}} {arrive_count = 1 : i32, ttg.partition = array<i32: 3>}
+      // CHECK-NOT: nvws.semaphore.release [[REGAIN]]
+      %lv = ttg.local_load %left {ttg.partition = array<i32: 3>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #blocked>
+      "use_left"(%lv) {ttg.partition = array<i32: 3>} : (tensor<128x128xf16, #blocked>) -> ()
+      // The right path is independent of the left path.
+      // CHECK: nvws.semaphore.acquire [[TO_RIGHT]] {ttg.partition = array<i32: 4>}
+      ttg.local_store %rightValue, %right {ttg.partition = array<i32: 4>} : tensor<128x128xf16, #blocked> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      // CHECK: nvws.semaphore.acquire [[RIGHT_DONE]] {ttg.partition = array<i32: 0>}
+      %rv = ttg.local_load %right {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #blocked>
+      "use_right"(%rv) {ttg.partition = array<i32: 0>} : (tensor<128x128xf16, #blocked>) -> ()
+      %j = arith.addi %i, %iv {ttg.partition = array<i32: 0, 1, 2, 3, 4>} : i32
+      // CHECK: scf.yield
+      scf.yield {ttg.partition = array<i32: 0, 1, 2, 3, 4>} %j : i32
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2, 3, 4>, ttg.partition.outputs = [array<i32: 0, 1, 2, 3, 4>], ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
     "use_i32"(%r) : (i32) -> ()
     tt.return
   }

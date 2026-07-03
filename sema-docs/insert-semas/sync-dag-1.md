@@ -432,7 +432,7 @@ The generated SYNC-DAG is:
 
 ```text
 |- scf.for (WS, tag=0) ... holdrule{pointofuse->ttg.local_store}
-|  |- a  S5(2)  {0}
+|  |- a  S5  {0}
 |  |- W m2  ttg.local_store {0}
 |  |- r  S0  {0} [none]
 |  |- a  S0  {1}
@@ -442,7 +442,6 @@ The generated SYNC-DAG is:
 |  |- a  S1  {2}
 |  |- W m0  ttg.local_store {2}
 |  |- r  S2  {2} [none]
-|  |- r  S5  {2} [none]
 |  |- a  S2  {3}
 |  |- R m0  ttg.local_load {3}
 |  |- r  S5  {3} [none]
@@ -453,7 +452,7 @@ The generated SYNC-DAG is:
 |  |- R m1  ttg.local_load {0}
 |  |- EXIT ... yield{native}
 SEMAS: S0{count=1} S1{count=1} S2{count=1} S3{count=1} S4{count=1}
-       S5{count=2 entry inherit={@0.0}}
+       S5{count=1 entry inherit={@0.0}}
 ```
 
 The full-width `W m2 {0}` releases `S0`, which `R m2 {1}` acquires. That read
@@ -463,7 +462,7 @@ boundary; `A --Sx--> B` means that `A` releases `Sx` and `B` acquires it:
 ```text
                               ENTER(i)
                                   |
-                            a S5(2) {0}
+                              a S5 {0}
                                   |
                               W m2 {0}
                                   | S0
@@ -473,20 +472,20 @@ boundary; `A --Sx--> B` means that `A` releases `Sx` and `B` acquires it:
                   S1 |                         | S3
                      v                         v
                  W m0 {2}                 W m1 {4}
-                +----+----+                    | S4
-             S2 |         | S5                 v
-                v         |                R m1 {0}
-            R m0 {3}      |                    |
-             S5 |         |                    v
-                |         |                 EXIT(i)
-                |         |                    |
-                |         |                    v
-                |         |               ENTER(i+1)
-                |         |                    |
-                +---------+---------------> a S5(2) {0}
-                                                |
-                                                v
-                                            W m2 {0}
+                     | S2                     | S4
+                     v                        v
+                 R m0 {3}                 R m1 {0}
+                     | S5                     |
+                     |                        v
+                     |                     EXIT(i)
+                     |                        |
+                     |                        v
+                     |                    ENTER(i+1)
+                     |                        |
+                     +-------------------> a S5 {0}
+                                              |
+                                              v
+                                          W m2 {0}
 ```
 
 EMIT-IR materializes those same two paths (unrelated operations and types
@@ -494,7 +493,7 @@ omitted):
 
 ```text
 for {
-  %t0 = a S5(2) {0}
+  %t0 = a S5 {0}
   W m2 [%t0] {0}
   r S0 %t0 {0}
 
@@ -506,7 +505,6 @@ for {
   %t2 = a S1 {2}
   W m0 [%t2] {2}
   r S2 %t2 {2}
-  r S5 %t2 {2}
   %t3 = a S2 {3}
   R m0 [%t3] {3}
   r S5 %t3 {3}
@@ -524,9 +522,11 @@ Although the dump and IR print the `m0` path first, the `m1` path waits only on
 release from `{2}` or `{3}`. Likewise, the `m0` path does not wait on `{4}` or
 the final `{0}` read. The right path already ends at `{0}`, the owner that starts
 the next iteration, so it needs no loop-closing release. `S5` is created
-initially released, so iteration zero's `a S5(2) {0}` succeeds. The two `r S5`
-operations from `{2}` and `{3}` feed that acquire on the next iteration; they do
-not order the two paths within the current iteration.
+initially released, so iteration zero's `a S5 {0}` succeeds. On the left path,
+`R m0 {3}` already waits for `W m0 {2}` through `S2`. Its loop-closing release
+therefore also covers the writer, whose separate close is deleted. The sole
+`r S5` feeds the count-1 acquire on the next iteration; it does not order the
+two paths within the current iteration.
 
 ### Composition: nested regions in the walk
 
@@ -596,7 +596,7 @@ Both levels, worked on one real test —
 `test/NVWS/insert_semas_release_count.mlir`
 `@release_multiplicity_unified_fanin_regain`: partition `{3}` stores at the
 outer level, then a nested plain `for` (summary `pieces{P0:W:{2}}`) runs
-readers `{2}`, `{1}`, `{0}`, with `{1}` also writing. The parent chain
+readers `{2}`, `{1}`, `{0}`, `{3}`, with `{1}` also writing. The parent chain
 walks the nested loop as one write by `{2}`:
 
 ```text
@@ -614,25 +614,29 @@ wait for that read as a separate WAR dependency:
 
 ```text
 child walk        edge                                        state AFTER the row
-R load {2}        — (reuse ENTER token)                       version=ENTER@{2} holders={2}      wave={2}
-R load {1}        e3: ENTER@{2} -> load@{1}  (RAW)            version=ENTER@{2} holders={2,1}    wave={1}
-W store {1}       e4: load@{2} -> store@{1}  (WAR)            version=store@{1} holders={1}      wave={1}
-R load {0}        e5: store@{1} -> load@{0}  (RAW)            version=store@{1} holders={1,0}    wave={0}
-EXIT              e6: store@{1} -> {2}@next  (WAR)
+R load {2}        — (reuse ENTER token)                       version=ENTER@{2} holders={2}        wave={2}
+R load {1}        e3: ENTER@{2} -> load@{1}  (RAW)            version=ENTER@{2} holders={2,1}      wave={1}
+W store {1}       e4: load@{2} -> store@{1}  (WAR)            version=store@{1} holders={1}        wave={1}
+R load {0}        e5: store@{1} -> load@{0}  (RAW)            version=store@{1} holders={1,0}      wave={0}
+R load {3}        e6: store@{1} -> load@{3}  (RAW)            version=store@{1} holders={1,0,3}    wave={3}
+EXIT              raw: store@{1} -> {2}@next (later deleted)
 (recurrence)      e7: load@{0} -> {2}@next   (WAR)
+                  e8: load@{3} -> {2}@next   (WAR)
 ```
 
-`e6` leaves from `{1}`'s *store*, not its earlier read: the write reset
-`{1}`'s holder record, so its last access is the store — which is why the
-`e6` release sits right after the store in the dump below.
+The walk proposes three recurrence closes because the corrected version is
+still held by its writer `{1}` and readers `{0}` and `{3}`. Both readers
+already wait for the writer through `e5` or `e6`, so either surviving reader
+close also covers the writer. Reduction deletes the writer's direct close.
+The two reader closes both remain because neither reader waits for the other.
 
-As emitted — `e1` lands on the same semaphore `S0` that `e6`/`e7` converge
+As emitted — `e1` lands on the same semaphore `S0` that `e7`/`e8` converge
 on; why a handoff into a loop node shares the loop's own semaphore, and why
 its release arrives with count 2, is the loop-node special case at the end
 of [Edges to semaphores](#edges-to-semaphores):
 
 ```text
-|- a  S4  root  ; entry
+|- a  S5  root  ; entry
 |- scf.for (WS, tag=0) ... holdrule{gated(rel-count)}
 |  |- W m0  ttg.local_store {3}
 |  |- r  S0(2)  {3} [none]        ; e1 tail
@@ -646,16 +650,20 @@ of [Edges to semaphores](#edges-to-semaphores):
 |  |  |- a  S2  {1}               ; e4 head
 |  |  |- W m0  ttg.local_store {1}
 |  |  |- r  S3  {1} [none]        ; e5 tail
-|  |  |- r  S0  {1} [none]        ; e6 tail
+|  |  |- r  S4  {1} [none]        ; e6 tail
 |  |  |- a  S3  {0}               ; e5 head
 |  |  |- R m0  ttg.local_load {0}
 |  |  |- r  S0  {0} [none]        ; e7 tail
-|  |  |- a  S0(2)  {2}            ; e6/e7 head: the child loop's regain
+|  |  |- a  S4  {3}               ; e6 head
+|  |  |- R m0  ttg.local_load {3}
+|  |  |- r  S0  {3} [none]        ; e8 tail
+|  |  |- a  S0(2)  {2}            ; e7/e8 head: the child loop's regain
 |  |  |- EXIT ... yield{a S0}
-|  |- r  S4  {2} [none]           ; e2 tail
-|  |- a  S4  {3}                  ; e2 head: the parent loop's regain
-|  |- EXIT ... yield{a S4}
-SEMAS: S0{count=2} S1{count=1} S2{count=1} S3{count=1} S4{count=1 entry inherit={@0.3}}
+|  |- r  S5  {2} [none]           ; e2 tail
+|  |- a  S5  {3}                  ; e2 head: the parent loop's regain
+|  |- EXIT ... yield{a S5}
+SEMAS: S0{count=2} S1{count=1} S2{count=1} S3{count=1} S4{count=1}
+       S5{count=1 entry inherit={@0.3}}
 ```
 
 ## Edges to semaphores
@@ -819,10 +827,9 @@ e5: R m0@{1} -> {0}@next   (pieces P0/P1 — same for {0}'s write)
 -> e4 dropped
 ```
 
-`e5` is the boundary case of fact 3: its destination owner `{0}` IS the
-chain's first wave owner — the loop-carried close that re-opens each
-iteration's first hold — so it is never dropped, and becomes `S3`. The
-emitted body, with `{2}`'s hold opening on the in-body `S1` alone:
+`e5` targets the chain's first wave owner, `{0}`. It is the only close feeding
+that next-iteration acquire, so it must remain and becomes `S3`. The emitted
+body, with `{2}`'s hold opening on the in-body `S1` alone:
 
 ```text
 |- scf.for (WS, tag=1) ... holdrule{pointofuse->ttg.local_alloc}
@@ -858,21 +865,30 @@ SEMAS: S0{count=1} S1{count=1} S2{count=1} S3{count=1 entry inherit={@1.0}}
    Edges that close the loop — from this iteration's nodes to the next
    iteration's — cannot be proven by the straight-line sweep, because the
    implication path wraps around the loop boundary; a second, wrap-around
-   traversal (`sweepTraversalClosure`) handles them, dropping a close only
-   when three facts hold: its ordering is implied by the kept edges; a kept
-   handoff into that owner has already been applied by the point, in
-   wrap-around order, where the destination owner first touches the edge's
-   pieces (the relaxed form of the second condition — *some* kept handoff into
-   that owner, evaluated at that first touch, not the first kept edge); and
-   the destination owner is not the chain's first wave owner — the
-   loop-carried close that re-opens each iteration's first hold is never
-   dropped. Finally, deletions can lean on
-   each other's proofs, so every deleted edge is re-proven against the
-   kept set alone rather than emit a missing wait. Straight-line drops are
-   re-proven by `sweepChain` and fail with `transitive-reduction closure
-   violation`; dropped closes are re-verified by `sweepTraversalClosure`
-   (which `sweepChain` skips) and fail with `traversal-closure violation:
-   dropped close not implied`.
+   traversal (`sweepTraversalClosure`) handles them in two cases.
+
+   Multiple closes feeding the same next-iteration acquire of the chain's
+   first wave owner are reduced within that fan-in. A later close can replace
+   an earlier one only when a kept direct edge from the earlier source to the
+   later source carries every completion required by the earlier close, and
+   the later close will not itself be merged away. At least one close remains;
+   closes on independent paths remain. The `W m0 {2}` close removed behind
+   `R m0 {3}` in
+   [Example: disjoint submember protocols run independently](#example-disjoint-submember-protocols-run-independently)
+   is this case.
+
+   A close to any other owner is dropped only when three facts hold: its
+   ordering is implied by the kept edges; a kept handoff into that owner has
+   already been applied by the point, in wrap-around order, where the
+   destination owner first touches the edge's pieces (the relaxed form of the
+   second condition — *some* kept handoff into that owner, evaluated at that
+   first touch, not the first kept edge); and the destination owner is not the
+   chain's first wave owner. Finally, deletions can lean on each other's
+   proofs, so every deleted edge is re-proven against the kept set alone rather
+   than emit a missing wait. Straight-line drops are re-proven by `sweepChain`
+   and fail with `transitive-reduction closure violation`; dropped closes are
+   re-verified by `sweepTraversalClosure` (which `sweepChain` skips) and fail
+   with `traversal-closure violation: dropped close not implied`.
 2. **Repeats from one sender** (`mergeEdges`). The same handoff raised
    through several pieces counts once (same source node, destination node,
    source owner) — the example above shows this form: `R m1 {0}` raises
@@ -933,11 +949,12 @@ Both raises are real in `test/NVWS/insert_semas_release_count.mlir`
 [Composition: nested regions in the walk](#composition-nested-regions-in-the-walk)
 above. Its parent handoff (`store@{3} -> for@{2}`) points at a loop node,
 and its acquiring owner `{2}` matches the owner of that loop's regain —
-the bottom re-acquire the two child closes converge on — so instead of a
-new semaphore the handoff reuses `S0`, and its acquire is spliced before
-the loop node. `S0`'s pending count is 2 (the two child closes), but the
-handoff has one source, so its single release stands in for both waits —
-`arrive_count` 2, dumped as `r S0(2)`:
+the bottom re-acquire on which the two surviving reader closes from `{0}`
+and `{3}` converge — so instead of a new semaphore the handoff reuses `S0`,
+and its acquire is spliced before the loop node. The writer's direct close
+was removed because both readers already wait for it. `S0`'s pending count
+is 2, but the handoff has one source, so its single release stands in for
+both waits — `arrive_count` 2, dumped as `r S0(2)`:
 
 ```text
 |- W m0  ttg.local_store {3}

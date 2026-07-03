@@ -14,10 +14,11 @@
 // that many arrives. Shape: producer {3} stores outside the inner loop;
 // inside, {2} (carried) and {1} read, {1} CORRECTS the buffer in place
 // after an explicit {2}->{1} WAR handoff, and {0} consumes the corrected
-// value AFTER the store. The last version's holders at the inner EXIT are
-// therefore {1} (the writer) and {0} (its reader) — a fan-in-2 regain —
-// while the For-row unification merges the outer single-source ready edge
-// onto the SAME semaphore. The lone outer release must arrive twice:
+// value AFTER the store, as does an independent reader {3}. The last
+// version's independent readers at the inner EXIT are therefore {0} and
+// {3} — a fan-in-2 regain — while the For-row unification merges the outer
+// single-source ready edge onto the SAME semaphore. The lone outer release
+// must arrive twice:
 // r S(2). The emitted and lowered IR checks below pin that multiplicity.
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
@@ -35,6 +36,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     // EMIT: [[S3:%.*]] = nvws.semaphore.create [[ALLOC]] false {pending_count = 1 : i32}
     // EMIT: [[S4:%.*]] = nvws.semaphore.create [[ALLOC]] false {pending_count = 1 : i32}
     // EMIT: [[S5:%.*]] = nvws.semaphore.create [[ALLOC]] false {pending_count = 1 : i32}
+    // EMIT: [[S6:%.*]] = nvws.semaphore.create [[ALLOC]] false {pending_count = 1 : i32}
     // EMIT: [[INIT:%.*]] = nvws.semaphore.acquire [[EMPTY]] : {{.*}} -> !ttg.async.token
     // EMIT: [[OUTER:%.*]] = scf.for {{.*}} iter_args([[CARRY:%.*]] = [[INIT]]) -> (!ttg.async.token)
     scf.for %i = %lb to %ub step %step : i32 {
@@ -61,7 +63,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
         // EMIT: [[BUF1W:%.*]] = nvws.semaphore.buffer [[S4]], [[ACQ1W]] {ttg.partition = array<i32: 1>}
         // EMIT: ttg.local_store {{%.*}}, [[BUF1W]] {ttg.partition = array<i32: 1>}
         // EMIT: nvws.semaphore.release [[S5]], [[ACQ1W]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>}
-        // EMIT: nvws.semaphore.release [[FULL2]], [[ACQ1W]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>}
+        // EMIT: nvws.semaphore.release [[S6]], [[ACQ1W]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>}
         ttg.local_store %c, %alloc {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
         // EMIT: [[ACQ0:%.*]] = nvws.semaphore.acquire [[S5]] {ttg.partition = array<i32: 0>} : {{.*}} -> !ttg.async.token
         // EMIT: [[BUF0:%.*]] = nvws.semaphore.buffer [[S5]], [[ACQ0]] {ttg.partition = array<i32: 0>}
@@ -69,9 +71,18 @@ module attributes {"ttg.num-warps" = 4 : i32} {
         %l0 = ttg.local_load %alloc {ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !ty
         // EMIT: nvws.semaphore.release [[FULL2]], [[ACQ0]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>}
         "use0"(%l0) {ttg.partition = array<i32: 0>} : (!ty) -> ()
+        // The second independent reader contributes the other FULL2 arrival.
+        // The correcting writer's direct close was reduced through these
+        // two writer-to-reader handoffs.
+        // EMIT: [[ACQ3R:%.*]] = nvws.semaphore.acquire [[S6]] {ttg.partition = array<i32: 3>} : {{.*}} -> !ttg.async.token
+        // EMIT: [[BUF3R:%.*]] = nvws.semaphore.buffer [[S6]], [[ACQ3R]] {ttg.partition = array<i32: 3>}
+        // EMIT: ttg.local_load [[BUF3R]] {ttg.partition = array<i32: 3>}
+        // EMIT: nvws.semaphore.release [[FULL2]], [[ACQ3R]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 3>}
+        %l3 = ttg.local_load %alloc {ttg.partition = array<i32: 3>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !ty
+        "use3"(%l3) {ttg.partition = array<i32: 3>} : (!ty) -> ()
         // EMIT: [[ACQ2B:%.*]] = nvws.semaphore.acquire [[FULL2]] {ttg.partition = array<i32: 2>} : {{.*}} -> !ttg.async.token
-        // EMIT: scf.yield {ttg.partition = array<i32: 0, 1, 2>} [[ACQ2B]]
-      } {ttg.partition = array<i32: 0, 1, 2>}
+        // EMIT: scf.yield {ttg.partition = array<i32: 0, 1, 2, 3>} [[ACQ2B]]
+      } {ttg.partition = array<i32: 0, 1, 2, 3>}
       // EMIT: nvws.semaphore.release [[EMPTY]], [[INNER]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 2>}
       // EMIT: [[ACQ3:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 3>} : {{.*}} -> !ttg.async.token
       // EMIT: scf.yield {ttg.partition = array<i32: 0, 1, 2, 3>} [[ACQ3]]
@@ -82,8 +93,8 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 
 // The outer ready release by {3} carries
 // arrive multiplicity 2 — one release op, two arrives — because it shares
-// the semaphore with the inner fan-in-2 regain ({1} the corrector and {0}
-// its post-store reader both close into carried {2}); both acquire sites
+// the semaphore with the inner fan-in-2 regain (independent post-store
+// readers {0} and {3} both close into carried {2}); both acquire sites
 // show the uniform pending count (2). The stable ENTER source lets {1}'s
 // read overlap {2}'s read, so the in-loop store takes an explicit {2}->{1}
 // WAR edge; {1}'s own read is ordered by program order. Under the v5 uniform
