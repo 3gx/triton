@@ -107,6 +107,10 @@ struct Node {
   gpu::StageCluster stageCluster;
   std::optional<int64_t> stageOffset;
   std::optional<int64_t> bufferStageOffset;
+  // The SYNC-DAG proved that this row can use its owner's earlier token in
+  // the same chain without a fresh handoff. EmitIR renders this fact; it does
+  // not infer retained-token eligibility on its own.
+  std::optional<int64_t> retainedTokenOwner;
   Node *sat = nullptr;
   Node *scheduleAnchor = nullptr;
   SmallVector<Crossing, 1> crossings;
@@ -114,11 +118,36 @@ struct Node {
   bool isRegion() const { return kind == For || kind == If; }
   bool isProtocol() const { return kind == Acquire || kind == Release; }
 };
+inline void markRetainedToken(Node *n, const Owner &owner) {
+  assert(owner && n->owner && sameOwner(n->owner, owner));
+  n->retainedTokenOwner = ownerKey(owner);
+}
+inline bool rowAllowsRetainedToken(const Node *n, const Owner &owner) {
+  return owner && n->retainedTokenOwner &&
+         *n->retainedTokenOwner == ownerKey(owner);
+}
 inline SmallVector<std::pair<PieceId, PieceInfo>, 4>
 sortedPieceInfo(const Node *n) {
   SmallVector<std::pair<PieceId, PieceInfo>, 4> v(n->pieceInfo.begin(), n->pieceInfo.end());
   llvm::sort(v, [](const auto &a, const auto &b) { return a.first < b.first; });
   return v;
+}
+// Outer optional: the row has one uniform owner. Inner Owner may still be
+// root; an empty outer optional means no pieces or mixed owners.
+inline std::optional<Owner> uniformPieceOwner(const Node *n) {
+  bool fresh = true;
+  Owner owner;
+  for (auto &[p, pi] : sortedPieceInfo(n)) {
+    if (fresh) {
+      owner = pi.owner;
+      fresh = false;
+    } else if (!sameOwner(owner, pi.owner)) {
+      return std::nullopt;
+    }
+  }
+  if (fresh)
+    return std::nullopt;
+  return std::optional<Owner>(std::in_place, owner);
 }
 
 struct Member {

@@ -1,4 +1,4 @@
-// SYNC analysis and scheduling; see sema-docs/insert-semas/sync-dag.md.
+// SYNC analysis and scheduling; see sema-docs/insert-semas/sync-dag-1.md.
 #include "InsertSemas.h"
 #include <limits>
 #include <numeric>
@@ -12,9 +12,19 @@ struct HolderRec {
   SmallVector<int64_t, 2> syncedBehind;
 };
 
+struct VersionSource {
+  Owner producer;    // logical producer of the current version
+  Owner sourceOwner; // owner of the chain-local source row
+  Node *row = nullptr;
+  SmallVector<AsyncOp, 1> payloads;
+};
+
 struct PieceGame {
   bool live = false;
-  Owner versionProducer; // current version's producer (root = nullopt)
+  // Reads move their holder record but not this source. New readers therefore
+  // fan out from the write, or from the ENTER row that represents an outer
+  // write in a child chain.
+  VersionSource version;
   SmallVector<HolderRec, 2> holders; // producer and/or readers, join order
 };
 using ChainState = std::map<PieceId, PieceGame>;
@@ -32,6 +42,11 @@ static HolderRec *findHolder(PieceGame &gm, const Owner &who) {
       return &h;
   return nullptr;
 }
+static void setVersionSource(PieceGame &gm, const Owner &producer,
+                             const Owner &sourceOwner, Node *row,
+                             const SmallVector<AsyncOp, 1> &payloads) {
+  gm.version = VersionSource{producer, sourceOwner, row, payloads};
+}
 static void unionPayloads(SmallVector<AsyncOp, 1> &into, const SmallVector<AsyncOp, 1> &from) {
   for (AsyncOp p : from)
     if (!llvm::is_contained(into, p))
@@ -40,61 +55,71 @@ static void unionPayloads(SmallVector<AsyncOp, 1> &into, const SmallVector<Async
     return static_cast<int>(a) < static_cast<int>(b);
   });
 }
-// Advance one piece's owner/reader game and emit only cross-owner dependencies.
+// Advance one piece's data game. This emits only RAW/WAR dependencies; the
+// chain walk separately adds a carrier handoff when no data edge can provide
+// a token for the toucher.
 static void applyTouch(ChainState &st, PieceId p, const Owner &who, Effect effect, Node *row,
                        const SmallVector<AsyncOp, 1> &rowPayloads,
-                       SmallVector<EdgeRec> &edges, bool wsAdopt, bool force = false,
-                       Node *waveSrc = nullptr, Owner waveOwner = Owner(),
-                       const SmallVector<AsyncOp, 1> &wavePay = {}) {
+                       SmallVector<EdgeRec> &edges, bool wsAdopt) {
   PieceGame &gm = st[p];
   if (!gm.live) { // first toucher in an unseeded (function-level) game
     gm.live = true;
-    gm.versionProducer = who;
+    setVersionSource(gm, who, who, row, rowPayloads);
     gm.holders.assign(1, HolderRec{who, row, rowPayloads, {}});
     return;
   }
   if (effect == Effect::W) {
-    bool edged = false;
     for (HolderRec &h : gm.holders) {
       if (sameOwner(h.owner, who))
         continue;
       if (wsAdopt && !h.owner.has_value())
         continue; // adoption: no edge from a root holder
-      if (!force && llvm::is_contained(h.syncedBehind, ownerKey(who)))
+      if (llvm::is_contained(h.syncedBehind, ownerKey(who)))
         continue; // transitively synchronized — edge redundant
       edges.push_back(EdgeRec{h.lastRow, row, h.owner, who, h.lastPayloads, {p}});
-      edged = true;
     }
-    if (force && !edged && waveSrc && !sameOwner(waveOwner, who))
-      edges.push_back(EdgeRec{waveSrc, row, waveOwner, who, wavePay, {p}});
     gm.holders.assign(1, HolderRec{who, row, rowPayloads, {}});
-    gm.versionProducer = who;
+    setVersionSource(gm, who, who, row, rowPayloads);
     return;
   }
   if (HolderRec *h = findHolder(gm, who)) { // reread (producer or reader)
-    if (force) { // wave closed: the reread must re-acquire
-      HolderRec *primary = findHolder(gm, gm.versionProducer);
-      if (primary && !sameOwner(primary->owner, who)) {
-        edges.push_back(EdgeRec{primary->lastRow, row, primary->owner, who, primary->lastPayloads, {p}});
-        primary->syncedBehind.push_back(ownerKey(who));
-      } else if (waveSrc && !sameOwner(waveOwner, who)) {
-        edges.push_back(EdgeRec{waveSrc, row, waveOwner, who, wavePay, {p}});
-      }
-    }
     h->lastRow = row;
     h->lastPayloads = rowPayloads;
     h->syncedBehind.clear(); // lastRow moved
     return;
   }
-  HolderRec *primary = findHolder(gm, gm.versionProducer);
-  if (!primary)
-    primary = &gm.holders.front();
-  if (!(wsAdopt && !primary->owner.has_value())) {
-    edges.push_back(EdgeRec{primary->lastRow, row, primary->owner, who, primary->lastPayloads, {p}});
-    primary->syncedBehind.push_back(ownerKey(who));
+  assert(gm.version.row && "live piece without a version source");
+  if (!(wsAdopt && !gm.version.sourceOwner.has_value()) &&
+      !sameOwner(gm.version.sourceOwner, who)) {
+    edges.push_back(EdgeRec{gm.version.row, row, gm.version.sourceOwner, who,
+                            gm.version.payloads, {p}});
+    // The source edge orders a holder only while that holder still names the
+    // same row. After a producer reread, the old write cannot discharge the
+    // reread's WAR obligation to a later foreign writer.
+    if (HolderRec *source = findHolder(gm, gm.version.sourceOwner))
+      if (source->lastRow == gm.version.row &&
+          !llvm::is_contained(source->syncedBehind, ownerKey(who)))
+        source->syncedBehind.push_back(ownerKey(who));
   }
   gm.holders.push_back(HolderRec{who, row, rowPayloads, {}});
 }
+
+static bool retentionEligible(ChainState &st, PieceId p, const Owner &who,
+                              Effect effect) {
+  auto it = st.find(p);
+  if (it == st.end() || !it->second.live)
+    return false;
+  PieceGame &gm = it->second;
+  if (effect == Effect::W) {
+    for (HolderRec &h : gm.holders)
+      if (!sameOwner(h.owner, who) &&
+          !llvm::is_contained(h.syncedBehind, ownerKey(who)))
+        return false;
+    return true;
+  }
+  return findHolder(gm, who) != nullptr;
+}
+
 static bool rowTouchesPiece(GroupDag &g, Node *n, PieceId piece) {
   if (n->kind == Node::Access)
     return touchesPiece(g, n, piece);
@@ -123,14 +148,14 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SmallVector<EdgeRec> &edges, 
     Node *lastRow = nullptr;
     SmallVector<AsyncOp, 1> pay;
   };
-  // Every chain starts with its wave unset; the first partition-owned
-  // access establishes it. Seeding the wave from ENTER's owners was
-  // provably effect-free: the seeded value could only act through the
-  // force paths of applyTouch, and at a chain's first group event the
-  // sole holder of every piece is the entry owner itself, so force is
-  // always false there (and mixed entries seeded the wave invalid, which
-  // is the unset state).
+  // Every chain starts with its current wave unset; the first partition-owned
+  // access establishes it. A uniform ENTER owner nevertheless has a real
+  // incoming token and may retain it after another owner opens the wave.
   WaveSt wave;
+  DenseSet<int64_t> hadWave;
+  if (head->kind == Node::Enter)
+    if (auto owner = uniformPieceOwner(head); owner && owner->has_value())
+      hadWave.insert(ownerKey(*owner));
   for (Node *n = head; n; n = n->next) {
     switch (n->kind) {
     case Node::Enter:
@@ -138,18 +163,39 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SmallVector<EdgeRec> &edges, 
     case Node::Access: {
       std::map<PieceId, Effect> eff;
       forEachTouchedPiece(g, n, [&](PieceId p, Effect e) { mergeEffect(eff, p, e); });
+      bool moved = wave.valid && n->owner.has_value() && wave.owner.has_value() &&
+                   !sameOwner(wave.owner, n->owner);
+      bool canReuse = n->owner.has_value() &&
+                      hadWave.contains(ownerKey(n->owner)) &&
+                      llvm::all_of(eff, [&](const auto &item) {
+                        return retentionEligible(st, item.first, n->owner,
+                                                 item.second);
+                      });
+      SmallVector<PieceId, 2> pieces;
+      for (auto &[p, e] : eff)
+        pieces.push_back(p);
+      size_t edgeStart = edges.size();
+      SmallVector<AsyncOp, 1> pay;
+      pay.push_back(asyncPayloadOf(n->op));
       for (auto &[p, e] : eff) {
-        SmallVector<AsyncOp, 1> pay;
-        pay.push_back(asyncPayloadOf(n->op));
-        WaveSt &w = wave;
-        bool force = w.valid && n->owner.has_value() && w.owner.has_value() && !sameOwner(w.owner, n->owner);
-        applyTouch(st, p, n->owner, e, n, pay, edges, /*wsAdopt=*/false, force, w.lastRow, w.owner, w.pay);
-        if (n->owner.has_value()) {
-          w.owner = n->owner;
-          w.valid = true;
-          w.lastRow = n;
-          w.pay.assign(1, asyncPayloadOf(n->op));
-        }
+        applyTouch(st, p, n->owner, e, n, pay, edges,
+                   /*wsAdopt=*/false);
+      }
+      bool retainedUse = edges.size() == edgeStart && canReuse;
+      bool keepsWave = moved && retainedUse;
+      if (retainedUse) {
+        markRetainedToken(n, n->owner);
+      } else if (moved && edges.size() == edgeStart) {
+        assert(wave.lastRow && "valid wave without a source row");
+        edges.push_back(EdgeRec{wave.lastRow, n, wave.owner, n->owner,
+                                wave.pay, pieces});
+      }
+      if (n->owner.has_value() && !keepsWave) {
+        wave.owner = n->owner;
+        wave.valid = true;
+        wave.lastRow = n;
+        wave.pay = pay;
+        hadWave.insert(ownerKey(n->owner));
       }
       break;
     }
@@ -157,19 +203,19 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SmallVector<EdgeRec> &edges, 
     case Node::If: {
       bool wsAdopt = n->kind == Node::For && gpu::hasWarpSpecializeTag(n->op);
       auto infos = sortedPieceInfo(n);
-      std::map<PieceId, std::pair<Owner, SmallVector<AsyncOp, 1>>> preProd;
+      struct PreVersion {
+        Owner producer;
+        SmallVector<AsyncOp, 1> payloads;
+      };
+      std::map<PieceId, PreVersion> preVersion;
       for (auto &[p, pi] : infos) {
         auto it = st.find(p);
         if (it == st.end() || !it->second.live)
           continue;
         PieceGame &gm = it->second;
-        HolderRec *ph = findHolder(gm, gm.versionProducer);
-        SmallVector<AsyncOp, 1> pay;
-        if (ph)
-          pay = ph->lastPayloads;
-        else
-          pay.push_back(AsyncOp::NONE);
-        preProd.emplace(p, std::make_pair(gm.versionProducer, pay));
+        preVersion.emplace(p,
+                           PreVersion{gm.version.producer,
+                                      gm.version.payloads});
       }
       for (auto &[p, pi] : infos) {
         SmallVector<AsyncOp, 1> none;
@@ -183,13 +229,16 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SmallVector<EdgeRec> &edges, 
           PieceGame gm;
           gm.live = true;
           Owner childCarried = pi.owner;
-          auto pre = preProd.find(p);
-          gm.versionProducer = pre != preProd.end() ? pre->second.first : childCarried;
+          auto pre = preVersion.find(p);
+          Owner producer =
+              pre != preVersion.end() ? pre->second.producer : childCarried;
           SmallVector<AsyncOp, 1> seedPay;
-          if (pre != preProd.end() && sameOwner(childCarried, pre->second.first))
-            seedPay = pre->second.second; // payload-seed IMPORT
+          if (pre != preVersion.end() &&
+              sameOwner(childCarried, pre->second.producer))
+            seedPay = pre->second.payloads; // payload-seed IMPORT
           else
             seedPay.push_back(AsyncOp::NONE); // transitivity witness
+          setVersionSource(gm, producer, childCarried, childHead, seedPay);
           gm.holders.assign(1, HolderRec{childCarried, childHead, seedPay, {}});
           child.emplace(p, std::move(gm));
         }
@@ -201,30 +250,23 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SmallVector<EdgeRec> &edges, 
         PieceGame &gm = st[p];
         if (HolderRec *h = findHolder(gm, pi.owner)) {
           auto it = unionRet.find(p);
-          if (it != unionRet.end())
+          if (it != unionRet.end()) {
             h->lastPayloads = it->second;
+            if (gm.version.row == n)
+              gm.version.payloads = it->second;
+          }
         }
       }
-      {
-        Owner roOwner;
-        bool roFresh = true, roUniform = true;
-        for (auto &[p, pi] : infos) {
-          if (roFresh) {
-            roOwner = pi.owner;
-            roFresh = false;
-          } else if (!sameOwner(roOwner, pi.owner)) {
-            roUniform = false;
-          }
-        }
-        if (!roFresh) {
-          if (roUniform && roOwner.has_value()) {
-            wave.owner = roOwner;
-            wave.valid = true;
-            wave.lastRow = n;
-            wave.pay.assign(1, AsyncOp::NONE);
-          } else {
-            wave.valid = false;
-          }
+      if (!infos.empty()) {
+        hadWave.clear();
+        if (auto owner = uniformPieceOwner(n); owner && owner->has_value()) {
+          wave.owner = *owner;
+          wave.valid = true;
+          wave.lastRow = n;
+          wave.pay.assign(1, AsyncOp::NONE);
+          hadWave.insert(ownerKey(*owner));
+        } else {
+          wave.valid = false;
         }
       }
       break;
@@ -250,7 +292,6 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SmallVector<EdgeRec> &edges, 
         else
           keep = HolderRec{pi.owner, n, {AsyncOp::NONE}, {}};
         gm.holders.assign(1, keep);
-        gm.versionProducer = pi.owner;
       }
       break;
     }
@@ -697,6 +738,8 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SmallVector<EdgeRec> &edges
       rel->payloads = e.payloads;
       rel->sat = acq;
       rel->scheduleAnchor = e.src;
+      if (rowAllowsRetainedToken(e.src, e.srcOwner))
+        markRetainedToken(rel, e.srcOwner);
       Node *anchor = lastAfter.lookup(e.src);
       spliceAfter(rel, anchor ? anchor : e.src);
       lastAfter[e.src] = rel;
@@ -1171,6 +1214,51 @@ static HoldPrefix analyzeHoldPrefix(GroupDag &g, Node *F,
     p.rejectReason = "rel-before-buf";
   return p;
 }
+
+struct OwnerScheduleState {
+  bool present = false;
+  gpu::StageCluster stageCluster;
+};
+
+static OwnerScheduleState ownerScheduleAfterChain(Node *head, const Owner &owner,
+                                                  OwnerScheduleState state);
+
+static OwnerScheduleState ownerScheduleAfterRegion(Node *region, const Owner &owner,
+                                                   OwnerScheduleState state) {
+  Node *firstChild = region->children.empty() ? nullptr : region->children[0];
+  if (auto forOp = dyn_cast_or_null<scf::ForOp>(region->op)) {
+    OwnerScheduleState body = ownerScheduleAfterChain(firstChild, owner, state);
+    return gpu::hasWarpSpecializeTag(forOp) ? state : body;
+  }
+
+  OwnerScheduleState thenState = ownerScheduleAfterChain(firstChild, owner, state);
+  Node *elseChild = region->children.size() > 1 ? region->children[1] : nullptr;
+  OwnerScheduleState elseState = ownerScheduleAfterChain(elseChild, owner, state);
+  return thenState.present ? thenState : elseState;
+}
+
+static OwnerScheduleState ownerScheduleAfterChain(Node *head, const Owner &owner,
+                                                  OwnerScheduleState state) {
+  for (Node *n = head; n; n = n->next) {
+    if (n->kind == Node::Access && sameOwner(n->owner, owner)) {
+      Operation *completion = n->completionAnchor ? n->completionAnchor : n->op;
+      state.present = true;
+      state.stageCluster = gpu::getStageCluster(completion);
+      continue;
+    }
+    if (n->isRegion())
+      state = ownerScheduleAfterRegion(n, owner, state);
+  }
+  return state;
+}
+
+static gpu::StageCluster ownerCompletionScheduleAtLoopExit(Node *F,
+                                                           const Owner &owner) {
+  Node *body = F->children.empty() ? nullptr : F->children[0];
+  OwnerScheduleState state = ownerScheduleAfterChain(body, owner, {});
+  return state.present ? state.stageCluster : gpu::StageCluster{};
+}
+
 // Select carrier, point-of-use, or child-owned realization for one loop crossing.
 static Hold buildUniformHold(GroupDag &g, Node *F, const Crossing &c) {
   auto forOp = F->op ? dyn_cast<scf::ForOp>(F->op) : scf::ForOp();
@@ -1222,6 +1310,16 @@ static Hold buildUniformHold(GroupDag &g, Node *F, const Crossing &c) {
     return carrierHold(prefix.rejectReason, regain);
   if (!prefixRowIsSingleBufferView(F, prefix.firstToucher))
     return carrierHold("prefix-not-buffer-view", regain);
+  // A final-permission acquire is emitted after F, where it inherits this
+  // owner's loop-exit stage.  If that differs from the moved acquire's stage,
+  // AssignStagePhase cannot treat the two acquires as one loop-local lane.
+  if (needsFinalAcquire && !gpu::hasWarpSpecializeTag(forOp) &&
+      sameOwner(prefix.firstToucher->owner, c.slotOwner)) {
+    gpu::StageCluster point = gpu::getStageCluster(prefix.firstToucher->op);
+    gpu::StageCluster exit = ownerCompletionScheduleAtLoopExit(F, c.slotOwner);
+    if (point && exit && point->first != exit->first)
+      return carrierHold("cross-stage-final-acquire", regain);
+  }
   return pointOfUseHold(prefix.firstToucher, feed.acquire,
                         prefix.closingRelease, regain, std::move(prefix.rows),
                         regionTail, needsFinalAcquire, c.hold.finalAcquire,
@@ -1444,12 +1542,24 @@ LogicalResult computeBackingPlan(GroupDag &g, bool useMetaPartitioner, int lower
 
 static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
   std::optional<Owner> carrier; // present == tracked; value is the held owner
+  DenseSet<int64_t> retained;
+  auto rememberRetained = [&](const Owner &owner) {
+    if (owner)
+      retained.insert(ownerKey(owner));
+  };
+  auto canUseRetained = [&](Node *n, const Owner &owner) {
+    return rowAllowsRetainedToken(n, owner) && owner &&
+           retained.contains(ownerKey(owner));
+  };
   auto seedFromPieces = [&](Node *n) {
-    for (auto &[p, pi] : sortedPieceInfo(n)) {
-      if (!carrier.has_value())
-        carrier = pi.owner;
-      else if (!sameOwner(*carrier, pi.owner))
-        carrier.reset(); // mixed: untracked
+    if (n->pieceInfo.empty())
+      return;
+    retained.clear();
+    if (auto owner = uniformPieceOwner(n)) {
+      carrier = *owner;
+      rememberRetained(*owner);
+    } else {
+      carrier.reset(); // mixed: untracked
     }
   };
   if (head->kind == Node::Enter)
@@ -1458,11 +1568,19 @@ static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
     switch (n->kind) {
     case Node::Acquire: {
       const Sema &sm = getSema(g, n);
-      carrier = sm.isEntry && !n->owner ? sm.inheritStamp : n->owner;
+      Owner owner = sm.isEntry && !n->owner ? sm.inheritStamp : n->owner;
+      carrier = owner;
+      rememberRetained(owner);
       break;
     }
     case Node::Release: {
-      if (n->owner && carrier.has_value() && *carrier && !sameOwner(*carrier, n->owner))
+      if (n->retainedTokenOwner &&
+          (!n->owner || *n->retainedTokenOwner != ownerKey(n->owner) ||
+           !retained.contains(*n->retainedTokenOwner)))
+        return semaError(n->sat && n->sat->op ? n->sat->op : g.root->op)
+               << "retained-token release names no live token for its owner";
+      if (n->owner && carrier.has_value() && *carrier &&
+          !sameOwner(*carrier, n->owner) && !canUseRetained(n, n->owner))
         return semaError(n->sat && n->sat->op ? n->sat->op : g.root->op)
                << "wave-locality violation: release owned by partition "
                << n->owner->first << " consumes a carrier held by partition " << (*carrier)->first;
@@ -1471,8 +1589,13 @@ static LogicalResult verifyCarrierLocality(GroupDag &g, Node *head) {
     case Node::Access: {
       if (!n->owner)
         break; // root rows: outside partition discipline
+      if (n->retainedTokenOwner &&
+          (*n->retainedTokenOwner != ownerKey(n->owner) ||
+           !retained.contains(*n->retainedTokenOwner)))
+        return semaError(n->op)
+               << "retained-token access names no live token for its owner";
       if (nodeTouchesGroup(g, n) && carrier.has_value() && *carrier &&
-          !sameOwner(*carrier, n->owner))
+          !sameOwner(*carrier, n->owner) && !canUseRetained(n, n->owner))
         return semaError(n->op) << "wave-locality violation: access owned by partition "
                << n->owner->first << " touches a carrier held by partition " << (*carrier)->first;
       break;

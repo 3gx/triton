@@ -420,6 +420,8 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // Multiplicity violates the one-carrier-slot rule, so the producer-side hold
   // stays carrier-bearing. The store's EMPTY sem fans out to two consumers
   // (pending_count = 2), threaded by a function-level carrier through both loops.
+  // The two reads share the stable inner-entry source, so the correcting store
+  // takes a separate {2}->{1} WAR handoff.
   // CHECK-LABEL: @uniform_hold_s10_fanout_multi_consumer
   tt.func @uniform_hold_s10_fanout_multi_consumer(%lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 990 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
@@ -427,6 +429,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     // CHECK: [[F2:%.*]] = nvws.semaphore.create [[ALLOC]] false {pending_count = 2 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F3:%.*]] = nvws.semaphore.create [[ALLOC]] false {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F4:%.*]] = nvws.semaphore.create [[ALLOC]] false {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[F5:%.*]] = nvws.semaphore.create [[ALLOC]] false {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[T0:%.*]] = nvws.semaphore.acquire [[EMPTY]] : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
     %alloc = ttg.local_alloc {buffer.id = 990 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     // CHECK: [[OUTER:%.*]] = scf.for {{.*}} iter_args([[OCARRY:%.*]] = [[T0]]) -> (!ttg.async.token)  : i32 {
@@ -440,9 +443,10 @@ module attributes {"ttg.num-warps" = 4 : i32} {
       // CHECK: [[T1:%.*]] = nvws.semaphore.acquire [[F2]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
       // CHECK: [[INNER:%.*]] = scf.for {{.*}} iter_args([[ICARRY:%.*]] = [[T1]]) -> (!ttg.async.token)  : i32 {
       scf.for %i1 = %lb to %ub step %step : i32 {
+        // CHECK: nvws.semaphore.release [[F3]], [[ICARRY]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
         // CHECK: [[B1:%.*]] = nvws.semaphore.buffer [[F2]], [[ICARRY]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
         // CHECK: ttg.local_load [[B1]] {ttg.partition = array<i32: 2>}
-        // CHECK: nvws.semaphore.release [[F3]], [[ICARRY]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
+        // CHECK: nvws.semaphore.release [[F4]], [[ICARRY]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
         %v1 = ttg.local_load %alloc {ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !ty
         "consumer1"(%v1) {ttg.partition = array<i32: 2>} : (!ty) -> ()
         // CHECK: [[T2:%.*]] = nvws.semaphore.acquire [[F3]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
@@ -451,24 +455,26 @@ module attributes {"ttg.num-warps" = 4 : i32} {
         %v2 = ttg.local_load %alloc {ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !ty
         "consumer2"(%v2) {ttg.partition = array<i32: 1>} : (!ty) -> ()
         // CHECK: "producer3"
-        // CHECK: ttg.local_store %{{.*}}, [[B2]] {ttg.partition = array<i32: 1>}
-        // CHECK: nvws.semaphore.release [[F4]], [[T2]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
-        // CHECK: nvws.semaphore.release [[F2]], [[T2]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
+        // CHECK: [[T3:%.*]] = nvws.semaphore.acquire [[F4]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+        // CHECK: [[B3:%.*]] = nvws.semaphore.buffer [[F4]], [[T3]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+        // CHECK: ttg.local_store %{{.*}}, [[B3]] {ttg.partition = array<i32: 1>}
+        // CHECK: nvws.semaphore.release [[F5]], [[T3]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
+        // CHECK: nvws.semaphore.release [[F2]], [[T3]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
         %v3 = "producer3"(%i1) {ttg.partition = array<i32: 1>} : (i32) -> !ty
         ttg.local_store %v3, %alloc {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-        // CHECK: [[T3:%.*]] = nvws.semaphore.acquire [[F4]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
-        // CHECK: [[B3:%.*]] = nvws.semaphore.buffer [[F4]], [[T3]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-        // CHECK: ttg.local_load [[B3]] {ttg.partition = array<i32: 0>}
-        // CHECK: nvws.semaphore.release [[F2]], [[T3]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
+        // CHECK: [[T4:%.*]] = nvws.semaphore.acquire [[F5]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+        // CHECK: [[B4:%.*]] = nvws.semaphore.buffer [[F5]], [[T4]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+        // CHECK: ttg.local_load [[B4]] {ttg.partition = array<i32: 0>}
+        // CHECK: nvws.semaphore.release [[F2]], [[T4]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
         %v4 = ttg.local_load %alloc {ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !ty
         "consumer4"(%v4) {ttg.partition = array<i32: 0>} : (!ty) -> ()
-        // CHECK: [[T4:%.*]] = nvws.semaphore.acquire [[F2]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
-        // CHECK: scf.yield {ttg.partition = array<i32: 0, 1, 2, 3>} [[T4]] : !ttg.async.token
+        // CHECK: [[T5:%.*]] = nvws.semaphore.acquire [[F2]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+        // CHECK: scf.yield {ttg.partition = array<i32: 0, 1, 2, 3>} [[T5]] : !ttg.async.token
       } {ttg.partition = array<i32: 0, 1, 2, 3>}
       // CHECK: } {ttg.partition = array<i32: 0, 1, 2, 3>, ttg.partition.outputs = [array<i32: 2>]}
       // CHECK: nvws.semaphore.release [[EMPTY]], [[INNER]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
-      // CHECK: [[T5:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
-      // CHECK: scf.yield {ttg.partition = array<i32: 0, 1, 2, 3>} [[T5]] : !ttg.async.token
+      // CHECK: [[T6:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+      // CHECK: scf.yield {ttg.partition = array<i32: 0, 1, 2, 3>} [[T6]] : !ttg.async.token
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2, 3>, ttg.warp_specialize.tag = 0 : i32}
     // CHECK: } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2, 3>, ttg.partition.outputs = [array<i32: 3>], ttg.warp_specialize.tag = 0 : i32}
     tt.return
