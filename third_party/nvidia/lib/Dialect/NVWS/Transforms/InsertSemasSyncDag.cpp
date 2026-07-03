@@ -443,16 +443,12 @@ static LogicalResult sweepTraversalClosure(GroupDag &g, Node *head, ChainIndex &
   DenseMap<Node *, SmallVector<unsigned, 2>> atDst;
   SmallVector<unsigned, 4> closes;
   for (auto [i, e] : llvm::enumerate(edges)) {
-    if (ci.chainOf.lookup(e.src) != head || ci.chainOf.lookup(e.dst) != head)
+    if (drop[i] || ci.chainOf.lookup(e.src) != head || ci.chainOf.lookup(e.dst) != head)
       continue;
-    if (e.dst->kind == Node::Exit && e.src->kind == Node::Access && e.srcOwner && e.dstOwner) {
-      // Verification must see the closes it is asked to re-prove, while all
-      // state below is still propagated through kept edges only.
-      if (!drop[i] || llvm::is_contained(checkIdxs, static_cast<unsigned>(i)))
-        closes.push_back(i);
-    } else if (!drop[i]) {
+    if (e.dst->kind == Node::Exit && e.src->kind == Node::Access && e.srcOwner && e.dstOwner)
+      closes.push_back(i);
+    else
       atDst[e.dst].push_back(i);
-    }
   }
   if (closes.empty())
     return success();
@@ -491,82 +487,6 @@ static LogicalResult sweepTraversalClosure(GroupDag &g, Node *head, ChainIndex &
       snap1[n] = behind[ownerKey(n->owner)];
     }
   }
-  using CloseKey = std::tuple<Node *, int64_t>;
-  llvm::MapVector<CloseKey, SmallVector<unsigned, 4>> closeGroups;
-  for (unsigned ei : closes) {
-    EdgeRec &e = edges[ei];
-    closeGroups[std::make_tuple(e.dst, ownerKey(e.dstOwner))].push_back(ei);
-  }
-  auto witnessSurvivesCloseMerge = [&](unsigned witnessIdx) {
-    EdgeRec &witness = edges[witnessIdx];
-    for (auto [i, other] : llvm::enumerate(edges)) {
-      if (i == witnessIdx || drop[i])
-        continue;
-      // mergeEdges coalesces these before grouping by destination owner. Do
-      // not rely on a witness whose destination owner could disappear there.
-      if (other.dst == witness.dst &&
-          sameOwner(other.srcOwner, witness.srcOwner) &&
-          !sameOwner(other.dstOwner, witness.dstOwner))
-        return false;
-    }
-    return true;
-  };
-  auto witnessOrdersCandidate = [&](unsigned witnessIdx, unsigned candidateIdx) {
-    EdgeRec &witness = edges[witnessIdx];
-    EdgeRec &candidate = edges[candidateIdx];
-    // Same-owner arms are left for mergeEdges, which keeps the latest source
-    // and unions their async payloads and pieces. Require a final direct edge
-    // from the exact candidate row to the witness row; unlike owner/index
-    // reachability, that edge carries the candidate's async completion kinds.
-    if (sameOwner(witness.srcOwner, candidate.srcOwner) ||
-        ci.idx.lookup(witness.src) <= ci.idx.lookup(candidate.src) ||
-        !witnessSurvivesCloseMerge(witnessIdx))
-      return false;
-    for (auto [i, direct] : llvm::enumerate(edges)) {
-      if (drop[i] || direct.src != candidate.src || direct.dst != witness.src ||
-          !sameOwner(direct.srcOwner, candidate.srcOwner) ||
-          !sameOwner(direct.dstOwner, witness.srcOwner))
-        continue;
-      if (llvm::all_of(candidate.payloads, [&](AsyncOp payload) {
-            return llvm::is_contained(direct.payloads, payload);
-          }))
-        return true;
-    }
-    return false;
-  };
-  // A close into the first owner must leave a real loop-reopening acquire.
-  // Within that acquire's exact fan-in group, however, a causally later arm
-  // subsumes an earlier arm. Process later sources first so every deletion
-  // names a retained witness; incomparable fan-out arms all survive.
-  if (reduce)
-    for (auto &[key, group] : closeGroups) {
-      if (group.empty() || !sameOwner(edges[group.front()].dstOwner, firstWaveOwner))
-        continue;
-      llvm::stable_sort(group, [&](unsigned a, unsigned b) {
-        return ci.idx.lookup(edges[a].src) > ci.idx.lookup(edges[b].src);
-      });
-      SmallVector<unsigned, 4> retained;
-      for (unsigned ei : group) {
-        bool coveredByRetained = llvm::any_of(
-            retained,
-            [&](unsigned keptIdx) { return witnessOrdersCandidate(keptIdx, ei); });
-        if (coveredByRetained)
-          drop[ei] = true;
-        else
-          retained.push_back(ei);
-      }
-    }
-  auto coveredByKeptClose = [&](unsigned candidateIdx) {
-    EdgeRec &candidate = edges[candidateIdx];
-    auto it = closeGroups.find(
-        std::make_tuple(candidate.dst, ownerKey(candidate.dstOwner)));
-    if (it == closeGroups.end())
-      return false;
-    return llvm::any_of(it->second, [&](unsigned witnessIdx) {
-      return witnessIdx != candidateIdx && !drop[witnessIdx] &&
-             witnessOrdersCandidate(witnessIdx, candidateIdx);
-    });
-  };
   DenseMap<Node *, SmallVector<unsigned, 2>> closeAt;
   for (unsigned ei : closes) {
     EdgeRec &e = edges[ei];
@@ -578,7 +498,7 @@ static LogicalResult sweepTraversalClosure(GroupDag &g, Node *head, ChainIndex &
     if (latest)
       closeAt[latest].push_back(ei);
   }
-  DenseSet<unsigned> verifiedCloses;
+  LogicalResult result = success();
   for (Node *n = head; n; n = n->next) {
     auto it = atDst.find(n);
     if (it != atDst.end())
@@ -595,21 +515,17 @@ static LogicalResult sweepTraversalClosure(GroupDag &g, Node *head, ChainIndex &
         int64_t dk = ownerKey(e.dstOwner);
         bool covered = covers(behind[dk], ownerKey(e.srcOwner), ci.idx.lookup(e.src));
         bool open = waveOpenAt.count(dk);
-        bool isFirstOwnerClose = sameOwner(e.dstOwner, firstWaveOwner);
+        bool isCarrierClose = sameOwner(e.dstOwner, firstWaveOwner);
         if (reduce) {
-          if (!drop[ei] && covered && open && !isFirstOwnerClose)
+          if (!drop[ei] && covered && open && !isCarrierClose)
             drop[ei] = true;
           if (!drop[ei]) // kept close: provides its ordering at dst
             applyKept(e, ci.idx.lookup(e.src), snap1);
         } else if (!drop[ei]) {
           applyKept(e, ci.idx.lookup(e.src), snap1);
-        } else if (llvm::is_contained(checkIdxs, ei)) {
-          bool implied = coveredByKeptClose(ei) ||
-                         (!isFirstOwnerClose && covered && open);
-          if (!implied)
-            return semaError(e.src->op ? e.src->op : g.root->op)
+        } else if (llvm::is_contained(checkIdxs, ei) && !(covered && open)) {
+          result = semaError(e.src->op ? e.src->op : g.root->op)
                    << "traversal-closure violation: dropped close not implied";
-          verifiedCloses.insert(ei);
         }
       }
     if (n->owner && n->kind == Node::Access) {
@@ -617,13 +533,7 @@ static LogicalResult sweepTraversalClosure(GroupDag &g, Node *head, ChainIndex &
       snap2[n] = behind[ownerKey(n->owner)];
     }
   }
-  if (!reduce)
-    for (unsigned ei : closes)
-      if (drop[ei] && llvm::is_contained(checkIdxs, ei) &&
-          !verifiedCloses.contains(ei) && !coveredByKeptClose(ei))
-        return semaError(edges[ei].src->op ? edges[ei].src->op : g.root->op)
-               << "traversal-closure violation: dropped close not implied";
-  return success();
+  return result;
 }
 
 // Remove only edges re-proved by kept waits, program order, and loop closure.
