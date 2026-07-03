@@ -3,31 +3,33 @@
 ## Contract
 
 `NVWSInsertSemas` consumes partitioned IR with explicit mutable SMEM/TMEM
-accesses. Optional `buffer.*` attributes describe physical reuse and depth.
+accesses. Optional `buffer.*` attributes describe physical reuse and the
+number of backing copies.
 It produces `nvws.semaphore.create/acquire/buffer/release`, threads semaphore
 tokens through structured control flow, and assigns pipeline-legal
 `loop.stage`/`loop.cluster` annotations. Pipeline-wide terms are defined in
 the [NVWS-AWS terminology](../nvws-aws-overview.md#terminology).
 
 The pass models exclusive ownership for writes and shared ownership for
-reads. The *producer* of a piece is the owner that last wrote it — or,
-before any write, its first toucher. A *holder* is an owner whose latest
-access to the current version a future writer must respect. After a write,
-the writer is the sole holder and later readers join; a child chain instead
-starts with its `ENTER` owner as the sole holder. The *version source* is the
-concrete DAG node from which a new reader receives that version:
+reads. SYNC-DAG keeps two facts for each piece. Its *source* records the
+logical producer of the current version and the concrete DAG node from which
+a new reader receives that version. Its *uses* record each owner's latest
+access to that version:
 
 ```text
-write:       reset the version source and holders to the writer
-reread:      move only that holder's latest node; keep the version source
-new reader:  wait on the stable version source, then join the holders
-new writer:  wait on every other holder's latest node, then become exclusive
+first touch: source = this node; uses = [this owner -> this node]
+write:       wait on uses owned by every other owner, unless already ordered;
+             reset source and uses
+reread:      move only this owner's use; keep the source
+new reader:  wait on the stable source; add this owner's use
 ```
 
-The version source is the write node in the same chain, the first toucher
+The source node is the latest write in the same chain, the first toucher
 before any write, or a child `ENTER` node that represents a version established
-outside the child. This keeps independent readers as a fan-out rather than a
-reader-to-reader chain.
+outside the child. A child preserves the inherited logical producer while
+using `ENTER` as its chain-local source. Keeping source and uses separate lets
+independent readers fan out from the same source while a later writer still
+waits for the node stored for every other owner in `uses`.
 
 ## One model, four steps
 
@@ -40,8 +42,8 @@ OWNER-DAG
   for/if node
       |
 SYNC-DAG
-  derive handoff edges, semaphores, current and retained token lifetimes,
-  control-flow threading, buffer-stage schedule
+  derive required memory edges, token-supply edges, semaphores, token reuse,
+  region token policy, buffer-stage schedule
       |
 EMIT-IR
   materialize the already-decided protocol
@@ -53,10 +55,10 @@ reconstructing ownership from mutated IR.
 ## Core objects
 
 Model objects with their code names — the shared graph types are in
-`InsertSemas.h`, Chain's builder `buildChainForBlock` is in
-`InsertSemasAccessDag.cpp`, and the walk's `VersionSource`, `PieceGame`, and
-`HolderRec` are in `InsertSemasSyncDag.cpp`. The step documents use these
-terms with exactly these meanings.
+`InsertSemas.h`, the chain builder `buildChainForBlock` is in
+`InsertSemasAccessDag.cpp`, and the walk's `VersionSource`, `PieceState`,
+`ActiveUse`, and `Tokens` are in `InsertSemasSyncDag.cpp`. The step documents
+use these terms with exactly these meanings.
 
 - **Group** (`GroupDag`): the allocations analyzed together for ownership.
   Ordinarily, allocations of one memory kind with the same `buffer.id` form
@@ -71,13 +73,13 @@ terms with exactly these meanings.
   (see [ACCESS-DAG](access-dag.md#pieces-must-connect)). The group is therefore the unit
   of synchronization — one set of semaphores, tokens scoped to the group
   (never to a piece), one set of crossings and holds — while
-  version/holder state is tracked per piece.
+  source/use state is tracked per piece.
 - **Node** (`Node`): one entry of a group's program-order graph. Kinds:
   `Func` (the root of the graph), `Access` (a real operation touching group
   memory), `For`/`If` (a nested region), `Acquire`/`Release` (semaphore
   protocol added by SYNC-DAG), and the `ENTER`/`EXIT` boundary markers. An
-  access or release may carry `Node::retainedTokenOwner`, SYNC-DAG's proof
-  that the node can reuse an earlier token acquired by that owner.
+  access or release may carry `Node::reuseTokenOwner`, SYNC-DAG's proof that
+  the node can reuse that owner's earlier token.
 - **Chain**: the node sequence of one block, built in program order
   (`buildChainForBlock`); each region node holds child chains.
 - **Owner** (`Owner`): the one partition that executes an access, acquire, or
@@ -98,27 +100,28 @@ terms with exactly these meanings.
   (`R`) or write (`W`).
 - **Semaphore token**: the `!ttg.async.token` returned by
   `nvws.semaphore.acquire`. `nvws.semaphore.buffer` uses it to expose the
-  guarded memory, and `nvws.semaphore.release` takes it as an operand. The
-  value is not linear: a SYNC-DAG-marked same-owner buffer or release may
-  reuse an earlier token even after a later acquire by another owner.
-- **Retained token**: that explicitly proved earlier owner-local token.
-  Retention is chain-local and is reset at region boundaries; EMIT-IR only
-  renders `retainedTokenOwner`, never infers eligibility.
+  guarded memory, and `nvws.semaphore.release` takes it as an operand. Tokens
+  are group-scoped, not piece-scoped. Within a chain, the pass keeps known
+  owner tokens in deterministic order and uses the last token by default. A
+  node marked with `reuseTokenOwner` instead uses that owner's earlier token.
+  The region token policy resets this chain-local reuse state; EMIT-IR renders
+  the mark and never infers reuse.
 - **Crossing** (`Crossing`): a record that a `for` or `if` may need to return a
-  token. An unused `if` crossing is removed; a surviving one returns a token.
-  For a loop, the hold decides whether a token iter-arg and result remain.
-- **Hold** (`Hold`): the token-placement decision for one loop crossing: keep a
-  token iter-arg and result, move its acquire to the first protected access,
-  or remove the outer loop's token slot when its final nested loop takes no
-  token from the outer loop and returns none. Its materialized span runs from
-  acquire through protected accesses to closing release. Retained owner-local
-  tokens may coexist with that token.
+  token. Its `tokenOwner` is the owner of that boundary token. An unused `if`
+  crossing is removed; a surviving one returns a token.
+- **Hold** (`Hold`): the region token policy for one loop crossing. It either
+  threads a token through the loop (`THREADED`), moves the acquire to the first
+  protected access (`POINT_OF_USE`), or removes the outer token slot because
+  the final child owns the protocol (`CHILD_OWNS`). Its materialized span runs
+  from acquire through protected accesses to closing release. Other
+  owner-indexed tokens may coexist inside the chain; the policy decides which
+  single token, if any, crosses the region boundary.
 
 One hold-placement safety check preserves the loop-carried form. For a plain
 inner loop in a WS scope, if moving the acquire to the first body access also
 needs an acquire after the loop, and those two acquires would have different
-`loop.stage` values, SYNC-DAG keeps the loop-carried form with reason
-`cross-stage-final-acquire`. Equal or unknown stages do not trigger it.
+`loop.stage` values, SYNC-DAG keeps the loop-carried form and the dump prints
+bare `gated`. Equal or unknown stages do not trigger this check.
 
 For supported accesses, owner resolution is:
 
@@ -140,10 +143,10 @@ may take ownership without an incoming partition-to-partition handoff.
 ## Mutation boundary
 
 ACCESS, OWNER, and per-group SYNC construction are analysis-only. Global SYNC
-schedule finalization may raise existing `loop.cluster` values so that
-dependencies with no pipeline-stage slack become legal (see
-[SYNC-DAG](sync-dag-1.md#buffer-stage-offsets-and-the-pipeline-schedule)); it
-never changes `loop.stage`. EMIT-IR then renders the graph and performs
+schedule finalization may raise existing `loop.cluster` values when a
+producer and consumer execute in the same pipelined iteration (see
+[SYNC-DAG](sync-dag-1.md#pipeline-schedule)); it never changes `loop.stage`.
+EMIT-IR then renders the graph and performs
 representation-driven folding and cleanup; its one schedule exception is the
 loop-scheduler workaround, which splits qualifying `scf.if` operations and
 may copy a pipeline stage onto a release it moves (see

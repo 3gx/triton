@@ -3,9 +3,9 @@
 ## Rule
 
 EMIT-IR materializes the finalized SYNC-DAG. It does not rediscover owners,
-handoff edges, holds, retained-token eligibility, pending counts, or stage
-offsets. A `Node::retainedTokenOwner` mark is a decision to render, not a
-decision EMIT-IR may make. Its one schedule exception is the loop-scheduler
+edges, holds, token-reuse decisions, pending counts, or stage offsets. A
+`Node::reuseTokenOwner` mark is a decision to render, not a decision EMIT-IR
+may make. Its one schedule exception is the loop-scheduler
 workaround (`workaroundLoopScheduler`), which
 splits qualifying `scf.if` operations so a release leading a branch is
 hoisted before the `if` and a trailing acquire follows it — a shape the loop
@@ -54,24 +54,23 @@ block. Model terms are defined in the
 8. Verify partition outputs, token/view locality, unmarked buffer use after
    release, and at most one semaphore token in a loop's iter-args per group.
 
-The rendering walk keeps the following state for each group (`RenderState`):
-the current token, used by an unmarked access or release; the semaphore it came
-from and its optional owner; a map from each retained owner to its earlier token
-and semaphore; and buffer views cached by member and owner. Every acquire makes
-its result the current token. If its resolved owner is a partition owner, the
-walk also remembers it for retained use. When a region returns a token, that
-token is the only one retained afterward. A loop hold
-with no token iter-arg or result passes no retained token through its boundary.
-A region with no crossing leaves the outer state unchanged. Retention proofs
-therefore do not leak across control-flow boundaries.
+For each group, the rendering walk's `RenderState` keeps one ordered list of
+token records — token value, semaphore, and optional owner — plus buffer views
+cached by member and owner. The last token is used by default. An acquire
+replaces any earlier record for its resolved owner and appends its result. A
+node marked with `reuseTokenOwner` may instead use its owner's record without
+changing the order. At a region boundary, only the token selected for
+threading remains. A loop hold with no token iter-arg or result passes no token
+through its boundary; a region with no crossing leaves the outer state
+unchanged.
 
 ## Node mapping
 
 | DAG node | Emitted form |
 |---|---|
-| `Acquire` | `nvws.semaphore.acquire`; becomes the current token and, when its resolved owner is a partition owner, is remembered for retained use |
-| `Release` | `nvws.semaphore.release` with the assigned completion kind and `arrive_count`; a marked node selects that owner's retained token when the current token belongs to another owner |
-| `Access` | `nvws.semaphore.buffer`, replayed view chain, and the retargeted access; a marked node builds the view from that owner's retained token |
+| `Acquire` | `nvws.semaphore.acquire`; records its result for the resolved owner and makes it the last token |
+| `Release` | `nvws.semaphore.release` with the assigned completion kind and `arrive_count`; a marked node uses its owner's token when that token is not last |
+| `Access` | `nvws.semaphore.buffer`, replayed view chain, and the retargeted access; a marked node builds the view from its owner's token, otherwise from the last token |
 | sourceful alloc | explicit SMEM/TMEM store into the semaphore buffer view |
 | `For`/`If` crossing | token init/result/yield position when the hold crosses the boundary |
 | `ENTER`/`EXIT` | no operation of their own; the token iter-args, results, and yields added on the parent `for`/`if` realize the boundary |
@@ -79,9 +78,10 @@ therefore do not leak across control-flow boundaries.
 POINT_OF_USE loop holds — acquires moved to the first body access — receive
 no token iter-arg: their moved acquire creates the token in the body and the
 closing release uses it there. If SYNC-DAG instead keeps a token iter-arg and
-result for `cross-stage-final-acquire` — printed as
-`holdrule{gated(cross-stage-final-acquire)}` — signature rewriting adds the
-ordinary loop token slot. EMIT-IR performs no stage comparison of its own.
+result because an eligibility check fails — printed as bare
+`holdrule{gated}` unless the blocker is `trailing-use` or `result-consumed` —
+signature rewriting adds the ordinary loop token slot. EMIT-IR performs no
+stage comparison of its own.
 
 ## Schedule preservation
 
@@ -108,12 +108,13 @@ reschedule the DAG.
 ## Output contract
 
 Every access rewritten by EMIT-IR uses a semaphore buffer view produced from
-the token held by that access's owner. Within one block, no *unmarked* buffer
-view may follow a release of its token. A view recorded in
-`retainedBufferOps` may do so only because its SYNC-DAG node explicitly proved
-same-owner retention; this is the sole buffer-after-release verifier
-exemption, not a general weakening. One loop carries at most one semaphore
-token per group — circular SMEM backings are excluded from that last verifier.
+the token selected by the finalized DAG. Within one block, no *unmarked*
+buffer view may follow a release of its token. A view recorded in
+`reusedTokenBufferOps` may do so only because its SYNC-DAG node explicitly
+proved owner-specific token reuse; this is the sole buffer-after-release
+verifier exemption, not a general weakening. One loop carries at most one
+semaphore token per group — circular SMEM backings are excluded from that
+last verifier.
 `LowerSemaphore` can therefore assign buffer stages and phases without
 reconstructing ownership.
 

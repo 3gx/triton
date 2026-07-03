@@ -69,7 +69,7 @@ reaches it. P0 and P1: the first access is `W m0 {0}` (m0's footprint is
 {P0, P1}) — owner `{0}`. P2: no m0 access reaches it; the first access
 through m1 is `W m1 {2}` — owner `{2}`. Each piece's effect is the body
 merge (every piece is written somewhere in the body, so all are `W`), and
-`ENTER`/`EXIT` mirror the loop row.
+`ENTER`/`EXIT` mirror the loop node.
 
 ### Worked example: the if rule
 

@@ -37,22 +37,22 @@ document uses these terms with exactly these meanings.
 
 - **Backing**: a mutable SMEM or TMEM allocation guarded by a semaphore
   (`GroupDag::backing` in `InsertSemas.h`).
-- **Depth**: the number of buffered copies of a backing. The memory planner
-  records it as `buffer.copy`. Without a planner, depth is 1, except that
+- **Number of backing copies**: the number of buffered copies of a backing.
+  The memory planner records it as `buffer.copy`. Without a planner, there is
+  one copy, except that
   `LowerSemaphore` widens TMA-load-fed SMEM backings to the owning WS loop's
-  depth — its explicit `tt.num_stages` when present, else the `num-stages`
-  pass option; the largest wins when several WS loops share the group — and
-  the default path may double-buffer TMEM accumulators (see
-  [SYNC-DAG, backing depth](insert-semas/sync-dag.md#backing-depth)). These
-  documents use only this one word for that count.
-- **Buffer stage**: an integer in `[0, depth)` selecting one backing copy and
+  number of stages — its explicit `tt.num_stages` when present, else the
+  `num-stages` pass option; the largest wins when several WS loops share the
+  group — and the default path may double-buffer TMEM accumulators (see
+  [SYNC-DAG, backing copies](insert-semas/sync-dag-1.md#backing-copies)).
+- **Buffer stage**: an integer selecting one backing copy and
   the mbarrier with the same index. In the IR it is the `stage` operand of the
   `nvws.semaphore.*` operations; `AssignStagePhase` tracks it as
   `State::stage`.
 - **Current buffer stage**: the buffer stage most recently selected for a
-  semaphore group. A fresh write advances it to the next copy modulo depth; a
-  read leaves it unchanged. All partitions that use the group share this one
-  value; there is no per-partition copy.
+  semaphore group. A fresh write advances it to the next copy modulo the
+  number of backing copies; a read leaves it unchanged. All partitions that
+  use the group share this one value; there is no per-partition copy.
 - **Fresh write**: an acquire whose first reachable buffer access writes the
   backing instead of reading it (`isFirstUseFreshWriteAfterAcquire` in
   `AssignStagePhase.cpp`). Only fresh writes advance the current buffer stage.
@@ -60,7 +60,7 @@ document uses these terms with exactly these meanings.
   semaphore operation's `stage` operand (`Node::stageOffset`). Because the
   current buffer stage is shared, an operation sometimes needs a different
   copy; its final buffer stage is
-  `(current buffer stage + stage offset) mod depth`.
+  `(current buffer stage + stage offset) mod number of backing copies`.
 - **Phase**: the mbarrier parity an acquire's wait expects.
 - **Pipeline stage**: the software pipeliner's static schedule, `loop.stage`
   together with `loop.cluster`. It determines when an operation executes; it
@@ -90,13 +90,12 @@ stage; `loop.stage` means the pipeline stage.
 
 ### Worked example
 
-Consider a depth-2 circular backing shared by two allocations A and B — a
+Consider a two-copy circular backing shared by two allocations A and B — a
 planner-selected reuse group, where `buffer.circular` marks the group and
 `buffer.start` is each allocation's starting copy (see
 [meta-ports](meta-ports.md#output-representation)) — with `buffer.start = 0`
-for A and 1 for B. The current buffer stage starts at `depth - 1`, which is
-1. Every partition uses this same shared
-value:
+for A and 1 for B. The current buffer stage starts one less than the number of
+backing copies, which is 1 here. Every partition uses this same shared value:
 
 | Operation | Current-buffer-stage action | Stage offset | Final buffer stage |
 |---|---|---:|---:|
@@ -119,7 +118,7 @@ and for exact-alias SMEM handoffs across multiple copies.
 | `bufferFull` / `bufferEmpty` mbarrier arrays | one mbarrier per buffer stage of each semaphore, allocated by `LowerSemaphore` |
 | `accumCnt`, `bufferIdx = accumCnt % numBuffers` | buffer stage, tracked by `AssignStagePhase` |
 | `phase = (accumCnt / numBuffers) & 1` | phase, computed by `AssignStagePhase` |
-| `numBuffers` / multi-buffering | depth (`buffer.copy` or `num-stages`) |
+| `numBuffers` / multi-buffering | number of backing copies (`buffer.copy` or `num-stages`) |
 | reuse group (allocations sharing `buffer.id`) | planner group sharing `buffer.id`; a semaphore group after lowering |
 | `async_task_id` | `ttg.partition` plus the WS tag |
 
@@ -139,7 +138,7 @@ modulo schedule                       [only with TRITON_USE_MODULO_SCHEDULE]
      -> MemoryPlanner                    [Meta-NVWS only]
      -> InsertSemas
      -> LowerSemaphore
-          -> multi-buffer TMA-load-fed SMEM backings to depth num-stages
+          -> give TMA-load-fed SMEM backings num-stages copies
           -> AssignStagePhase
           -> lower semaphore IR to barriers
      -> partition loops
@@ -153,10 +152,11 @@ modulo schedule                       [only with TRITON_USE_MODULO_SCHEDULE]
 `LowerSemaphore`'s first step (`multiBufferSemaphore` in `LowerAref.cpp`)
 widens backings the planner did not size: a semaphore group whose release is
 fed by a TMA load and whose SMEM backings carry no `buffer.copy` is rewritten
-from one copy to the effective depth (`tt.num_stages` on the owning WS loop,
-defaulting to the `num-stages` option) before `AssignStagePhase` computes
-buffer stages. `InsertSemas` already analyzes such groups at that final depth (see
-[SYNC-DAG, backing depth](insert-semas/sync-dag.md#backing-depth)).
+from one copy to the effective number of copies (`tt.num_stages` on the owning
+WS loop, defaulting to the `num-stages` option) before `AssignStagePhase`
+computes buffer stages. `InsertSemas` already analyzes such groups with that
+final number of copies (see
+[SYNC-DAG, backing copies](insert-semas/sync-dag-1.md#backing-copies)).
 
 The terminal `schedule loops` run also differs per path: the AWS driver passes
 it a Meta flag (`useMetaWS` in `AutomaticWarpSpecialization.cpp`), selecting

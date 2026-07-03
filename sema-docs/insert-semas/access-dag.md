@@ -11,7 +11,7 @@ depends on those answers.
 
 Figures use the pass's dump format (`NVWS_INSERT_SEMA_DUMP_DAG=1`, trimmed
 excerpts): `W m0 ttg.local_alloc {0}` is a write of member `m0` by the op
-`ttg.local_alloc` in partition 0, and region rows carry
+`ttg.local_alloc` in partition 0, and region nodes carry
 `effects{piece:effect}`. Model terms are defined in the
 [InsertSemas overview](overview.md#core-objects).
 
@@ -52,11 +52,13 @@ namespaces; an allocation without an ID receives a private synthetic group.
 
 The analysis runs **once per group**: ACCESS-DAG and OWNER-DAG are fully
 independent per group, and SYNC-DAG walks each group's ownership
-separately (the per-piece games — see [SYNC-DAG](sync-dag-1.md)). The later steps do share some state — SYNC-DAG validates
+separately (the per-piece source/use state — see
+[SYNC-DAG](sync-dag-1.md)). The later steps do share some state — SYNC-DAG validates
 circular sibling groups together, threads a function-wide TMEM budget,
 validates the mixed-depth TMEM aliases of one `buffer.id` as a pair (an
-alternating two-partition lifecycle with pipeline-slack checks — see
-[SYNC-DAG](sync-dag-1.md#mixed-depth-tmem-aliases-schedule-validation-across-split-groups)),
+alternating two-partition lifecycle checked against `loop.stage` and
+`loop.cluster` — see
+[SYNC-DAG](sync-dag-1.md#mixed-depth-tmem-aliases-dependencies-across-split-groups)),
 and its final schedule legalization runs over the whole
 function; EMIT-IR
 sees all groups at once so it can reunify shared storage — but across
@@ -209,13 +211,14 @@ for each op, in program order:
 ```
 
 An op yields at most one access node, carrying one touch per map-hit value
-(normally one per member it reached); the ACCESS dump prints one row per
-touch, and the SYNC dump joins them on a single row. Membership is always the same plain map lookup —
-classification only decides which of the op's values to look up and with
-what effect, and an op whose values all miss the map contributes nothing.
+(normally one per member it reached); the ACCESS dump prints one line per
+touch, and the SYNC dump joins them on a single node. Membership is always
+the same plain map lookup — classification only decides which of the op's
+values to look up and with what effect, and an op whose values all miss the
+map contributes nothing.
 The one write with no memdesc operand is the sourceful allocation: it
 initializes the memory its own result names (that result is already in the
-map from seeding), producing the `W m0 ttg.local_alloc {0}` rows in the
+map from seeding), producing the `W m0 ttg.local_alloc {0}` lines in the
 figures. A descriptor load's destination is an ordinary memdesc operand —
 the op returns nothing.
 
@@ -264,7 +267,7 @@ P1: W{0}, R{1}, W{2}, R{0}        (both members reach it — the overlap)
 P2: W{0}, R{1}                    (only m0 reaches it)
 ```
 
-The loop row's `effects{P0:W, P1:W, P2:W}` annotation is the per-piece merge
+The loop node's `effects{P0:W, P1:W, P2:W}` annotation is the per-piece merge
 of exactly these lists — `W` if any access in the body writes the piece,
 otherwise `R`. The enclosing chain treats the whole loop as one event, and
 `effects{}` is what that event looks like from outside.
@@ -323,9 +326,9 @@ control-flow crossing, or owner mismatch fails the pass with a diagnostic.
 
 ## Effects inside `for` and `if`
 
-For every retained `for` and `if`, ACCESS-DAG records each piece accessed in
+For every kept `for` and `if`, ACCESS-DAG records each piece accessed in
 its body. The recorded effect is `W` if any access writes the piece, otherwise
-`R` (the `effects{...}` row in the figure above). No owner is assigned yet,
+`R` (the `effects{...}` annotation in the figure above). No owner is assigned yet,
 and the `ENTER`/`EXIT` boundary markers are added by the next step,
 OWNER-DAG.
 
@@ -346,7 +349,7 @@ OWNER-DAG.
                                          (touches, op, partition)
       keep a for/if node (with its child chains) only when its body touched
       the group
-3. per retained for/if: record the pieces its body touches and the merged
+3. per kept for/if: record the pieces its body touches and the merged
    R/W effect
 ```
 
