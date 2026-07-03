@@ -123,18 +123,14 @@ walkChain(GroupDag &g, Node *head, ChainState &st, SmallVector<EdgeRec> &edges, 
     Node *lastRow = nullptr;
     SmallVector<AsyncOp, 1> pay;
   };
+  // Every chain starts with its wave unset; the first partition-owned
+  // access establishes it. Seeding the wave from ENTER's owners was
+  // provably effect-free: the seeded value could only act through the
+  // force paths of applyTouch, and at a chain's first group event the
+  // sole holder of every piece is the entry owner itself, so force is
+  // always false there (and mixed entries seeded the wave invalid, which
+  // is the unset state).
   WaveSt wave;
-  if (head->kind == Node::Enter)
-    for (auto &[p, pi] : sortedPieceInfo(head)) {
-      WaveSt &w = wave;
-      if (!w.lastRow) {
-        w.owner = pi.owner;
-        w.valid = true;
-        w.lastRow = head;
-        w.pay.assign(1, AsyncOp::NONE);
-      } else if (!sameOwner(w.owner, pi.owner))
-        w.valid = false;
-    }
   for (Node *n = head; n; n = n->next) {
     switch (n->kind) {
     case Node::Enter:
