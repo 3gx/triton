@@ -70,14 +70,14 @@ struct Node;
 
 struct Hold {
   enum class Outcome { THREADED, POINT_OF_USE, CHILD_OWNS };
+  enum class Blocker { NONE, TRAILING_USE, RESULT_CONSUMED };
   Outcome outcome = Outcome::THREADED;
-  const char *reason = "";
+  Blocker blocker = Blocker::NONE;
   SmallVector<Node *, 4> nodes;
   Node *entryAcquire = nullptr, *closingRelease = nullptr;
   Node *regain = nullptr, *firstToucher = nullptr;
-  Node *finalAcquire = nullptr, *bridgeAcquire = nullptr;
-  Node *bridgeRelease = nullptr;
-  bool needsFinalAcquire = false, keepsEntryAcquire = false;
+  Node *bridgeAcquire = nullptr;
+  bool needsPostLoopAcquire = false, keepsEntryAcquire = false;
   bool regionTail = false;
   bool threadsToken() const { return outcome == Outcome::THREADED; }
   bool isPointOfUse() const { return outcome == Outcome::POINT_OF_USE; }
@@ -88,6 +88,7 @@ struct Crossing {
   Owner tokenOwner;
   SmallVector<Node *, 2> finals;
   Hold hold;
+  Node *postLoopAcquire = nullptr, *bridgeAcquire = nullptr, *bridgeRelease = nullptr;
 };
 
 struct Node {
@@ -102,7 +103,7 @@ struct Node {
   DenseMap<PieceId, PieceInfo> pieceInfo;
   SemaId sema = 0;
   unsigned count = 0;
-  bool finalPermissionAcquire = false;
+  bool postLoopAcquire = false;
   SmallVector<AsyncOp, 1> payloads;
   gpu::StageCluster stageCluster;
   std::optional<int64_t> stageOffset;
