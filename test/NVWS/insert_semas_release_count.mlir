@@ -88,5 +88,5 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 // read overlap {2}'s read, so the in-loop store takes an explicit {2}->{1}
 // WAR edge; {1}'s own read is ordered by program order. Under the v5 uniform
 // hold rule, the outer ready hold remains carrier-bearing: the prefix's
-// release has arrive multiplicity 2, so condition E rejects point-of-use
-// (`rel-count`) to preserve the one-carrier-slot rule.
+// release has arrive multiplicity 2, so the eligibility check rejects
+// point-of-use (printed as bare `gated`) to preserve the one-carrier-slot rule.

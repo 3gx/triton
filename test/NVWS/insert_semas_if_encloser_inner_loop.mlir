@@ -5,16 +5,13 @@
 //
 // WS-tagged outer loop -> scf.if -> non-WS inner loop, with ONE inner-confined
 // ping-pong buffer in the if-branch. The scf.if sits BETWEEN the WS loop and
-// the inner for, so it is the inner loop's encloser. The SYNC-DAG today is
-// outer holdrule{gated(nested-final)} + inner holdrule{gated(non-ws-loop)};
-// the if threads the carrier.
+// the inner for, so it is the inner loop's encloser. The SYNC-DAG prints both
+// loops as holdrule{gated}; the if threads the carrier.
 //
 // This pins TODAY's all-gated emission. After M2, canDrop(If)=false keeps the
-// inner loop GATED (clause (ii) of edit 1 finds the scf.if in the chain) and
-// the only change is the dump gate-reason label (non-ws-loop -> if-encloser);
-// the EMITTED IR here must stay BYTE-IDENTICAL. This is the only artifact that
-// lets M2 verify the C3 claim ("if-encloser stays byte-identical, only the
-// label changes"). Optimizing this shape is the UNSCHEDULED M4.2 follow-up
+// inner loop GATED (clause (ii) of edit 1 finds the scf.if in the chain), and
+// the EMITTED IR here must stay BYTE-IDENTICAL. Optimizing this shape is the
+// UNSCHEDULED M4.2 follow-up
 // (flip canDrop(If) to true + build the else pass-through).
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
