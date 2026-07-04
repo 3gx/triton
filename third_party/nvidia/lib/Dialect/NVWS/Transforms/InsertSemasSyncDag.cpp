@@ -1510,8 +1510,8 @@ static scf::ForOp outerWSLoop(scf::ForOp loop) {
         ws = f;
   return ws;
 }
-static bool isMultiStagedGroup(GroupDag &g, int numTmemBlocks) {
-  bool isMultiStaged = true;
+static bool isMultiBufferedGroup(GroupDag &g, int numTmemBlocks) {
+  bool isMultiBuffered = true;
   for (const Member &m : g.pieceTable.members) {
     for (Operation *user : m.allocOp->getResult(0).getUsers()) {
       if (auto mmaOp = dyn_cast<nvidia_gpu::MMAv5OpInterface>(user)) {
@@ -1520,12 +1520,12 @@ static bool isMultiStagedGroup(GroupDag &g, int numTmemBlocks) {
           bool accIsMultiBuffered = !nvidia_gpu::hasAccReadModifyWrite(mmaOp, loop) &&
               nvidia_gpu::isAccMultibufferingPossible(mmaOp, loop) &&
               !getDisallowAccMultiBuffer(wsLoop) && canDoubleBufferAcc(mmaOp, numTmemBlocks);
-          isMultiStaged = isMultiStaged && accIsMultiBuffered;
+          isMultiBuffered = isMultiBuffered && accIsMultiBuffered;
         }
       }
     }
   }
-  return isMultiStaged;
+  return isMultiBuffered;
 }
 static LogicalResult getPlannedBufferCopy(GroupDag &g, std::optional<int> &plannedCopy) {
   bool sawMissing = false;
@@ -1550,28 +1550,29 @@ static LogicalResult getPlannedBufferCopy(GroupDag &g, std::optional<int> &plann
 
 LogicalResult computeBackingPlan(GroupDag &g, bool useMetaPartitioner, int lowerSemaphoreNumStages,
                                  int &numTmemBlocks) {
-  g.numStages = 1;
+  g.numCopies = 1;
   bool untouched = g.semas.empty();
   std::optional<int> plannedBufferCopy;
   if (failed(getPlannedBufferCopy(g, plannedBufferCopy)))
     return failure();
   if (!untouched && plannedBufferCopy) {
-    g.numStages = *plannedBufferCopy;
-  } else if (g.isTmem() && !untouched && !useMetaPartitioner && isMultiStagedGroup(g, numTmemBlocks))
-    g.numStages = 2;
-  g.semaphoreDepth = g.numStages;
+    g.numCopies = *plannedBufferCopy;
+  } else if (g.isTmem() && !untouched && !useMetaPartitioner &&
+             isMultiBufferedGroup(g, numTmemBlocks))
+    g.numCopies = 2;
+  g.numSemaphoreCopies = g.numCopies;
   bool hasProducerLoad = false;
   forEachNode(g, [&](Node *node) {
     if (node->kind == Node::Release && llvm::is_contained(node->payloads, AsyncOp::TMALoad))
       hasProducerLoad = true;
   });
   if (!untouched && g.isLocal() && !plannedBufferCopy && hasProducerLoad)
-    g.semaphoreDepth = std::max(1, lowerSemaphoreNumStages);
+    g.numSemaphoreCopies = std::max(1, lowerSemaphoreNumStages);
   if (g.isTmem() && !untouched)
     for (const Member &m : g.pieceTable.members) {
       auto shape = m.type.getShape();
       if (shape.size() >= 2)
-        numTmemBlocks += shape[0] * shape[1] * g.numStages;
+        numTmemBlocks += shape[0] * shape[1] * g.numCopies;
     }
   return success();
 }
@@ -1872,8 +1873,8 @@ static LogicalResult verifySyncDag(GroupDag &g) {
 using ScheduleCache = DenseMap<int64_t, gpu::StageCluster>;
 
 struct ScheduleEdge {
-  Operation *src = nullptr;
-  Operation *dst = nullptr;
+  Operation *producer = nullptr;
+  Operation *consumer = nullptr;
 };
 
 struct SlotSchedule {
@@ -1901,7 +1902,7 @@ static LogicalResult assignCircularStageOffsets(MutableArrayRef<GroupDag> groups
   for (auto &[id, set] : sets) {
     (void)id;
     auto type = set.front()->pieceTable.members.front().type;
-    int64_t depth = set.front()->numStages;
+    int64_t numCopies = set.front()->numCopies;
     DenseSet<int64_t> starts;
     DenseMap<Operation *, SmallVector<Event, 1>> eventsByOp;
     for (GroupDag *g : set) {
@@ -1910,9 +1911,9 @@ static LogicalResult assignCircularStageOffsets(MutableArrayRef<GroupDag> groups
         return semaError(g->root->op) << "malformed circular local logical group";
       if (member.type != type)
         return semaError(member.allocOp) << "circular local group has mismatched member types";
-      if (g->numStages != depth)
-        return semaError(member.allocOp) << "circular local group has mismatched depth";
-      if (member.circularStart < 0 || member.circularStart >= depth)
+      if (g->numCopies != numCopies)
+        return semaError(member.allocOp) << "circular local group has mismatched buffer.copy";
+      if (member.circularStart < 0 || member.circularStart >= numCopies)
         return semaError(member.allocOp) << "circular buffer.start is outside buffer.copy";
       if (!starts.insert(member.circularStart).second)
         return semaError(member.allocOp) << "duplicate circular buffer.start in one group";
@@ -1933,9 +1934,9 @@ static LogicalResult assignCircularStageOffsets(MutableArrayRef<GroupDag> groups
       const Member &member = event.group->pieceTable.members.front();
       if (accessEffect(event.access) == Effect::W) {
         ++ordinal;
-        if (member.circularStart != ordinal % depth)
+        if (member.circularStart != ordinal % numCopies)
           return semaError(member.allocOp) << "circular producer order expects buffer.start "
-                 << ordinal % depth << ", got " << member.circularStart;
+                 << ordinal % numCopies << ", got " << member.circularStart;
         lastProduced[event.group] = ordinal;
         offset[event.access] = 0;
       } else {
@@ -2017,9 +2018,9 @@ static LogicalResult addMixedDepthAliasScheduleEdges(MutableArrayRef<GroupDag> g
              << "mixed-depth TMEM reuse has no unique physical owner by span " "and element width";
     GroupDag *owner = firstOwns ? set[0] : set[1];
     GroupDag *reuser = firstOwns ? set[1] : set[0];
-    if (owner->numStages == reuser->numStages)
+    if (owner->numCopies == reuser->numCopies)
       return semaError(reuser->pieceTable.members.front().allocOp)
-             << "mixed-depth TMEM reuse lost its distinct logical copy depths";
+             << "mixed-depth TMEM reuse lost its distinct buffer.copy values";
     MixedDepthLifecycle a, b;
     if (failed(collectMixedDepthLifecycle(*owner, a)) || failed(collectMixedDepthLifecycle(*reuser, b)))
       return failure();
@@ -2049,23 +2050,22 @@ static LogicalResult addMixedDepthAliasScheduleEdges(MutableArrayRef<GroupDag> g
     if (!ownerRead || !reuserWrite || !reuserRead || !ownerWrite)
       return semaError(a.writer->op) << "mixed-depth TMEM reuse accesses require fixed "
                 "loop.stage/loop.cluster annotations";
-    int64_t sameIterationSlack = reuserWrite->first - ownerRead->first;
-    if (sameIterationSlack < 0)
-      return semaError(a.reader->op) << "mixed-depth TMEM same-iteration handoff has negative "
-                "pipeline-stage slack";
-    if (sameIterationSlack == 0)
+    if (ownerRead->first > reuserWrite->first)
+      return semaError(a.reader->op)
+             << "mixed-depth TMEM consumer loop.stage precedes its producer";
+    if (ownerRead->first == reuserWrite->first)
       edgesByLoop[loop.getOperation()].push_back(ScheduleEdge{a.reader->op, b.writer->op});
-    int64_t backedgeSlack = 1 + ownerWrite->first - reuserRead->first;
-    if (backedgeSlack <= 0)
-      return semaError(b.reader->op) << "mixed-depth TMEM backedge does not have positive "
-                "pipeline-stage slack";
+    if (reuserRead->first >= 1 + ownerWrite->first)
+      return semaError(b.reader->op)
+             << "mixed-depth TMEM loop-carried consumer does not execute "
+                "after its producer";
   }
   return success();
 }
-static Operation *realScheduleAnchor(Node *anchor, bool source) {
-  for (Node *n = anchor; n; n = source ? n->prev : n->next) {
+static Operation *realScheduleAnchor(Node *anchor, bool producer) {
+  for (Node *n = anchor; n; n = producer ? n->prev : n->next) {
     if (n->kind == Node::Access)
-      return source && n->completionAnchor ? n->completionAnchor : n->op;
+      return producer && n->completionAnchor ? n->completionAnchor : n->op;
     if (n->isRegion() && n->op)
       return n->op;
   }
@@ -2074,20 +2074,22 @@ static Operation *realScheduleAnchor(Node *anchor, bool source) {
 
 struct LoopAnchorPair {
   scf::ForOp loop;
-  Operation *src = nullptr;
-  Operation *dst = nullptr;
+  Operation *producer = nullptr;
+  Operation *consumer = nullptr;
 };
 static std::optional<LoopAnchorPair>
-findCommonScheduledLoop(Operation *src, Operation *dst) {
-  for (Operation *parent = src->getParentOp(); parent;
+findCommonScheduledLoop(Operation *producer, Operation *consumer) {
+  for (Operation *parent = producer->getParentOp(); parent;
        parent = parent->getParentOp()) {
     auto loop = dyn_cast<scf::ForOp>(parent);
     if (!loop || !loop->hasAttr(triton::kScheduledMaxStageAttrName))
       continue;
-    Operation *srcInLoop = loop.getBody()->findAncestorOpInBlock(*src);
-    Operation *dstInLoop = loop.getBody()->findAncestorOpInBlock(*dst);
-    if (srcInLoop && dstInLoop)
-      return LoopAnchorPair{loop, srcInLoop, dstInLoop};
+    Operation *producerInLoop =
+        loop.getBody()->findAncestorOpInBlock(*producer);
+    Operation *consumerInLoop =
+        loop.getBody()->findAncestorOpInBlock(*consumer);
+    if (producerInLoop && consumerInLoop)
+      return LoopAnchorPair{loop, producerInLoop, consumerInLoop};
   }
   return std::nullopt;
 }
@@ -2166,22 +2168,28 @@ static int64_t positiveMod(int64_t value, int64_t modulus) {
   return remainder < 0 ? remainder + modulus : remainder;
 }
 static std::optional<int64_t>
-computeRecurrenceDistance(const SlotSchedule &slots, int64_t depth, Node *src, Node *dst) {
-  auto srcIt = slots.ordinalByAccess.find(src);
-  auto dstIt = slots.ordinalByAccess.find(dst);
-  if (!slots.complete || srcIt == slots.ordinalByAccess.end() ||
-      dstIt == slots.ordinalByAccess.end() || slots.advancesPerIteration <= 0)
+computeLoopCarriedDistance(const SlotSchedule &slots,
+                           int64_t numSemaphoreCopies,
+                           Node *producer, Node *consumer) {
+  auto producerIt = slots.ordinalByAccess.find(producer);
+  auto consumerIt = slots.ordinalByAccess.find(consumer);
+  if (!slots.complete || producerIt == slots.ordinalByAccess.end() ||
+      consumerIt == slots.ordinalByAccess.end() ||
+      slots.advancesPerIteration <= 0)
     return std::nullopt;
-  int64_t orbit = depth / std::gcd(depth, slots.advancesPerIteration);
+  int64_t orbit = numSemaphoreCopies /
+                  std::gcd(numSemaphoreCopies, slots.advancesPerIteration);
   for (int64_t distance = 1; distance <= orbit; ++distance)
-    if (positiveMod(dstIt->second +
-                        distance * slots.advancesPerIteration, depth) == positiveMod(srcIt->second, depth))
+    if (positiveMod(consumerIt->second +
+                        distance * slots.advancesPerIteration,
+                    numSemaphoreCopies) ==
+        positiveMod(producerIt->second, numSemaphoreCopies))
       return distance;
   return std::nullopt;
 }
-static bool isExactAliasMultistageGroup(const GroupDag &group) {
+static bool isExactAliasMultibufferedGroup(const GroupDag &group) {
   if (!group.isLocal() || group.isCircular() || group.mixedDepthPhysicalAlias ||
-      group.pieceTable.members.size() < 2 || group.semaphoreDepth <= 1)
+      group.pieceTable.members.size() < 2 || group.numSemaphoreCopies <= 1)
     return false;
   const Member &first = group.pieceTable.members.front();
   return llvm::all_of(group.pieceTable.members, [&](const Member &member) {
@@ -2190,7 +2198,7 @@ static bool isExactAliasMultistageGroup(const GroupDag &group) {
 }
 
 static LogicalResult assignAliasedHandoffStageOffsets(GroupDag &group) {
-  if (!isExactAliasMultistageGroup(group))
+  if (!isExactAliasMultibufferedGroup(group))
     return success();
   DenseMap<Operation *, SlotSchedule> slotsByLoop;
   bool hasShiftedRelease = false;
@@ -2198,40 +2206,49 @@ static LogicalResult assignAliasedHandoffStageOffsets(GroupDag &group) {
   forEachNode(group, [&](Node *release) {
     if (failed(result) || release->kind != Node::Release || !release->sat)
       return;
-    Node *src = release->scheduleAnchor;
-    Node *dst = release->sat->scheduleAnchor;
-    if (!src || !dst || src->kind != Node::Access ||
-        dst->kind != Node::Access || src->parent != dst->parent ||
-        !src->parent || src->parent->kind != Node::For) {
-      result = semaError(src && src->op ? src->op : group.root->op)
-               << "staged exact-alias handoff requires direct accesses in one loop body";
+    Node *producer = release->scheduleAnchor;
+    Node *consumer = release->sat->scheduleAnchor;
+    if (!producer || !consumer || producer->kind != Node::Access ||
+        consumer->kind != Node::Access || producer->parent != consumer->parent ||
+        !producer->parent || producer->parent->kind != Node::For) {
+      result = semaError(producer && producer->op ? producer->op : group.root->op)
+               << "multibuffered exact-alias handoff requires direct accesses "
+                  "in one loop body";
       return;
     }
-    auto loop = dyn_cast<scf::ForOp>(src->parent->op);
-    if (!loop || loop.getBody()->findAncestorOpInBlock(*src->op) != src->op ||
-        loop.getBody()->findAncestorOpInBlock(*dst->op) != dst->op) {
-      result = semaError(src->op) << "staged exact-alias handoff is not directly represented in "
-                  "its ownership loop";
+    auto loop = dyn_cast<scf::ForOp>(producer->parent->op);
+    if (!loop ||
+        loop.getBody()->findAncestorOpInBlock(*producer->op) != producer->op ||
+        loop.getBody()->findAncestorOpInBlock(*consumer->op) != consumer->op) {
+      result = semaError(producer->op)
+               << "multibuffered exact-alias handoff is not directly "
+                  "represented in its ownership loop";
       return;
     }
     auto [it, inserted] = slotsByLoop.try_emplace(loop.getOperation());
     if (inserted)
       it->second = computeSlotSchedule(ArrayRef<GroupDag *>{&group}, loop);
     const SlotSchedule &slots = it->second;
-    auto srcIt = slots.ordinalByAccess.find(src);
-    auto dstIt = slots.ordinalByAccess.find(dst);
-    if (!slots.complete || srcIt == slots.ordinalByAccess.end() ||
-        dstIt == slots.ordinalByAccess.end() || slots.advancesPerIteration <= 0) {
-      result = semaError(src->op) << "cannot derive staged exact-alias handoff slots";
+    auto producerIt = slots.ordinalByAccess.find(producer);
+    auto consumerIt = slots.ordinalByAccess.find(consumer);
+    if (!slots.complete || producerIt == slots.ordinalByAccess.end() ||
+        consumerIt == slots.ordinalByAccess.end() ||
+        slots.advancesPerIteration <= 0) {
+      result = semaError(producer->op)
+               << "cannot derive multibuffered exact-alias handoff slots";
       return;
     }
-    int64_t depth = group.semaphoreDepth;
+    int64_t numSemaphoreCopies = group.numSemaphoreCopies;
     int64_t offset = 0;
     if (precedesInChain(release, release->sat)) {
-      offset = positiveMod(dstIt->second - srcIt->second, depth);
-    } else if (!computeRecurrenceDistance(slots, depth, src, dst)) {
-      int64_t nextDst = dstIt->second + slots.advancesPerIteration;
-      offset = positiveMod(nextDst - srcIt->second, depth);
+      offset = positiveMod(consumerIt->second - producerIt->second,
+                           numSemaphoreCopies);
+    } else if (!computeLoopCarriedDistance(
+                   slots, numSemaphoreCopies, producer, consumer)) {
+      int64_t nextConsumer =
+          consumerIt->second + slots.advancesPerIteration;
+      offset =
+          positiveMod(nextConsumer - producerIt->second, numSemaphoreCopies);
     }
     release->stageOffset = offset;
     hasShiftedRelease |= offset != 0;
@@ -2279,16 +2296,21 @@ static LogicalResult addSyncScheduleEdges(MutableArrayRef<GroupDag> groups,
       if (failed(result) || release->kind != Node::Release || !release->sat)
         return;
       Node *acquire = release->sat;
-      Operation *src = realScheduleAnchor(release->scheduleAnchor, /*source=*/true);
-      Operation *dst = realScheduleAnchor(acquire->scheduleAnchor, /*source=*/false);
-      if (!src || !dst)
+      Operation *producer =
+          realScheduleAnchor(release->scheduleAnchor, /*producer=*/true);
+      Operation *consumer =
+          realScheduleAnchor(acquire->scheduleAnchor, /*producer=*/false);
+      if (!producer || !consumer)
         return;
-      std::optional<LoopAnchorPair> anchors = findCommonScheduledLoop(src, dst);
-      if (!anchors || anchors->src == anchors->dst)
+      std::optional<LoopAnchorPair> anchors =
+          findCommonScheduledLoop(producer, consumer);
+      if (!anchors || anchors->producer == anchors->consumer)
         return;
-      gpu::StageCluster srcSchedule = gpu::getStageCluster(anchors->src);
-      gpu::StageCluster dstSchedule = gpu::getStageCluster(anchors->dst);
-      if (!srcSchedule || !dstSchedule)
+      gpu::StageCluster producerSchedule =
+          gpu::getStageCluster(anchors->producer);
+      gpu::StageCluster consumerSchedule =
+          gpu::getStageCluster(anchors->consumer);
+      if (!producerSchedule || !consumerSchedule)
         return;
       int64_t distance = 0;
       if (!precedesInChain(release, acquire)) {
@@ -2299,38 +2321,43 @@ static LogicalResult addSyncScheduleEdges(MutableArrayRef<GroupDag> groups,
           it = slotCache
                    .emplace(key, computeSlotSchedule(physicalSets[setIndex], anchors->loop))
                    .first;
-        std::optional<int64_t> recurrenceDistance = computeRecurrenceDistance(
-            it->second, group.semaphoreDepth, release->scheduleAnchor, acquire->scheduleAnchor);
-        if (!recurrenceDistance) {
-          InFlightDiagnostic diag = semaError(anchors->src)
-              << "cannot prove physical-slot recurrence distance for a " "scheduled semaphore handoff";
-          diag.attachNote(anchors->dst->getLoc())
+        std::optional<int64_t> loopCarriedDistance = computeLoopCarriedDistance(
+            it->second, group.numSemaphoreCopies, release->scheduleAnchor,
+            acquire->scheduleAnchor);
+        if (!loopCarriedDistance) {
+          InFlightDiagnostic diag = semaError(anchors->producer)
+              << "cannot determine loop-carried dependency distance for a "
+                 "physical buffer slot";
+          diag.attachNote(anchors->consumer->getLoc())
               << "next token ownership starts here";
           result = failure();
           return;
         }
-        distance = *recurrenceDistance;
+        distance = *loopCarriedDistance;
       }
-      int64_t slack = distance + dstSchedule->first - srcSchedule->first;
-      if (slack < 0) {
-        InFlightDiagnostic diag = semaError(anchors->src) << "fixed loop.stage assignment cannot "
+      if (producerSchedule->first > consumerSchedule->first + distance) {
+        InFlightDiagnostic diag = semaError(anchors->producer) << "fixed loop.stage assignment cannot "
                                      "satisfy semaphore handoff";
-        diag << " (source stage " << srcSchedule->first << ", destination stage " << dstSchedule->first
-             << ", recurrence distance " << distance << ")";
-        diag.attachNote(anchors->dst->getLoc())
-            << "destination would execute before the released slot can be " "reacquired";
+        diag << " (producer loop.stage " << producerSchedule->first
+             << ", consumer loop.stage " << consumerSchedule->first
+             << ", loop-carried dependency distance " << distance << ")";
+        diag.attachNote(anchors->consumer->getLoc())
+            << "consumer would execute before the released slot can be "
+               "reacquired";
         result = failure();
         return;
       }
-      if (slack == 0)
-        edgesByLoop[anchors->loop.getOperation()].push_back(ScheduleEdge{anchors->src, anchors->dst});
+      if (producerSchedule->first == consumerSchedule->first + distance)
+        edgesByLoop[anchors->loop.getOperation()].push_back(
+            ScheduleEdge{anchors->producer, anchors->consumer});
     });
     if (failed(result))
       return failure();
   }
   return success();
 }
-static void addZeroSlackSSAEdges(scf::ForOp loop, SmallVectorImpl<ScheduleEdge> &edges) {
+static void addSSAClusterConstraints(scf::ForOp loop,
+                                     SmallVectorImpl<ScheduleEdge> &edges) {
   for (Operation &consumer : loop.getBody()->without_terminator()) {
     gpu::StageCluster consumerSchedule = gpu::getStageCluster(&consumer);
     if (!consumerSchedule)
@@ -2345,9 +2372,7 @@ static void addZeroSlackSSAEdges(scf::ForOp loop, SmallVectorImpl<ScheduleEdge> 
       gpu::StageCluster producerSchedule = gpu::getStageCluster(producer);
       if (!producerSchedule)
         continue;
-      int64_t slack = distance + consumerSchedule->first -
-                      producerSchedule->first;
-      if (slack == 0)
+      if (producerSchedule->first == consumerSchedule->first + distance)
         edges.push_back(ScheduleEdge{producer, &consumer});
     }
   }
@@ -2367,19 +2392,20 @@ static LogicalResult legalizeLoopSchedule(scf::ForOp loop, ArrayRef<ScheduleEdge
   for (unsigned iteration = 0; iteration <= scheduledOps.size(); ++iteration) {
     changed = false;
     for (const ScheduleEdge &edge : edges) {
-      if (!cluster.contains(edge.src) || !cluster.contains(edge.dst))
+      if (!cluster.contains(edge.producer) || !cluster.contains(edge.consumer))
         continue;
-      int64_t separation = edge.src->isBeforeInBlock(edge.dst) ? 0 : 1;
-      int64_t required = cluster.lookup(edge.src) + separation;
-      if (cluster.lookup(edge.dst) >= required)
+      int64_t separation =
+          edge.producer->isBeforeInBlock(edge.consumer) ? 0 : 1;
+      int64_t required = cluster.lookup(edge.producer) + separation;
+      if (cluster.lookup(edge.consumer) >= required)
         continue;
-      cluster[edge.dst] = required;
+      cluster[edge.consumer] = required;
       changed = true;
     }
     if (!changed)
       break;
     if (iteration == scheduledOps.size())
-      return semaError(loop) << "cyclic zero-slack semaphore schedule";
+      return semaError(loop) << "cyclic loop.cluster constraints";
   }
   OpBuilder builder(loop.getContext());
   for (Operation *op : scheduledOps) {
@@ -2488,7 +2514,7 @@ LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups) {
     return failure();
   for (auto &[loopOp, edges] : edgesByLoop) {
     auto loop = cast<scf::ForOp>(loopOp);
-    addZeroSlackSSAEdges(loop, edges);
+    addSSAClusterConstraints(loop, edges);
     if (failed(legalizeLoopSchedule(loop, edges)))
       return failure();
   }
@@ -2747,6 +2773,6 @@ void dumpGroupSyncDag(GroupDag &g, triton::FuncOp funcOp) {
     os << "  BACKING: untouched (no semaphores)\n";
     return;
   }
-  os << "  BACKING: numStages=" << g.numStages << "\n";
+  os << "  BACKING: numCopies=" << g.numCopies << "\n";
 }
 } // namespace mlir::triton::nvws_semas

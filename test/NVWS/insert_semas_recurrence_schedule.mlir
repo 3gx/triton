@@ -6,10 +6,11 @@
 #smem = #ttg.shared_memory
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  // This is the one-slot Q shape from attention backward.  The final read in
-  // stage 1 releases the slot consumed by the stage-0 producer in a future
-  // iteration.  Because the recurrence distance is one, stage terms cancel;
-  // the producer and its first consumer must be ordered after the final read.
+  // This is the one-slot Q shape from attention backward. The final read at
+  // loop.stage 1 releases the slot reused by the loop.stage 0 store in a future
+  // iteration. Because the loop-carried dependency distance is one, the final
+  // read and next store execute in the same pipelined iteration; loop.cluster
+  // must order the store and its first consumer after the final read.
   // CHECK-LABEL: @one_slot_recurrence
   // PIPE-LABEL: @one_slot_recurrence
   // PIPE: partition0

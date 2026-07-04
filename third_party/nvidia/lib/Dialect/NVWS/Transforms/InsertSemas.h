@@ -195,7 +195,7 @@ struct GroupDag {
   SmallVector<std::unique_ptr<Node>> nodes;
   Node *root = nullptr;
   SmallVector<Sema> semas;
-  int numStages = 1, semaphoreDepth = 1;
+  int numCopies = 1, numSemaphoreCopies = 1;
   SmallVector<Value> backing;
   bool isTmem() const { return memory == MemKind::Tmem; }
   bool isLocal() const { return memory == MemKind::Local; }
@@ -226,8 +226,8 @@ inline bool canOwnMixedDepthTmem(const GroupDag &owner, const GroupDag &reuser) 
   unsigned reuserWidth = reuserMember.type.getElementTypeBitWidth();
   if (ownerWidth != reuserWidth && ownerWidth != 2 * reuserWidth)
     return false;
-  int64_t ownerSpan = ownerMember.extent * owner.numStages;
-  int64_t reuserSpan = reuserMember.extent * reuser.numStages;
+  int64_t ownerSpan = ownerMember.extent * owner.numCopies;
+  int64_t reuserSpan = reuserMember.extent * reuser.numCopies;
   return reuserMember.offset >= ownerMember.offset &&
          reuserMember.offset + reuserSpan <= ownerMember.offset + ownerSpan;
 }

@@ -153,7 +153,7 @@ static gpu::MemDescType backingType(const GroupDag &g, const Member &m) {
   auto t = m.type;
   SmallVector<int64_t> shape(t.getShape());
   if (!isScalesEnc(t))
-    shape.insert(shape.begin(), g.numStages);
+    shape.insert(shape.begin(), g.numCopies);
   return gpu::MemDescType::get(shape, t.getElementType(), t.getEncoding(),
                                t.getMemorySpace(), /*mutableMemory=*/true);
 }
