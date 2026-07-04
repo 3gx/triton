@@ -47,7 +47,7 @@ static bool toucherContribution(GroupDag &g, Node *n, PieceId piece, Owner &out)
       return true;
     }
   }
-  return false; // Enter/Exit and non-touching rows contribute nothing.
+  return false; // Enter/Exit and non-touching nodes contribute nothing.
 }
 static bool findOwner(GroupDag &g, Node *start, PieceId piece, Owner &out, bool forward) {
   for (Node *n = start; n; n = forward ? n->next : n->prev)

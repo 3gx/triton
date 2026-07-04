@@ -69,23 +69,23 @@ struct Touch {
 struct Node;
 
 struct Hold {
-  enum class Outcome { CARRIER, POINT_OF_USE, CHILD_OWNS };
-  Outcome outcome = Outcome::CARRIER;
+  enum class Outcome { THREADED, POINT_OF_USE, CHILD_OWNS };
+  Outcome outcome = Outcome::THREADED;
   const char *reason = "";
-  SmallVector<Node *, 4> rows;
+  SmallVector<Node *, 4> nodes;
   Node *entryAcquire = nullptr, *closingRelease = nullptr;
   Node *regain = nullptr, *firstToucher = nullptr;
   Node *finalAcquire = nullptr, *bridgeAcquire = nullptr;
   Node *bridgeRelease = nullptr;
   bool needsFinalAcquire = false, keepsEntryAcquire = false;
   bool regionTail = false;
-  bool materializesCarrier() const { return outcome == Outcome::CARRIER; }
+  bool threadsToken() const { return outcome == Outcome::THREADED; }
   bool isPointOfUse() const { return outcome == Outcome::POINT_OF_USE; }
   bool isChildOwns() const { return outcome == Outcome::CHILD_OWNS; }
 };
 
 struct Crossing {
-  Owner slotOwner;
+  Owner tokenOwner;
   SmallVector<Node *, 2> finals;
   Hold hold;
 };
@@ -107,10 +107,10 @@ struct Node {
   gpu::StageCluster stageCluster;
   std::optional<int64_t> stageOffset;
   std::optional<int64_t> bufferStageOffset;
-  // The SYNC-DAG proved that this row can use its owner's earlier token in
+  // The SYNC-DAG proved that this node can reuse its owner's earlier token in
   // the same chain without a fresh handoff. EmitIR renders this fact; it does
-  // not infer retained-token eligibility on its own.
-  std::optional<int64_t> retainedTokenOwner;
+  // not infer token-reuse eligibility on its own.
+  std::optional<int64_t> reuseTokenOwner;
   Node *sat = nullptr;
   Node *scheduleAnchor = nullptr;
   SmallVector<Crossing, 1> crossings;
@@ -118,13 +118,13 @@ struct Node {
   bool isRegion() const { return kind == For || kind == If; }
   bool isProtocol() const { return kind == Acquire || kind == Release; }
 };
-inline void markRetainedToken(Node *n, const Owner &owner) {
+inline void markTokenReuse(Node *n, const Owner &owner) {
   assert(owner && n->owner && sameOwner(n->owner, owner));
-  n->retainedTokenOwner = ownerKey(owner);
+  n->reuseTokenOwner = ownerKey(owner);
 }
-inline bool rowAllowsRetainedToken(const Node *n, const Owner &owner) {
-  return owner && n->retainedTokenOwner &&
-         *n->retainedTokenOwner == ownerKey(owner);
+inline bool nodeReusesToken(const Node *n, const Owner &owner) {
+  return owner && n->reuseTokenOwner &&
+         *n->reuseTokenOwner == ownerKey(owner);
 }
 inline SmallVector<std::pair<PieceId, PieceInfo>, 4>
 sortedPieceInfo(const Node *n) {
@@ -132,7 +132,7 @@ sortedPieceInfo(const Node *n) {
   llvm::sort(v, [](const auto &a, const auto &b) { return a.first < b.first; });
   return v;
 }
-// Outer optional: the row has one uniform owner. Inner Owner may still be
+// Outer optional: the node has one uniform owner. Inner Owner may still be
 // root; an empty outer optional means no pieces or mixed owners.
 inline std::optional<Owner> uniformPieceOwner(const Node *n) {
   bool fresh = true;
@@ -174,7 +174,7 @@ struct Sema {
   SmallVector<PieceId, 2> pieces;
   unsigned count = 0, expectedReleases = 0;
   bool isEntry = false;
-  Owner inheritStamp;
+  Owner entryTokenOwner;
   Value create;
 };
 
@@ -190,7 +190,7 @@ struct GroupDag {
   PieceTable pieceTable;
   DenseMap<Value, std::pair<MemberId, SmallVector<AliasStep, 2>>> aliases;
   SmallVector<Operation *, 1> ttDescriptorFedMembers;
-  DenseSet<Operation *> accessRowOps;
+  DenseSet<Operation *> accessNodeOps;
   SmallVector<std::unique_ptr<Node>> nodes;
   Node *root = nullptr;
   SmallVector<Sema> semas;

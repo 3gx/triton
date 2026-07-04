@@ -12,36 +12,55 @@ struct EmitCtx {
     unsigned index; // absolute result / iter_arg index in the NEW op
   };
   llvm::MapVector<Operation *, SmallVector<Slot, 2>> slots;
-  DenseSet<Operation *> retainedBufferOps;
+  DenseSet<Operation *> reusedTokenBufferOps;
 };
 
 struct RenderState {
-  Value carrier;                            // current carrier token (per group)
-  Value carrierSema;                        // the create of that carrier's semaphore
-  std::optional<int64_t> carrierOwner;
-  DenseMap<int64_t, std::pair<Value, Value>> retained; // owner -> {token, sema}
+  struct Token {
+    Value value;
+    Value sema;
+    std::optional<int64_t> owner;
+  };
+  // One record per token known in this chain. The last record is the token
+  // used by default; owner-marked nodes may instead use their owner's record.
+  SmallVector<Token, 2> tokens;
   DenseMap<MemberId, std::pair<Value, int64_t>> view;  // member view + owner
   void clearViews() { view.clear(); }
-  void rememberAcquire(Value token, Value sema, const Owner &owner) {
-    carrier = token;
-    carrierSema = sema;
-    if (owner) {
-      carrierOwner = ownerKey(owner);
-      retained[*carrierOwner] = {token, sema};
-    } else {
-      carrierOwner.reset();
+  const Token *lastToken() const {
+    return tokens.empty() ? nullptr : &tokens.back();
+  }
+  Token *tokenForOwner(int64_t owner) {
+    for (Token &token : tokens)
+      if (token.owner && *token.owner == owner && token.value && token.sema)
+        return &token;
+    return nullptr;
+  }
+  void recordToken(Value value, Value sema, const Owner &owner) {
+    std::optional<int64_t> key = owner ? std::optional(ownerKey(owner))
+                                       : std::nullopt;
+    for (auto it = tokens.begin(); it != tokens.end();) {
+      if (!it->owner || it->owner == key)
+        it = tokens.erase(it);
+      else
+        ++it;
     }
+    tokens.push_back(Token{value, sema, key});
   }
-  void resetRetainedToCarrier() {
-    retained.clear();
-    if (carrier && carrierSema && carrierOwner)
-      retained[*carrierOwner] = {carrier, carrierSema};
+  void keepLastTokenFor(const Owner &owner) {
+    Token token = tokens.empty() ? Token{} : tokens.back();
+    token.owner = owner ? std::optional(ownerKey(owner)) : std::nullopt;
+    tokens.clear();
+    tokens.push_back(token);
   }
-  void clearCarrier() {
-    carrier = Value();
-    carrierSema = Value();
-    carrierOwner.reset();
-    retained.clear();
+  void replaceLastToken(Value value, const Owner &owner) {
+    Token token = tokens.empty() ? Token{} : tokens.back();
+    token.value = value;
+    token.owner = owner ? std::optional(ownerKey(owner)) : std::nullopt;
+    tokens.clear();
+    tokens.push_back(token);
+  }
+  void clearTokens() {
+    tokens.clear();
     clearViews();
   }
   RenderState nested() const {
@@ -362,9 +381,9 @@ static void rewriteSignatures(EmitCtx &ctx, MutableArrayRef<GroupDag> groups) {
     forEachNode(g, [&](Node *n) {
       if (n->isRegion())
         for (const Crossing &c : n->crossings) {
-          if (n->kind == Node::For && !c.hold.materializesCarrier())
+          if (n->kind == Node::For && !c.hold.threadsToken())
             continue;
-          wanted[n->op].push_back(Want{&g, c.slotOwner});
+          wanted[n->op].push_back(Want{&g, c.tokenOwner});
         }
     });
   }
@@ -467,23 +486,23 @@ static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs, Node *node,
       else
         types.push_back(localViewType(g, static_cast<MemberId>(mi), {&t}, bt));
     }
-    Value tok = rs.carrier;
-    Value semaVal = rs.carrierSema;
-    bool usesRetained = rowAllowsRetainedToken(node, owner);
-    if (usesRetained &&
-        (!rs.carrierOwner || *rs.carrierOwner != viewOwner)) {
-      auto retained = rs.retained.find(viewOwner);
-      assert(retained != rs.retained.end() &&
-             "retained-token DAG fact without retained token");
-      tok = retained->second.first;
-      semaVal = retained->second.second;
+    const RenderState::Token *lastToken = rs.lastToken();
+    Value tok = lastToken ? lastToken->value : Value();
+    Value semaVal = lastToken ? lastToken->sema : Value();
+    bool reusesToken = nodeReusesToken(node, owner);
+    if (reusesToken &&
+        (!lastToken || !lastToken->owner || *lastToken->owner != viewOwner)) {
+      RenderState::Token *token = rs.tokenForOwner(viewOwner);
+      assert(token && "token-reuse DAG fact without token");
+      tok = token->value;
+      semaVal = token->sema;
     }
-    assert(tok && "no carrier for view");
-    assert(semaVal && "no semaphore for carrier");
+    assert(tok && "no token for view");
+    assert(semaVal && "no semaphore for token");
     auto buf = emitInto<nvws::SemaphoreBufferOp>(
         b, accessOp->getLoc(), owner, gpu::getStageCluster(accessOp), semaVal, TypeRange(types), tok);
-    if (usesRetained)
-      ctx.retainedBufferOps.insert(buf.getOperation());
+    if (reusesToken)
+      ctx.reusedTokenBufferOps.insert(buf.getOperation());
     if (node->bufferStageOffset)
       buf.setStage(materializeI32Before(buf, *node->bufferStageOffset));
     for (auto [mi, v] : llvm::enumerate(buf.getBuffers()))
@@ -517,10 +536,9 @@ static void seedRegionEntry(RenderState &state, Node *head) {
   if (head->pieceInfo.empty())
     return;
   if (auto owner = uniformPieceOwner(head); owner && owner->has_value())
-    state.carrierOwner = ownerKey(*owner);
+    state.keepLastTokenFor(*owner);
   else
-    state.carrierOwner.reset();
-  state.resetRetainedToCarrier();
+    state.keepLastTokenFor(std::nullopt);
 }
 static Operation *renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
                                RenderState &rs) {
@@ -536,7 +554,8 @@ static Operation *renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
                                                  Value(), ta.getSrc(), vTrue);
       ta.getResult().replaceUsesWithIf(view, [&](OpOperand &use) {
         return !isa<nvws::SemaphoreCreateOp>(use.getOwner()) &&
-               use.getOwner() != view.getDefiningOp() && !g.accessRowOps.contains(use.getOwner());
+               use.getOwner() != view.getDefiningOp() &&
+               !g.accessNodeOps.contains(use.getOwner());
       });
       return anchor;
     }
@@ -550,7 +569,8 @@ static Operation *renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
       }
       anchor = emitInto<gpu::LocalStoreOp>(b, op->getLoc(), n->owner, gpu::getStageCluster(op), src, view);
       la.getResult().replaceUsesWithIf(view, [&](OpOperand &use) {
-        return !isa<nvws::SemaphoreCreateOp>(use.getOwner()) && !g.accessRowOps.contains(use.getOwner());
+        return !isa<nvws::SemaphoreCreateOp>(use.getOwner()) &&
+               !g.accessNodeOps.contains(use.getOwner());
       });
       return anchor;
     }
@@ -574,10 +594,11 @@ static Operation *renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
 static void renderRegion(EmitCtx &ctx, GroupDag &g, Node *n, RenderState &rs,
                          DenseMap<Node *, Value> &emitted) {
   for (const Crossing &c : n->crossings) {
-    if (n->kind == Node::For && !c.hold.materializesCarrier())
+    if (n->kind == Node::For && !c.hold.threadsToken())
       continue; // native point-of-use: no slot (plan M2)
     unsigned idx = slotIndexFor(ctx, n->op, &g);
-    Value incoming = rs.carrier;
+    const RenderState::Token *lastToken = rs.lastToken();
+    Value incoming = lastToken ? lastToken->value : Value();
     if (!incoming)
       incoming = ctx.poison; // group starts inside this region
     if (auto forOp = dyn_cast<scf::ForOp>(n->op))
@@ -595,33 +616,24 @@ static void renderRegion(EmitCtx &ctx, GroupDag &g, Node *n, RenderState &rs,
     RenderState body = rs.nested();
     seedRegionEntry(body, n->children[0]);
     for (const Crossing &c : n->crossings) {
-      if (!c.hold.materializesCarrier()) {
-        body.clearCarrier();
+      if (!c.hold.threadsToken()) {
+        body.clearTokens();
         continue;
       }
       unsigned idx = slotIndexFor(ctx, n->op, &g);
-      body.carrier = forOp.getRegionIterArg(idx);
-      if (c.slotOwner)
-        body.carrierOwner = ownerKey(c.slotOwner);
-      else
-        body.carrierOwner.reset();
-      body.resetRetainedToCarrier();
+      body.replaceLastToken(forOp.getRegionIterArg(idx), c.tokenOwner);
     }
     renderChain(ctx, g, n->children[0], body, emitted);
     auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
     for (const Crossing &c : n->crossings) {
-      if (!c.hold.materializesCarrier()) {
-        rs.clearCarrier(); // token died in the body; nothing flows out
+      if (!c.hold.threadsToken()) {
+        rs.clearTokens(); // token died in the body; nothing flows out
         continue;
       }
       unsigned idx = slotIndexFor(ctx, n->op, &g);
-      yield->setOperand(idx, body.carrier);
-      rs.carrier = forOp.getResult(idx);
-      if (c.slotOwner)
-        rs.carrierOwner = ownerKey(c.slotOwner);
-      else
-        rs.carrierOwner.reset();
-      rs.resetRetainedToCarrier();
+      const RenderState::Token *bodyToken = body.lastToken();
+      yield->setOperand(idx, bodyToken ? bodyToken->value : Value());
+      rs.replaceLastToken(forOp.getResult(idx), c.tokenOwner);
     }
     rs.clearViews();
     return;
@@ -636,21 +648,23 @@ static void renderRegion(EmitCtx &ctx, GroupDag &g, Node *n, RenderState &rs,
     renderChain(ctx, g, n->children[1], elseSt, emitted);
   for (const Crossing &c : n->crossings) {
     unsigned idx = slotIndexFor(ctx, n->op, &g);
-    Value incoming = rs.carrier;
+    const RenderState::Token *lastToken = rs.lastToken();
+    Value incoming = lastToken ? lastToken->value : Value();
     if (!incoming)
       incoming = ctx.poison;
-    Value thenV = c.finals[0] ? thenSt.carrier : incoming;
-    Value elseV = (c.finals.size() > 1 && c.finals[1]) ? elseSt.carrier : incoming;
+    const RenderState::Token *thenToken = thenSt.lastToken();
+    const RenderState::Token *elseToken = elseSt.lastToken();
+    Value thenV = c.finals[0]
+                      ? (thenToken ? thenToken->value : Value())
+                      : incoming;
+    Value elseV = (c.finals.size() > 1 && c.finals[1])
+                      ? (elseToken ? elseToken->value : Value())
+                      : incoming;
     auto thenYield = cast<scf::YieldOp>(ifOp.thenBlock()->getTerminator());
     thenYield->setOperand(idx, thenV);
     auto elseYield = cast<scf::YieldOp>(ifOp.elseBlock()->getTerminator());
     elseYield->setOperand(idx, elseV);
-    rs.carrier = ifOp.getResult(idx);
-    if (c.slotOwner)
-      rs.carrierOwner = ownerKey(c.slotOwner);
-    else
-      rs.carrierOwner.reset();
-    rs.resetRetainedToCarrier();
+    rs.replaceLastToken(ifOp.getResult(idx), c.tokenOwner);
   }
   rs.clearViews();
 }
@@ -665,10 +679,10 @@ static void renderChain(EmitCtx &ctx, GroupDag &g, Node *head, RenderState &rs,
       break; // markers; yield wiring is the parent's job
     case Node::Acquire: {
       const Sema &sema = getSema(g, n);
-      Owner carrierOwner = sema.isEntry && !n->owner ? sema.inheritStamp
-                                                     : n->owner;
+      Owner tokenOwner =
+          sema.isEntry && !n->owner ? sema.entryTokenOwner : n->owner;
       if (Value v = emitted.lookup(n)) { // pre-rendered entry instance
-        rs.rememberAcquire(v, sema.create, carrierOwner);
+        rs.recordToken(v, sema.create, tokenOwner);
         rs.clearViews();
         break;
       }
@@ -690,22 +704,22 @@ static void renderChain(EmitCtx &ctx, GroupDag &g, Node *head, RenderState &rs,
       if (n->stageOffset)
         acq.setStage(materializeI32Before(acq, *n->stageOffset));
       emitted[n] = acq.getToken();
-      rs.rememberAcquire(acq.getToken(), sema.create, carrierOwner);
+      rs.recordToken(acq.getToken(), sema.create, tokenOwner);
       rs.clearViews();
       lastReal = acq;
       break;
     }
     case Node::Release: {
-      Value tok = rs.carrier;
-      if (rowAllowsRetainedToken(n, n->owner) &&
-          (!rs.carrierOwner ||
-           *rs.carrierOwner != ownerKey(n->owner))) {
-        auto retained = rs.retained.find(ownerKey(n->owner));
-        assert(retained != rs.retained.end() &&
-               "retained-token release without retained token");
-        tok = retained->second.first;
+      const RenderState::Token *lastToken = rs.lastToken();
+      Value tok = lastToken ? lastToken->value : Value();
+      if (nodeReusesToken(n, n->owner) &&
+          (!lastToken || !lastToken->owner ||
+           *lastToken->owner != ownerKey(n->owner))) {
+        RenderState::Token *token = rs.tokenForOwner(ownerKey(n->owner));
+        assert(token && "token-reuse release without token");
+        tok = token->value;
       }
-      assert(tok && "release without carrier");
+      assert(tok && "release without token");
       OpBuilder b(ctx.func);
       if (lastReal)
         b.setInsertionPointAfter(lastReal);
@@ -1237,7 +1251,7 @@ static LogicalResult verifyTokenLocality(triton::FuncOp func) {
 }
 static LogicalResult
 verifyNoUseAfterRelease(triton::FuncOp funcOp,
-                        const DenseSet<Operation *> &retainedBufferOps) {
+                        const DenseSet<Operation *> &reusedTokenBufferOps) {
   auto checkToken = [&](Value tok) -> LogicalResult {
     llvm::SmallDenseMap<Block *, SmallVector<Operation *, 4>> byBlock;
     for (Operation *u : tok.getUsers())
@@ -1251,7 +1265,7 @@ verifyNoUseAfterRelease(triton::FuncOp funcOp,
         if (isa<nvws::SemaphoreReleaseOp>(u))
           sawRelease = true;
         else if (sawRelease && isa<nvws::SemaphoreBufferOp>(u) &&
-                 !retainedBufferOps.contains(u))
+                 !reusedTokenBufferOps.contains(u))
           return semaError(u) << "token has a buffer view after its release "
                     "(use-after-release; spec fable/semas-report3.md Addendum B.3(b))";
       }
@@ -1290,7 +1304,7 @@ static nvws::SemaphoreAcquireOp resolveAcquireThroughIfs(Value v) {
   }
   return nullptr;
 }
-static LogicalResult verifySingleCarrierPerGroup(triton::FuncOp funcOp) {
+static LogicalResult verifySingleTokenSlotPerGroup(triton::FuncOp funcOp) {
   auto res = funcOp.walk([&](scf::ForOp forOp) -> WalkResult {
     llvm::SmallDenseMap<Value, unsigned> slotsPerBacking;
     auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
@@ -1309,7 +1323,7 @@ static LogicalResult verifySingleCarrierPerGroup(triton::FuncOp funcOp) {
         if (alloc->hasAttr(kBufferCircularAttrName))
           continue;
       if (++slotsPerBacking[backing] > 1) {
-        semaError(forOp) << "two carrier token slots for one semaphore group in a single "
+        semaError(forOp) << "two token slots for one semaphore group in a single "
                "loop (spec fable/semas-report3.md Addendum B.3(a)); " "AssignStagePhase cannot thread this";
         return WalkResult::interrupt();
       }
@@ -1332,7 +1346,7 @@ LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups) {
       nukeGroupTokens(ctx, g);
       forEachNode(g, [&](Node *n) {
         if (n->kind == Node::Access && n->op)
-          g.accessRowOps.insert(n->op);
+          g.accessNodeOps.insert(n->op);
       });
     }
   while (eraseDeadTokenSlots(ctx, groups)) {
@@ -1351,9 +1365,9 @@ LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups) {
     for (Node *n = g.root->children[0]; n; n = n->next)
       if (n->kind == Node::Acquire && emitted.count(n)) {
         const Sema &sema = getSema(g, n);
-        Owner owner = sema.isEntry && !n->owner ? sema.inheritStamp
-                                               : n->owner;
-        rs.rememberAcquire(emitted.lookup(n), sema.create, owner);
+        Owner owner =
+            sema.isEntry && !n->owner ? sema.entryTokenOwner : n->owner;
+        rs.recordToken(emitted.lookup(n), sema.create, owner);
       }
     renderChain(ctx, g, g.root->children[0], rs, emitted);
   }
@@ -1397,9 +1411,9 @@ LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups) {
     return failure();
   if (failed(verifyTokenLocality(funcOp)))
     return failure();
-  if (failed(verifyNoUseAfterRelease(funcOp, ctx.retainedBufferOps)))
+  if (failed(verifyNoUseAfterRelease(funcOp, ctx.reusedTokenBufferOps)))
     return failure();
-  if (failed(verifySingleCarrierPerGroup(funcOp)))
+  if (failed(verifySingleTokenSlotPerGroup(funcOp)))
     return failure();
   return success();
 }
