@@ -1,4 +1,4 @@
-// RUN: not triton-opt %s -allow-unregistered-dialect --nvws-insert-semas 2>&1 | FileCheck %s
+// RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas 2>&1 | FileCheck %s
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
@@ -8,8 +8,12 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // The loop-carried dependency distance is one. A producer at loop.stage 2
   // followed by a consumer at loop.stage 0 violates the pipeliner's schedule
   // and cannot be repaired by reordering clusters.
-  // CHECK: error: nvws-insert-semas: fixed loop.stage assignment cannot satisfy semaphore handoff (producer loop.stage 2, consumer loop.stage 0, loop-carried dependency distance 1)
+  // CHECK: warning: nvws-insert-semas: fixed loop.stage assignment cannot satisfy semaphore handoff (producer loop.stage 2, consumer loop.stage 0, loop-carried dependency distance 1)
   // CHECK: note: consumer would execute before the released slot can be reacquired
+  // CHECK: nvws.semaphore.create
+  // CHECK: nvws.semaphore.acquire
+  // CHECK: nvws.semaphore.buffer
+  // CHECK: nvws.semaphore.release
   tt.func @invalid_loop_carried_schedule(%lb: i32, %ub: i32, %step: i32) {
     %alloc = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 421 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {

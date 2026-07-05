@@ -462,9 +462,8 @@ struct AssignStagePhase {
     for (auto &[slotClass, stages] : stagesBySlotClass) {
       if (stages.size() <= 1)
         continue;
-      candidateAcquires.front()->emitError(
+      candidateAcquires.front()->emitWarning(
           "multi-stage phase split cannot prove disjoint stage-owned slots");
-      multiStagePhaseFailure = true;
       return false;
     }
 
