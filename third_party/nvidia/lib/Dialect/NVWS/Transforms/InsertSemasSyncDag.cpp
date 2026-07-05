@@ -1970,98 +1970,6 @@ static LogicalResult assignCircularStageOffsets(MutableArrayRef<GroupDag> groups
   return success();
 }
 
-struct MixedDepthLifecycle {
-  GroupDag *group = nullptr;
-  Node *writer = nullptr;
-  Node *reader = nullptr;
-};
-static LogicalResult collectMixedDepthLifecycle(GroupDag &group, MixedDepthLifecycle &life) {
-  life.group = &group;
-  LogicalResult result = success();
-  forEachNode(group, [&](Node *node) {
-    if (failed(result) || node->kind != Node::Access)
-      return;
-    Node *&slot = accessEffect(node) == Effect::W ? life.writer : life.reader;
-    if (slot) {
-      result = semaError(node->op) << "mixed-depth TMEM reuse requires exactly one writer and "
-                  "one reader per logical channel";
-      return;
-    }
-    slot = node;
-  });
-  if (failed(result))
-    return failure();
-  if (!life.writer || !life.reader)
-    return semaError(group.pieceTable.members.front().allocOp)
-           << "mixed-depth TMEM reuse requires exactly one writer and one " "reader per logical channel";
-  return success();
-}
-
-static LogicalResult addMixedDepthAliasScheduleEdges(MutableArrayRef<GroupDag> groups,
-    llvm::MapVector<Operation *, SmallVector<ScheduleEdge, 4>> &edgesByLoop) {
-  llvm::MapVector<int64_t, SmallVector<GroupDag *, 2>> sets;
-  for (GroupDag &group : groups)
-    if (group.mixedDepthPhysicalAlias)
-      sets[group.bufferId].push_back(&group);
-  for (auto &[bufferId, set] : sets) {
-    if (set.size() != 2)
-      return semaError(set.front()->pieceTable.members.front().allocOp)
-             << "mixed-depth TMEM reuse requires exactly two logical channels " "for buffer.id " << bufferId;
-    for (GroupDag *group : set) {
-      if (group->pieceTable.members.size() != 1 || !group->isTmem())
-        return semaError(group->root->op) << "malformed mixed-depth TMEM logical group";
-    }
-    bool firstOwns = canOwnMixedDepthTmem(*set[0], *set[1]);
-    bool secondOwns = canOwnMixedDepthTmem(*set[1], *set[0]);
-    if (firstOwns == secondOwns)
-      return semaError(set.front()->pieceTable.members.front().allocOp)
-             << "mixed-depth TMEM reuse has no unique physical owner by span " "and element width";
-    GroupDag *owner = firstOwns ? set[0] : set[1];
-    GroupDag *reuser = firstOwns ? set[1] : set[0];
-    if (owner->numCopies == reuser->numCopies)
-      return semaError(reuser->pieceTable.members.front().allocOp)
-             << "mixed-depth TMEM reuse lost its distinct buffer.copy values";
-    MixedDepthLifecycle a, b;
-    if (failed(collectMixedDepthLifecycle(*owner, a)) || failed(collectMixedDepthLifecycle(*reuser, b)))
-      return failure();
-    if (!a.writer->owner || !a.reader->owner || !b.writer->owner ||
-        !b.reader->owner || a.writer->owner != b.reader->owner ||
-        a.reader->owner != b.writer->owner || a.writer->owner == a.reader->owner)
-      return semaError(reuser->pieceTable.members.front().allocOp)
-             << "mixed-depth TMEM reuse does not form the required alternating " "two-owner cycle";
-    Operation *ops[] = {a.writer->op, a.reader->op, b.writer->op, b.reader->op};
-    Block *block = ops[0]->getBlock();
-    if (llvm::any_of(ArrayRef<Operation *>(ops), [&](Operation *op) { return op->getBlock() != block; }) ||
-        !a.writer->op->isBeforeInBlock(b.reader->op) || !a.reader->op->isBeforeInBlock(b.writer->op))
-      return semaError(reuser->pieceTable.members.front().allocOp)
-             << "mixed-depth TMEM reuse is not ordered as owner.write -> "
-                "reuser.read and owner.read -> reuser.write";
-    auto loop = a.writer->op->getParentOfType<scf::ForOp>();
-    if (!loop || !loop->hasAttr(triton::kScheduledMaxStageAttrName))
-      return semaError(a.writer->op) << "mixed-depth TMEM reuse requires one scheduled loop";
-    for (Operation *op : ops)
-      if (loop.getBody()->findAncestorOpInBlock(*op) != op)
-        return semaError(op) << "mixed-depth TMEM reuse accesses must be direct operations "
-                  "in one scheduled loop body";
-    gpu::StageCluster ownerRead = gpu::getStageCluster(a.reader->op);
-    gpu::StageCluster reuserWrite = gpu::getStageCluster(b.writer->op);
-    gpu::StageCluster reuserRead = gpu::getStageCluster(b.reader->op);
-    gpu::StageCluster ownerWrite = gpu::getStageCluster(a.writer->op);
-    if (!ownerRead || !reuserWrite || !reuserRead || !ownerWrite)
-      return semaError(a.writer->op) << "mixed-depth TMEM reuse accesses require fixed "
-                "loop.stage/loop.cluster annotations";
-    if (ownerRead->first > reuserWrite->first)
-      return semaError(a.reader->op)
-             << "mixed-depth TMEM consumer loop.stage precedes its producer";
-    if (ownerRead->first == reuserWrite->first)
-      edgesByLoop[loop.getOperation()].push_back(ScheduleEdge{a.reader->op, b.writer->op});
-    if (reuserRead->first >= 1 + ownerWrite->first)
-      return semaError(b.reader->op)
-             << "mixed-depth TMEM loop-carried consumer does not execute "
-                "after its producer";
-  }
-  return success();
-}
 static Operation *realScheduleAnchor(Node *anchor, bool producer) {
   for (Node *n = anchor; n; n = producer ? n->prev : n->next) {
     if (n->kind == Node::Access)
@@ -2188,7 +2096,7 @@ computeLoopCarriedDistance(const SlotSchedule &slots,
   return std::nullopt;
 }
 static bool isExactAliasMultibufferedGroup(const GroupDag &group) {
-  if (!group.isLocal() || group.isCircular() || group.mixedDepthPhysicalAlias ||
+  if (!group.isLocal() || group.isCircular() ||
       group.pieceTable.members.size() < 2 || group.numSemaphoreCopies <= 1)
     return false;
   const Member &first = group.pieceTable.members.front();
@@ -2507,8 +2415,6 @@ LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups) {
   for (GroupDag &group : groups)
     if (failed(assignAliasedHandoffStageOffsets(group)))
       return failure();
-  if (failed(addMixedDepthAliasScheduleEdges(groups, edgesByLoop)))
-    return failure();
   if (failed(addSyncScheduleEdges(groups, edgesByLoop)))
     return failure();
   for (auto &[loopOp, edges] : edgesByLoop) {
