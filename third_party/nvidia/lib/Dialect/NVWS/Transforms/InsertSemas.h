@@ -172,7 +172,6 @@ struct PieceTable {
 
 struct Sema {
   std::string name;
-  SmallVector<PieceId, 2> pieces;
   unsigned count = 0, expectedReleases = 0;
   bool isEntry = false;
   Owner entryTokenOwner;
