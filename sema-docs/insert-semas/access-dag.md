@@ -6,7 +6,7 @@ ACCESS-DAG is the memory fact layer: it answers *who touches what, where,
 and how* — physical overlap, program-order accesses, executing partitions,
 and region effects — without deciding any synchronization. Who *owns* memory
 and when ownership must move is decided by the later steps
-([OWNER-DAG](owner-dag.md), [SYNC-DAG](sync-dag-1.md)); nothing in this step
+([OWNER-DAG](owner-dag.md), [SYNC-DAG](sync-dag.md)); nothing in this step
 depends on those answers.
 
 Figures use the pass's dump format (`NVWS_INSERT_SEMA_DUMP_DAG=1`, trimmed
@@ -53,25 +53,16 @@ namespaces; an allocation without an ID receives a private synthetic group.
 The analysis runs **once per group**: ACCESS-DAG and OWNER-DAG are fully
 independent per group, and SYNC-DAG walks each group's ownership
 separately (the per-piece source/use state — see
-[SYNC-DAG](sync-dag-1.md)). The later steps do share some state — SYNC-DAG validates
-circular sibling groups together, threads a function-wide TMEM budget,
-validates the mixed-depth TMEM aliases of one `buffer.id` as a pair (an
-alternating two-partition lifecycle checked against `loop.stage` and
-`loop.cluster` — see
-[SYNC-DAG](sync-dag-1.md#mixed-depth-tmem-aliases-dependencies-across-split-groups)),
-and its final schedule legalization runs over the whole
-function; EMIT-IR
-sees all groups at once so it can reunify shared storage — but across
-distinct `buffer.id`s no step ever tracks a *conflict*. The license for
-that is a contract from
-upstream: distinct `buffer.id`s mean the planner placed the allocations in
-disjoint storage (and `InsertAllocas` creates unrelated buffers as separate
-groups), so those cross-group conflicts cannot exist by construction. Split
-groups that share one `buffer.id` (circular, mixed-depth) instead rely on
-validated time-sharing — the mixed-depth pair validation is the one step
-that checks a hazard between two groups. The dump
-prints one complete `GROUP` block per group; an op that touches two groups
-appears in both analyses, each seeing only its own facet.
+[SYNC-DAG](sync-dag.md)). The later steps do share some state — SYNC-DAG
+validates circular sibling groups together, threads a function-wide TMEM
+budget, and runs final schedule legalization over the whole function;
+EMIT-IR sees all groups at once so it can reunify shared storage. Across
+groups, however, synchronization remains independent. The license for that
+is a contract from upstream: distinct `buffer.id`s occupy disjoint storage,
+while split groups with one `buffer.id` are planned to take turns using the
+shared storage. The dump prints one complete `GROUP` block per group; an op
+that touches two groups appears in both analyses, each seeing only its own
+facet.
 
 The memory planner can make several logical buffers take turns occupying
 one physical allocation (announced through the `buffer.*` attributes): at
@@ -138,7 +129,7 @@ two accesses land on the same piece.
 members — one connected component (`piecesSingleComponent`, a union-find
 over the piece table). The rest of the pass relies on it: one group is one
 synchronization unit, with one group-scoped semaphore/token protocol
-([SYNC-DAG](sync-dag-1.md)). Draw members and pieces as a graph — an edge
+([SYNC-DAG](sync-dag.md)). Draw members and pieces as a graph — an edge
 wherever a member covers a piece — and the requirement is that the graph is
 one island:
 

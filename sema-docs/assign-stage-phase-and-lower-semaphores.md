@@ -1,5 +1,20 @@
 # AssignStagePhase and LowerSemaphore
 
+## Contents
+
+- [Division of responsibility](#division-of-responsibility)
+- [LowerSemaphore order](#lowersemaphore-order)
+- [The state carried by AssignStagePhase](#the-state-carried-by-assignstagephase)
+- [Updating `state.stage`](#updating-statestage)
+  - [Schedule-local copies of `state.stage`](#schedule-local-copies-of-statestage)
+- [Updating `state.phases`](#updating-statephases)
+  - [Choosing single-phase or multiphase](#choosing-single-phase-or-multiphase)
+  - [Why clone a phase value for each `loop.stage`?](#why-clone-a-phase-value-for-each-loopstage)
+  - [Proving that pipeline stages use disjoint buffer stages](#proving-that-pipeline-stages-use-disjoint-buffer-stages)
+- [Structured control flow metadata](#structured-control-flow-metadata)
+- [Additional lowering invariants](#additional-lowering-invariants)
+- [Code map](#code-map)
+
 ## Division of responsibility
 
 `InsertSemas` assigns ownership, `loop.stage`/`loop.cluster`, pending and
@@ -7,7 +22,7 @@ arrive counts, and optional stage offsets. `AssignStagePhase` computes the
 final buffer stage for each acquire, buffer, and release, plus the wait phase
 for each acquire. `LowerSemaphore` consumes those values to emit hardware
 barrier operations. Buffer stage, current buffer stage, stage offset, phase,
-pipeline stage, fresh write, and semaphore group are defined in the
+pipeline stage, and fresh write are also defined in the
 [NVWS-AWS terminology](nvws-aws-overview.md#terminology).
 
 ```text
@@ -15,6 +30,20 @@ current buffer stage (advanced on a fresh write) + stage offset
   -> AssignStagePhase: buffer stage, wait phase
   -> LowerSemaphore: mbarrier view, wait, arrive/commit
 ```
+
+A **semaphore group** is every `nvws.semaphore.create` whose first buffer
+operand is the same allocation. For example, these two semaphores form one
+group because both guard `%buf`:
+
+```text
+%empty = nvws.semaphore.create %buf true
+%full  = nvws.semaphore.create %buf false
+```
+
+The group shares one circular-buffer depth and one canonical `state.stage`.
+Its semaphores still have separate `state.phases` entries, further separated
+by partition. Grouping therefore means “share the buffer cursor,” not “share
+one phase.”
 
 ## LowerSemaphore order
 
@@ -30,7 +59,7 @@ current buffer stage (advanced on a fresh write) + stage offset
 5. Lower release to the corresponding view plus arrive, MMA commit, or TMA
    completion path.
 6. Replace semaphore buffers with buffer-stage-indexed memdesc views, except
-   TMEM scale encodings, which reuse the original buffer; remove semaphore IR.
+   TMEM scale encodings, which reuse the existing buffer; remove semaphore IR.
 7. Coalesce eligible, dominating, shape/width/bounds-compatible TMEM aliases
    around a zero-offset representative; then remove planning attributes even
    for groups that could not be coalesced.
@@ -44,136 +73,482 @@ scaffolding: they receive the semaphore's partition IDs, because
 `PartitionLoops` requires every operation to carry one, but no WS tag or
 pipeline stage.
 
-## Buffer-stage assignment
+## The state carried by AssignStagePhase
 
-Each semaphore group carries one current buffer stage. It advances only on
-a fresh write — an acquire whose first reachable buffer access writes the
-backing; other acquires leave it unchanged. The current buffer stage starts
-at `depth - 1`, so the first fresh write advances to 0.
-
-An initially released semaphore starts at phase 0. Any other semaphore starts
-at phase 1 in single-phase mode and all-ones (`-1`) in multiphase mode; the
-two modes are defined under [Phase assignment](#phase-assignment) below.
-
-A stage-offset operand from `InsertSemas` is not a final buffer stage:
+`AssignStagePhase` walks each semaphore group in program order. Two pieces of
+state determine the operands written on an acquire:
 
 ```text
-baseStage   = advance_if_fresh_write(state.stage)
-finalStage  = positive_mod(baseStage + stageOffset, depth)
-state.stage = baseStage
+state.stage       one canonical cursor for the group's circular buffer
+state.phases[key] phase history for one partition and one semaphore
 ```
 
-Stage-offset mode is enabled only when the group contains an acquire with a
-stage-offset operand but no phase operand. (`InsertSemas` never emits a
-`phase` operand; one appears only in already-assigned or hand-written IR.) In that mode the unshifted
-`baseStage` follows the acquire token through loops and `if` results, while
-each release/buffer keeps its own stage offset. Outside that mode,
-propagation replaces an existing release/buffer `stage` operand with the
-current buffer stage.
+The normal phase key is `(partition, semaphore)`. Under the conditions proved
+later, the pass may keep one copy per pipeline stage, keyed by
+`(partition, semaphore, loop.stage)`. `loop.cluster` is never part of a phase
+key.
 
-The emitted buffer-stage arithmetic carries the semaphore operation's
-`loop.stage`/`loop.cluster`. The pipeline stage determines *when* the
-arithmetic runs; the buffer stage it computes determines *which* backing copy
-and mbarrier the operation addresses.
+Single-phase mode stores one bit in each phase value. Multiphase mode stores a
+bitset with one bit per buffer stage. Their exact updates are shown
+below.
 
-## Phase assignment
-
-Phase state was originally keyed by `(partition, semaphore)` (the
-`egx/nvws-semaphore` branch). That key is sufficient only when all acquires
-of the key execute in one `loop.stage`.
-
-For a key whose acquires execute in more than one `loop.stage`, the pass:
-
-1. requires the affected key's candidate acquires in one direct loop body,
-   each carrying a static `loop.stage` (a missing one fails the pass),
-   rejects the group's acquires in nested regions there, and analyzes all of
-   the group's direct acquires in that body as one path-invariant sequence;
-2. requires every affected stage offset to be constant;
-3. computes `A`, the sequence's nonzero number of fresh-write advances per
-   iteration; each direct acquire's position in that advance sequence,
-   `advancePosition`; and `G = gcd(depth, A)`;
-4. assigns each acquire the class
-   `positive_mod(advancePosition + stageOffset, G)` — acquires in one class
-   address the same buffer stages over the loop's lifetime;
-5. fails the pass if one class is touched by more than one `loop.stage`;
-6. keeps one phase word per `(partition, semaphore, loop.stage)`, holding one
-   phase bit per buffer stage;
-7. updates only the word belonging to the acquire's `loop.stage`.
-
-The phase update for buffer stage `s` is:
+For a group of depth `D`, initialization is:
 
 ```text
-phaseWord ^= 1 << s
-waitPhase = (phaseWord >> s) & 1
+state.stage = D - 1
+
+state.phases[key] = 0    if the semaphore is initially released
+state.phases[key] = 1    otherwise, in single-phase mode
+state.phases[key] = -1   otherwise, in multiphase mode
 ```
 
-Worked trace — depth 4, one loop body with two fresh-write acquires (so
-`A = 2` advances per iteration and `G = gcd(4, 2) = 2`), acquire X in
-`loop.stage 0` and acquire Y in `loop.stage 1`, both with stage offset 0:
+In multiphase mode `-1` is an all-ones bitset with one phase bit per buffer
+stage.
+
+## Updating `state.stage`
+
+An acquire advances the canonical cursor only when its first reachable buffer
+access is a fresh write. Reads and non-fresh writes leave it unchanged. The
+stage offset selects the buffer stage for the current operation; it does not
+change the canonical cursor:
 
 ```text
-classes:  X: positive_mod(0 + 0, 2) = 0     Y: positive_mod(1 + 0, 2) = 1
-          each class is touched by ONE loop.stage -> the split is accepted
+if acquire starts a fresh write:
+    state.stage = (state.stage + 1) mod D
 
-buffer stages over iterations (start depth-1 = 3, +1 per fresh write):
-          iter 0        iter 1        iter 2
-X:        3 -> 0        1 -> 2        3 -> 0 ...   only even stages {0, 2}
-Y:        0 -> 1        2 -> 3        0 -> 1 ...   only odd  stages {1, 3}
-
-phase words, one per (partition, semaphore, loop.stage):
-word[ls0] covers X's stages {0, 2}:  iter 0: ^= 1<<0   iter 1: ^= 1<<2
-word[ls1] covers Y's stages {1, 3}:  iter 0: ^= 1<<1   iter 1: ^= 1<<3
-iter 2 revisits stage 0: the bit flips back — the phase, not the stage,
-tells the wait apart from iteration 0's.
+baseStage    = state.stage
+acquireStage = positive_mod(baseStage + stageOffset, D)
 ```
 
-Acquires in one class address the same buffer stages forever (`stage ≡
-class (mod G)`), so giving each `loop.stage` its own word is safe exactly
-when no class is shared between two `loop.stage` values — that is what step
-5 checks. Had Y carried stage offset `-1`, both acquires would land in
-class 0 while sitting in different `loop.stage`s, and the pass fails.
+The acquire receives `acquireStage`. The unshifted `baseStage` follows its token
+through loops and `if` results. When `InsertSemas` supplies stage offsets, each
+buffer and release applies its own offset to that base; without offsets, they
+use the base directly.
 
-The phase arithmetic is emitted in its selected `loop.stage` and partition. A
-diagnostic reports an acquire whose buffer-stage SSA value is produced in
-another or an unknown `loop.stage`. Stage offsets force multiphase mode; so
-does a multi-`loop.stage` phase split anywhere in the group, independent of
-the eligibility checks below.
-Single-phase mode — one single-bit phase per `(partition, semaphore)` instead
-of the multiphase per-buffer-stage word; only the mode choice is group-wide —
-additionally requires `gcd(depth, advances per iteration) == 1`, which
-guarantees that repeated advancing visits every copy before revisiting any.
+For example, with `D = 3`:
 
-Depth 1 is always single-phase and skips the single-phase eligibility checks
-(stage offsets, WS loop, duplicate visits, nonzero advance, and the gcd
-requirement).
+```text
+initial state.stage = 2
+
+access                    state.stage after access    acquireStage
+K fresh, offset  0                   0                     0
+V fresh, offset  0                   1                     1
+K read,  offset -1                   1                     0
+```
+
+The read addresses buffer stage 0, but `state.stage` remains 1. That distinction
+is why the offset must never be written back into `state.stage`.
+
+### Schedule-local copies of `state.stage`
+
+There is one logical cursor, the canonical `state.stage`. It is the only cursor
+carried into the loop, yielded from the loop, and used after the loop.
+
+When one SSA chain cannot obey the loop schedule, the pass also creates one or
+more schedule-local copies of that cursor calculation:
+
+```text
+state.stage                                  canonical loop-carried cursor
+state.localStages[(loop.stage,loop.cluster)] schedule-local SSA copy
+```
+
+These are SSA values, not additional hardware cursors. A copy is created only
+for a `(loop.stage, loop.cluster)` that needs the same cursor value without a
+backward SSA dependency.
+
+The examples below write `schedule=(a,b)` as shorthand for
+`{loop.stage=a, loop.cluster=b}`. `loop.stage` places an operation in a
+software-pipeline stage. Within one `loop.stage`, `loop.cluster` orders the
+operations: a value at `(0,1)` may feed an operation at `(0,4)` in the same
+iteration, but a value at `(0,4)` may not feed an operation at `(0,1)` in that
+iteration.
+
+Here is a depth-2 shape before assignment. Types, phases, and releases are
+omitted because this example shows only the stage dataflow. The first two
+acquires lead to fresh writes, so each advances the buffer cursor. The last two
+lead to reads, so neither advances it:
+
+```text
+scf.for ... {
+  %t1 = acquire %empty[offset=0]  schedule=(0,1)
+  W A through %t1                                    // fresh: advance
+
+  %t2 = acquire %empty[offset=0]  schedule=(0,4)
+  W B through %t2                                    // fresh: advance
+
+  %t3 = acquire %full[offset=0]   schedule=(0,4)
+  R B through %t3                                    // non-fresh: no advance
+
+  %t4 = acquire %full[offset=0]   schedule=(0,1)
+  R B through %t4                                    // non-fresh: no advance
+}
+```
+
+With only the canonical chain, the fourth acquire would consume the cursor
+produced by the second fresh write:
+
+```text
+first advance (0,1) -> second advance (0,4) -> fourth acquire (0,1)
+                                                   ^ backward cluster edge
+```
+
+An SSA value has one defining operation, and that operation has one
+`(loop.stage, loop.cluster)`. Here the logical cursor after the second advance
+is required at two different schedule points:
+
+```text
+(0,4)  the second and third acquires need it
+(0,1)  the fourth acquire needs it
+```
+
+Using the `(0,4)` definition at `(0,1)` creates a backward SSA dependency.
+Using the cursor before the second advance selects the wrong buffer stage.
+
+The cursor advance is pure integer bookkeeping: it does not execute either
+memory access. The pass can therefore calculate the same logical cursor twice,
+once at each required schedule point. `AssignStagePhase` emits identical
+canonical and local first advances at `(0,1)`; the following CSE merges them.
+The resulting stage dataflow is:
+
+```text
+scf.for ... iter_args(%stage = %stageIn, ...) {
+  %s1_c1 = (%stage + 1) mod D       schedule=(0,1)
+  acquire bufferStage=%s1_c1        schedule=(0,1)
+
+  %s2_c4 = (%s1_c1 + 1) mod D       schedule=(0,4)  // canonical
+  %s2_c1 = (%s1_c1 + 1) mod D       schedule=(0,1)  // local copy
+  acquire bufferStage=%s2_c4        schedule=(0,4)
+
+  acquire bufferStage=%s2_c4        schedule=(0,4)  // no advance
+  acquire bufferStage=%s2_c1        schedule=(0,1)  // no advance
+
+  scf.yield %s2_c4, ...
+}
+```
+
+Immediately after the second advance, the walk's state is:
+
+```text
+state.stage              = %s2_c4  // canonical value at (0,4)
+state.localStages[(0,1)] = %s2_c1  // copy requested at (0,1)
+```
+
+`%s2_c4` and `%s2_c1` contain the same cursor integer. The third acquire uses
+the canonical value at `(0,4)`. The fourth uses the local value at `(0,1)`, so
+there is no same-iteration `(0,4) -> (0,1)` dependency. Only `%s2_c4` is
+loop-carried; `%s2_c1` is discarded when the walk leaves the loop.
+
+The analysis selects at most the first qualifying loop. In that loop, copies
+handle direct, same-iteration non-fresh acquires and direct authored-offset
+buffer/release consumers only when the scalar loop backedge feeding each copy
+is schedule-legal. Other loops and fresh-write, recurrence, or nested shapes
+retain only the canonical scalar chain.
+
+## Updating `state.phases`
+
+After `acquireStage` is known, the acquire updates exactly one
+`state.phases[key]` value and receives the resulting `waitPhase`.
+
+Single-phase mode keeps one bit in each value. The code changes it when
+`acquireStage == 0`, which marks the ring wrap for an eligible phase history:
+
+```text
+phase = state.phases[key]
+if acquireStage == 0:
+    phase = phase xor 1
+state.phases[key] = phase
+waitPhase = phase
+```
+
+Multiphase mode keeps one bit per buffer stage. An acquire of buffer stage `s`
+changes only bit `s`:
+
+```text
+word = state.phases[key] xor (1 << acquireStage)
+state.phases[key] = word
+waitPhase = (word >> acquireStage) & 1
+```
+
+### Choosing single-phase or multiphase
+
+These are two representations of one phase history. Do not confuse them with
+phase cloning:
+
+```text
+single-phase / multiphase   how many bits one state.phases value contains
+phase cloning               how many state.phases values exist for one
+                            (partition, semaphore)
+```
+
+Multiphase is the general representation. `state.phases[key]` is an `i32`
+bitset with one phase bit per buffer stage. Single-phase is an arithmetic
+optimization: the same `i32` carries one parity bit for the entire
+`(partition, semaphore)` history. It avoids the per-buffer-stage shift and
+extract, but it does not remove a phase state value, buffer stage, or mbarrier.
+
+For an initially released semaphore with `D = 2` and one fresh-write cursor
+advance per iteration (`A = 1`), both representations produce the same wait
+phase:
+
+```text
+iteration       0  1  2  3
+buffer stage    0  1  0  1
+single-phase    1  1  0  0
+multiphase      1  1  0  0
+```
+
+The acquire visits every buffer stage before returning to one. Single-phase
+can therefore change its one bit at buffer stage 0 and use that value for the
+whole traversal.
+
+With `D = 2` and two fresh-write acquires per iteration (`A = 2`), consider
+the acquire after the second advance. The cursor starts at 1, the first
+advance reaches 0, and the second returns to 1. That acquire therefore remains
+at buffer stage 1:
+
+```text
+iteration       0  1  2
+buffer stage    1  1  1
+single-phase    0  0  0    <- never changes because it never reaches 0
+multiphase      1  0  1    <- changes buffer stage 1's bit on every reuse
+```
+
+That second acquire needs multiphase. More generally, the pass makes one choice
+for the whole semaphore group:
+
+```text
+single-phase =
+  no phase splitting by loop.stage
+  and
+  (D == 1
+   or, for D > 1, all of:
+     no authored buffer-stage offsets
+     an enclosing warp-specialized loop
+     A > 0
+     no path repeats the same (semaphore, partition, advance position)
+     gcd(D, A) == 1)
+```
+
+The advance position is the number of fresh-write cursor advances encountered
+so far in the walked iteration. If single-phase eligibility fails, the group
+uses multiphase. The offset and enclosing-loop checks are conservative proof
+limits, not claims that every other shape fundamentally requires multiphase.
+For simplicity, this implementation does not combine the two optimizations:
+when phase state is split by `loop.stage`, it always uses multiphase.
+
+### Why clone a phase value for each `loop.stage`?
+
+Suppose acquires X and Y use the same partition `P` and semaphore `S`, but X is
+in `loop.stage 0` and Y is in `loop.stage 1`. One shared value creates this SSA
+chain:
+
+```text
+state.phases[(P,S)] -> X(i) -> Y(i) -> X(i+1)
+```
+
+The software pipeline executes stage 0 of a newer iteration before stage 1 of
+an older iteration. The shared chain can therefore make `X(i+1)` depend on
+`Y(i)`, even though the schedule places X first. To remove that scheduling
+conflict, the pass would like to clone the value:
+
+```text
+before:  state.phases[(P,S)]
+
+after:   state.phases[(P,S,loop.stage=0)]   used and updated by X
+         state.phases[(P,S,loop.stage=1)]   used and updated by Y
+```
+
+This transformation is called phase splitting in the code. It is legal only
+under the buffer-stage disjointness condition below.
+
+### Proving that pipeline stages use disjoint buffer stages
+
+For one `(partition, semaphore)`, phase splitting is allowed only when
+different `loop.stage` values access disjoint sets of buffer stages across all
+loop iterations:
+
+```text
+allowed                         forbidden
+
+loop.stage 0 -> {0,2}           loop.stage 0 -> {0,1}
+loop.stage 1 -> {1,3}           loop.stage 1 -> {1,2}
+no shared buffer stage          both use buffer stage 1
+```
+
+In the allowed case, each phase value owns the complete phase history of its
+buffer stages. In the forbidden case, two independent phase values would
+update buffer stage 1 and split its phase history in two. Any overlap is
+forbidden.
+
+The pass must prove this without enumerating every loop iteration. The access
+pattern repeats according to `D`, the circular-buffer depth, and `A`, the
+number of fresh-write cursor advances per iteration. Their greatest common
+divisor, `G = gcd(D,A)`, divides the accesses into repeating buffer-stage
+classes. Splitting is permitted only when `G > 1` and no class is used by more
+than one `loop.stage`; `G > 1` alone is not sufficient. The formulas below
+compute those classes.
+
+Let:
+
+```text
+D = circular-buffer depth
+A = number of fresh-write cursor advances in one loop iteration
+p = an acquire's position in that advance sequence
+o = its stage offset
+```
+
+`p` starts at zero and increments before each fresh-write acquire is recorded;
+a non-fresh acquire uses the number of advances already seen. The cursor starts
+at `D - 1`. In iteration `i`, that acquire addresses:
+
+```text
+bufferStage(i) = positive_mod(D - 1 + p + o + i*A, D)
+```
+
+Each iteration therefore moves the acquire's buffer stage by `A` around a ring
+of size `D`. The pass assigns the acquire this class:
+
+```text
+class = positive_mod(p + o, G)
+```
+
+Acquires with the same class eventually address the same buffer stages.
+Acquires with different classes never do. Phase values may be cloned per
+`loop.stage` only when every class belongs to exactly one `loop.stage`.
+
+Safe example — `%S` is initially released and guards a four-copy buffer, so
+the physical barrier array is `%S[0..3]`. Both acquires use partition `P` and
+semaphore `%S`; their next buffer uses are fresh writes:
+
+```text
+// Input pseudo-IR. Both stage operands are offset 0.
+scf.for ... {
+  %tx = nvws.semaphore.acquire %S[offset=0]
+          {partition=P, loop.stage=0, loop.cluster=1}
+  W X through %tx
+
+  %ty = nvws.semaphore.acquire %S[offset=0]
+          {partition=P, loop.stage=1, loop.cluster=1}
+  W Y through %ty
+}
+```
+
+There are two fresh-write advances per iteration, so `D = 4`, `A = 2`, and
+`G = 2`:
+
+```text
+acquire   loop.stage   p   o   class       buffer stages over iterations
+X             0        1   0     1                      {0, 2}
+Y             1        2   0     0                      {1, 3}
+```
+
+The buffer-stage sets are disjoint, so the output carries two phase words. The
+suffix `LS0` or `LS1` names the owning `loop.stage`; it does not name a buffer
+stage:
+
+```text
+// Output pseudo-IR. Every fresh write advances by exactly one.
+scf.for ... iter_args(%stage = 3,
+                      %phaseLS0 = 0,
+                      %phaseLS1 = 0) {
+  %xStage = (%stage + 1) mod 4                       loop.stage=0
+  %xWord  = %phaseLS0 xor (1 << %xStage)             loop.stage=0
+  %xWait  = (%xWord >> %xStage) & 1                  loop.stage=0
+  %tx = nvws.semaphore.acquire %S[%xStage, %xWait]    loop.stage=0
+
+  %yStage = (%xStage + 1) mod 4                      loop.stage=1
+  %yWord  = %phaseLS1 xor (1 << %yStage)             loop.stage=1
+  %yWait  = (%yWord >> %yStage) & 1                  loop.stage=1
+  %ty = nvws.semaphore.acquire %S[%yStage, %yWait]    loop.stage=1
+
+  scf.yield %yStage, %xWord, %yWord
+}
+```
+
+The three loop-carried values are:
+
+```text
+state.stage              = %yStage    canonical buffer cursor
+state.phases[(P,S,0)]    = %xWord     phase bits for X's buffer stages {0,2}
+state.phases[(P,S,1)]    = %yWord     phase bits for Y's buffer stages {1,3}
+```
+
+Their first three iterations are:
+
+```text
+iteration   X buffer stage   phaseLS0 -> xWait   Y buffer stage   phaseLS1 -> yWait
+    0              0              0 -> 1 / 1            1              0 -> 2  / 1
+    1              2              1 -> 5 / 1            3              2 -> 10 / 1
+    2              0              5 -> 4 / 0            1             10 -> 8  / 0
+```
+
+For example, decimal word 5 is binary `0101`: only the bits for buffer stages 0
+and 2 have been changed by X. Decimal word 10 is binary `1010`: only the bits
+for buffer stages 1 and 3 have been changed by Y. The pass cloned compiler SSA
+phase values; it did not clone `%S[0..3]` or the backing buffers.
+
+In map notation, the same updates are:
+
+```text
+state.phases[(P,S,0)] updates only bits for buffer stages {0,2}
+state.phases[(P,S,1)] updates only bits for buffer stages {1,3}
+```
+
+Unsafe example — `D = 2`, `A = 2`:
+
+```text
+acquire   loop.stage   p    o   class       buffer stages over iterations
+X             0        1   -1     0                       {1}
+Y             1        2    0     0                       {1}
+```
+
+Both acquires use buffer stage 1, whose correct phase history is:
+
+```text
+X(i) -> Y(i) -> X(i+1)
+```
+
+But the expanded pipeline places `X(i+1)` before `Y(i)`. Preserving that buffer
+stage's history makes X wait for Y and can deadlock before the same partition
+reaches Y. Removing that dependency lets X accept a completed generation from
+an earlier access and creates a race. There is no correct independent phase
+value for each `loop.stage`, so the pass rejects the clone.
+
+This restriction does not apply to `state.stage` replay. Cursor replay merely
+recomputes the same buffer stage; it does not divide one buffer stage's phase
+history into independent values.
+
+Before applying this disjointness proof, the pass also requires a single direct
+loop body, static `loop.stage` values, constant stage offsets, and at least one
+cursor advance. These conditions make the acquire sequence and its classes
+provable.
 
 ## Structured control flow metadata
 
 Buffer-stage and phase state is threaded through only the `for` and `if`
-regions that use it. A buffer-stage result is stamped with all of the
+regions that use it. A loop carries one canonical `state.stage` plus every
+`state.phases[key]` used in its body as iter-args and results; schedule-local
+stage replays are not carried. A buffer-stage result is stamped with all of the
 semaphore group's partitions, and that partition set is extended when another
 partition consumes its block argument; phase result partitions are inferred
-from their final SSA values. After assignment, every invariant iter-arg in a
-WS loop is removed, including invariants this pass did not introduce.
+from their final SSA values. After assignment, every invariant iter-arg in a WS
+loop is removed, including invariants this pass did not introduce.
 
-## Changes from `egx/nvws-semaphore`
+## Additional lowering invariants
 
-| Area | Branch behavior | Current behavior |
-|---|---|---|
-| Stage-offset operands | Replaced by the base stage | Preserved as modulo offsets, only for a group in stage-offset mode |
-| Phase key across `loop.stage` values | One phase value per partition/semaphore | Proven stage-disjoint phase word per `loop.stage` |
-| Single-phase proof | Requires a WS loop and rejects duplicate semaphore/partition/virtual-stage visits (virtual stage = the un-wrapped advance count within one simulated iteration) | Retains those checks and adds the gcd requirement; stage offsets force multiphase |
-| Buffer-stage propagation | Propagates the acquire's final buffer stage | Propagates the base stage; applies stage offsets at each user |
-| Pending count | Re-derived during lowering | Required from `semaphore.create` |
-| Release multiplicity | One count-1 arrive/commit per applicable async kind; no release-side arrival for TMA load | The assigned `arrive_count` controls each lowerable release contribution |
-| Semaphore combining | Enabled before AssignStagePhase | Disabled; preserves the InsertSemas protocol and entry acquires |
-| TMEM reuse | Separate lowered allocs | Eligible aliases coalesced only after dominance and compatible-view checks |
+- `semaphore.create` must already carry the pending count.
+- Each release's `arrive_count` controls its lowerable contribution.
+- Semaphore protocols and entry acquires are preserved through
+  `AssignStagePhase`; semaphore combining is disabled.
+- Eligible TMEM aliases are coalesced only after dominance and
+  compatible-view checks.
 
 ## Code map
 
 - Buffer-stage and phase analysis:
   [`AssignStagePhase.cpp`](../third_party/nvidia/lib/Dialect/NVWS/Transforms/AssignStagePhase.cpp),
-  `AssignStagePhase::run`, `assignStateInBlock`, and `propagateStage`.
+  `AssignStagePhase::run`, `analyzeStageCopies`, `assignStateInBlock`, and
+  `propagateStage`.
 - Multi-`loop.stage` phase proof: the same file,
   `computeMultiStagePhaseLanes` and `proveStageDisjointSlotOwnership`.
 - Barrier lowering:

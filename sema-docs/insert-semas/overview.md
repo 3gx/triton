@@ -145,7 +145,7 @@ may take ownership without an incoming partition-to-partition handoff.
 ACCESS, OWNER, and per-group SYNC construction are analysis-only. Global SYNC
 schedule finalization may raise existing `loop.cluster` values when a
 producer and consumer execute in the same pipelined iteration (see
-[SYNC-DAG](sync-dag-1.md#pipeline-schedule)); it never changes `loop.stage`.
+[SYNC-DAG](sync-dag.md#pipeline-schedule)); it never changes `loop.stage`.
 EMIT-IR then renders the graph and performs
 representation-driven folding and cleanup; its one schedule exception is the
 loop-scheduler workaround, which splits qualifying `scf.if` operations and
@@ -156,7 +156,7 @@ may copy a pipeline stage onto a release it moves (see
 
 - [ACCESS-DAG](access-dag.md)
 - [OWNER-DAG](owner-dag.md)
-- [SYNC-DAG](sync-dag-1.md)
+- [SYNC-DAG](sync-dag.md)
 - [EMIT-IR](emit-ir.md)
 
 ## Code map
