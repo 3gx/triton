@@ -9,6 +9,7 @@
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // SEMA-LABEL: @fused_alias_depth_two
@@ -74,6 +75,69 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       ttg.local_store %v1, %m1 {ttg.partition = array<i32: 4>} : tensor<128x128xf16, #blocked> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       %r1 = ttg.local_load %m1 {ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #blocked>
       "consume1"(%r1) {ttg.partition = array<i32: 2>} : (tensor<128x128xf16, #blocked>) -> ()
+    } {tt.warp_specialize, ttg.partition = array<i32: 2, 4>, ttg.partition.outputs = [], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // SEMA-LABEL: @tmem_fused_alias_depth_two
+  // SEMA: [[TBASE:%.*]] = ttng.tmem_alloc {buffer.copy = 2 : i32, buffer.id = 501 : i32, buffer.offset = 0 : i32}
+  // SEMA: [[TENTRY:%.*]] = nvws.semaphore.create [[TBASE]], [[TBASE]] true
+  // SEMA: [[TFULL0:%.*]] = nvws.semaphore.create [[TBASE]], [[TBASE]] false
+  // SEMA: [[TEMPTY1:%.*]] = nvws.semaphore.create [[TBASE]], [[TBASE]] false
+  // SEMA: [[TFULL1:%.*]] = nvws.semaphore.create [[TBASE]], [[TBASE]] false
+  // SEMA: scf.for
+  // SEMA: [[TW0_ZERO:%.*]] = arith.constant {ttg.partition = array<i32: 4>} 0 : i32
+  // SEMA: [[TW0_TOK:%.*]] = nvws.semaphore.acquire [[TENTRY]][[[TW0_ZERO]]]
+  // SEMA: [[TW0_REL_ZERO:%.*]] = arith.constant {ttg.partition = array<i32: 4>} 0 : i32
+  // SEMA: nvws.semaphore.release [[TFULL0]][[[TW0_REL_ZERO]]], [[TW0_TOK]]
+  // SEMA: [[TR0_ZERO:%.*]] = arith.constant {ttg.partition = array<i32: 2>} 0 : i32
+  // SEMA: [[TR0_TOK:%.*]] = nvws.semaphore.acquire [[TFULL0]][[[TR0_ZERO]]]
+  // SEMA: [[T_TO_M1:%.*]] = arith.constant {ttg.partition = array<i32: 2>} 1 : i32
+  // SEMA: nvws.semaphore.release [[TEMPTY1]][[[T_TO_M1]]], [[TR0_TOK]]
+  // SEMA: [[TW1_ZERO:%.*]] = arith.constant {ttg.partition = array<i32: 4>} 0 : i32
+  // SEMA: [[TW1_TOK:%.*]] = nvws.semaphore.acquire [[TEMPTY1]][[[TW1_ZERO]]]
+  // SEMA: [[TW1_REL_ZERO:%.*]] = arith.constant {ttg.partition = array<i32: 4>} 0 : i32
+  // SEMA: nvws.semaphore.release [[TFULL1]][[[TW1_REL_ZERO]]], [[TW1_TOK]]
+  // SEMA: [[TR1_ZERO:%.*]] = arith.constant {ttg.partition = array<i32: 2>} 0 : i32
+  // SEMA: [[TR1_TOK:%.*]] = nvws.semaphore.acquire [[TFULL1]][[[TR1_ZERO]]]
+  // SEMA: [[T_TO_M0:%.*]] = arith.constant {ttg.partition = array<i32: 2>} 1 : i32
+  // SEMA: nvws.semaphore.release [[TENTRY]][[[T_TO_M0]]], [[TR1_TOK]]
+
+  // ASP-LABEL: @tmem_fused_alias_depth_two
+  // ASP: [[TENTRY:%.*]] = nvws.semaphore.create
+  // ASP: [[TFULL0:%.*]] = nvws.semaphore.create
+  // ASP: [[TEMPTY1:%.*]] = nvws.semaphore.create
+  // ASP: [[TFULL1:%.*]] = nvws.semaphore.create
+  // ASP: scf.for {{.*}} iter_args([[TCURSOR:%.*]] = {{%.*}}
+  // ASP: [[TSLOT0:%.*]] = arith.select {{%.*}}, {{%.*}}, {{%.*}} {ttg.partition = array<i32: 2, 4>} : i32
+  // ASP: [[TW0_TOK:%.*]] = nvws.semaphore.acquire [[TENTRY]][[[TSLOT0]], {{%.*}}]
+  // ASP: nvws.semaphore.release [[TFULL0]][[[TSLOT0]]], [[TW0_TOK]]
+  // ASP: [[TR0_TOK:%.*]] = nvws.semaphore.acquire [[TFULL0]][[[TSLOT0]], {{%.*}}]
+  // ASP: [[T_TO_M1_RAW:%.*]] = arith.addi [[TSLOT0]], {{%.*}} {ttg.partition = array<i32: 2>} : i32
+  // ASP: [[T_TO_M1_REM:%.*]] = arith.remsi [[T_TO_M1_RAW]], {{%.*}} {ttg.partition = array<i32: 2>} : i32
+  // ASP: [[T_TO_M1:%.*]] = arith.select {{%.*}}, {{%.*}}, [[T_TO_M1_REM]] {ttg.partition = array<i32: 2>} : i32
+  // ASP: nvws.semaphore.release [[TEMPTY1]][[[T_TO_M1]]], [[TR0_TOK]]
+  // ASP: [[TSLOT1_RAW:%.*]] = arith.addi [[TSLOT0]], {{%.*}} {ttg.partition = array<i32: 2, 4>} : i32
+  // ASP: [[TSLOT1:%.*]] = arith.select {{%.*}}, {{%.*}}, [[TSLOT1_RAW]] {ttg.partition = array<i32: 2, 4>} : i32
+  // ASP: [[TW1_TOK:%.*]] = nvws.semaphore.acquire [[TEMPTY1]][[[TSLOT1]], {{%.*}}]
+  // ASP: nvws.semaphore.release [[TFULL1]][[[TSLOT1]]], [[TW1_TOK]]
+  // ASP: [[TR1_TOK:%.*]] = nvws.semaphore.acquire [[TFULL1]][[[TSLOT1]], {{%.*}}]
+  // ASP: [[T_TO_M0_RAW:%.*]] = arith.addi [[TSLOT1]], {{%.*}} {ttg.partition = array<i32: 2>} : i32
+  // ASP: [[T_TO_M0_REM:%.*]] = arith.remsi [[T_TO_M0_RAW]], {{%.*}} {ttg.partition = array<i32: 2>} : i32
+  // ASP: [[T_TO_M0:%.*]] = arith.select {{%.*}}, {{%.*}}, [[T_TO_M0_REM]] {ttg.partition = array<i32: 2>} : i32
+  // ASP: nvws.semaphore.release [[TENTRY]][[[T_TO_M0]]], [[TR1_TOK]]
+
+  tt.func @tmem_fused_alias_depth_two(%lb: i32, %ub: i32, %step: i32) {
+    %v0 = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    %v1 = arith.constant dense<1.000000e+00> : tensor<128x128xf32, #blocked>
+
+    scf.for %iv = %lb to %ub step %step : i32 {
+      %m0 = ttng.tmem_alloc %v0 {buffer.copy = 2 : i32, buffer.id = 501 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 4>} : (tensor<128x128xf32, #blocked>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory>
+      %r0, %t0 = ttng.tmem_load %m0[] {ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory> -> tensor<128x128xf32, #blocked>
+      "consume0"(%r0) {ttg.partition = array<i32: 2>} : (tensor<128x128xf32, #blocked>) -> ()
+      %m1 = ttng.tmem_alloc %v1 {buffer.copy = 2 : i32, buffer.id = 501 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 4>} : (tensor<128x128xf32, #blocked>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory>
+      %r1, %t1 = ttng.tmem_load %m1[] {ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory> -> tensor<128x128xf32, #blocked>
+      "consume1"(%r1) {ttg.partition = array<i32: 2>} : (tensor<128x128xf32, #blocked>) -> ()
     } {tt.warp_specialize, ttg.partition = array<i32: 2, 4>, ttg.partition.outputs = [], ttg.warp_specialize.tag = 0 : i32}
     tt.return
   }

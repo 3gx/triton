@@ -1889,6 +1889,39 @@ static Effect accessEffect(const Node *n) {
   return effect;
 }
 
+struct PhysicalStage {
+  int64_t requiredOrdinal;
+  int64_t cursorOrdinal;
+};
+
+static std::optional<PhysicalStage> recordPhysicalStage(
+    SlotSchedule &result,
+    DenseMap<GroupDag *, int64_t> &lastProducedOrdinal,
+    int64_t &cursorOrdinal, GroupDag *group, Node *access,
+    unsigned advances) {
+  int64_t requiredOrdinal;
+  if (accessEffect(access) == Effect::W) {
+    if (advances > 1)
+      result.complete = false;
+    cursorOrdinal += advances;
+    result.advancesPerIteration += advances;
+    if (cursorOrdinal < 0) {
+      result.complete = false;
+      return std::nullopt;
+    }
+    requiredOrdinal = lastProducedOrdinal[group] = cursorOrdinal;
+  } else {
+    auto it = lastProducedOrdinal.find(group);
+    if (it == lastProducedOrdinal.end()) {
+      result.complete = false;
+      return std::nullopt;
+    }
+    requiredOrdinal = it->second;
+  }
+  result.ordinalByAccess[access] = requiredOrdinal;
+  return PhysicalStage{requiredOrdinal, cursorOrdinal};
+}
+
 // Derive physical ring displacements before EMIT so protocol and views agree.
 static LogicalResult assignCircularStageOffsets(MutableArrayRef<GroupDag> groups) {
   llvm::MapVector<int64_t, SmallVector<GroupDag *, 4>> sets;
@@ -1907,8 +1940,9 @@ static LogicalResult assignCircularStageOffsets(MutableArrayRef<GroupDag> groups
     DenseMap<Operation *, SmallVector<Event, 1>> eventsByOp;
     for (GroupDag *g : set) {
       const Member &member = g->pieceTable.members.front();
-      if (!g->isLocal() || g->pieceTable.members.size() != 1)
-        return semaError(g->root->op) << "malformed circular local logical group";
+      if (g->pieceTable.members.size() != 1)
+        return semaError(g->root->op)
+               << "malformed circular local logical group";
       if (member.type != type)
         return semaError(member.allocOp) << "circular local group has mismatched member types";
       if (g->numCopies != numCopies)
@@ -1927,25 +1961,27 @@ static LogicalResult assignCircularStageOffsets(MutableArrayRef<GroupDag> groups
       if (auto it = eventsByOp.find(op); it != eventsByOp.end())
         ordered.append(it->second.begin(), it->second.end());
     });
-    int64_t ordinal = -1;
-    DenseMap<GroupDag *, int64_t> lastProduced;
-    DenseMap<Node *, int64_t> offset;
-    for (Event event : ordered) {
+    SlotSchedule slots;
+    int64_t cursorOrdinal = -1;
+    DenseMap<GroupDag *, int64_t> lastProducedOrdinal;
+    for (const Event &event : ordered) {
       const Member &member = event.group->pieceTable.members.front();
+      auto stage = recordPhysicalStage(
+          slots, lastProducedOrdinal, cursorOrdinal, event.group,
+          event.access, accessEffect(event.access) == Effect::W);
       if (accessEffect(event.access) == Effect::W) {
-        ++ordinal;
-        if (member.circularStart != ordinal % numCopies)
-          return semaError(member.allocOp) << "circular producer order expects buffer.start "
-                 << ordinal % numCopies << ", got " << member.circularStart;
-        lastProduced[event.group] = ordinal;
-        offset[event.access] = 0;
-      } else {
-        auto it = lastProduced.find(event.group);
-        if (it == lastProduced.end())
-          return semaError(member.allocOp) << "circular consumer appears before producer";
-        offset[event.access] = it->second - ordinal;
+        assert(stage);
+        if (member.circularStart != stage->requiredOrdinal % numCopies)
+          return semaError(member.allocOp)
+                 << "circular producer order expects buffer.start "
+                 << stage->requiredOrdinal % numCopies << ", got "
+                 << member.circularStart;
+      } else if (!stage) {
+        return semaError(member.allocOp)
+               << "circular consumer appears before producer";
       }
-      event.access->bufferStageOffset = offset.lookup(event.access);
+      event.access->bufferStageOffset =
+          stage->requiredOrdinal - stage->cursorOrdinal;
     }
     for (GroupDag *g : set)
       forEachNode(*g, [&](Node *n) {
@@ -1953,18 +1989,18 @@ static LogicalResult assignCircularStageOffsets(MutableArrayRef<GroupDag> groups
         if (n->kind == Node::Acquire) {
           access = n;
           while ((access = access->next))
-            if (access->kind == Node::Access && offset.contains(access))
+            if (access->kind == Node::Access && access->bufferStageOffset)
               break;
         } else if (n->kind == Node::Release) {
           access = n;
           while ((access = access->prev))
-            if (access->kind == Node::Access && offset.contains(access))
+            if (access->kind == Node::Access && access->bufferStageOffset)
               break;
         } else {
           return;
         }
         if (access)
-          n->stageOffset = offset.lookup(access);
+          n->stageOffset = access->bufferStageOffset;
       });
   }
   return success();
@@ -2043,32 +2079,12 @@ static SlotSchedule computeSlotSchedule(ArrayRef<GroupDag *> physicalSet, scf::F
     unsigned rhsOrder = operationOrder.lookup(rhs.op);
     return lhsOrder != rhsOrder ? lhsOrder < rhsOrder : lhs.groupOrder < rhs.groupOrder;
   });
-  int64_t ordinal = -1;
-  int64_t advanceCount = 0;
+  int64_t cursorOrdinal = -1;
   DenseMap<GroupDag *, int64_t> lastProducedOrdinal;
-  for (const Event &event : events) {
-    if (accessEffect(event.node) == Effect::W) {
-      unsigned advances = advancesByAccess.lookup(event.node);
-      if (advances > 1)
-        result.complete = false;
-      ordinal += advances;
-      advanceCount += advances;
-      if (ordinal < 0) {
-        result.complete = false;
-        continue;
-      }
-      lastProducedOrdinal[event.group] = ordinal;
-      result.ordinalByAccess[event.node] = ordinal;
-      continue;
-    }
-    auto it = lastProducedOrdinal.find(event.group);
-    if (it == lastProducedOrdinal.end()) {
-      result.complete = false;
-      continue;
-    }
-    result.ordinalByAccess[event.node] = it->second;
-  }
-  result.advancesPerIteration = advanceCount;
+  for (const Event &event : events)
+    recordPhysicalStage(result, lastProducedOrdinal, cursorOrdinal,
+                        event.group, event.node,
+                        advancesByAccess.lookup(event.node));
   return result;
 }
 static int64_t positiveMod(int64_t value, int64_t modulus) {
@@ -2096,8 +2112,18 @@ computeLoopCarriedDistance(const SlotSchedule &slots,
   return std::nullopt;
 }
 static bool isExactAliasMultibufferedGroup(const GroupDag &group) {
-  if (!group.isLocal() || group.isCircular() ||
+  if (group.isCircular() ||
       group.pieceTable.members.size() < 2 || group.numSemaphoreCopies <= 1)
+    return false;
+  bool hasPlannedCopy =
+      llvm::all_of(group.pieceTable.members, [](const Member &member) {
+        return member.allocOp->hasAttr(kBufferCopyAttrName);
+      });
+  // A planned copy depth or a separately staged semaphore provides the
+  // stable stage domain required for authored offsets.
+  bool authoredMulticopy = hasPlannedCopy && group.numCopies > 1;
+  bool extraSemaphoreStages = group.numSemaphoreCopies > group.numCopies;
+  if (!authoredMulticopy && !extraSemaphoreStages)
     return false;
   const Member &first = group.pieceTable.members.front();
   return llvm::all_of(group.pieceTable.members, [&](const Member &member) {
@@ -2174,6 +2200,16 @@ static LogicalResult assignAliasedHandoffStageOffsets(GroupDag &group) {
     if (node->kind == Node::Acquire)
       node->stageOffset = 0;
   });
+  return success();
+}
+
+static LogicalResult
+assignBufferStageOffsets(MutableArrayRef<GroupDag> groups) {
+  if (failed(assignCircularStageOffsets(groups)))
+    return failure();
+  for (GroupDag &group : groups)
+    if (failed(assignAliasedHandoffStageOffsets(group)))
+      return failure();
   return success();
 }
 
@@ -2410,11 +2446,8 @@ static void assignSyncScheduleChain(Node *head, ScheduleCache &cache) {
 
 LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups) {
   llvm::MapVector<Operation *, SmallVector<ScheduleEdge, 4>> edgesByLoop;
-  if (failed(assignCircularStageOffsets(groups)))
+  if (failed(assignBufferStageOffsets(groups)))
     return failure();
-  for (GroupDag &group : groups)
-    if (failed(assignAliasedHandoffStageOffsets(group)))
-      return failure();
   if (failed(addSyncScheduleEdges(groups, edgesByLoop)))
     return failure();
   for (auto &[loopOp, edges] : edgesByLoop) {
