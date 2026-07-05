@@ -86,6 +86,7 @@ struct AssignStagePhase {
     }
   };
   using OrderedPhaseKeys = std::set<PhaseKey>;
+  using StageKey = std::pair<int, int>;
 
   struct PhaseShiftUse {
     Operation *op;
@@ -95,6 +96,7 @@ struct AssignStagePhase {
 
   struct State {
     Value stage;                      // shared stage index (per buffer group)
+    std::map<StageKey, Value> localStages;
     std::map<PhaseKey, Value> phases; // phase values by (pid, sema)
     Value token;                      // token used for stage propagation
   };
@@ -109,6 +111,9 @@ struct AssignStagePhase {
   std::map<PhaseKey, SmallVector<int>> stageLanesByBaseKey;
   SmallVector<PhaseShiftUse> phaseShiftUses;
   bool multiStagePhaseFailure = false;
+  SmallVector<StageKey> stageKeys;
+  scf::ForOp stageCloneLoop;
+  DenseSet<Operation *> usesLocalStage;
 
   int getDepth() const {
     assert(!groupSemaphores.empty());
@@ -275,6 +280,7 @@ struct AssignStagePhase {
       allGroupPartitionIds.insert(0);
     authoredStageOffsets = computeAuthoredStageOffsets();
     computeMultiStagePhaseLanes();
+    analyzeStageCopies(semaOps.front());
   }
 
   unsigned getSemaphoreOrder(Value semaphore) const {
@@ -502,6 +508,147 @@ struct AssignStagePhase {
       stageLanesByBaseKey[key] =
           SmallVector<int>(stagesIt->second.begin(), stagesIt->second.end());
     }
+  }
+
+  struct ScheduledStageUse {
+    Operation *op;
+    StageKey key;
+    unsigned order;
+  };
+
+  static bool stageEdgeFitsSchedule(const ScheduledStageUse &producer,
+                                    const ScheduledStageUse &consumer,
+                                    unsigned distance) {
+    int producerStage = producer.key.first;
+    int consumerLimit = consumer.key.first + static_cast<int>(distance);
+    if (producerStage != consumerLimit)
+      return producerStage < consumerLimit;
+    if (producer.key.second != consumer.key.second)
+      return producer.key.second < consumer.key.second;
+    return producer.order <= consumer.order;
+  }
+
+  std::optional<ScheduledStageUse> getDirectStageUse(Operation *op,
+                                                     scf::ForOp loop) const {
+    if (op->getBlock() != loop.getBody())
+      return std::nullopt;
+    auto stageCluster = getStageCluster(op);
+    if (!stageCluster)
+      return std::nullopt;
+    unsigned order = 0;
+    for (Operation &bodyOp : *loop.getBody()) {
+      if (&bodyOp == op)
+        break;
+      ++order;
+    }
+    return ScheduledStageUse{op, *stageCluster, order};
+  }
+
+  // Find direct cursor consumers whose scalar SSA edge runs backward.  The
+  // repair replays the pure cursor updates at only those schedule points;
+  // phase state remains governed by proveStageDisjointSlotOwnership.
+  void analyzeStageCopies(SemaphoreCreateOp firstSemaOp) {
+    firstSemaOp->getParentOp()->walk([&](scf::ForOp loop) {
+      if (stageCloneLoop)
+        return;
+      SmallVector<SemaphoreAcquireOp> events;
+      // Local cursor replay is not threaded through nested control flow.  A
+      // loop containing a nested group acquire is therefore not a candidate.
+      if (!collectDirectGroupAcquireEvents(loop, events))
+        return;
+      for (SemaphoreAcquireOp acquireOp : events) {
+        if (!getDirectStageUse(acquireOp, loop))
+          return;
+      }
+      if (events.empty())
+        return;
+
+      SmallVector<unsigned> advances;
+      SmallVector<ScheduledStageUse> eventUses;
+      for (auto [index, acquireOp] : llvm::enumerate(events)) {
+        eventUses.push_back(*getDirectStageUse(acquireOp, loop));
+        if (isFirstUseFreshWriteAfterAcquire(acquireOp))
+          advances.push_back(index);
+      }
+      if (advances.empty())
+        return;
+
+      auto sourceBefore = [&](unsigned order) {
+        auto previous = llvm::find_if(
+            llvm::reverse(advances),
+            [&](unsigned advance) { return eventUses[advance].order < order; });
+        if (previous == advances.rend())
+          return std::make_pair(advances.back(), 1u);
+        return std::make_pair(*previous, 0u);
+      };
+
+      SmallVector<Operation *> localUses;
+      SmallVector<StageKey> localKeys;
+      bool unsupportedEdge = false;
+      for (auto [index, acquireOp] : llvm::enumerate(events)) {
+        auto [producer, distance] =
+            sourceBefore(eventUses[index].order);
+        if (!stageEdgeFitsSchedule(eventUses[producer], eventUses[index],
+                                   distance)) {
+          // A fresh acquire still has to update the canonical loop cursor;
+          // replay cannot remove that canonical dependency.
+          if (distance != 0 ||
+              isFirstUseFreshWriteAfterAcquire(acquireOp)) {
+            unsupportedEdge = true;
+            continue;
+          }
+          localUses.push_back(acquireOp);
+          localKeys.push_back(eventUses[index].key);
+        }
+      }
+      for (Value semaphore : groupSemaphores) {
+        for (Operation *user : semaphore.getDefiningOp()->getUsers()) {
+          auto stageOp = dyn_cast<SemaphoreStageInterface>(user);
+          if (!stageOp || isa<SemaphoreAcquireOp>(user) ||
+              !hasAuthoredStageOffsets() || !stageOp.getStage())
+            continue;
+          auto consumer = getDirectStageUse(user, loop);
+          if (!consumer)
+            continue;
+          auto [producer, distance] = sourceBefore(consumer->order);
+          if (!stageEdgeFitsSchedule(eventUses[producer], *consumer,
+                                     distance)) {
+            if (distance != 0) {
+              unsupportedEdge = true;
+              continue;
+            }
+            localUses.push_back(user);
+            localKeys.push_back(consumer->key);
+          }
+        }
+      }
+
+      if (unsupportedEdge || localKeys.empty())
+        return;
+
+      llvm::sort(localKeys);
+      localKeys.erase(std::unique(localKeys.begin(), localKeys.end()),
+                      localKeys.end());
+      // Local copies start from the scalar loop iter-arg.  Keep the repair
+      // narrow: if that distance-one edge is itself illegal, leave the
+      // original scalar chain for a future, loop-carried-copy transform.
+      for (StageKey key : localKeys) {
+        unsigned firstLocalOrder = eventUses[advances.front()].order;
+        for (Operation *localUse : localUses) {
+          auto use = getDirectStageUse(localUse, loop);
+          if (use && use->key == key)
+            firstLocalOrder = std::min(firstLocalOrder, use->order);
+        }
+        ScheduledStageUse firstLocal{events[advances.front()].getOperation(),
+                                     key, firstLocalOrder};
+        if (!stageEdgeFitsSchedule(eventUses[advances.back()], firstLocal, 1))
+          return;
+      }
+
+      stageCloneLoop = loop;
+      stageKeys = std::move(localKeys);
+      usesLocalStage.insert(localUses.begin(), localUses.end());
+    });
   }
 
   // --- useD analysis --------------------------------------------------------
@@ -1175,6 +1322,17 @@ struct AssignStagePhase {
     return summary;
   }
 
+  Value getStageForOp(const State &state, Operation *op) const {
+    if (!usesLocalStage.contains(op))
+      return state.stage;
+    auto stageCluster = getStageCluster(op);
+    assert(stageCluster && "local state.stage consumer has no schedule");
+    auto it = state.localStages.find(*stageCluster);
+    assert(it != state.localStages.end() &&
+           "local state.stage consumer has no replayed cursor");
+    return it->second;
+  }
+
   Value getPhase(State &state, PhaseKey key) {
     auto [it, inserted] =
         state.phases.try_emplace(key, initialPhases.at(key.semaphore));
@@ -1264,6 +1422,7 @@ struct AssignStagePhase {
   }
 
   void assignStateInForOp(scf::ForOp forOp, State &state) {
+    bool cloneRoot = stageCloneLoop && forOp == stageCloneLoop;
     Value newTok;
     if (auto pos = findValuePosInRange(forOp.getInitArgs(), state.token)) {
       newTok = forOp.getRegionIterArgs()[*pos];
@@ -1295,6 +1454,8 @@ struct AssignStagePhase {
     auto forOpIds = getPartitionIds(forOp);
     auto forOpOutputsIds = getPartitionOutputs(forOp);
     forOp = addIterArgsToLoop(builder, forOp, extraIterArgs);
+    if (cloneRoot)
+      stageCloneLoop = forOp;
 
     // Make loop result partition metadata match the added iter args before
     // recursing. The body walk may widen the new stage block arg's metadata.
@@ -1311,6 +1472,9 @@ struct AssignStagePhase {
     setPartitionOutputs(forOp, forOpOutputsIds);
 
     state.stage = forOp.getRegionIterArgs()[nArgs];
+    if (cloneRoot)
+      for (StageKey key : stageKeys)
+        state.localStages[key] = state.stage;
     for (auto [i, key] : llvm::enumerate(summary.acquiredPhaseKeys))
       state.phases[key] = forOp.getRegionIterArgs()[nArgs + 1 + i];
     recordForInputTokenStageMappings(forOp, nArgs, nArgs);
@@ -1349,6 +1513,8 @@ struct AssignStagePhase {
     setPartitionOutputs(forOp, forOpOutputsIds);
 
     state.stage = forOp.getResult(nArgs);
+    if (cloneRoot)
+      state.localStages.clear();
     for (auto [i, key] : llvm::enumerate(summary.acquiredPhaseKeys))
       state.phases[key] = forOp.getResult(nArgs + 1 + i);
     for (auto [idx, tokenRef] : tokenRefs)
@@ -1472,6 +1638,11 @@ struct AssignStagePhase {
           return createInto(stagePids, opTy,
                             std::forward<decltype(args)>(args)...);
         };
+        auto createIntoLocalStage = [&](StageKey key, auto opTy,
+                                        auto... args) {
+          return createIntoAt(stagePids, key, opTy,
+                              std::forward<decltype(args)>(args)...);
+        };
         auto createIntoPhase = [&](auto opTy, auto... args) {
           return createInto(phasePids, opTy,
                             std::forward<decltype(args)>(args)...);
@@ -1520,7 +1691,8 @@ struct AssignStagePhase {
                                  remStage);
         };
 
-        // Stage update.
+        // Keep the scalar cursor unchanged.  When analysis found a backward
+        // consumer, replay the same pure advances at that consumer's schedule.
         Value rawStage = state.stage;
         Value baseStage = rawStage;
         bool advanceStage = isFirstUseFreshWriteAfterAcquire(acquireOp);
@@ -1532,16 +1704,30 @@ struct AssignStagePhase {
               arith::CmpIOp{}, arith::CmpIPredicate::eq, nextStage,
               createIntoStage(arith::ConstantIntOp{}, getDepth(), 32));
           auto zero = createIntoStage(arith::ConstantIntOp{}, 0, 32);
-          auto wrappedStage =
+          baseStage =
               createIntoStage(arith::SelectOp{}, stageWrapped, zero, nextStage);
-          baseStage = wrappedStage;
+
+          for (auto &[key, localStage] : state.localStages) {
+            auto localNext = createIntoLocalStage(
+                key, arith::AddIOp{}, localStage,
+                createIntoLocalStage(key, arith::ConstantIntOp{}, 1, 32));
+            auto localWrapped = createIntoLocalStage(
+                key, arith::CmpIOp{}, arith::CmpIPredicate::eq, localNext,
+                createIntoLocalStage(key, arith::ConstantIntOp{}, getDepth(),
+                                     32));
+            auto localZero = createIntoLocalStage(
+                key, arith::ConstantIntOp{}, 0, 32);
+            localStage = createIntoLocalStage(
+                key, arith::SelectOp{}, localWrapped, localZero, localNext);
+          }
         }
+        state.stage = baseStage;
+        baseStage = getStageForOp(state, &op);
         Value authoredOffset =
             acquireOp.getPhase() ? Value() : acquireOp.getStage();
         Value acquireStage =
             authoredOffset ? applyStageOffset(baseStage, authoredOffset)
                            : baseStage;
-        state.stage = baseStage;
         acquireOp.getStageMutable().assign(acquireStage);
         state.token = acquireOp.getToken();
         tokenLogicalStage[acquireOp.getToken()] = baseStage;
@@ -1622,8 +1808,9 @@ struct AssignStagePhase {
           return createIntoStage(arith::SelectOp{}, isNegative, wrappedStage,
                                  remStage);
         };
-        widenStageBlockArgUse(stageOp, state.stage);
-        stageOp.setStage(applyStageOffset(state.stage, stageOp.getStage()));
+        Value baseStage = getStageForOp(state, &op);
+        widenStageBlockArgUse(stageOp, baseStage);
+        stageOp.setStage(applyStageOffset(baseStage, stageOp.getStage()));
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
         assignStateInForOp(forOp, state);
       } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
