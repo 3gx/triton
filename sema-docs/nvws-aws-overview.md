@@ -44,7 +44,7 @@ document uses these terms with exactly these meanings.
   number of stages — its explicit `tt.num_stages` when present, else the
   `num-stages` pass option; the largest wins when several WS loops share the
   group — and the default path may double-buffer TMEM accumulators (see
-  [SYNC-DAG, backing copies](insert-semas/sync-dag-1.md#backing-copies)).
+  [SYNC-DAG, backing copies](insert-semas/sync-dag.md#backing-copies)).
 - **Buffer stage**: an integer selecting one backing copy and
   the mbarrier with the same index. In the IR it is the `stage` operand of the
   `nvws.semaphore.*` operations; `AssignStagePhase` tracks it as
@@ -107,7 +107,7 @@ backing copies, which is 1 here. Every partition uses this same shared value:
 The `-1` offset lets the read of A select copy 0 after the shared current
 buffer stage has advanced to 1 for B. Ordinary groups use the current buffer
 stage directly; `InsertSemas` assigns stage offsets only for circular reuse
-and for exact-alias SMEM handoffs across multiple copies.
+and for exact-alias handoffs across multiple copies in both SMEM and TMEM.
 
 ### For readers coming from Meta AutoWS
 
@@ -156,7 +156,7 @@ from one copy to the effective number of copies (`tt.num_stages` on the owning
 WS loop, defaulting to the `num-stages` option) before `AssignStagePhase`
 computes buffer stages. `InsertSemas` already analyzes such groups with that
 final number of copies (see
-[SYNC-DAG, backing copies](insert-semas/sync-dag-1.md#backing-copies)).
+[SYNC-DAG, backing copies](insert-semas/sync-dag.md#backing-copies)).
 
 The terminal `schedule loops` run also differs per path: the AWS driver passes
 it a Meta flag (`useMetaWS` in `AutomaticWarpSpecialization.cpp`), selecting
