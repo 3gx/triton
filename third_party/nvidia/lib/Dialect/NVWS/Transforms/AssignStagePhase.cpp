@@ -58,8 +58,10 @@ namespace triton {
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h.inc"
 namespace {
 
-// Stage/phase algorithm and the egx/nvws-semaphore delta:
+// Stage/phase algorithm. Doc section references below point into
 // sema-docs/assign-stage-phase-and-lower-semaphores.md.
+// Doc:
+// assign-stage-phase-and-lower-semaphores.md#the-state-carried-by-assignstagephase
 struct AssignStagePhase {
   enum class AccessKind { Store, Read };
   struct PhaseKey {
@@ -121,6 +123,8 @@ struct AssignStagePhase {
         .getNumStages();
   }
 
+  // Doc:
+  // assign-stage-phase-and-lower-semaphores.md#choosing-single-phase-or-multiphase
   // --- Single-phase eligibility analysis ------------------------------------
 
   bool computeAuthoredStageOffsets() const {
@@ -386,6 +390,9 @@ struct AssignStagePhase {
     return loop;
   }
 
+  // Docs:
+  // assign-stage-phase-and-lower-semaphores.md#why-clone-a-phase-value-for-each-loopstage
+  //       assign-stage-phase-and-lower-semaphores.md#proving-that-pipeline-stages-use-disjoint-buffer-stages
   bool proveStageDisjointSlotOwnership(
       PhaseKey key, ArrayRef<SemaphoreAcquireOp> candidateAcquires) {
     scf::ForOp loop = getSingleCandidateLoop(candidateAcquires);
@@ -510,6 +517,8 @@ struct AssignStagePhase {
     }
   }
 
+  // Doc:
+  // assign-stage-phase-and-lower-semaphores.md#schedule-local-copies-of-statestage
   struct ScheduledStageUse {
     Operation *op;
     StageKey key;
@@ -653,6 +662,7 @@ struct AssignStagePhase {
 
   // --- useD analysis --------------------------------------------------------
 
+  // Doc: assign-stage-phase-and-lower-semaphores.md#updating-statestage
   Value remapUseDThroughIf(Value useD, scf::IfOp ifOp, bool takeThen) const {
     auto result = dyn_cast<OpResult>(useD);
     if (!result || result.getOwner() != ifOp)
@@ -1202,6 +1212,8 @@ struct AssignStagePhase {
   }
 
   // --- Stage and Phase computation -----------------------------------------
+  // Doc:
+  // assign-stage-phase-and-lower-semaphores.md#structured-control-flow-metadata
   struct SemaphoreUseSummary {
     bool hasStageUse = false;
     OrderedPhaseKeys acquiredPhaseKeys;
@@ -1368,6 +1380,8 @@ struct AssignStagePhase {
   }
 
   // Infer partition IDs for a yield argumend value.
+  // Doc:
+  // assign-stage-phase-and-lower-semaphores.md#structured-control-flow-metadata
   SetVector<int> inferPartitionIds(Value arg, int fallbackPartitionId) {
     SetVector<int> argIds;
     if (auto defOp = arg.getDefiningOp()) {
@@ -1602,6 +1616,8 @@ struct AssignStagePhase {
       *tokenRef = newIfOp.getResult(idx);
   }
 
+  // Docs: assign-stage-phase-and-lower-semaphores.md#updating-statestage
+  //       assign-stage-phase-and-lower-semaphores.md#updating-statephases
   State assignStateInBlock(Block *block, State state) {
     for (auto &op : llvm::make_early_inc_range(*block)) {
       if (auto acquireOp = getAcquireOp(&op)) {
@@ -1821,6 +1837,7 @@ struct AssignStagePhase {
     return state;
   }
 
+  // Doc: assign-stage-phase-and-lower-semaphores.md#updating-statestage
   void propagateStage(Value token, Value stage,
                       DenseSet<Operation *> &visited) {
     for (auto &tokUse : token.getUses()) {
@@ -1848,6 +1865,8 @@ struct AssignStagePhase {
     }
   }
 
+  // Doc:
+  // assign-stage-phase-and-lower-semaphores.md#the-state-carried-by-assignstagephase
   static LogicalResult run(ArrayRef<SemaphoreCreateOp> semaOps) {
     if (semaOps.empty())
       return success();
@@ -1916,6 +1935,8 @@ struct AssignStagePhase {
   }
 };
 
+// Doc:
+// assign-stage-phase-and-lower-semaphores.md#structured-control-flow-metadata
 void updateOutputWithDefaultPartition(Operation *op, int pos) {
   auto opIds = getPartitionIds(op);
   opIds.insert(0);
@@ -1976,6 +1997,8 @@ void visitBackwardSlice(scf::ForOp wsLoop, Value value,
 // the init value and rebuild the loop without those iter_args. Only clean up
 // loops that are part of a warp-specialized region: the root
 // `tt.warp_specialize` loop itself and any nested loops beneath it.
+// Doc:
+// assign-stage-phase-and-lower-semaphores.md#structured-control-flow-metadata
 void removeLoopInvariantIterArgs(triton::FuncOp funcOp) {
   SmallVector<scf::ForOp> loops;
   funcOp.walk([&](scf::ForOp forOp) {
@@ -2049,6 +2072,7 @@ void removeLoopInvariantIterArgs(triton::FuncOp funcOp) {
   }
 }
 
+// Doc: assign-stage-phase-and-lower-semaphores.md#division-of-responsibility
 LogicalResult assignStagePhase(triton::FuncOp funcOp) {
   SmallVector<SemaphoreCreateOp> semaOps;
   funcOp.walk([&](SemaphoreCreateOp op) { semaOps.push_back(op); });
