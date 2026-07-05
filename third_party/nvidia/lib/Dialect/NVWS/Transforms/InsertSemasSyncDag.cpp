@@ -1,4 +1,4 @@
-// SYNC analysis and scheduling; see sema-docs/insert-semas/sync-dag-1.md.
+// SYNC analysis and scheduling; see sema-docs/insert-semas/sync-dag.md.
 #include "InsertSemas.h"
 #include <limits>
 #include <numeric>
