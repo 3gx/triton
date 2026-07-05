@@ -2429,6 +2429,24 @@ static gpu::StageCluster cachedSchedule(const ScheduleCache &cache, const Owner 
   auto it = cache.find(ownerKey(owner));
   return it == cache.end() ? gpu::StageCluster{} : it->second;
 }
+static gpu::StageCluster scheduleAtOwnerBoundary(
+    const Node *n, gpu::StageCluster schedule) {
+  if (!schedule || nextScheduleAnchor(n->next))
+    return schedule;
+  auto forOp = dyn_cast_or_null<scf::ForOp>(n->parent ? n->parent->op : nullptr);
+  if (!forOp || !forOp->hasAttr(triton::kScheduledMaxStageAttrName))
+    return schedule;
+  auto [stage, cluster] = *schedule;
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    gpu::StageCluster candidate = gpu::getStageCluster(&op);
+    if (!candidate || candidate->first != stage || !gpu::hasPartition(&op))
+      continue;
+    SetVector<int> partitions = gpu::getPartitionIds(&op);
+    if (partitions.contains(n->owner->first))
+      cluster = std::max(cluster, candidate->second);
+  }
+  return std::make_pair(stage, cluster);
+}
 static void assignSyncScheduleChain(Node *head, ScheduleCache &cache);
 static void assignSyncScheduleRegion(Node *n, ScheduleCache &cache) {
   if (auto forOp = dyn_cast<scf::ForOp>(n->op)) {
@@ -2452,12 +2470,12 @@ static void assignSyncScheduleChain(Node *head, ScheduleCache &cache) {
     switch (n->kind) {
     case Node::Acquire:
       if (n->owner) {
-        if (n->postLoopAcquire)
-          n->stageCluster = cachedSchedule(cache, n->owner);
-        else if (Operation *anchor = nextScheduleAnchor(n->next))
-          n->stageCluster = gpu::getStageCluster(anchor);
-        else
-          n->stageCluster = cachedSchedule(cache, n->owner);
+        Operation *anchor = n->postLoopAcquire ? nullptr
+                                                : nextScheduleAnchor(n->next);
+        n->stageCluster =
+            anchor ? gpu::getStageCluster(anchor)
+                   : scheduleAtOwnerBoundary(
+                         n, cachedSchedule(cache, n->owner));
       }
       break;
     case Node::Release:
@@ -2480,25 +2498,6 @@ static void assignSyncScheduleChain(Node *head, ScheduleCache &cache) {
       break;
     }
   }
-}
-static void placeFinalAcquireAtLaneExit(Node *n) {
-  if (n->kind != Node::Acquire || !n->owner || !n->stageCluster || nextScheduleAnchor(n->next))
-    return;
-  auto forOp = dyn_cast_or_null<scf::ForOp>(n->parent ? n->parent->op : nullptr);
-  if (!forOp || !forOp->hasAttr(triton::kScheduledMaxStageAttrName))
-    return;
-  auto [stage, cluster] = *n->stageCluster;
-  int exitCluster = cluster;
-  for (Operation &op : forOp.getBody()->without_terminator()) {
-    gpu::StageCluster candidate = gpu::getStageCluster(&op);
-    if (!candidate || candidate->first != stage || !gpu::hasPartition(&op))
-      continue;
-    SetVector<int> partitions = gpu::getPartitionIds(&op);
-    if (!partitions.contains(n->owner->first))
-      continue;
-    exitCluster = std::max(exitCluster, candidate->second);
-  }
-  n->stageCluster = std::make_pair(stage, exitCluster);
 }
 
 LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups) {
@@ -2524,8 +2523,6 @@ LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups) {
     ScheduleCache cache;
     assignSyncScheduleChain(g.root->children[0], cache);
   }
-  for (GroupDag &g : groups)
-    forEachNode(g, placeFinalAcquireAtLaneExit);
   return success();
 }
 
