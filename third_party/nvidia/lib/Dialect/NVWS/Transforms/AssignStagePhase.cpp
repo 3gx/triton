@@ -534,6 +534,8 @@ struct AssignStagePhase {
     }
   }
 
+  // Doc:
+  // assign-stage-phase-and-lower-semaphores.md#cloning-a-split-phase-value-into-multiple-partitions
   void computeSharedPhaseLanePartitions() {
     SmallVector<std::pair<PhaseKey, int>> lanesToAdd;
     for (auto &[baseKey, lanes] : stageLanesByBaseKey) {
