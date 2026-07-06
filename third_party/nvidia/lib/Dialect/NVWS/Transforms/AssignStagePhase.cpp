@@ -21,7 +21,6 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include "InsertSemas.h"
 #include "Utilities.h"
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -108,7 +107,6 @@ struct AssignStagePhase {
   bool useSinglePhaseForGroup = false;
   SetVector<int> allGroupPartitionIds;  // all partition IDs across all acquires
   DenseMap<std::pair<Value, int>, SetVector<int>> sharedPhaseLanePartitionIds;
-  DenseMap<std::pair<Value, int>, SetVector<int>> sharedBasePhasePartitionIds;
   DenseMap<Value, Value> initialPhases; // initial phase by semaphore
   DenseMap<std::pair<Operation *, Value>, int> tokToStagePosMap;
   DenseMap<Value, Value> tokenLogicalStage;
@@ -299,34 +297,20 @@ struct AssignStagePhase {
 
   PhaseKey getPhaseKey(int partitionId, Value semaphore,
                        int stageLane = -1) const {
-    if (stageLane < 0) {
-      auto sharedIt =
-          sharedBasePhasePartitionIds.find({semaphore, partitionId});
-      if (sharedIt != sharedBasePhasePartitionIds.end())
-        partitionId = sharedIt->second.front();
-    } else {
-      auto sharedIt =
-          sharedPhaseLanePartitionIds.find({semaphore, stageLane});
-      if (sharedIt != sharedPhaseLanePartitionIds.end() &&
-          sharedIt->second.contains(partitionId))
-        partitionId = sharedIt->second.front();
-    }
+    auto sharedIt =
+        sharedPhaseLanePartitionIds.find({semaphore, stageLane});
+    if (sharedIt != sharedPhaseLanePartitionIds.end() &&
+        sharedIt->second.contains(partitionId))
+      partitionId = sharedIt->second.front();
     return PhaseKey{partitionId, getSemaphoreOrder(semaphore), semaphore,
                     stageLane};
   }
 
   SetVector<int> getPhasePartitionIds(PhaseKey key) const {
-    if (!key.hasStageLane()) {
-      auto it =
-          sharedBasePhasePartitionIds.find({key.semaphore, key.partitionId});
-      if (it != sharedBasePhasePartitionIds.end())
-        return it->second;
-    } else {
-      auto it =
-          sharedPhaseLanePartitionIds.find({key.semaphore, key.stageLane});
-      if (it != sharedPhaseLanePartitionIds.end())
-        return it->second;
-    }
+    auto it =
+        sharedPhaseLanePartitionIds.find({key.semaphore, key.stageLane});
+    if (it != sharedPhaseLanePartitionIds.end())
+      return it->second;
     SetVector<int> ids;
     ids.insert(key.partitionId);
     return ids;
@@ -587,50 +571,6 @@ struct AssignStagePhase {
         lanes.push_back(lane);
         llvm::sort(lanes);
       }
-    }
-
-    // A circular semaphore is one sequential generation stream.  When its
-    // ordinary, unsplit phase lane crosses partitions at the same loop.stage,
-    // replay that one multiphase history in every participating partition.
-    DenseMap<std::pair<Value, int>, std::set<int>> basePidsByStage;
-    for (Value sema : groupSemaphores) {
-      auto create = sema.getDefiningOp<SemaphoreCreateOp>();
-      bool isCircular = create && llvm::any_of(create.getBuffers(), [](Value v) {
-                          Operation *def = v.getDefiningOp();
-                          return def && def->hasAttr(
-                                            nvws_semas::kBufferCircularAttrName);
-                        });
-      if (!isCircular)
-        continue;
-
-      for (Operation *user : sema.getDefiningOp()->getUsers()) {
-        auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user);
-        if (!acquireOp || !hasPartition(acquireOp))
-          continue;
-        auto stageCluster = getStageCluster(acquireOp);
-        if (!stageCluster)
-          continue;
-        auto partitionIds = getPartitionIds(acquireOp);
-        if (partitionIds.size() != 1)
-          continue;
-        int pid = partitionIds.front();
-        PhaseKey baseKey = getPhaseKey(pid, sema);
-        if (stageLanesByBaseKey.find(baseKey) != stageLanesByBaseKey.end())
-          continue;
-        basePidsByStage[{sema, stageCluster->first}].insert(pid);
-      }
-    }
-
-    for (auto &[laneKey, sortedPartitionIds] : basePidsByStage) {
-      if (sortedPartitionIds.size() < 2)
-        continue;
-
-      Value sema = laneKey.first;
-      SetVector<int> partitionIds;
-      partitionIds.insert(sortedPartitionIds.begin(),
-                          sortedPartitionIds.end());
-      for (int pid : partitionIds)
-        sharedBasePhasePartitionIds[{sema, pid}] = partitionIds;
     }
   }
 
@@ -1869,10 +1809,9 @@ struct AssignStagePhase {
         // Phase update. Internal phase state stays group-specific, but the
         // acquire itself always receives the final parity bit consumed by
         // mbarrier.wait.
-        auto acquirePartitionIds = hasPartition(&op) ? getPartitionIds(&op)
-                                                     : allGroupPartitionIds;
         for (int pid : allGroupPartitionIds) {
-          if (!llvm::is_contained(acquirePartitionIds, pid))
+          if (hasPartition(&op) &&
+              !llvm::is_contained(getPartitionIds(&op), pid))
             continue;
           PhaseKey key = getSelectedPhaseKey(pid, acquireOp);
           Value phaseState = getPhase(state, key);
@@ -1906,26 +1845,6 @@ struct AssignStagePhase {
           }
           state.phases[key] = phaseState;
           acquireOp.getPhaseMutable().assign(acquirePhase);
-        }
-
-        // A shared phase history is also one ordered runtime wait stream.
-        // Keep the owning acquire single-partition, and replay a passive wait
-        // in every other partition that carries this phase history.  Without
-        // the shadow wait, a partition can skip an intervening generation and
-        // accept the same one-bit parity again after the circular cursor wraps.
-        if (acquirePartitionIds.size() == 1) {
-          int ownerPid = acquirePartitionIds.front();
-          PhaseKey key = getSelectedPhaseKey(ownerPid, acquireOp);
-          for (int pid : getPhasePartitionIds(key)) {
-            if (pid == ownerPid)
-              continue;
-            b.setInsertionPointAfter(acquireOp);
-            auto shadowAcquire = cast<SemaphoreAcquireOp>(b.clone(*acquireOp));
-            SetVector<int> shadowPartitionIds;
-            shadowPartitionIds.insert(pid);
-            setPartition(shadowAcquire, shadowPartitionIds);
-            tokenLogicalStage[shadowAcquire.getToken()] = baseStage;
-          }
         }
       } else if (auto stageOp = getAuthoredStageOp(&op)) {
         ImplicitLocOpBuilder b(op.getLoc(), &op);
