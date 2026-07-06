@@ -172,7 +172,7 @@ struct PieceTable {
 
 struct Sema {
   std::string name;
-  unsigned count = 0, expectedReleases = 0;
+  unsigned count = 0, expectedArrivals = 0;
   bool isEntry = false;
   Owner entryTokenOwner;
   Value create;

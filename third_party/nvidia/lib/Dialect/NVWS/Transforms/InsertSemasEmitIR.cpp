@@ -1,5 +1,6 @@
 // Protocol materialization; see sema-docs/insert-semas/emit-ir.md.
 #include "InsertSemas.h"
+#include "mlir/Interfaces/InferTypeOpInterface.h"
 
 namespace mlir::triton::nvws_semas {
 
@@ -468,6 +469,28 @@ static unsigned slotIndexFor(EmitCtx &ctx, Operation *op, GroupDag *g) {
       return s.index;
   llvm_unreachable("missing slot");
 }
+static void refreshAliasResultTypes(Operation *op, Value source) {
+  // A mapped semaphore view can carry a staged allocShape that was absent from
+  // the original alias operand. Let each alias op derive its result from the
+  // cloned operands before falling back to the old mutability-only adjustment.
+  if (auto typeInfer = dyn_cast<InferTypeOpInterface>(op)) {
+    SmallVector<Type> inferredTypes;
+    if (succeeded(typeInfer.inferReturnTypes(
+            op->getContext(), op->getLoc(), op->getOperands(),
+            op->getAttrDictionary(), op->getPropertiesStorage(),
+            op->getRegions(), inferredTypes)) &&
+        inferredTypes.size() == op->getNumResults()) {
+      for (auto [result, type] : llvm::zip(op->getResults(), inferredTypes))
+        result.setType(type);
+      return;
+    }
+  }
+  if (op->getNumResults() == 1)
+    if (auto resultType = dyn_cast<gpu::MemDescType>(op->getResult(0).getType()))
+      op->getResult(0).setType(withMutable(
+          resultType,
+          cast<gpu::MemDescType>(source.getType()).getMutableMemory()));
+}
 static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs, Node *node,
                      const Touch &t, Operation *accessOp,
                      const Owner &owner) {
@@ -521,10 +544,7 @@ static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs, Node *node,
       mapping.map(operand, idx == step.operandIdx ? cur : operand);
     Value source = cur;
     Operation *cloned = b.clone(*old, mapping);
-    if (cloned->getNumResults() == 1)
-      if (auto rt = dyn_cast<gpu::MemDescType>(cloned->getResult(0).getType()))
-        cloned->getResult(0).setType(withMutable(
-            rt, cast<gpu::MemDescType>(source.getType()).getMutableMemory()));
+    refreshAliasResultTypes(cloned, source);
     cur = cloned->getResult(0);
   }
   return cur;

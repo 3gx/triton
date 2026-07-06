@@ -226,6 +226,40 @@ private:
                     });
     size_t edgeStart = edges.size();
     Payloads payloads{asyncPayloadOf(node->op)};
+
+    // A release describes every completion signal produced during one
+    // ownership wave, not just the last access in that wave.  Exact-alias
+    // members can be written consecutively by the same owner before another
+    // owner consumes either member.  Keep earlier async completions in that
+    // case; otherwise a later synchronous write would hide (for example) a
+    // descriptor load from LowerAref.
+    //
+    // A foreign active use marks an ownership handoff.  Its dependency has
+    // already consumed the earlier wave, so a write after that handoff starts
+    // a fresh payload set rather than carrying completed work forward.
+    // Limit this local proof to an exact-alias group.  With multiple pieces,
+    // another piece can force a token handoff without changing this piece's
+    // active uses; retaining its old payload would then attach work from an
+    // earlier token to the new release.
+    if (group.pieceTable.members.size() > 1 &&
+        group.pieceTable.pieces.size() == 1) {
+      for (auto [id, effect] : effects) {
+        if (effect != Effect::W)
+          continue;
+        auto it = state.find(id);
+        if (it == state.end() || !it->second.initialized())
+          continue;
+        PieceState &piece = it->second;
+        if (!sameOwner(piece.source.sourceOwner, node->owner))
+          continue;
+        bool sameOwnerWave = llvm::all_of(piece.uses, [&](const ActiveUse &use) {
+          return sameOwner(use.owner, node->owner);
+        });
+        if (sameOwnerWave)
+          unionPayloads(payloads, piece.source.payloads);
+      }
+    }
+
     for (auto [id, effect] : effects)
       applyTouch(state[id], id, node->owner, effect, node, payloads, edges,
                  /*wsAdopt=*/false);
@@ -611,6 +645,19 @@ static SmallVector<EdgeRec> collapseEdges(ArrayRef<EdgeRec> edges) {
   return merged;
 }
 
+static unsigned arrivalContribution(const EdgeRec &edge) {
+  // Payload kinds are the distinct completion mechanisms emitted by one
+  // release.  Each kind contributes one arrival when arrive_count is one.
+  return std::max(1u, static_cast<unsigned>(edge.payloads.size()));
+}
+
+static unsigned arrivalContribution(ArrayRef<EdgeRec> edges) {
+  return std::accumulate(edges.begin(), edges.end(), 0u,
+                         [](unsigned total, const EdgeRec &edge) {
+                           return total + arrivalContribution(edge);
+                         });
+}
+
 // Doc: sync-dag.md#one-destination-node-one-semaphore
 static LogicalResult buildEdgesAndSemas(GroupDag &g,
                                         SmallVector<EdgeRec> &edges) {
@@ -644,7 +691,7 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g,
     SemaId sid = g.semas.size();
     Sema s;
     s.name = "S" + std::to_string(sid);
-    s.count = handoff.incoming.size();
+    s.count = arrivalContribution(handoff.incoming);
     handoff.sema = sid;
     g.semas.push_back(std::move(s));
   };
@@ -664,12 +711,18 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g,
   for (Handoff &handoff : handoffs) {
     Sema &sema = g.semas[*handoff.sema];
     unsigned sources = handoff.incoming.size();
-    if (sources != sema.count && sources != 1)
+    unsigned arrivals = arrivalContribution(handoff.incoming);
+    if (arrivals != sema.count &&
+        !(sources == 1 && arrivals == 1))
       return semaError(handoff.dst->op ? handoff.dst->op : g.root->op)
-             << "destination group with " << sources
+             << "destination group with " << arrivals
+             << " arrival contributions from " << sources
              << " sources cannot meet semaphore " << sema.name
              << " pending count " << sema.count;
-    unsigned releaseCount = sources == 1 ? sema.count : 1;
+    // A lone generic release may be scaled to satisfy a reused semaphore's
+    // fan-in count.  A release with multiple completion kinds already emits
+    // one arrival per kind and must keep arrive_count equal to one.
+    unsigned releaseCount = arrivals == sema.count ? 1 : sema.count;
     Node *acquire = newProtocolNode(g, Node::Acquire, handoff.dst->parent,
                                     handoff.owner, *handoff.sema, sema.count);
     Node *destination = handoff.dst;
@@ -696,7 +749,7 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g,
     }
     acquire->scheduleAnchor = destination;
     spliceBefore(acquire, destination);
-    sema.expectedReleases += sources * releaseCount;
+    sema.expectedArrivals += arrivals * releaseCount;
     for (const EdgeRec &edge : handoff.incoming) {
       Node *release =
           newProtocolNode(g, Node::Release, edge.src->parent, edge.srcOwner,
@@ -793,7 +846,7 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
   s.name = "E" + std::to_string(sid);
   s.count = 1;
   s.isEntry = true;
-  s.expectedReleases = 1; // the terminal release
+  s.expectedArrivals = 1; // the terminal release
   s.entryTokenOwner = *entryTokenOwner;
   Node *acq = newProtocolNode(g, Node::Acquire, nodes.front()->parent,
                               std::nullopt, sid, 1);
@@ -1287,7 +1340,7 @@ static bool materializeHoldHandoffs(GroupDag &g, Node *head) {
                                       recurrenceAcquire->count);
         bridge->payloads.push_back(AsyncOp::NONE);
         spliceAfter(bridge, c.bridgeAcquire);
-        getSema(g, bridge).expectedReleases += bridge->count;
+        getSema(g, bridge).expectedArrivals += bridge->count;
         c.bridgeRelease = bridge;
         changed = true;
       }
@@ -1339,7 +1392,7 @@ static void applyHoldRulePlacement(GroupDag &g, Node *head) {
         closing->sat = pointAcquire;
         closing->scheduleAnchor = tail;
         spliceAfter(closing, tail);
-        s.expectedReleases += closing->count;
+        s.expectedArrivals += closing->count;
         c.hold.closingRelease = closing;
         continue;
       }
@@ -1736,13 +1789,15 @@ static LogicalResult verifySyncDag(GroupDag &g) {
   if (!g.root->children.empty())
     if (failed(forEachNodeChecked(g.root->children[0], verifyHold)))
       return failure();
-  SmallVector<unsigned> releaseCount(g.semas.size(), 0);
+  SmallVector<unsigned> releaseArrivals(g.semas.size(), 0);
   SmallVector<std::optional<int64_t>> acqClass(g.semas.size(), std::nullopt);
   auto verifySemaNode = [&](Node *n) -> LogicalResult {
       if (n->kind == Node::Release) {
-        releaseCount[n->sema] += std::max(1u, n->count);
         if (n->payloads.empty())
           return semaError(g.root->op) << "release without payload record";
+        releaseArrivals[n->sema] +=
+            std::max(1u, n->count) *
+            std::max(1u, static_cast<unsigned>(n->payloads.size()));
         if (n->sat) {
           if (n->sat->parent != n->parent)
             return semaError(g.root->op) << "release and its acquire are in different chains";
@@ -1766,9 +1821,10 @@ static LogicalResult verifySyncDag(GroupDag &g) {
     if (failed(forEachNodeChecked(g.root->children[0], verifySemaNode)))
       return failure();
   for (auto [sid, s] : llvm::enumerate(g.semas)) {
-    if (releaseCount[sid] != s.expectedReleases)
+    if (releaseArrivals[sid] != s.expectedArrivals)
       return semaError(g.root->op) << "semaphore "
-             << s.name << " has " << releaseCount[sid] << " releases, expected " << s.expectedReleases;
+             << s.name << " has " << releaseArrivals[sid]
+             << " release arrivals, expected " << s.expectedArrivals;
   }
   return success();
 }
