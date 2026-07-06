@@ -403,7 +403,7 @@ struct AssignStagePhase {
 
   // Docs:
   // assign-stage-phase-and-lower-semaphores.md#proving-that-pipeline-stages-use-disjoint-buffer-stages
-  // assign-stage-phase-and-lower-semaphores.md#proving-that-unsplit-circular-acquires-use-partition-disjoint-buffer-stages
+  // assign-stage-phase-and-lower-semaphores.md#proving-that-circular-acquires-use-partition-disjoint-buffer-stages
   template <typename GetOwner>
   bool proveDisjointSlotOwnership(
       ArrayRef<SemaphoreAcquireOp> candidateAcquires, StringRef proofName,
@@ -539,7 +539,7 @@ struct AssignStagePhase {
   }
 
   // Doc:
-  // assign-stage-phase-and-lower-semaphores.md#proving-that-unsplit-circular-acquires-use-partition-disjoint-buffer-stages
+  // assign-stage-phase-and-lower-semaphores.md#proving-that-circular-acquires-use-partition-disjoint-buffer-stages
   bool provePartitionDisjointSlotOwnership(
       ArrayRef<SemaphoreAcquireOp> candidateAcquires) {
     return proveDisjointSlotOwnership(
@@ -599,10 +599,9 @@ struct AssignStagePhase {
   }
 
   // Doc:
-  // assign-stage-phase-and-lower-semaphores.md#proving-that-unsplit-circular-acquires-use-partition-disjoint-buffer-stages
+  // assign-stage-phase-and-lower-semaphores.md#proving-that-circular-acquires-use-partition-disjoint-buffer-stages
   void validateCircularPartitionSlotOwnership() {
-    DenseMap<std::pair<Value, int>, SmallVector<SemaphoreAcquireOp>>
-        baseAcquiresByStage;
+    DenseMap<Value, SmallVector<SemaphoreAcquireOp>> baseAcquiresBySemaphore;
     for (Value sema : groupSemaphores) {
       auto create = sema.getDefiningOp<SemaphoreCreateOp>();
       bool isCircular = create && llvm::any_of(create.getBuffers(), [](Value v) {
@@ -622,15 +621,11 @@ struct AssignStagePhase {
         if (!stageCluster || partitionIds.size() != 1)
           continue;
 
-        int pid = partitionIds.front();
-        PhaseKey baseKey = getPhaseKey(pid, sema);
-        if (stageLanesByBaseKey.find(baseKey) != stageLanesByBaseKey.end())
-          continue;
-        baseAcquiresByStage[{sema, stageCluster->first}].push_back(acquireOp);
+        baseAcquiresBySemaphore[sema].push_back(acquireOp);
       }
     }
 
-    for (auto &entry : baseAcquiresByStage) {
+    for (auto &entry : baseAcquiresBySemaphore) {
       auto &acquires = entry.second;
       std::set<int> sortedPartitionIds;
       for (SemaphoreAcquireOp acquireOp : acquires)

@@ -60,38 +60,52 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @split_phase_shared_across_partitions
   // CHECK: [[SEM:%.*]] = nvws.semaphore.create
   // CHECK: {{%.*}}:4 = scf.for {{.*}} iter_args([[STAGE_IN:%[^ ]+]] = {{%[^,]+}}, [[L0_IN:%[^ ]+]] = {{%[^,]+}}, [[L1_IN:%[^ ]+]] = {{%[^,]+}}, {{%[^)]+}}) -> (i32, i32, i32, i32)
-  // CHECK: [[P1_L0:%.*]] = arith.xori [[L0_IN]], {{%.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
-  // CHECK: nvws.semaphore.acquire [[SEM]][{{.*}}] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>}
-  // CHECK: [[P2_L0:%.*]] = arith.xori [[P1_L0]], {{%.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
-  // CHECK: nvws.semaphore.acquire [[SEM]][{{.*}}] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>}
-  // CHECK: [[P1_L1:%.*]] = arith.xori [[L1_IN]], {{%.*}} {loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : i32
-  // CHECK: nvws.semaphore.acquire [[SEM]][{{.*}}] {loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>}
+  // CHECK: [[X_SHIFT:%.*]] = arith.shli {{%.*}}, [[X_STAGE:%.*]] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
+  // CHECK: [[P1_L0:%.*]] = arith.xori [[L0_IN]], [[X_SHIFT]] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
+  // CHECK: [[X_PHASE_SHIFT:%.*]] = arith.shrui [[P1_L0]], [[X_STAGE]] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
+  // CHECK: [[X_PHASE:%.*]] = arith.andi [[X_PHASE_SHIFT]], {{%.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
+  // CHECK: nvws.semaphore.acquire [[SEM]][[[X_STAGE]], [[X_PHASE]]] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>}
+  // CHECK: [[Y_SHIFT:%.*]] = arith.shli {{%.*}}, [[Y_STAGE:%.*]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
+  // CHECK: [[P2_L0:%.*]] = arith.xori [[P1_L0]], [[Y_SHIFT]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
+  // CHECK: [[Y_PHASE_SHIFT:%.*]] = arith.shrui [[P2_L0]], [[Y_STAGE]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
+  // CHECK: [[Y_PHASE:%.*]] = arith.andi [[Y_PHASE_SHIFT]], {{%.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
+  // CHECK: nvws.semaphore.acquire [[SEM]][[[Y_STAGE]], [[Y_PHASE]]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>}
+  // CHECK: [[Z_SHIFT:%.*]] = arith.shli {{%.*}}, [[Z_STAGE:%.*]] {loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : i32
+  // CHECK: [[P1_L1:%.*]] = arith.xori [[L1_IN]], [[Z_SHIFT]] {loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : i32
+  // CHECK: [[Z_PHASE_SHIFT:%.*]] = arith.shrui [[P1_L1]], [[Z_STAGE]] {loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : i32
+  // CHECK: [[Z_PHASE:%.*]] = arith.andi [[Z_PHASE_SHIFT]], {{%.*}} {loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : i32
+  // CHECK: nvws.semaphore.acquire [[SEM]][[[Z_STAGE]], [[Z_PHASE]]] {loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>}
   // CHECK: scf.yield {{.*}}, [[P2_L0]], [[P1_L1]], {{%.*}} : i32, i32, i32, i32
   // CHECK: ttg.partition.outputs = [array<i32: 1, 2>, array<i32: 1, 2>, array<i32: 1>, array<i32: 1>]
   tt.func @split_phase_shared_across_partitions(%lb: i32, %ub: i32,
                                                  %step: i32) {
-    %base = ttg.local_alloc {buffer.circular, buffer.copy = 4 : i32, buffer.id = 305 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<4x1xi32, #shared, #smem, mutable>
-    %sem = nvws.semaphore.create %base true {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]>
-    %driver = nvws.semaphore.create %base true {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]>
+    %base = ttg.local_alloc {buffer.circular, buffer.copy = 3 : i32, buffer.id = 305 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<3x1xi32, #shared, #smem, mutable>
+    %sem = nvws.semaphore.create %base true {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]>
+    %driver = nvws.semaphore.create %base true {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]>
     scf.for %i = %lb to %ub step %step : i32 {
       %zd0 = arith.constant {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} 0 : i32
-      %td0 = nvws.semaphore.acquire %driver[%zd0] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
-      %bd0 = nvws.semaphore.buffer %driver[%zd0], %td0 {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+      %td0 = nvws.semaphore.acquire %driver[%zd0] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+      %bd0 = nvws.semaphore.buffer %driver[%zd0], %td0 {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
       "test_store"(%bd0) {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : (!ttg.memdesc<1xi32, #shared, #smem, mutable>) -> ()
 
       %z0 = arith.constant {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} 0 : i32
-      %t0 = nvws.semaphore.acquire %sem[%z0] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+      %t0 = nvws.semaphore.acquire %sem[%z0] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+
+      %zd1 = arith.constant {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} 0 : i32
+      %td1 = nvws.semaphore.acquire %driver[%zd1] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+      %bd1 = nvws.semaphore.buffer %driver[%zd1], %td1 {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+      "test_store"(%bd1) {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : (!ttg.memdesc<1xi32, #shared, #smem, mutable>) -> ()
 
       %z1 = arith.constant {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} 0 : i32
-      %t1 = nvws.semaphore.acquire %sem[%z1] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+      %t1 = nvws.semaphore.acquire %sem[%z1] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
 
-      %zd1 = arith.constant {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} 0 : i32
-      %td1 = nvws.semaphore.acquire %driver[%zd1] {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
-      %bd1 = nvws.semaphore.buffer %driver[%zd1], %td1 {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-      "test_store"(%bd1) {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : (!ttg.memdesc<1xi32, #shared, #smem, mutable>) -> ()
+      %zd2 = arith.constant {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} 0 : i32
+      %td2 = nvws.semaphore.acquire %driver[%zd2] {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+      %bd2 = nvws.semaphore.buffer %driver[%zd2], %td2 {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+      "test_store"(%bd2) {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : (!ttg.memdesc<1xi32, #shared, #smem, mutable>) -> ()
 
       %z2 = arith.constant {loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} 0 : i32
-      %t2 = nvws.semaphore.acquire %sem[%z2] {loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+      %t2 = nvws.semaphore.acquire %sem[%z2] {loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
     } {tt.scheduled_max_stage = 1 : i32, tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.outputs = [], ttg.warp_specialize.tag = 11 : i32}
     tt.return
   }
