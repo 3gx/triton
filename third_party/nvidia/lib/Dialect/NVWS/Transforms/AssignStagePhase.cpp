@@ -21,6 +21,7 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include "InsertSemas.h"
 #include "Utilities.h"
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -113,7 +114,7 @@ struct AssignStagePhase {
   bool authoredStageOffsets = false;
   std::map<PhaseKey, SmallVector<int>> stageLanesByBaseKey;
   SmallVector<PhaseShiftUse> phaseShiftUses;
-  bool multiStagePhaseFailure = false;
+  bool phaseLegalityFailure = false;
   SmallVector<StageKey> stageKeys;
   scf::ForOp stageCloneLoop;
   DenseSet<Operation *> usesLocalStage;
@@ -286,6 +287,7 @@ struct AssignStagePhase {
     authoredStageOffsets = computeAuthoredStageOffsets();
     computeMultiStagePhaseLanes();
     computeSharedPhaseLanePartitions();
+    validateCircularPartitionSlotOwnership();
     analyzeStageCopies(semaOps.front());
   }
 
@@ -341,19 +343,11 @@ struct AssignStagePhase {
   }
 
   bool hasAffectedPhaseKeys() const { return !stageLanesByBaseKey.empty(); }
-  bool hasMultiStagePhaseFailure() const { return multiStagePhaseFailure; }
+  bool hasPhaseLegalityFailure() const { return phaseLegalityFailure; }
 
   static int64_t positiveMod(int64_t value, int64_t mod) {
     int64_t rem = value % mod;
     return rem < 0 ? rem + mod : rem;
-  }
-
-  bool acquireAppliesToKey(SemaphoreAcquireOp acquireOp, PhaseKey key) const {
-    if (acquireOp.getSemaphore() != key.semaphore)
-      return false;
-    if (!hasPartition(acquireOp))
-      return allGroupPartitionIds.contains(key.partitionId);
-    return llvm::is_contained(getPartitionIds(acquireOp), key.partitionId);
   }
 
   std::optional<int64_t>
@@ -407,25 +401,23 @@ struct AssignStagePhase {
     return loop;
   }
 
-  // Docs:
-  // assign-stage-phase-and-lower-semaphores.md#why-clone-a-phase-value-for-each-loopstage
-  //       assign-stage-phase-and-lower-semaphores.md#proving-that-pipeline-stages-use-disjoint-buffer-stages
-  bool proveStageDisjointSlotOwnership(
-      PhaseKey key, ArrayRef<SemaphoreAcquireOp> candidateAcquires) {
+  template <typename GetOwner>
+  bool proveDisjointSlotOwnership(
+      ArrayRef<SemaphoreAcquireOp> candidateAcquires, StringRef proofName,
+      StringRef conflictMessage, GetOwner getOwner) {
     scf::ForOp loop = getSingleCandidateLoop(candidateAcquires);
     if (!loop) {
-      candidateAcquires.front()->emitError(
-          "multi-stage phase split requires one statically walkable loop body");
-      multiStagePhaseFailure = true;
+      candidateAcquires.front()->emitError()
+          << proofName << " requires one statically walkable loop body";
+      phaseLegalityFailure = true;
       return false;
     }
 
     SmallVector<SemaphoreAcquireOp> groupEvents;
     if (!collectDirectGroupAcquireEvents(loop, groupEvents)) {
-      candidateAcquires.front()->emitError(
-          "multi-stage phase split requires path-invariant group acquire "
-          "sequence");
-      multiStagePhaseFailure = true;
+      candidateAcquires.front()->emitError()
+          << proofName << " requires path-invariant group acquire sequence";
+      phaseLegalityFailure = true;
       return false;
     }
 
@@ -438,54 +430,63 @@ struct AssignStagePhase {
     }
 
     if (advanceCount == 0) {
-      candidateAcquires.front()->emitError(
-          "multi-stage phase split requires at least one State.stage advance");
-      multiStagePhaseFailure = true;
+      candidateAcquires.front()->emitError()
+          << proofName << " requires at least one State.stage advance";
+      phaseLegalityFailure = true;
       return false;
     }
 
-    int64_t gcd = std::gcd(static_cast<int64_t>(getDepth()), advanceCount);
-    assert(gcd > 0 && "expected positive slot-class gcd");
+    int64_t modulus =
+        std::gcd(static_cast<int64_t>(getDepth()), advanceCount);
+    assert(modulus > 0 && "expected positive slot-class gcd");
 
-    std::map<int64_t, std::set<int>> stagesBySlotClass;
-    for (SemaphoreAcquireOp acquireOp : groupEvents) {
-      if (!acquireAppliesToKey(acquireOp, key))
-        continue;
-
-      auto stageCluster = getStageCluster(acquireOp);
-      if (!stageCluster) {
-        acquireOp->emitError(
-            "multi-stage phase split requires static loop.stage");
-        multiStagePhaseFailure = true;
+    std::map<int64_t, std::set<int>> ownersBySlotClass;
+    for (SemaphoreAcquireOp acquireOp : candidateAcquires) {
+      FailureOr<int> owner = getOwner(acquireOp);
+      if (failed(owner)) {
+        phaseLegalityFailure = true;
         return false;
       }
-
       std::optional<int64_t> authoredOffset =
           getAuthoredStageOffset(acquireOp);
       if (!authoredOffset) {
-        acquireOp->emitError(
-            "multi-stage phase split requires constant authored stage offset");
-        multiStagePhaseFailure = true;
+        acquireOp->emitError()
+            << proofName << " requires constant authored stage offset";
+        phaseLegalityFailure = true;
         return false;
       }
-
       int64_t classOffset =
           advancePositionByAcquire.lookup(acquireOp.getOperation()) +
           *authoredOffset;
-      int64_t slotClass = positiveMod(classOffset, gcd);
-      stagesBySlotClass[slotClass].insert(stageCluster->first);
+      ownersBySlotClass[positiveMod(classOffset, modulus)].insert(*owner);
     }
 
-    for (auto &[slotClass, stages] : stagesBySlotClass) {
-      if (stages.size() <= 1)
-        continue;
-      candidateAcquires.front()->emitError(
-          "multi-stage phase split cannot prove disjoint stage-owned slots");
-      multiStagePhaseFailure = true;
+    if (llvm::any_of(ownersBySlotClass,
+                     [](auto &entry) { return entry.second.size() > 1; })) {
+      candidateAcquires.front()->emitError(conflictMessage);
+      phaseLegalityFailure = true;
       return false;
     }
-
     return true;
+  }
+
+  // Docs:
+  // assign-stage-phase-and-lower-semaphores.md#why-clone-a-phase-value-for-each-loopstage
+  //       assign-stage-phase-and-lower-semaphores.md#proving-that-pipeline-stages-use-disjoint-buffer-stages
+  bool proveStageDisjointSlotOwnership(
+      ArrayRef<SemaphoreAcquireOp> candidateAcquires) {
+    return proveDisjointSlotOwnership(
+        candidateAcquires, "multi-stage phase split",
+        "multi-stage phase split cannot prove disjoint stage-owned slots",
+        [](SemaphoreAcquireOp acquireOp) -> FailureOr<int> {
+          auto stageCluster = getStageCluster(acquireOp);
+          if (!stageCluster) {
+            acquireOp->emitError(
+                "multi-stage phase split requires static loop.stage");
+            return failure();
+          }
+          return stageCluster->first;
+        });
   }
 
   void computeMultiStagePhaseLanes() {
@@ -522,16 +523,34 @@ struct AssignStagePhase {
       if (keysWithMissingStage.count(key)) {
         acquires.front()->emitError(
             "multi-stage phase split requires static loop.stage");
-        multiStagePhaseFailure = true;
+        phaseLegalityFailure = true;
         continue;
       }
 
-      if (!proveStageDisjointSlotOwnership(key, acquires))
+      if (!proveStageDisjointSlotOwnership(acquires))
         continue;
 
       stageLanesByBaseKey[key] =
           SmallVector<int>(stagesIt->second.begin(), stagesIt->second.end());
     }
+  }
+
+  bool provePartitionDisjointSlotOwnership(
+      ArrayRef<SemaphoreAcquireOp> candidateAcquires) {
+    return proveDisjointSlotOwnership(
+        candidateAcquires, "circular partition ownership check",
+        "circular semaphore has overlapping cross-partition physical-slot "
+        "ownership",
+        [](SemaphoreAcquireOp acquireOp) -> FailureOr<int> {
+          if (!hasPartition(acquireOp) ||
+              getPartitionIds(acquireOp).size() != 1) {
+            acquireOp->emitError(
+                "circular partition ownership check requires exactly one "
+                "partition per acquire");
+            return failure();
+          }
+          return getPartitionIds(acquireOp).front();
+        });
   }
 
   // Doc:
@@ -571,6 +590,47 @@ struct AssignStagePhase {
         lanes.push_back(lane);
         llvm::sort(lanes);
       }
+    }
+  }
+
+  void validateCircularPartitionSlotOwnership() {
+    DenseMap<std::pair<Value, int>, SmallVector<SemaphoreAcquireOp>>
+        baseAcquiresByStage;
+    for (Value sema : groupSemaphores) {
+      auto create = sema.getDefiningOp<SemaphoreCreateOp>();
+      bool isCircular = create && llvm::any_of(create.getBuffers(), [](Value v) {
+                          Operation *def = v.getDefiningOp();
+                          return def && def->hasAttr(
+                                            nvws_semas::kBufferCircularAttrName);
+                        });
+      if (!isCircular)
+        continue;
+
+      for (Operation *user : sema.getDefiningOp()->getUsers()) {
+        auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user);
+        if (!acquireOp || !hasPartition(acquireOp))
+          continue;
+        auto stageCluster = getStageCluster(acquireOp);
+        auto partitionIds = getPartitionIds(acquireOp);
+        if (!stageCluster || partitionIds.size() != 1)
+          continue;
+
+        int pid = partitionIds.front();
+        PhaseKey baseKey = getPhaseKey(pid, sema);
+        if (stageLanesByBaseKey.find(baseKey) != stageLanesByBaseKey.end())
+          continue;
+        baseAcquiresByStage[{sema, stageCluster->first}].push_back(acquireOp);
+      }
+    }
+
+    for (auto &entry : baseAcquiresByStage) {
+      auto &acquires = entry.second;
+      std::set<int> sortedPartitionIds;
+      for (SemaphoreAcquireOp acquireOp : acquires)
+        sortedPartitionIds.insert(getPartitionIds(acquireOp).front());
+      if (sortedPartitionIds.size() < 2)
+        continue;
+      provePartitionDisjointSlotOwnership(acquires);
     }
   }
 
@@ -1931,7 +1991,7 @@ struct AssignStagePhase {
 
     // Compute single-phase eligibility per buffer group.
     AssignStagePhase impl(semaOps);
-    if (impl.hasMultiStagePhaseFailure())
+    if (impl.hasPhaseLegalityFailure())
       return failure();
     bool finalUseSinglePhase =
         !impl.hasAffectedPhaseKeys() && impl.computeSinglePhaseEligibility();

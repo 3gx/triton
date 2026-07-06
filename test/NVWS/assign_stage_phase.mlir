@@ -98,6 +98,48 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 }
 
 // -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @base_phase_independent_across_disjoint_partitions
+  // CHECK: [[BASE_EMPTY:%.*]] = nvws.semaphore.create
+  // CHECK: {{%.*}}:3 = scf.for {{.*}} iter_args({{%[^,]+}} = {{%[^,]+}}, [[BASE_P1_IN:%[^ ]+]] = {{%[^,]+}}, [[BASE_P2_IN:%[^ ]+]] = {{%[^)]+}}) -> (i32, i32, i32)
+  // CHECK: [[BASE_A_STAGE:%.*]] = arith.select {{%.*}}, {{%.*}}, {{%.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
+  // CHECK: [[BASE_A_WORD:%.*]] = arith.xori [[BASE_P2_IN]], {{%.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : i32
+  // CHECK: [[BASE_A_SHIFT:%.*]] = arith.shrui [[BASE_A_WORD]], [[BASE_A_STAGE]] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : i32
+  // CHECK: [[BASE_A_PHASE:%.*]] = arith.andi [[BASE_A_SHIFT]], {{%.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : i32
+  // CHECK: nvws.semaphore.acquire [[BASE_EMPTY]][[[BASE_A_STAGE]], [[BASE_A_PHASE]]] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>}
+  // CHECK-NOT: nvws.semaphore.acquire [[BASE_EMPTY]]
+  // CHECK: [[BASE_B_STAGE:%.*]] = arith.select {{%.*}}, {{%.*}}, {{%.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
+  // CHECK: [[BASE_B_WORD:%.*]] = arith.xori [[BASE_P1_IN]], {{%.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : i32
+  // CHECK: [[BASE_B_SHIFT:%.*]] = arith.shrui [[BASE_B_WORD]], [[BASE_B_STAGE]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : i32
+  // CHECK: [[BASE_B_PHASE:%.*]] = arith.andi [[BASE_B_SHIFT]], {{%.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : i32
+  // CHECK: nvws.semaphore.acquire [[BASE_EMPTY]][[[BASE_B_STAGE]], [[BASE_B_PHASE]]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>}
+  // CHECK-NOT: nvws.semaphore.acquire [[BASE_EMPTY]]
+  // CHECK: scf.yield {{.*}}, [[BASE_B_WORD]], [[BASE_A_WORD]] : i32, i32, i32
+  // CHECK: ttg.partition.outputs = [array<i32: 1, 2>, array<i32: 1>, array<i32: 2>]
+  tt.func @base_phase_independent_across_disjoint_partitions(
+      %lb: i32, %ub: i32, %step: i32) {
+    %base = ttg.local_alloc {buffer.circular, buffer.copy = 4 : i32, buffer.id = 306 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<4x1xi32, #shared, #smem, mutable>
+    %empty = nvws.semaphore.create %base true {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]>
+    scf.for %i = %lb to %ub step %step : i32 {
+      %a0 = arith.constant {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} 0 : i32
+      %ta = nvws.semaphore.acquire %empty[%a0] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+      %ba = nvws.semaphore.buffer %empty[%a0], %ta {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+      "test_store"(%ba) {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : (!ttg.memdesc<1xi32, #shared, #smem, mutable>) -> ()
+
+      %b0 = arith.constant {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} 0 : i32
+      %tb = nvws.semaphore.acquire %empty[%b0] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+      %bb = nvws.semaphore.buffer %empty[%b0], %tb {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+      "test_store"(%bb) {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : (!ttg.memdesc<1xi32, #shared, #smem, mutable>) -> ()
+    } {tt.scheduled_max_stage = 0 : i32, tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.outputs = [], ttg.warp_specialize.tag = 12 : i32}
+    tt.return
+  }
+}
+
+// -----
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
