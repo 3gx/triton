@@ -61,12 +61,20 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK: [[SEM:%.*]] = nvws.semaphore.create
   // CHECK: {{%.*}}:4 = scf.for {{.*}} iter_args([[STAGE_IN:%[^ ]+]] = {{%[^,]+}}, [[L0_IN:%[^ ]+]] = {{%[^,]+}}, [[L1_IN:%[^ ]+]] = {{%[^,]+}}, {{%[^)]+}}) -> (i32, i32, i32, i32)
   // CHECK: [[P1_L0:%.*]] = arith.xori [[L0_IN]], {{%.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
-  // CHECK: nvws.semaphore.acquire [[SEM]][{{.*}}] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>}
+  // CHECK: [[P1_L0_SHIFT:%.*]] = arith.shrui [[P1_L0]], [[P1_STAGE:%.*]] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
+  // CHECK: [[P1_PHASE:%.*]] = arith.andi [[P1_L0_SHIFT]], {{%.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
+  // CHECK: nvws.semaphore.acquire [[SEM]][[[P1_STAGE]], [[P1_PHASE]]] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>}
+  // CHECK-NEXT: nvws.semaphore.acquire [[SEM]][[[P1_STAGE]], [[P1_PHASE]]] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>}
   // CHECK: [[P2_L0:%.*]] = arith.xori [[P1_L0]], {{%.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
-  // CHECK: nvws.semaphore.acquire [[SEM]][{{.*}}] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>}
+  // CHECK: [[P2_L0_SHIFT:%.*]] = arith.shrui [[P2_L0]], [[P2_STAGE:%.*]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
+  // CHECK: [[P2_PHASE:%.*]] = arith.andi [[P2_L0_SHIFT]], {{%.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i32
+  // CHECK: nvws.semaphore.acquire [[SEM]][[[P2_STAGE]], [[P2_PHASE]]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>}
+  // CHECK-NEXT: nvws.semaphore.acquire [[SEM]][[[P2_STAGE]], [[P2_PHASE]]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>}
   // CHECK: [[P1_L1:%.*]] = arith.xori [[L1_IN]], {{%.*}} {loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : i32
-  // CHECK: nvws.semaphore.acquire [[SEM]][{{.*}}] {loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>}
-  // CHECK: scf.yield {{.*}}, [[P2_L0]], [[P1_L1]], {{%.*}} : i32, i32, i32, i32
+  // CHECK: [[P1_L1_SHIFT:%.*]] = arith.shrui [[P1_L1]], [[P1_L1_STAGE:%.*]] {loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : i32
+  // CHECK: [[P1_L1_PHASE:%.*]] = arith.andi [[P1_L1_SHIFT]], {{%.*}} {loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : i32
+  // CHECK: nvws.semaphore.acquire [[SEM]][[[P1_L1_STAGE]], [[P1_L1_PHASE]]] {loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>}
+  // CHECK-NEXT: scf.yield {{.*}}, [[P2_L0]], [[P1_L1]], {{%.*}} : i32, i32, i32, i32
   // CHECK: ttg.partition.outputs = [array<i32: 1, 2>, array<i32: 1, 2>, array<i32: 1>, array<i32: 1>]
   tt.func @split_phase_shared_across_partitions(%lb: i32, %ub: i32,
                                                  %step: i32) {
