@@ -1835,6 +1835,33 @@ struct ScheduleEdge {
   Operation *consumer = nullptr;
 };
 
+// A handoff constrains the whole-iteration skew between its two owners. If a
+// release by `producerOwner` at stage P supplies an acquire by `consumerOwner`
+// at stage C and loop distance D, their owner offsets must satisfy
+//
+//   offset[consumerOwner] >= offset[producerOwner] + P - C - D.
+//
+// One positive edge is legal backpressure: the consumer can wait while the
+// producer advances. Only a positive-weight owner cycle is impossible.
+struct OwnerScheduleConstraint {
+  Owner producerOwner;
+  Owner consumerOwner;
+  Operation *producer = nullptr;
+  Operation *consumer = nullptr;
+  int64_t producerStage = 0;
+  int64_t consumerStage = 0;
+  int64_t distance = 0;
+
+  int64_t requiredDelay() const {
+    return producerStage - consumerStage - distance;
+  }
+};
+
+struct LoopScheduleModel {
+  SmallVector<ScheduleEdge, 4> clusterEdges;
+  SmallVector<OwnerScheduleConstraint, 4> ownerConstraints;
+};
+
 struct SlotSchedule {
   int64_t advancesPerIteration = 0;
   DenseMap<Node *, int64_t> ordinalByAccess;
@@ -2173,8 +2200,153 @@ assignBufferStageOffsets(MutableArrayRef<GroupDag> groups) {
 }
 
 // Doc: sync-dag.md#finalizing-one-handoff
+// Solve the owner-skew difference constraints for one scheduled loop. Longest
+// path relaxation converges exactly when every owner cycle has non-positive
+// total required delay. A change on the |V|th pass proves a positive cycle.
+//
+// Edges on a zero-delay cycle execute in the same expanded pipeline wave after
+// applying the solved owner offsets. They need the same loop.cluster ordering
+// repair as a directly zero-delay handoff. Direct zero-delay edges retain the
+// existing repair even when they are not part of a cycle.
+static LogicalResult solveOwnerScheduleConstraints(LoopScheduleModel &model) {
+  if (model.ownerConstraints.empty())
+    return success();
+
+  DenseMap<int64_t, unsigned> vertexByOwner;
+  auto getVertex = [&](const Owner &owner) {
+    int64_t key = ownerKey(owner);
+    auto [it, inserted] =
+        vertexByOwner.try_emplace(key, vertexByOwner.size());
+    return it->second;
+  };
+  for (const OwnerScheduleConstraint &constraint : model.ownerConstraints) {
+    getVertex(constraint.producerOwner);
+    getVertex(constraint.consumerOwner);
+  }
+
+  const unsigned numVertices = vertexByOwner.size();
+  SmallVector<int64_t, 8> offset(numVertices, 0);
+  SmallVector<std::optional<unsigned>, 8> predecessor(numVertices);
+  std::optional<unsigned> lastUpdated;
+  for (unsigned iteration = 0; iteration < numVertices; ++iteration) {
+    lastUpdated.reset();
+    for (auto [edgeIndex, constraint] :
+         llvm::enumerate(model.ownerConstraints)) {
+      unsigned producer = getVertex(constraint.producerOwner);
+      unsigned consumer = getVertex(constraint.consumerOwner);
+      int64_t candidate =
+          offset[producer] + constraint.requiredDelay();
+      if (offset[consumer] >= candidate)
+        continue;
+      offset[consumer] = candidate;
+      predecessor[consumer] = edgeIndex;
+      lastUpdated = edgeIndex;
+    }
+    if (!lastUpdated)
+      break;
+  }
+
+  if (lastUpdated) {
+    unsigned vertex = getVertex(
+        model.ownerConstraints[*lastUpdated].consumerOwner);
+    for (unsigned i = 0; i < numVertices; ++i) {
+      if (!predecessor[vertex])
+        break;
+      vertex = getVertex(
+          model.ownerConstraints[*predecessor[vertex]].producerOwner);
+    }
+
+    SmallVector<unsigned, 4> cycle;
+    unsigned cycleStart = vertex;
+    do {
+      if (!predecessor[vertex]) {
+        cycle.clear();
+        break;
+      }
+      unsigned edgeIndex = *predecessor[vertex];
+      cycle.push_back(edgeIndex);
+      vertex = getVertex(
+          model.ownerConstraints[edgeIndex].producerOwner);
+    } while (vertex != cycleStart && cycle.size() <= numVertices);
+
+    if (cycle.empty())
+      cycle.push_back(*lastUpdated);
+    int64_t cycleDelay = 0;
+    for (unsigned edgeIndex : cycle)
+      cycleDelay += model.ownerConstraints[edgeIndex].requiredDelay();
+
+    const OwnerScheduleConstraint &first =
+        model.ownerConstraints[cycle.front()];
+    InFlightDiagnostic diag = semaError(first.producer)
+                              << "fixed loop.stage assignments form an "
+                                 "unsatisfiable semaphore handoff cycle";
+    if (cycleDelay > 0)
+      diag << " (cycle requires " << cycleDelay
+           << " additional pipeline iteration"
+           << (cycleDelay == 1 ? "" : "s") << ")";
+    for (unsigned edgeIndex : llvm::reverse(cycle)) {
+      const OwnerScheduleConstraint &constraint =
+          model.ownerConstraints[edgeIndex];
+      diag.attachNote(constraint.consumer->getLoc())
+          << "handoff "
+          << ownerStr(constraint.producer, constraint.producerOwner) << " -> "
+          << ownerStr(constraint.consumer, constraint.consumerOwner)
+          << " has producer loop.stage " << constraint.producerStage
+          << ", consumer loop.stage " << constraint.consumerStage
+          << ", loop-carried dependency distance " << constraint.distance
+          << ", and required delay " << constraint.requiredDelay();
+    }
+    return failure();
+  }
+
+  SmallVector<unsigned, 8> producerVertex;
+  SmallVector<unsigned, 8> consumerVertex;
+  SmallVector<bool, 8> tight;
+  for (const OwnerScheduleConstraint &constraint : model.ownerConstraints) {
+    unsigned producer = getVertex(constraint.producerOwner);
+    unsigned consumer = getVertex(constraint.consumerOwner);
+    producerVertex.push_back(producer);
+    consumerVertex.push_back(consumer);
+    tight.push_back(offset[consumer] ==
+                    offset[producer] + constraint.requiredDelay());
+  }
+
+  auto hasTightPath = [&](unsigned from, unsigned to) {
+    SmallVector<unsigned, 8> stack{from};
+    SmallVector<bool, 8> seen(numVertices, false);
+    while (!stack.empty()) {
+      unsigned vertex = stack.pop_back_val();
+      if (vertex == to)
+        return true;
+      if (seen[vertex])
+        continue;
+      seen[vertex] = true;
+      for (unsigned edgeIndex = 0; edgeIndex < model.ownerConstraints.size();
+           ++edgeIndex)
+        if (tight[edgeIndex] && producerVertex[edgeIndex] == vertex)
+          stack.push_back(consumerVertex[edgeIndex]);
+    }
+    return false;
+  };
+
+  for (unsigned edgeIndex = 0; edgeIndex < model.ownerConstraints.size();
+       ++edgeIndex) {
+    const OwnerScheduleConstraint &constraint =
+        model.ownerConstraints[edgeIndex];
+    bool directlySameWave = constraint.requiredDelay() == 0;
+    bool onZeroDelayCycle =
+        tight[edgeIndex] &&
+        hasTightPath(consumerVertex[edgeIndex], producerVertex[edgeIndex]);
+    if (directlySameWave || onZeroDelayCycle)
+      model.clusterEdges.push_back(
+          ScheduleEdge{constraint.producer, constraint.consumer});
+  }
+  return success();
+}
+
+// Doc: sync-dag.md#finalizing-one-handoff
 static LogicalResult addSyncScheduleEdges(MutableArrayRef<GroupDag> groups,
-    llvm::MapVector<Operation *, SmallVector<ScheduleEdge, 4>> &edgesByLoop) {
+    llvm::MapVector<Operation *, LoopScheduleModel> &modelsByLoop) {
   SmallVector<SmallVector<GroupDag *, 2>, 8> physicalSets;
   DenseMap<GroupDag *, unsigned> setByGroup;
   llvm::MapVector<int64_t, unsigned> circularSetByBuffer;
@@ -2237,20 +2409,11 @@ static LogicalResult addSyncScheduleEdges(MutableArrayRef<GroupDag> groups,
         }
         distance = *loopCarriedDistance;
       }
-      if (producerSchedule->first > consumerSchedule->first + distance) {
-        InFlightDiagnostic diag = semaError(anchors->producer) << "fixed loop.stage assignment cannot "
-                                     "satisfy semaphore handoff";
-        diag << " (producer loop.stage " << producerSchedule->first
-             << ", consumer loop.stage " << consumerSchedule->first
-             << ", loop-carried dependency distance " << distance << ")";
-        diag.attachNote(anchors->consumer->getLoc())
-            << "consumer would execute before the released slot can be "
-               "reacquired";
-        return failure();
-      }
-      if (producerSchedule->first == consumerSchedule->first + distance)
-        edgesByLoop[anchors->loop.getOperation()].push_back(
-            ScheduleEdge{anchors->producer, anchors->consumer});
+      modelsByLoop[anchors->loop.getOperation()]
+          .ownerConstraints.push_back(OwnerScheduleConstraint{
+              release->owner, acquire->owner, anchors->producer,
+              anchors->consumer, producerSchedule->first,
+              consumerSchedule->first, distance});
       return success();
     };
     if (!group.root->children.empty() &&
@@ -2405,16 +2568,20 @@ static void assignSyncScheduleChain(Node *head, ScheduleCache &cache) {
 }
 
 LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups) {
-  llvm::MapVector<Operation *, SmallVector<ScheduleEdge, 4>> edgesByLoop;
+  llvm::MapVector<Operation *, LoopScheduleModel> modelsByLoop;
   if (failed(assignBufferStageOffsets(groups)))
     return failure();
-  if (failed(addSyncScheduleEdges(groups, edgesByLoop)))
+  if (failed(addSyncScheduleEdges(groups, modelsByLoop)))
     return failure();
-  for (auto &[loopOp, edges] : edgesByLoop) {
+  for (auto &[loopOp, model] : modelsByLoop) {
     auto loop = cast<scf::ForOp>(loopOp);
-    addSSAClusterConstraints(loop, edges);
-    if (failed(legalizeLoopSchedule(loop, edges)))
+    if (failed(solveOwnerScheduleConstraints(model)))
       return failure();
+    if (!model.clusterEdges.empty()) {
+      addSSAClusterConstraints(loop, model.clusterEdges);
+      if (failed(legalizeLoopSchedule(loop, model.clusterEdges)))
+        return failure();
+    }
   }
   for (GroupDag &g : groups) {
     if (g.root->children.empty())

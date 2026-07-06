@@ -5,11 +5,12 @@
 #smem = #ttg.shared_memory
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-  // The loop-carried dependency distance is one. A producer at loop.stage 2
-  // followed by a consumer at loop.stage 0 violates the pipeliner's schedule
-  // and cannot be repaired by reordering clusters.
-  // CHECK: error: nvws-insert-semas: fixed loop.stage assignment cannot satisfy semaphore handoff (producer loop.stage 2, consumer loop.stage 0, loop-carried dependency distance 1)
-  // CHECK: note: consumer would execute before the released slot can be reacquired
+  // The EMPTY handoff from partition 1 to partition 3 requires one iteration
+  // of owner delay, while the reverse FULL handoff has zero delay. Their
+  // positive cycle cannot be satisfied by cross-partition backpressure.
+  // CHECK: error: nvws-insert-semas: fixed loop.stage assignments form an unsatisfiable semaphore handoff cycle (cycle requires 1 additional pipeline iteration)
+  // CHECK-DAG: note: handoff {1} -> {3} has producer loop.stage 2, consumer loop.stage 0, loop-carried dependency distance 1, and required delay 1
+  // CHECK-DAG: note: handoff {3} -> {1} has producer loop.stage 0, consumer loop.stage 0, loop-carried dependency distance 0, and required delay 0
   tt.func @invalid_loop_carried_schedule(%lb: i32, %ub: i32, %step: i32) {
     %alloc = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 421 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {

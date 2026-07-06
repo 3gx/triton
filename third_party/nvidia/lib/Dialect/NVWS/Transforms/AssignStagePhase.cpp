@@ -401,6 +401,9 @@ struct AssignStagePhase {
     return loop;
   }
 
+  // Docs:
+  // assign-stage-phase-and-lower-semaphores.md#proving-that-pipeline-stages-use-disjoint-buffer-stages
+  // assign-stage-phase-and-lower-semaphores.md#proving-that-unsplit-circular-acquires-use-partition-disjoint-buffer-stages
   template <typename GetOwner>
   bool proveDisjointSlotOwnership(
       ArrayRef<SemaphoreAcquireOp> candidateAcquires, StringRef proofName,
@@ -535,6 +538,8 @@ struct AssignStagePhase {
     }
   }
 
+  // Doc:
+  // assign-stage-phase-and-lower-semaphores.md#proving-that-unsplit-circular-acquires-use-partition-disjoint-buffer-stages
   bool provePartitionDisjointSlotOwnership(
       ArrayRef<SemaphoreAcquireOp> candidateAcquires) {
     return proveDisjointSlotOwnership(
@@ -593,6 +598,8 @@ struct AssignStagePhase {
     }
   }
 
+  // Doc:
+  // assign-stage-phase-and-lower-semaphores.md#proving-that-unsplit-circular-acquires-use-partition-disjoint-buffer-stages
   void validateCircularPartitionSlotOwnership() {
     DenseMap<std::pair<Value, int>, SmallVector<SemaphoreAcquireOp>>
         baseAcquiresByStage;
