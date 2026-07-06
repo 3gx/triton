@@ -904,6 +904,18 @@ static LogicalResult foldCircularBackingsAndCreates(ArrayRef<GroupDag *> set) {
       break;
     }
   Value base = baseGroup->backing.front();
+  Operation *baseAlloc = base.getDefiningOp();
+  Operation *earliestAlloc = baseAlloc;
+  for (GroupDag *g : set) {
+    Operation *alloc = g->backing.front().getDefiningOp();
+    if (!alloc || alloc->getBlock() != baseAlloc->getBlock())
+      return semaError(baseAlloc)
+             << "circular folded backings must be defined in one block";
+    if (alloc->isBeforeInBlock(earliestAlloc))
+      earliestAlloc = alloc;
+  }
+  if (earliestAlloc != baseAlloc)
+    baseAlloc->moveBefore(earliestAlloc);
   for (GroupDag *g : set) {
     Value backing = g->backing.front();
     if (backing == base)
