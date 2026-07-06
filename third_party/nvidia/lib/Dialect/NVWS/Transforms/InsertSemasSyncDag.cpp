@@ -1818,15 +1818,6 @@ static std::optional<int64_t> recordPhysicalStage(
   return requiredOrdinal;
 }
 
-static InFlightDiagnostic scheduleWarning(Operation *op) {
-  return op->emitWarning() << "nvws-insert-semas: ";
-}
-
-template <typename OpTy>
-static InFlightDiagnostic scheduleWarning(OpTy op) {
-  return scheduleWarning(op.getOperation());
-}
-
 // Doc: sync-dag.md#circular-groups
 // Derive physical ring displacements before EMIT so protocol and views agree.
 static LogicalResult assignCircularStageOffsets(MutableArrayRef<GroupDag> groups) {
@@ -1878,15 +1869,13 @@ static LogicalResult assignCircularStageOffsets(MutableArrayRef<GroupDag> groups
                               event.group, event.access, produces);
       if (produces) {
         assert(stage);
-        if (member.circularStart != *stage % numCopies) {
-          scheduleWarning(member.allocOp)
-              << "circular producer order expects buffer.start "
-              << *stage % numCopies << ", got " << member.circularStart;
-        }
+        if (member.circularStart != *stage % numCopies)
+          return semaError(member.allocOp)
+                 << "circular producer order expects buffer.start "
+                 << *stage % numCopies << ", got " << member.circularStart;
       } else if (!stage) {
-        scheduleWarning(member.allocOp)
-            << "circular consumer appears before producer";
-        continue;
+        return semaError(member.allocOp)
+               << "circular consumer appears before producer";
       }
       event.access->bufferStageOffset = *stage - cursorOrdinal;
     }
@@ -2057,19 +2046,19 @@ static LogicalResult assignAliasedHandoffStageOffsets(GroupDag &group) {
     if (!producer || !consumer || producer->kind != Node::Access ||
         consumer->kind != Node::Access || producer->parent != consumer->parent ||
         !producer->parent || producer->parent->kind != Node::For) {
-      scheduleWarning(producer && producer->op ? producer->op : group.root->op)
+      semaError(producer && producer->op ? producer->op : group.root->op)
           << "multibuffered exact-alias handoff requires direct accesses "
              "in one loop body";
-      return success();
+      return failure();
     }
     auto loop = dyn_cast<scf::ForOp>(producer->parent->op);
     if (!loop ||
         loop.getBody()->findAncestorOpInBlock(*producer->op) != producer->op ||
         loop.getBody()->findAncestorOpInBlock(*consumer->op) != consumer->op) {
-      scheduleWarning(producer->op)
+      semaError(producer->op)
           << "multibuffered exact-alias handoff is not directly "
              "represented in its ownership loop";
-      return success();
+      return failure();
     }
     auto [it, inserted] = slotsByLoop.try_emplace(loop.getOperation());
     if (inserted)
@@ -2080,9 +2069,9 @@ static LogicalResult assignAliasedHandoffStageOffsets(GroupDag &group) {
     if (!slots.complete || producerIt == slots.ordinalByAccess.end() ||
         consumerIt == slots.ordinalByAccess.end() ||
         slots.advancesPerIteration <= 0) {
-      scheduleWarning(producer->op)
+      semaError(producer->op)
           << "cannot derive multibuffered exact-alias handoff slots";
-      return success();
+      return failure();
     }
     int64_t numSemaphoreCopies = group.numSemaphoreCopies;
     int64_t offset = 0;
@@ -2183,26 +2172,25 @@ static LogicalResult addSyncScheduleEdges(MutableArrayRef<GroupDag> groups,
             it->second, group.numSemaphoreCopies, release->scheduleAnchor,
             acquire->scheduleAnchor);
         if (!loopCarriedDistance) {
-          InFlightDiagnostic diag = scheduleWarning(anchors->producer)
+          InFlightDiagnostic diag = semaError(anchors->producer)
               << "cannot determine loop-carried dependency distance for a "
                  "physical buffer slot";
           diag.attachNote(anchors->consumer->getLoc())
               << "next token ownership starts here";
-          return success();
+          return failure();
         }
         distance = *loopCarriedDistance;
       }
       if (producerSchedule->first > consumerSchedule->first + distance) {
-        InFlightDiagnostic diag =
-            scheduleWarning(anchors->producer)
-            << "fixed loop.stage assignment cannot satisfy semaphore handoff";
+        InFlightDiagnostic diag = semaError(anchors->producer) << "fixed loop.stage assignment cannot "
+                                     "satisfy semaphore handoff";
         diag << " (producer loop.stage " << producerSchedule->first
              << ", consumer loop.stage " << consumerSchedule->first
              << ", loop-carried dependency distance " << distance << ")";
         diag.attachNote(anchors->consumer->getLoc())
             << "consumer would execute before the released slot can be "
                "reacquired";
-        return success();
+        return failure();
       }
       if (producerSchedule->first == consumerSchedule->first + distance)
         edgesByLoop[anchors->loop.getOperation()].push_back(
@@ -2263,17 +2251,8 @@ static LogicalResult legalizeLoopSchedule(scf::ForOp loop, ArrayRef<ScheduleEdge
     }
     if (!changed)
       break;
-    if (iteration == scheduledOps.size()) {
-      scheduleWarning(loop) << "cyclic loop.cluster constraints";
-      return success();
-    }
-  }
-  for (Operation *op : scheduledOps) {
-    int64_t newCluster = cluster.lookup(op);
-    if (newCluster <= std::numeric_limits<int32_t>::max())
-      continue;
-    scheduleWarning(op) << "legalized loop.cluster exceeds i32 range";
-    return success();
+    if (iteration == scheduledOps.size())
+      return semaError(loop) << "cyclic loop.cluster constraints";
   }
   OpBuilder builder(loop.getContext());
   for (Operation *op : scheduledOps) {
@@ -2281,9 +2260,9 @@ static LogicalResult legalizeLoopSchedule(scf::ForOp loop, ArrayRef<ScheduleEdge
     int64_t newCluster = cluster.lookup(op);
     if (newCluster == oldSchedule->second)
       continue;
-    gpu::setStageCluster(
-        builder, op,
-        std::make_pair(oldSchedule->first, static_cast<int>(newCluster)));
+    if (newCluster > std::numeric_limits<int32_t>::max())
+      return semaError(op) << "legalized loop.cluster exceeds i32 range";
+    gpu::setStageCluster(builder, op, std::make_pair(oldSchedule->first, static_cast<int>(newCluster)));
   }
   return success();
 }
