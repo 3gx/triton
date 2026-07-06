@@ -33,7 +33,7 @@
   - [Finalizing one handoff](#finalizing-one-handoff)
 - [Authored buffer-stage offsets](#authored-buffer-stage-offsets)
   - [Circular groups](#circular-groups)
-  - [Non-circular exact-alias handoffs](#non-circular-exact-alias-handoffs)
+  - [Non-circular alias handoffs](#non-circular-alias-handoffs)
 - [Code map](#code-map)
 
 ## Purpose
@@ -2150,7 +2150,7 @@ as bare `gated`. All three use the same carried-token fallback.
 
 `computeBackingPlan` chooses the number of copies. `buffer.copy`, when
 present, is authoritative: `@fused_alias_depth_two` (worked below in
-[Exact-alias handoffs](#non-circular-exact-alias-handoffs))
+[Alias handoffs](#non-circular-alias-handoffs))
 carries it on its allocation —
 
 ```text
@@ -2536,15 +2536,15 @@ shift from the current stage of its backing buffer. The shift is applied modulo
 `+1` the following stage.
 
 `assignBufferStageOffsets` runs one physical-stage analysis for circular
-groups and non-circular exact-alias backings. It replays the fresh-write cursor
+groups and non-circular aliased backings. It replays the fresh-write cursor
 that ASP will use: a write records the cursor ordinal as the group's current
 value, and a read uses the latest ordinal recorded for its group. The analysis
-does not distinguish SMEM from TMEM. Circular metadata and exact aliasing only
+does not distinguish SMEM from TMEM. Circular metadata and alias grouping only
 determine how the allocations are represented and where the computed offsets
 are attached.
 
-Circular members are separate groups, while exact aliases are names in one
-group. For an access or semaphore node:
+Circular members are separate groups, while non-circular aliases are names in
+one group. For an access or semaphore node:
 
 ```text
 stage-offset = required value ordinal - current cursor ordinal
@@ -2601,11 +2601,15 @@ before any release has run (`S1{count=1 entry inherit={@1.1}}`). K's consumer
 must address the copy produced *before* V advanced the ring — the `-1` on
 exactly K's consumer nodes (`a S0 {2}` and `r S1 {2}`).
 
-### Non-circular exact-alias handoffs
+### Non-circular alias handoffs
 
-Non-circular exact-alias handoffs reuse the fresh-write stage replay described
-above. Their release shifts are derived from that replay. This handling applies
-uniformly to SMEM and TMEM.
+Non-circular alias handoffs reuse the fresh-write stage replay described above.
+Their release shifts are derived from that replay. Planner-authored
+`buffer.copy` supplies one shared physical stage domain for every member of a
+`buffer.id` group; the member memdescs may be different views of that backing.
+Separately staged semaphores without a planner-authored multi-copy backing keep
+the narrower exact-alias requirement. This handling applies uniformly to SMEM
+and TMEM.
 
 The motivating example happens to use SMEM: a split epilogue such as the `dV`
 store in backward attention. Two logical allocations have the same

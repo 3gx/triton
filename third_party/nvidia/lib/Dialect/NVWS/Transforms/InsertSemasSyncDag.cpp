@@ -228,21 +228,22 @@ private:
     Payloads payloads{asyncPayloadOf(node->op)};
 
     // A release describes every completion signal produced during one
-    // ownership wave, not just the last access in that wave.  Exact-alias
-    // members can be written consecutively by the same owner before another
-    // owner consumes either member.  Keep earlier async completions in that
-    // case; otherwise a later synchronous write would hide (for example) a
-    // descriptor load from LowerAref.
+    // ownership wave, not just the last access in that wave.  Members can be
+    // written consecutively by the same owner before another owner consumes
+    // either member.  Keep earlier async completions in that case; otherwise a
+    // later synchronous write would hide (for example) a descriptor load from
+    // LowerAref.
     //
     // A foreign active use marks an ownership handoff.  Its dependency has
     // already consumed the earlier wave, so a write after that handoff starts
     // a fresh payload set rather than carrying completed work forward.
-    // Limit this local proof to an exact-alias group.  With multiple pieces,
-    // another piece can force a token handoff without changing this piece's
-    // active uses; retaining its old payload would then attach work from an
-    // earlier token to the new release.
-    if (group.pieceTable.members.size() > 1 &&
-        group.pieceTable.pieces.size() == 1) {
+    // Use the group-wide token-reuse proof rather than member geometry.  It
+    // requires one reusable owner token and proves that no new handoff is
+    // needed on any touched piece, so a handoff forced by an overlapping piece
+    // starts a fresh payload set.
+    bool synchronousWrite = payloads.front() == AsyncOp::NONE;
+    if (group.pieceTable.members.size() > 1 && canReuse &&
+        synchronousWrite) {
       for (auto [id, effect] : effects) {
         if (effect != Effect::W)
           continue;
@@ -2095,8 +2096,8 @@ computeLoopCarriedDistance(const SlotSchedule &slots,
       return distance;
   return std::nullopt;
 }
-// Doc: sync-dag.md#non-circular-exact-alias-handoffs
-static bool isExactAliasMultibufferedGroup(const GroupDag &group) {
+// Doc: sync-dag.md#non-circular-alias-handoffs
+static bool isAliasedMultibufferedGroup(const GroupDag &group) {
   if (group.isCircular() ||
       group.pieceTable.members.size() < 2 || group.numSemaphoreCopies <= 1)
     return false;
@@ -2108,8 +2109,16 @@ static bool isExactAliasMultibufferedGroup(const GroupDag &group) {
   // stable stage domain required for authored offsets.
   bool authoredMulticopy = hasPlannedCopy && group.numCopies > 1;
   bool extraSemaphoreStages = group.numSemaphoreCopies > group.numCopies;
-  if (!authoredMulticopy && !extraSemaphoreStages)
+  // Planner-authored copies give every member of this buffer.id group one
+  // shared physical stage domain.  Member memdescs are views of that backing
+  // and need not have identical offsets, extents, or types.
+  if (authoredMulticopy)
+    return true;
+  if (!extraSemaphoreStages)
     return false;
+
+  // Preserve the existing exact-alias fallback for separately staged
+  // semaphores that do not have a planner-authored multi-copy backing.
   const Member &first = group.pieceTable.members.front();
   return llvm::all_of(group.pieceTable.members, [&](const Member &member) {
     return member.offset == first.offset && member.extent == first.extent && member.type == first.type;
@@ -2117,7 +2126,7 @@ static bool isExactAliasMultibufferedGroup(const GroupDag &group) {
 }
 
 static LogicalResult assignAliasedHandoffStageOffsets(GroupDag &group) {
-  if (!isExactAliasMultibufferedGroup(group))
+  if (!isAliasedMultibufferedGroup(group))
     return success();
   DenseMap<Operation *, SlotSchedule> slotsByLoop;
   bool hasShiftedRelease = false;
@@ -2130,7 +2139,7 @@ static LogicalResult assignAliasedHandoffStageOffsets(GroupDag &group) {
         consumer->kind != Node::Access || producer->parent != consumer->parent ||
         !producer->parent || producer->parent->kind != Node::For) {
       semaError(producer && producer->op ? producer->op : group.root->op)
-          << "multibuffered exact-alias handoff requires direct accesses "
+          << "multibuffered alias handoff requires direct accesses "
              "in one loop body";
       return failure();
     }
@@ -2139,7 +2148,7 @@ static LogicalResult assignAliasedHandoffStageOffsets(GroupDag &group) {
         loop.getBody()->findAncestorOpInBlock(*producer->op) != producer->op ||
         loop.getBody()->findAncestorOpInBlock(*consumer->op) != consumer->op) {
       semaError(producer->op)
-          << "multibuffered exact-alias handoff is not directly "
+          << "multibuffered alias handoff is not directly "
              "represented in its ownership loop";
       return failure();
     }
@@ -2153,7 +2162,7 @@ static LogicalResult assignAliasedHandoffStageOffsets(GroupDag &group) {
         consumerIt == slots.ordinalByAccess.end() ||
         slots.advancesPerIteration <= 0) {
       semaError(producer->op)
-          << "cannot derive multibuffered exact-alias handoff slots";
+          << "cannot derive multibuffered alias handoff slots";
       return failure();
     }
     int64_t numSemaphoreCopies = group.numSemaphoreCopies;
