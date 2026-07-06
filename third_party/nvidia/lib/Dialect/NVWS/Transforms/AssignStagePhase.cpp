@@ -106,6 +106,7 @@ struct AssignStagePhase {
   SetVector<Value> groupSemaphores;
   bool useSinglePhaseForGroup = false;
   SetVector<int> allGroupPartitionIds;  // all partition IDs across all acquires
+  DenseMap<std::pair<Value, int>, SetVector<int>> sharedPhaseLanePartitionIds;
   DenseMap<Value, Value> initialPhases; // initial phase by semaphore
   DenseMap<std::pair<Operation *, Value>, int> tokToStagePosMap;
   DenseMap<Value, Value> tokenLogicalStage;
@@ -284,6 +285,7 @@ struct AssignStagePhase {
       allGroupPartitionIds.insert(0);
     authoredStageOffsets = computeAuthoredStageOffsets();
     computeMultiStagePhaseLanes();
+    computeSharedPhaseLanePartitions();
     analyzeStageCopies(semaOps.front());
   }
 
@@ -295,8 +297,23 @@ struct AssignStagePhase {
 
   PhaseKey getPhaseKey(int partitionId, Value semaphore,
                        int stageLane = -1) const {
+    auto sharedIt =
+        sharedPhaseLanePartitionIds.find({semaphore, stageLane});
+    if (sharedIt != sharedPhaseLanePartitionIds.end() &&
+        sharedIt->second.contains(partitionId))
+      partitionId = sharedIt->second.front();
     return PhaseKey{partitionId, getSemaphoreOrder(semaphore), semaphore,
                     stageLane};
+  }
+
+  SetVector<int> getPhasePartitionIds(PhaseKey key) const {
+    auto it =
+        sharedPhaseLanePartitionIds.find({key.semaphore, key.stageLane});
+    if (it != sharedPhaseLanePartitionIds.end())
+      return it->second;
+    SetVector<int> ids;
+    ids.insert(key.partitionId);
+    return ids;
   }
 
   SmallVector<PhaseKey> getPhaseKeys(int partitionId, Value semaphore) const {
@@ -514,6 +531,44 @@ struct AssignStagePhase {
 
       stageLanesByBaseKey[key] =
           SmallVector<int>(stagesIt->second.begin(), stagesIt->second.end());
+    }
+  }
+
+  void computeSharedPhaseLanePartitions() {
+    SmallVector<std::pair<PhaseKey, int>> lanesToAdd;
+    for (auto &[baseKey, lanes] : stageLanesByBaseKey) {
+      for (int lane : lanes) {
+        auto laneKey = std::make_pair(baseKey.semaphore, lane);
+        if (sharedPhaseLanePartitionIds.contains(laneKey))
+          continue;
+        std::set<int> sortedPartitionIds;
+        for (Operation *user : baseKey.semaphore.getDefiningOp()->getUsers()) {
+          auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user);
+          auto stageCluster = acquireOp ? getStageCluster(acquireOp)
+                                        : StageCluster{};
+          if (!stageCluster || stageCluster->first != lane ||
+              !hasPartition(acquireOp))
+            continue;
+          auto partitionIds = getPartitionIds(acquireOp);
+          if (partitionIds.size() == 1)
+            sortedPartitionIds.insert(partitionIds.front());
+        }
+        if (sortedPartitionIds.size() < 2)
+          continue;
+        auto &partitionIds = sharedPhaseLanePartitionIds[laneKey];
+        partitionIds.insert(sortedPartitionIds.begin(),
+                            sortedPartitionIds.end());
+        for (int pid : partitionIds)
+          lanesToAdd.push_back({getPhaseKey(pid, baseKey.semaphore), lane});
+      }
+    }
+
+    for (auto [baseKey, lane] : lanesToAdd) {
+      auto &lanes = stageLanesByBaseKey[baseKey];
+      if (!llvm::is_contained(lanes, lane)) {
+        lanes.push_back(lane);
+        llvm::sort(lanes);
+      }
     }
   }
 
@@ -1477,8 +1532,7 @@ struct AssignStagePhase {
     forOpOutputsIds.push_back(SetVector<int>(allGroupPartitionIds.begin(),
                                              allGroupPartitionIds.end()));
     for (PhaseKey key : summary.acquiredPhaseKeys) {
-      SetVector<int> argIds;
-      argIds.insert(key.partitionId);
+      SetVector<int> argIds = getPhasePartitionIds(key);
       forOpIds.insert(argIds.begin(), argIds.end());
       forOpOutputsIds.push_back(argIds);
     }
@@ -1520,6 +1574,8 @@ struct AssignStagePhase {
     // Replace provisional phase result IDs with IDs inferred from final values.
     for (auto [i, key] : llvm::enumerate(summary.acquiredPhaseKeys)) {
       auto argIds = inferPartitionIds(extraYieldArgs[1 + i], key.partitionId);
+      auto phaseIds = getPhasePartitionIds(key);
+      argIds.insert(phaseIds.begin(), phaseIds.end());
       forOpIds.insert(argIds.begin(), argIds.end());
       forOpOutputsIds[nArgs + 1 + i] = argIds;
     }
@@ -1598,7 +1654,7 @@ struct AssignStagePhase {
                                             allGroupPartitionIds.end()));
     // Phase: per-key partition IDs.
     for (PhaseKey key : thenSummary.acquiredPhaseKeys) {
-      SetVector<int> phaseIds;
+      SetVector<int> phaseIds = getPhasePartitionIds(key);
       for (Value arg : {getPhase(thenState, key), getPhase(elseState, key)}) {
         auto ids = inferPartitionIds(arg, key.partitionId);
         phaseIds.insert(ids.begin(), ids.end());
@@ -1665,16 +1721,16 @@ struct AssignStagePhase {
         };
         auto createIntoPhaseForKey = [&](PhaseKey key, auto opTy,
                                          auto... args) {
-          if (!key.hasStageLane())
+          auto phaseIds = getPhasePartitionIds(key);
+          bool sharedPhase = phaseIds.size() > 1;
+          if (!key.hasStageLane() && !sharedPhase)
             return createIntoPhase(opTy,
                                    std::forward<decltype(args)>(args)...);
 
-          std::optional<SetVector<int>> keyPids;
-          keyPids.emplace();
-          keyPids->insert(key.partitionId);
+          std::optional<SetVector<int>> keyPids(std::move(phaseIds));
 
           StageCluster keyStageCluster = stageCluster;
-          if (keyStageCluster)
+          if (keyStageCluster && key.hasStageLane())
             keyStageCluster->first = key.stageLane;
 
           return createIntoAt(keyPids, keyStageCluster, opTy,
