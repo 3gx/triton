@@ -116,8 +116,11 @@ void AutomaticWarpSpecialization::runOnOperation() {
     NVWSMemoryPlannerOptions memoryPlannerOptions;
     memoryPlannerOptions.numBuffers = numStages;
     memoryPlannerOptions.smemBudget = smemBudget;
-    memoryPlannerOptions.smemAllocAlgo =
-        numStages >= 2 && smemBudget > 0 ? 1 : 0;
+    // Algorithm 1 keeps compatible channels in separate multi-buffered SMEM
+    // allocations when circular reuse is disabled, increasing both footprint
+    // and semaphore traffic. Keep the liveness planner as the global default;
+    // loops with a proven benefit can opt in through tt.smem_alloc_algo.
+    memoryPlannerOptions.smemAllocAlgo = 0;
     addPassWithPartitionVerifier(createNVWSMemoryPlanner(memoryPlannerOptions));
   }
   NVWSInsertSemasOptions insertSemasOptions;
