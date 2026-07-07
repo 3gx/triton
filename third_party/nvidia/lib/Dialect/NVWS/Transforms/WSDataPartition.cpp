@@ -2222,6 +2222,60 @@ namespace triton {
 #define GEN_PASS_DEF_NVWSWSDATAPARTITION
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h.inc"
 
+// Data partitioning inserts each partition's clone next to the original op.
+// For a merged epilogue this interleaves the partition slices by operation
+// kind, keeping multiple accumulator slices live at once.  Move the complete
+// backward slice of the first descriptor store to the front of the epilogue
+// so each slice can finish before the next one becomes live.
+static void sequentializeMergedEpilogue(triton::FuncOp funcOp) {
+  funcOp->walk([&](scf::ForOp forOp) {
+    if (!forOp->hasAttr(mlir::triton::kWarpSpecializeAttrName) ||
+        !forOp->hasAttr("tt.merge_epilogue"))
+      return;
+
+    Block *body = forOp.getBody();
+    Operation *lastInnerFor = nullptr;
+    for (Operation &op : body->without_terminator())
+      if (isa<scf::ForOp>(op))
+        lastInnerFor = &op;
+    if (!lastInnerFor)
+      return;
+
+    SmallVector<Operation *> segment;
+    for (Operation *op = lastInnerFor->getNextNode();
+         op && op != body->getTerminator(); op = op->getNextNode())
+      segment.push_back(op);
+
+    DenseSet<Operation *> segmentSet(segment.begin(), segment.end());
+    Operation *root = nullptr;
+    for (Operation *op : segment)
+      if (isa<triton::DescriptorStoreOp>(op)) {
+        root = op;
+        break;
+      }
+    if (!root)
+      return;
+
+    DenseSet<Operation *> slice;
+    SmallVector<Operation *> worklist{root};
+    slice.insert(root);
+    while (!worklist.empty()) {
+      Operation *op = worklist.pop_back_val();
+      for (Value operand : op->getOperands())
+        if (Operation *def = operand.getDefiningOp())
+          if (segmentSet.contains(def) && slice.insert(def).second)
+            worklist.push_back(def);
+    }
+
+    SmallVector<Operation *> sliceInOrder;
+    for (Operation *op : segment)
+      if (slice.contains(op))
+        sliceInOrder.push_back(op);
+    for (Operation *op : llvm::reverse(sliceInOrder))
+      op->moveAfter(lastInnerFor);
+  });
+}
+
 class NVWSWSDataPartition
     : public impl::NVWSWSDataPartitionBase<NVWSWSDataPartition> {
 public:
@@ -2248,8 +2302,11 @@ public:
       dataPartitonFactor = numWarpGroups - 1;
     if (dataPartitonFactor < 2)
       return;
-    if (!doDataPartition(funcOp, *dataPartitonFactor))
+    if (!doDataPartition(funcOp, *dataPartitonFactor)) {
       signalPassFailure();
+      return;
+    }
+    sequentializeMergedEpilogue(funcOp);
   }
 
   void runOnOperation() override {

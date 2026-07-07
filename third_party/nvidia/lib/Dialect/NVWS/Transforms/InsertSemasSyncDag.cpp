@@ -8,7 +8,12 @@ namespace mlir::triton::nvws_semas {
 
 using Payloads = SmallVector<AsyncOp, 1>;
 using PieceEffects = std::map<PieceId, Effect>;
-using PiecePayloads = std::map<PieceId, Payloads>;
+
+struct PieceExitFacts {
+  Payloads payloads;
+  SmallVector<int64_t, 2> mustOrderedBefore;
+};
+using ExitFacts = std::map<PieceId, PieceExitFacts>;
 
 // Doc: sync-dag.md#the-walk-accesses-to-edges
 struct ActiveUse {
@@ -100,6 +105,27 @@ static void unionPayloads(Payloads &into, const Payloads &from) {
   });
 }
 
+static SmallVector<int64_t, 2>
+intersectOrderFacts(ArrayRef<int64_t> lhs, ArrayRef<int64_t> rhs) {
+  SmallVector<int64_t, 2> result;
+  for (int64_t owner : lhs)
+    if (llvm::is_contained(rhs, owner))
+      result.push_back(owner);
+  return result;
+}
+
+static bool knownNonEmptyLoop(Node *node) {
+  auto forOp = dyn_cast_or_null<scf::ForOp>(node->op);
+  if (!forOp)
+    return false;
+  if (forOp->hasAttr("ttg.must-execute"))
+    return true;
+  std::optional<APInt> tripCount = forOp.getStaticTripCount();
+  if (!tripCount)
+    return false;
+  return forOp.getUnsignedCmp() ? tripCount->ugt(0) : tripCount->sgt(0);
+}
+
 // Doc: sync-dag.md#the-per-access-rules-in-full
 // Apply one piece's RAW/WAR rules. Token supply is handled after all pieces of
 // an access have advanced.
@@ -183,7 +209,7 @@ public:
               bool underFor)
       : group(group), state(state), edges(edges), underFor(underFor) {}
 
-  PiecePayloads run(Node *head) {
+  ExitFacts run(Node *head) {
     if (head->kind == Node::Enter)
       if (auto owner = uniformPieceOwner(head); owner && owner->has_value())
         tokens.remember(*owner);
@@ -206,7 +232,7 @@ public:
         break;
       }
     }
-    return returnedPayloads(head);
+    return returnedExitFacts(head);
   }
 
 private:
@@ -282,10 +308,14 @@ private:
   void visitRegion(Node *node) {
     auto infos = sortedPieceInfo(node);
     std::map<PieceId, VersionSource> incoming;
+    std::map<PieceId, SmallVector<int64_t, 2>> incomingOrder;
     for (auto [id, info] : infos) {
       auto it = state.find(id);
-      if (it != state.end() && it->second.initialized())
+      if (it != state.end() && it->second.initialized()) {
         incoming.emplace(id, it->second.source);
+        if (ActiveUse *use = it->second.useFor(info.owner))
+          incomingOrder[id] = use->orderedBefore;
+      }
     }
 
     Payloads none{AsyncOp::NONE};
@@ -295,7 +325,8 @@ private:
       applyTouch(state[id], id, info.owner, info.effect, node, none, edges,
                  wsAdopt);
 
-    PiecePayloads returned;
+    ExitFacts returned;
+    bool firstChild = true;
     for (Node *childHead : node->children) {
       ChainState child;
       for (auto [id, info] : sortedPieceInfo(childHead)) {
@@ -310,18 +341,49 @@ private:
       }
       ChainWalker nested(group, child, edges,
                          underFor || node->kind == Node::For);
-      for (auto &[id, payloads] : nested.run(childHead))
-        unionPayloads(returned[id], payloads);
+      ExitFacts childFacts = nested.run(childHead);
+      for (auto &[id, facts] : childFacts)
+        unionPayloads(returned[id].payloads, facts.payloads);
+
+      for (auto [id, info] : infos) {
+        SmallVector<int64_t, 2> branchOrder = incomingOrder[id];
+        if (auto it = childFacts.find(id); it != childFacts.end())
+          branchOrder = it->second.mustOrderedBefore;
+        if (firstChild)
+          returned[id].mustOrderedBefore = std::move(branchOrder);
+        else
+          returned[id].mustOrderedBefore = intersectOrderFacts(
+              returned[id].mustOrderedBefore, branchOrder);
+      }
+      firstChild = false;
+    }
+
+    // A loop body does not establish a fact on its zero-trip path. Likewise,
+    // an absent else branch carries the incoming fact unchanged.
+    if (node->kind == Node::For && !knownNonEmptyLoop(node)) {
+      for (auto [id, info] : infos)
+        returned[id].mustOrderedBefore = intersectOrderFacts(
+            returned[id].mustOrderedBefore, incomingOrder[id]);
+    } else if (node->kind == Node::If && node->children.size() < 2) {
+      for (auto [id, info] : infos)
+        returned[id].mustOrderedBefore = intersectOrderFacts(
+            returned[id].mustOrderedBefore, incomingOrder[id]);
     }
 
     for (auto [id, info] : infos) {
-      auto payload = returned.find(id);
+      auto facts = returned.find(id);
       ActiveUse *use = state[id].useFor(info.owner);
-      if (payload == returned.end() || !use)
+      if (facts == returned.end() || !use)
         continue;
-      use->payloads = payload->second;
-      if (state[id].source.node == node)
-        state[id].source.payloads = payload->second;
+      if (!facts->second.payloads.empty())
+        use->payloads = facts->second.payloads;
+      if (use->node == node)
+        for (int64_t owner : facts->second.mustOrderedBefore)
+          if (!llvm::is_contained(use->orderedBefore, owner))
+            use->orderedBefore.push_back(owner);
+      if (state[id].source.node == node &&
+          !facts->second.payloads.empty())
+        state[id].source.payloads = facts->second.payloads;
     }
     if (infos.empty())
       return;
@@ -349,18 +411,21 @@ private:
     }
   }
 
-  PiecePayloads returnedPayloads(Node *head) {
-    PiecePayloads result;
+  ExitFacts returnedExitFacts(Node *head) {
+    ExitFacts result;
     if (head->kind != Node::Enter)
       return result;
     for (auto [id, info] : sortedPieceInfo(head)) {
-      Payloads payloads{AsyncOp::NONE};
+      PieceExitFacts facts;
+      facts.payloads.push_back(AsyncOp::NONE);
       auto it = state.find(id);
       if (it != state.end())
-        if (ActiveUse *use = it->second.useFor(info.owner))
+        if (ActiveUse *use = it->second.useFor(info.owner)) {
           if (!use->payloads.empty())
-            payloads = use->payloads;
-      result.emplace(id, std::move(payloads));
+            facts.payloads = use->payloads;
+          facts.mustOrderedBefore = use->orderedBefore;
+        }
+      result.emplace(id, std::move(facts));
     }
     return result;
   }
@@ -372,8 +437,8 @@ private:
   Tokens tokens;
 };
 
-static PiecePayloads walkChain(GroupDag &g, Node *head, ChainState &state,
-                               EdgeList &edges, bool underFor) {
+static ExitFacts walkChain(GroupDag &g, Node *head, ChainState &state,
+                           EdgeList &edges, bool underFor) {
   return ChainWalker(g, state, edges, underFor).run(head);
 }
 static void spliceBefore(Node *node, Node *before) {
@@ -1090,16 +1155,98 @@ static Node *findBridgeAcquireAfter(GroupDag &g, Node *F, SemaId feedSema, Owner
   return nullptr;
 }
 
-static Node *findHoldFeedAcquire(GroupDag &g, Node *F) {
+struct HoldFeed {
+  Node *acquire = nullptr;
+  bool retainForPrefix = false;
+};
+
+static bool carrierPreservesFeed(GroupDag &g, Node *carrier,
+                                 const Owner &owner, SemaId sema) {
+  if (!carrier || carrier->kind != Node::For)
+    return false;
+  std::optional<Owner> boundaryOwner = uniformPieceOwner(carrier);
+  const Crossing *crossing = findCrossing(carrier);
+  if (!boundaryOwner || !sameOwner(*boundaryOwner, owner) || !crossing ||
+      !sameOwner(crossing->tokenOwner, owner) ||
+      crossing->finals.size() > carrier->children.size())
+    return false;
+
+  for (unsigned i = 0, e = carrier->children.size(); i < e; ++i) {
+    Node *final = i < crossing->finals.size() ? crossing->finals[i] : nullptr;
+    std::optional<SemaId> returned =
+        returnedSemaForFinal(g, final, sema);
+    if (!returned || *returned != sema ||
+        !sameOwner(returnedOwnerForFinal(final, owner), owner))
+      return false;
+  }
+  return true;
+}
+
+static bool feedDominatesThroughCarriers(GroupDag &g, Node *F, Node *feed,
+                                         const Owner &owner, SemaId sema) {
+  if (!feed || feed->kind != Node::Acquire || feed->sema != sema)
+    return false;
+  const Sema &feedSema = getSema(g, feed);
+  Owner feedOwner = feed->owner ? feed->owner : feedSema.entryTokenOwner;
+  if (!sameOwner(feedOwner, owner))
+    return false;
+
+  for (Node *cursor = F; cursor;) {
+    if (feed->parent == cursor->parent)
+      return precedesInChain(feed, cursor);
+    Node *carrier = cursor->parent;
+    if (!carrierPreservesFeed(g, carrier, owner, sema))
+      return false;
+    cursor = carrier;
+  }
+  return false;
+}
+
+static std::optional<HoldFeed>
+findHoldFeedAcquire(GroupDag &g, Node *F, const Crossing &crossing) {
+  bool crossedPrefixUse = false;
+  bool hasPrefixCut = crossing.bridgeRelease &&
+                      crossing.bridgeRelease->parent == F->parent &&
+                      crossing.bridgeRelease->next == F;
   for (Node *cur = F;; cur = cur->parent) {
+    bool originalChain = cur == F;
     for (Node *m = cur->prev; m; m = m->prev) {
-      if (m->kind == Node::Acquire)
-        return m;
-      if (isTokenEvent(g, m))
-        return nullptr;
+      // A previously materialized prefix cut is part of this same hold. Skip
+      // it while reclassifying the fixed point and recover its feed acquire.
+      if (m == crossing.bridgeRelease && m->kind == Node::Release &&
+          m->parent == F->parent) {
+        crossedPrefixUse = true;
+        continue;
+      }
+      if (m->kind == Node::Acquire) {
+        const Sema &sema = getSema(g, m);
+        Owner owner = m->owner ? m->owner : sema.entryTokenOwner;
+        if (!sameOwner(owner, crossing.tokenOwner) ||
+            (hasPrefixCut && m != crossing.bridgeAcquire) ||
+            !feedDominatesThroughCarriers(g, F, m, crossing.tokenOwner,
+                                          m->sema))
+          return std::nullopt;
+        return HoldFeed{m, crossedPrefixUse};
+      }
+      if (m->isRegion() && nodeInvolvesComp(g, m))
+        return std::nullopt;
+      if (!isTokenEvent(g, m))
+        continue;
+      if (m->kind == Node::Access &&
+          originalChain &&
+          sameOwner(m->owner, crossing.tokenOwner) &&
+          (!m->reuseTokenOwner ||
+           *m->reuseTokenOwner == ownerKey(crossing.tokenOwner)) &&
+          asyncPayloadOf(m->op) == AsyncOp::NONE) {
+        crossedPrefixUse = true;
+        continue;
+      }
+      return std::nullopt;
     }
     if (!cur->parent || !cur->parent->isRegion())
-      return nullptr;
+      return std::nullopt;
+    if (crossedPrefixUse && cur->parent->kind != Node::For)
+      return std::nullopt;
   }
 }
 
@@ -1185,10 +1332,15 @@ static gpu::StageCluster ownerCompletionScheduleAtLoopExit(Node *F,
 static std::optional<Hold>
 matchPointOfUse(GroupDag &g, Node *F, scf::ForOp forOp, const Crossing &c,
                 Node *regain, Node *entryAcquire, SemaId recurrenceSema,
-                bool regionTail, bool needsPostLoopAcquire) {
-  bool keepsEntryAcquire = entryAcquire->sema != recurrenceSema;
-  Node *bridgeAcquire = nullptr;
-  if (keepsEntryAcquire) {
+                bool regionTail, bool needsPostLoopAcquire,
+                bool retainSameSemaphoreFeed) {
+  bool differentEntrySemaphore = entryAcquire->sema != recurrenceSema;
+  bool keepsEntryAcquire =
+      differentEntrySemaphore || retainSameSemaphoreFeed;
+  Node *bridgeAcquire = retainSameSemaphoreFeed ? entryAcquire : nullptr;
+  if (retainSameSemaphoreFeed && regionTail)
+    return std::nullopt;
+  if (differentEntrySemaphore) {
     if (regionTail || !needsPostLoopAcquire)
       return std::nullopt;
     const Sema &entrySema = getSema(g, entryAcquire);
@@ -1229,6 +1381,15 @@ matchPointOfUse(GroupDag &g, Node *F, scf::ForOp forOp, const Crossing &c,
   return h;
 }
 
+static bool hasPlannedSingleCopy(const GroupDag &g) {
+  return !g.pieceTable.members.empty() &&
+         llvm::all_of(g.pieceTable.members, [](const Member &member) {
+           auto copy =
+               member.allocOp->getAttrOfType<IntegerAttr>(kBufferCopyAttrName);
+           return copy && copy.getInt() == 1;
+         });
+}
+
 // Doc: sync-dag.md#the-decision-per-region
 // Select threaded, point-of-use, or child-owned token handling for one loop
 // crossing.  Structural mismatches retain the token silently; only uses after
@@ -1251,9 +1412,16 @@ static Hold buildUniformHold(GroupDag &g, Node *F, const Crossing &c) {
   if (hasTrailingCompUse(g, regain))
     return threadedTokenHold(regain, Hold::Blocker::TRAILING_USE);
 
-  Node *entryAcquire = findHoldFeedAcquire(g, F);
-  if (!entryAcquire)
+  std::optional<HoldFeed> feed = findHoldFeedAcquire(g, F, c);
+  if (!feed)
     return threadedTokenHold(regain);
+  // Moving an inherited regain across the backedge is currently modeled only
+  // for a planner-authored single physical slot. Unknown or multibuffered
+  // groups retain the existing threaded form so physical-slot distance remains
+  // derived by the normal schedule analysis.
+  if (feed->retainForPrefix && !hasPlannedSingleCopy(g))
+    return threadedTokenHold(regain);
+  Node *entryAcquire = feed->acquire;
   std::optional<SemaId> recurrenceSema =
       regionTail
           ? returnedSemaForFinal(g, regain, entryAcquire->sema)
@@ -1261,9 +1429,11 @@ static Hold buildUniformHold(GroupDag &g, Node *F, const Crossing &c) {
   if (!recurrenceSema)
     return threadedTokenHold(regain);
 
-  bool needsPostLoopAcquire = c.postLoopAcquire || regionResultConsumedAfter(g, F);
+  bool needsPostLoopAcquire = c.postLoopAcquire ||
+                              regionResultConsumedAfter(g, F) ||
+                              feed->retainForPrefix;
   bool sameSemaphore = entryAcquire->sema == *recurrenceSema;
-  if (sameSemaphore && needsPostLoopAcquire)
+  if (sameSemaphore && needsPostLoopAcquire && regionTail)
     return threadedTokenHold(regain, Hold::Blocker::RESULT_CONSUMED);
 
   // A nested boundary may normalize a different incoming semaphore through
@@ -1271,7 +1441,7 @@ static Hold buildUniformHold(GroupDag &g, Node *F, const Crossing &c) {
   // that realization separate from the direct same-semaphore rule above.
   std::optional<Hold> pointOfUse = matchPointOfUse(
       g, F, forOp, c, regain, entryAcquire, *recurrenceSema, regionTail,
-      needsPostLoopAcquire);
+      needsPostLoopAcquire, feed->retainForPrefix);
   return pointOfUse ? std::move(*pointOfUse) : threadedTokenHold(regain);
 }
 
@@ -1333,7 +1503,22 @@ static bool materializeHoldHandoffs(GroupDag &g, Node *head) {
       anchor = c.postLoopAcquire;
       if (c.hold.keepsEntryAcquire && !c.bridgeAcquire)
         c.bridgeAcquire = c.hold.bridgeAcquire;
-      if (c.hold.keepsEntryAcquire && !c.bridgeRelease) {
+      bool prefixCut = c.hold.keepsEntryAcquire &&
+                       c.hold.bridgeAcquire == c.hold.entryAcquire &&
+                       c.hold.entryAcquire->sema == recurrenceAcquire->sema;
+      if (prefixCut && !c.bridgeRelease) {
+        Node *cut = newProtocolNode(g, Node::Release, n->parent,
+                                    c.tokenOwner, recurrenceAcquire->sema,
+                                    recurrenceAcquire->count);
+        cut->payloads.push_back(AsyncOp::NONE);
+        if (c.tokenOwner)
+          markTokenReuse(cut, c.tokenOwner);
+        spliceBefore(cut, n);
+        getSema(g, cut).expectedArrivals += cut->count;
+        c.bridgeRelease = cut;
+        changed = true;
+      } else if (!prefixCut && c.hold.keepsEntryAcquire &&
+                 !c.bridgeRelease) {
         Node *bridge = newProtocolNode(g, Node::Release,
                                       c.bridgeAcquire->parent,
                                       c.tokenOwner,
@@ -1739,17 +1924,44 @@ static LogicalResult verifyPointOfUseTransparency(GroupDag &g, Node *F, const Cr
     const Sema &recurrenceSema = getSema(g, recurrenceAcquire);
     Node *bridgeAcquire = c.bridgeAcquire;
     Node *bridgeRelease = c.bridgeRelease;
-    if (!recurrenceSema.isEntry || !bridgeAcquire ||
-        h.bridgeAcquire != bridgeAcquire || !bridgeRelease ||
-        bridgeAcquire->kind != Node::Acquire || bridgeAcquire->sema != h.entryAcquire->sema ||
-        bridgeAcquire->parent != F->parent ||
-        !sameOwner(bridgeAcquire->owner, c.tokenOwner) ||
-        bridgeRelease->kind != Node::Release || bridgeRelease->parent != bridgeAcquire->parent ||
-        bridgeRelease->sema != recurrenceAcquire->sema || bridgeRelease->count != recurrenceAcquire->count ||
-        !sameOwner(bridgeRelease->owner, c.tokenOwner) || bridgeRelease->sat)
-      return errorAt(F) << "malformed outer-to-local semaphore bridge";
-    if (!precedesInChain(F, bridgeAcquire) || !precedesInChain(bridgeAcquire, bridgeRelease))
-      return errorAt(F) << "semaphore bridge is not after its loop";
+    bool prefixCut = bridgeAcquire == h.entryAcquire &&
+                     h.entryAcquire->sema == recurrenceAcquire->sema;
+    if (prefixCut) {
+      const Sema &entrySema = getSema(g, bridgeAcquire);
+      Owner entryOwner = bridgeAcquire->owner ? bridgeAcquire->owner
+                                               : entrySema.entryTokenOwner;
+      if (!recurrenceSema.isEntry || h.bridgeAcquire != bridgeAcquire ||
+          !bridgeRelease || bridgeAcquire->kind != Node::Acquire ||
+          !sameOwner(entryOwner, c.tokenOwner) ||
+          !feedDominatesThroughCarriers(g, F, bridgeAcquire, c.tokenOwner,
+                                        recurrenceAcquire->sema) ||
+          bridgeRelease->kind != Node::Release ||
+          bridgeRelease->parent != F->parent ||
+          bridgeRelease->sema != recurrenceAcquire->sema ||
+          bridgeRelease->count != recurrenceAcquire->count ||
+          !sameOwner(bridgeRelease->owner, c.tokenOwner) ||
+          (c.tokenOwner && !nodeReusesToken(bridgeRelease, c.tokenOwner)) ||
+          bridgeRelease->payloads != Payloads{AsyncOp::NONE} ||
+          bridgeRelease->sat || bridgeRelease->next != F)
+        return errorAt(F) << "malformed same-semaphore prefix cut";
+    } else {
+      if (!recurrenceSema.isEntry || !bridgeAcquire ||
+          h.bridgeAcquire != bridgeAcquire || !bridgeRelease ||
+          bridgeAcquire->kind != Node::Acquire ||
+          bridgeAcquire->sema != h.entryAcquire->sema ||
+          bridgeAcquire->parent != F->parent ||
+          !sameOwner(bridgeAcquire->owner, c.tokenOwner) ||
+          bridgeRelease->kind != Node::Release ||
+          bridgeRelease->parent != bridgeAcquire->parent ||
+          bridgeRelease->sema != recurrenceAcquire->sema ||
+          bridgeRelease->count != recurrenceAcquire->count ||
+          !sameOwner(bridgeRelease->owner, c.tokenOwner) ||
+          bridgeRelease->sat)
+        return errorAt(F) << "malformed outer-to-local semaphore bridge";
+      if (!precedesInChain(F, bridgeAcquire) ||
+          !precedesInChain(bridgeAcquire, bridgeRelease))
+        return errorAt(F) << "semaphore bridge is not after its loop";
+    }
   } else if (h.bridgeAcquire || c.bridgeAcquire || c.bridgeRelease) {
     return errorAt(F) << "unexpected outer-to-local semaphore bridge";
   }
@@ -2339,6 +2551,23 @@ static LogicalResult addSyncScheduleEdges(MutableArrayRef<GroupDag> groups,
   }
   std::map<std::pair<unsigned, Operation *>, SlotSchedule> slotCache;
   for (GroupDag &group : groups) {
+    DenseMap<Node *, Node *> singleCopyPrefixRegainLoops;
+    if (group.numSemaphoreCopies == 1) {
+      for (const std::unique_ptr<Node> &storage : group.nodes) {
+        Node *loop = storage.get();
+        if (loop->kind != Node::For)
+          continue;
+        for (const Crossing &crossing : loop->crossings) {
+          const Hold &hold = crossing.hold;
+          if (hold.isPointOfUse() && !hold.regionTail && hold.regain &&
+              hold.entryAcquire && hold.keepsEntryAcquire &&
+              hold.bridgeAcquire == hold.entryAcquire &&
+              hold.entryAcquire->sema == hold.regain->sema &&
+              crossing.bridgeRelease && crossing.bridgeRelease->next == loop)
+            singleCopyPrefixRegainLoops[hold.regain] = loop;
+        }
+      }
+    }
     auto addReleaseEdge = [&](Node *release) -> LogicalResult {
       if (release->kind != Node::Release || !release->sat)
         return success();
@@ -2361,25 +2590,41 @@ static LogicalResult addSyncScheduleEdges(MutableArrayRef<GroupDag> groups,
         return success();
       int64_t distance = 0;
       if (!precedesInChain(release, acquire)) {
-        unsigned setIndex = setByGroup.lookup(&group);
-        auto key = std::make_pair(setIndex, anchors->loop.getOperation());
-        auto it = slotCache.find(key);
-        if (it == slotCache.end())
-          it = slotCache
-                   .emplace(key, computeSlotSchedule(physicalSets[setIndex], anchors->loop))
-                   .first;
-        std::optional<int64_t> loopCarriedDistance = computeLoopCarriedDistance(
-            it->second, group.numSemaphoreCopies, release->scheduleAnchor,
-            acquire->scheduleAnchor);
-        if (!loopCarriedDistance) {
-          InFlightDiagnostic diag = semaError(anchors->producer)
-              << "cannot determine loop-carried dependency distance for a "
-                 "physical buffer slot";
-          diag.attachNote(anchors->consumer->getLoc())
-              << "next token ownership starts here";
-          return failure();
+        Node *prefixRegainLoop =
+            singleCopyPrefixRegainLoops.lookup(acquire);
+        bool exactPrefixRecurrence =
+            prefixRegainLoop && release->parent == acquire->parent &&
+            acquire->parent == prefixRegainLoop &&
+            anchors->loop.getOperation() == prefixRegainLoop->op;
+        if (exactPrefixRecurrence) {
+          // The point-of-use transform moved this recurrence acquire from the
+          // loop tail to its first use. Its closing release is therefore in the
+          // immediately preceding iteration; with one physical slot the exact
+          // loop-carried distance is one.
+          distance = 1;
+        } else {
+          unsigned setIndex = setByGroup.lookup(&group);
+          auto key = std::make_pair(setIndex, anchors->loop.getOperation());
+          auto it = slotCache.find(key);
+          if (it == slotCache.end())
+            it = slotCache
+                     .emplace(key, computeSlotSchedule(
+                                       physicalSets[setIndex], anchors->loop))
+                     .first;
+          std::optional<int64_t> loopCarriedDistance =
+              computeLoopCarriedDistance(
+                  it->second, group.numSemaphoreCopies,
+                  release->scheduleAnchor, acquire->scheduleAnchor);
+          if (!loopCarriedDistance) {
+            InFlightDiagnostic diag = semaError(anchors->producer)
+                << "cannot determine loop-carried dependency distance for a "
+                   "physical buffer slot";
+            diag.attachNote(anchors->consumer->getLoc())
+                << "next token ownership starts here";
+            return failure();
+          }
+          distance = *loopCarriedDistance;
         }
-        distance = *loopCarriedDistance;
       }
       modelsByLoop[anchors->loop.getOperation()]
           .ownerConstraints.push_back(OwnerScheduleConstraint{

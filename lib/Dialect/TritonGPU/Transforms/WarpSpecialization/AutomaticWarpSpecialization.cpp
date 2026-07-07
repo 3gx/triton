@@ -116,6 +116,8 @@ void AutomaticWarpSpecialization::runOnOperation() {
     NVWSMemoryPlannerOptions memoryPlannerOptions;
     memoryPlannerOptions.numBuffers = numStages;
     memoryPlannerOptions.smemBudget = smemBudget;
+    memoryPlannerOptions.smemAllocAlgo =
+        numStages >= 2 && smemBudget > 0 ? 1 : 0;
     addPassWithPartitionVerifier(createNVWSMemoryPlanner(memoryPlannerOptions));
   }
   NVWSInsertSemasOptions insertSemasOptions;
