@@ -2535,7 +2535,7 @@ shift from the current stage of its backing buffer. The shift is applied modulo
 `buffer.copy`: `0` selects the current stage, `-1` the preceding stage, and
 `+1` the following stage.
 
-`assignBufferStageOffsets` runs one physical-stage analysis for circular
+`analyzeSyncSchedule` runs one physical-stage analysis for circular
 groups and non-circular aliased backings. It replays the fresh-write cursor
 that ASP will use: a write records the cursor ordinal as the group's current
 value, and a read uses the latest ordinal recorded for its group. The analysis
@@ -2750,9 +2750,10 @@ crossing releases likewise receive `stage-offset=1`.
   `InsertSemas.h`)
 - `ownerCompletionScheduleAtLoopExit`
 - `computeBackingPlan`
-- `assignBufferStageOffsets`, `computeSlotSchedule`,
-  `computeLoopCarriedDistance`, `addSyncScheduleEdges`,
-  `legalizeLoopSchedule`, `assignSyncScheduleChain`, and
+- `assignCircularStageOffsets`, `assignAliasedHandoffStageOffsets`,
+  `computeSlotSchedule`, `computeLoopCarriedDistance`,
+  `addSyncScheduleEdges`, `legalizeLoopSchedule`, `analyzeSyncSchedule`,
+  `validateSyncSchedule`, `assignSyncScheduleChain`, and
   `finalizeSyncSchedule`
 - `buildSyncDag`
 - the DAG dump used throughout: `NVWS_INSERT_SEMA_DUMP_DAG=1`

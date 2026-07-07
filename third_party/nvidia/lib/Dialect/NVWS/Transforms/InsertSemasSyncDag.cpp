@@ -1868,11 +1868,27 @@ struct SlotSchedule {
   DenseMap<Node *, int64_t> ordinalByAccess;
   bool complete = true;
 };
-static Effect accessEffect(const Node *n) {
+
+// A scheduled region is one atomic event in its enclosing loop.  ACCESS-DAG
+// has already summarized its children in pieceInfo, so slot replay uses that
+// summary rather than descending into the region.
+static Effect slotEventEffect(const Node *n) {
   Effect effect = Effect::R;
-  for (const Touch &touch : n->touches)
-    effect = joinEffect(effect, touch.effect);
+  if (n->kind == Node::Access)
+    for (const Touch &touch : n->touches)
+      effect = joinEffect(effect, touch.effect);
+  else
+    for (const auto &[_, info] : n->pieceInfo)
+      effect = joinEffect(effect, info.effect);
   return effect;
+}
+
+static bool isSlotEvent(const Node *n) {
+  return n->kind == Node::Access ||
+         (n->isRegion() && !n->pieceInfo.empty());
+}
+static bool isDirectLoopNode(const Node *n) {
+  return n->parent && n->parent->kind == Node::For;
 }
 
 // Doc: sync-dag.md#authored-buffer-stage-offsets
@@ -1880,7 +1896,7 @@ static std::optional<int64_t> recordPhysicalStage(
     SlotSchedule &result, DenseMap<GroupDag *, int64_t> &lastProducedOrdinal,
     int64_t &cursorOrdinal, GroupDag *group, Node *access, unsigned advances) {
   int64_t requiredOrdinal;
-  if (accessEffect(access) == Effect::W) {
+  if (slotEventEffect(access) == Effect::W) {
     if (advances > 1)
       result.complete = false;
     cursorOrdinal += advances;
@@ -1920,10 +1936,10 @@ static LogicalResult assignCircularStageOffsets(MutableArrayRef<GroupDag> groups
     DenseSet<int64_t> starts;
     DenseMap<Operation *, SmallVector<Event, 1>> eventsByOp;
     for (GroupDag *g : set) {
-      const Member &member = g->pieceTable.members.front();
       if (g->pieceTable.members.size() != 1)
         return semaError(g->root->op)
                << "malformed circular local logical group";
+      const Member &member = g->pieceTable.members.front();
       if (member.type != type)
         return semaError(member.allocOp) << "circular local group has mismatched member types";
       if (g->numCopies != numCopies)
@@ -1947,7 +1963,7 @@ static LogicalResult assignCircularStageOffsets(MutableArrayRef<GroupDag> groups
     DenseMap<GroupDag *, int64_t> lastProducedOrdinal;
     for (const Event &event : ordered) {
       const Member &member = event.group->pieceTable.members.front();
-      bool produces = accessEffect(event.access) == Effect::W;
+      bool produces = slotEventEffect(event.access) == Effect::W;
       auto stage =
           recordPhysicalStage(slots, lastProducedOrdinal, cursorOrdinal,
                               event.group, event.access, produces);
@@ -1957,10 +1973,9 @@ static LogicalResult assignCircularStageOffsets(MutableArrayRef<GroupDag> groups
           return semaError(member.allocOp)
                  << "circular producer order expects buffer.start "
                  << *stage % numCopies << ", got " << member.circularStart;
-      } else if (!stage) {
+      } else if (!stage)
         return semaError(member.allocOp)
                << "circular consumer appears before producer";
-      }
       event.access->bufferStageOffset = *stage - cursorOrdinal;
     }
     for (GroupDag *g : set)
@@ -2025,43 +2040,34 @@ static SlotSchedule computeSlotSchedule(ArrayRef<GroupDag *> physicalSet,
   struct Event {
     GroupDag *group = nullptr;
     Node *node = nullptr;
-    Operation *op = nullptr;
-    unsigned groupOrder = 0;
   };
-  DenseMap<Operation *, unsigned> operationOrder;
-  for (auto [index, op] :
-       llvm::enumerate(loop.getBody()->without_terminator()))
-    operationOrder[&op] = index;
   SlotSchedule result;
   SmallVector<Event, 8> events;
   DenseMap<Node *, unsigned> advancesByAccess;
-  for (auto [groupOrder, group] : llvm::enumerate(physicalSet)) {
-    forEachNode(*group, [&](Node *node) {
+  for (GroupDag *group : physicalSet) {
+    // Select only nodes in this loop's direct SYNC-DAG chain.  In particular,
+    // do not recurse into scf.if/scf.for children: the scheduled region op is
+    // the enclosing loop's event and already carries their ownership/effect
+    // summary.
+    for (const std::unique_ptr<Node> &storage : group->nodes) {
+      Node *node = storage.get();
+      if (!node->parent || node->parent->kind != Node::For ||
+          node->parent->op != loop.getOperation())
+        continue;
       if (node->kind == Node::Acquire && node->scheduleAnchor &&
-          node->scheduleAnchor->kind == Node::Access &&
-          accessEffect(node->scheduleAnchor) == Effect::W) {
-        Operation *direct =
-            loop.getBody()->findAncestorOpInBlock(*node->scheduleAnchor->op);
-        if (direct == node->scheduleAnchor->op)
-          ++advancesByAccess[node->scheduleAnchor];
-        return;
+          isSlotEvent(node->scheduleAnchor) &&
+          slotEventEffect(node->scheduleAnchor) == Effect::W) {
+        ++advancesByAccess[node->scheduleAnchor];
+        continue;
       }
-      if (node->kind != Node::Access || !node->op)
-        return;
-      Operation *direct = loop.getBody()->findAncestorOpInBlock(*node->op);
-      if (!direct)
-        return;
-      if (direct != node->op) {
-        result.complete = false;
-        return;
-      }
-      events.push_back(Event{group, node, direct, static_cast<unsigned>(groupOrder)});
-    });
+      if (!isSlotEvent(node) || !node->op)
+        continue;
+      events.push_back(Event{group, node});
+    }
   }
-  llvm::sort(events, [&](const Event &lhs, const Event &rhs) {
-    unsigned lhsOrder = operationOrder.lookup(lhs.op);
-    unsigned rhsOrder = operationOrder.lookup(rhs.op);
-    return lhsOrder != rhsOrder ? lhsOrder < rhsOrder : lhs.groupOrder < rhs.groupOrder;
+  llvm::stable_sort(events, [](const Event &lhs, const Event &rhs) {
+    return lhs.node->op != rhs.node->op &&
+           lhs.node->op->isBeforeInBlock(rhs.node->op);
   });
   int64_t cursorOrdinal = -1;
   DenseMap<GroupDag *, int64_t> lastProducedOrdinal;
@@ -2101,24 +2107,15 @@ static bool isAliasedMultibufferedGroup(const GroupDag &group) {
   if (group.isCircular() ||
       group.pieceTable.members.size() < 2 || group.numSemaphoreCopies <= 1)
     return false;
-  bool hasPlannedCopy =
-      llvm::all_of(group.pieceTable.members, [](const Member &member) {
-        return member.allocOp->hasAttr(kBufferCopyAttrName);
-      });
-  // A planned copy depth or a separately staged semaphore provides the
-  // stable stage domain required for authored offsets.
-  bool authoredMulticopy = hasPlannedCopy && group.numCopies > 1;
-  bool extraSemaphoreStages = group.numSemaphoreCopies > group.numCopies;
   // Planner-authored copies give every member of this buffer.id group one
-  // shared physical stage domain.  Member memdescs are views of that backing
-  // and need not have identical offsets, extents, or types.
-  if (authoredMulticopy)
-    return true;
-  if (!extraSemaphoreStages)
-    return false;
-
-  // Preserve the existing exact-alias fallback for separately staged
-  // semaphores that do not have a planner-authored multi-copy backing.
+  // shared physical stage domain, regardless of view geometry.
+  bool authored = group.numCopies > 1 &&
+                  llvm::all_of(group.pieceTable.members, [](const Member &m) {
+                    return m.allocOp->hasAttr(kBufferCopyAttrName);
+                  });
+  if (authored || group.numSemaphoreCopies <= group.numCopies)
+    return authored;
+  // Keep the exact-alias fallback for separately staged semaphores.
   const Member &first = group.pieceTable.members.front();
   return llvm::all_of(group.pieceTable.members, [&](const Member &member) {
     return member.offset == first.offset && member.extent == first.extent && member.type == first.type;
@@ -2135,23 +2132,13 @@ static LogicalResult assignAliasedHandoffStageOffsets(GroupDag &group) {
       return success();
     Node *producer = release->scheduleAnchor;
     Node *consumer = release->sat->scheduleAnchor;
-    if (!producer || !consumer || producer->kind != Node::Access ||
-        consumer->kind != Node::Access || producer->parent != consumer->parent ||
-        !producer->parent || producer->parent->kind != Node::For) {
-      semaError(producer && producer->op ? producer->op : group.root->op)
-          << "multibuffered alias handoff requires direct accesses "
-             "in one loop body";
-      return failure();
-    }
-    auto loop = dyn_cast<scf::ForOp>(producer->parent->op);
-    if (!loop ||
-        loop.getBody()->findAncestorOpInBlock(*producer->op) != producer->op ||
-        loop.getBody()->findAncestorOpInBlock(*consumer->op) != consumer->op) {
-      semaError(producer->op)
-          << "multibuffered alias handoff is not directly "
-             "represented in its ownership loop";
-      return failure();
-    }
+    if (!producer || !consumer || !isSlotEvent(producer) ||
+        !isSlotEvent(consumer) || producer->parent != consumer->parent ||
+        !producer->parent || producer->parent->kind != Node::For)
+      return semaError(producer && producer->op ? producer->op : group.root->op)
+             << "multibuffered alias handoff requires direct scheduled events "
+                "in one loop body";
+    auto loop = cast<scf::ForOp>(producer->parent->op);
     auto [it, inserted] = slotsByLoop.try_emplace(loop.getOperation());
     if (inserted)
       it->second = computeSlotSchedule(ArrayRef<GroupDag *>{&group}, loop);
@@ -2160,11 +2147,9 @@ static LogicalResult assignAliasedHandoffStageOffsets(GroupDag &group) {
     auto consumerIt = slots.ordinalByAccess.find(consumer);
     if (!slots.complete || producerIt == slots.ordinalByAccess.end() ||
         consumerIt == slots.ordinalByAccess.end() ||
-        slots.advancesPerIteration <= 0) {
-      semaError(producer->op)
-          << "cannot derive multibuffered alias handoff slots";
-      return failure();
-    }
+        slots.advancesPerIteration <= 0)
+      return semaError(producer->op)
+             << "cannot derive multibuffered alias handoff slots";
     int64_t numSemaphoreCopies = group.numSemaphoreCopies;
     int64_t offset = 0;
     if (precedesInChain(release, release->sat)) {
@@ -2181,30 +2166,18 @@ static LogicalResult assignAliasedHandoffStageOffsets(GroupDag &group) {
     hasShiftedRelease |= offset != 0;
     return success();
   };
-  if (!group.root->children.empty() &&
-      failed(forEachNodeChecked(group.root->children[0], assignRelease)))
-    return failure();
-  if (!hasShiftedRelease) {
-    forEachNode(group, [&](Node *node) {
-      if (node->kind == Node::Release)
-        node->stageOffset.reset();
-    });
-    return success();
-  }
-  forEachNode(group, [&](Node *node) {
-    if (node->kind == Node::Acquire)
-      node->stageOffset = 0;
-  });
-  return success();
-}
-
-static LogicalResult
-assignBufferStageOffsets(MutableArrayRef<GroupDag> groups) {
-  if (failed(assignCircularStageOffsets(groups)))
-    return failure();
-  for (GroupDag &group : groups)
-    if (failed(assignAliasedHandoffStageOffsets(group)))
+  // The flat node store avoids descending through scheduled region events.
+  for (const auto &node : group.nodes)
+    if (isDirectLoopNode(node.get()) && failed(assignRelease(node.get())))
       return failure();
+  for (const auto &node : group.nodes) {
+    if (!isDirectLoopNode(node.get()))
+      continue;
+    if (!hasShiftedRelease && node->kind == Node::Release)
+      node->stageOffset.reset();
+    if (hasShiftedRelease && node->kind == Node::Acquire)
+      node->stageOffset = 0;
+  }
   return success();
 }
 
@@ -2308,18 +2281,11 @@ static LogicalResult solveOwnerScheduleConstraints(LoopScheduleModel &model) {
     return failure();
   }
 
-  SmallVector<unsigned, 8> producerVertex;
-  SmallVector<unsigned, 8> consumerVertex;
-  SmallVector<bool, 8> tight;
-  for (const OwnerScheduleConstraint &constraint : model.ownerConstraints) {
-    unsigned producer = getVertex(constraint.producerOwner);
-    unsigned consumer = getVertex(constraint.consumerOwner);
-    producerVertex.push_back(producer);
-    consumerVertex.push_back(consumer);
-    tight.push_back(offset[consumer] ==
-                    offset[producer] + constraint.requiredDelay());
-  }
-
+  auto isTight = [&](const OwnerScheduleConstraint &constraint) {
+    return offset[getVertex(constraint.consumerOwner)] ==
+           offset[getVertex(constraint.producerOwner)] +
+               constraint.requiredDelay();
+  };
   auto hasTightPath = [&](unsigned from, unsigned to) {
     SmallVector<unsigned, 8> stack{from};
     SmallVector<bool, 8> seen(numVertices, false);
@@ -2330,22 +2296,19 @@ static LogicalResult solveOwnerScheduleConstraints(LoopScheduleModel &model) {
       if (seen[vertex])
         continue;
       seen[vertex] = true;
-      for (unsigned edgeIndex = 0; edgeIndex < model.ownerConstraints.size();
-           ++edgeIndex)
-        if (tight[edgeIndex] && producerVertex[edgeIndex] == vertex)
-          stack.push_back(consumerVertex[edgeIndex]);
+      for (const OwnerScheduleConstraint &constraint : model.ownerConstraints)
+        if (isTight(constraint) &&
+            getVertex(constraint.producerOwner) == vertex)
+          stack.push_back(getVertex(constraint.consumerOwner));
     }
     return false;
   };
 
-  for (unsigned edgeIndex = 0; edgeIndex < model.ownerConstraints.size();
-       ++edgeIndex) {
-    const OwnerScheduleConstraint &constraint =
-        model.ownerConstraints[edgeIndex];
+  for (const OwnerScheduleConstraint &constraint : model.ownerConstraints) {
     bool directlySameWave = constraint.requiredDelay() == 0;
-    bool onZeroDelayCycle =
-        tight[edgeIndex] &&
-        hasTightPath(consumerVertex[edgeIndex], producerVertex[edgeIndex]);
+    bool onZeroDelayCycle = isTight(constraint) &&
+                            hasTightPath(getVertex(constraint.consumerOwner),
+                                         getVertex(constraint.producerOwner));
     if (directlySameWave || onZeroDelayCycle)
       model.clusterEdges.push_back(
           ScheduleEdge{constraint.producer, constraint.consumer});
@@ -2425,9 +2388,9 @@ static LogicalResult addSyncScheduleEdges(MutableArrayRef<GroupDag> groups,
               consumerSchedule->first, distance});
       return success();
     };
-    if (!group.root->children.empty() &&
-        failed(forEachNodeChecked(group.root->children[0], addReleaseEdge)))
-      return failure();
+    for (const auto &node : group.nodes)
+      if (isDirectLoopNode(node.get()) && failed(addReleaseEdge(node.get())))
+        return failure();
   }
   return success();
 }
@@ -2576,22 +2539,53 @@ static void assignSyncScheduleChain(Node *head, ScheduleCache &cache) {
   }
 }
 
-LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups) {
-  llvm::MapVector<Operation *, LoopScheduleModel> modelsByLoop;
-  if (failed(assignBufferStageOffsets(groups)))
+static LogicalResult analyzeSyncSchedule(
+    MutableArrayRef<GroupDag> groups,
+    llvm::MapVector<Operation *, LoopScheduleModel> &modelsByLoop) {
+  if (failed(assignCircularStageOffsets(groups)))
     return failure();
+  for (GroupDag &group : groups)
+    if (failed(assignAliasedHandoffStageOffsets(group)))
+      return failure();
   if (failed(addSyncScheduleEdges(groups, modelsByLoop)))
     return failure();
   for (auto &[loopOp, model] : modelsByLoop) {
     auto loop = cast<scf::ForOp>(loopOp);
     if (failed(solveOwnerScheduleConstraints(model)))
       return failure();
-    if (!model.clusterEdges.empty()) {
-      addSSAClusterConstraints(loop, model.clusterEdges);
-      if (failed(legalizeLoopSchedule(loop, model.clusterEdges)))
-        return failure();
-    }
+    if (model.clusterEdges.empty())
+      continue;
+    addSSAClusterConstraints(loop, model.clusterEdges);
+    if (failed(legalizeLoopSchedule(loop, model.clusterEdges)))
+      return failure();
   }
+  return success();
+}
+
+static LogicalResult validateSyncSchedule(LogicalResult result,
+                                          std::optional<Diagnostic> &error) {
+  if (succeeded(result) || !error)
+    return result;
+  error->getLocation().getContext()->getDiagEngine().emit(std::move(*error));
+  return failure();
+}
+
+LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups) {
+  if (groups.empty())
+    return success();
+  llvm::MapVector<Operation *, LoopScheduleModel> modelsByLoop;
+  std::optional<Diagnostic> scheduleError;
+  LogicalResult result = success();
+  {
+    ScopedDiagnosticHandler defer(
+        groups.front().root->op->getContext(),
+        [&](Diagnostic &diag) { scheduleError.emplace(std::move(diag)); });
+    result = analyzeSyncSchedule(groups, modelsByLoop);
+  }
+  // The sole rejection gate; analysis and its diagnostics remain available if
+  // this policy check is temporarily disabled.
+  if (failed(validateSyncSchedule(result, scheduleError)))
+    return failure();
   for (GroupDag &g : groups) {
     if (g.root->children.empty())
       continue;
