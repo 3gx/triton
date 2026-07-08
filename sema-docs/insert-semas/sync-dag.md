@@ -19,6 +19,7 @@
   - [The deletion conditions, in full](#the-deletion-conditions-in-full)
     - [Implied ordering (`reduceEdges`)](#1-implied-ordering-reduceedges)
     - [Repeats from one sender (`buildEdgesAndSemas`)](#2-repeats-from-one-sender-buildedgesandsemas)
+    - [Covered senders (`buildEdgesAndSemas`)](#3-covered-senders-buildedgesandsemas)
   - [One destination node, one semaphore](#one-destination-node-one-semaphore)
   - [Composition: why loop entry and loop recurrence share one semaphore](#composition-why-loop-entry-and-loop-recurrence-share-one-semaphore)
 - [Region flows](#region-flows)
@@ -1397,6 +1398,39 @@ omitted:
                                 v
                             W m0 {0}
 ```
+
+#### 3. Covered senders (`buildEdgesAndSemas`)
+
+The walk annotates rather than deletes: when a WAR/WAW edge's source use is
+the piece's version source and another live use is already ordered after it
+(the source's `orderedBefore` names that use's owner), the edge is recorded
+with `coveredVia` = that owner. The fact is still true and the edge still
+participates in reduction and in the same-sender merge above — a covered
+edge of a surviving sender anchors that sender's release exactly as before.
+
+After grouping and merging, a sender whose EVERY merged edge is covered
+contributes no ordering of its own: each covered source is ordered before
+the coverer's acquire, and the coverer raises its own arrival into the same
+destination. Such a sender's arrival is deleted whole, and the semaphore's
+pending count shrinks by its contribution; a handoff whose every sender is
+covered dissolves entirely. The deletion validates that the covering path
+survives: the coverer must still arrive at this destination (leg 2), and a
+surviving release of the deleted sender — acquired by the coverer no later
+than the coverer's own release into this handoff — must certify the covered
+source (leg 1). A candidate may only rely on paths that themselves survive,
+so the candidate set shrinks to a fixpoint before it is applied.
+
+Granularity is the point of this rule. Deleting a covered edge whose sender
+keeps other edges into the destination saves nothing — the merge emits one
+release either way — but re-anchors that release at an earlier surviving
+source. A release lowers to a warp-group rendezvous plus one arrive, and
+re-anchoring it from after the sender's last write to just after a long
+TMEM read exposed the rendezvous on the read's dependency shadow, stalling
+all warps of the bottleneck partition on the slowest read every iteration
+(~7% FP16 flash-attention loss on B300). Handoff-granularity deletion can
+only remove whole arrivals or whole semaphores, never move a surviving
+release earlier, so redundancy elimination is placement-invariant by
+construction.
 
 ### One destination node, one semaphore
 

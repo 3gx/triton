@@ -100,33 +100,36 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
     // The buffer.id=4 accumulator-class TMEM allocation is hoisted to a single
     // 1x128x128 alloc whose subslices (alpha/offsetkv stats + acc + f16 view)
-    // form one multi-member semaphore group: two true gates (pending_count =
-    // 2) plus six false(FULL) phases (pending_count = 1).
+    // form one multi-member semaphore group: an inner true gate (pending_count
+    // = 2), an outer true gate (pending_count = 1) plus five false(FULL)
+    // phases (pending_count = 1). Handoff-level dedup dropped the outer gate's
+    // partition-5 arrival (covered by partition 0's reload chain) and merged
+    // the two post-loop stats-store phases into a single FULL phase.
     // CHECK:           [[R4:%.*]] = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     // CHECK:           [[R4_IN:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R4]], %{{.*}} true {pending_count = 2 : i32} : <[{{.*}}]>
-    // CHECK:           [[R4_E:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R4]], %{{.*}} true {pending_count = 2 : i32} : <[{{.*}}]>
+    // CHECK:           [[R4_E:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R4]], %{{.*}} true {pending_count = 1 : i32} : <[{{.*}}]>
     // CHECK:           [[R4_F1:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R4]], %{{.*}} false {pending_count = 1 : i32} : <[{{.*}}]>
     // CHECK:           [[R4_F2:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R4]], %{{.*}} false {pending_count = 1 : i32} : <[{{.*}}]>
     // CHECK:           [[R4_F3:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R4]], %{{.*}} false {pending_count = 1 : i32} : <[{{.*}}]>
     // CHECK:           [[R4_F4:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R4]], %{{.*}} false {pending_count = 1 : i32} : <[{{.*}}]>
     // CHECK:           [[R4_F5:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R4]], %{{.*}} false {pending_count = 1 : i32} : <[{{.*}}]>
-    // CHECK:           [[R4_F6:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R4]], %{{.*}} false {pending_count = 1 : i32} : <[{{.*}}]>
     %alpha = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32, buffer.offset = 64 : i32} : () -> !ttg.memdesc<128x1xf32, #tmem, #ttng.tensor_memory, mutable>
     %alpha_15 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.offset = 64 : i32} : () -> !ttg.memdesc<128x1xf32, #tmem, #ttng.tensor_memory, mutable>
     %offsetkv_y = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32, buffer.offset = 66 : i32} : () -> !ttg.memdesc<128x1xf32, #tmem, #ttng.tensor_memory, mutable>
     %offsetkv_y_16 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32, buffer.offset = 65 : i32} : () -> !ttg.memdesc<128x1xf32, #tmem, #ttng.tensor_memory, mutable>
     // The buffer.id=5 accumulator-class TMEM allocation forms the second
-    // multi-member group: one true gate (pending_count = 2) plus seven
-    // false(FULL) phases. R5_F4 has pending_count = 2.
+    // multi-member group: one true gate (pending_count = 1; the partition-4
+    // arrival is covered by partition 0's reload chain) plus six false(FULL)
+    // phases (the two post-loop stats-store phases merged). R5_F4 has
+    // pending_count = 2.
     // CHECK:           [[R5:%.*]] = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-    // CHECK:           [[R5_E:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R5]], %{{.*}} true {pending_count = 2 : i32} : <[{{.*}}]>
+    // CHECK:           [[R5_E:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R5]], %{{.*}} true {pending_count = 1 : i32} : <[{{.*}}]>
     // CHECK:           [[R5_F1:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R5]], %{{.*}} false {pending_count = 1 : i32} : <[{{.*}}]>
     // CHECK:           [[R5_F2:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R5]], %{{.*}} false {pending_count = 1 : i32} : <[{{.*}}]>
     // CHECK:           [[R5_F3:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R5]], %{{.*}} false {pending_count = 1 : i32} : <[{{.*}}]>
     // CHECK:           [[R5_F4:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R5]], %{{.*}} false {pending_count = 2 : i32} : <[{{.*}}]>
     // CHECK:           [[R5_F5:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R5]], %{{.*}} false {pending_count = 1 : i32} : <[{{.*}}]>
     // CHECK:           [[R5_F6:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R5]], %{{.*}} false {pending_count = 1 : i32} : <[{{.*}}]>
-    // CHECK:           [[R5_F7:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R5]], %{{.*}} false {pending_count = 1 : i32} : <[{{.*}}]>
     %offsetkv_y_17 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.offset = 66 : i32} : () -> !ttg.memdesc<128x1xf32, #tmem, #ttng.tensor_memory, mutable>
     %offsetkv_y_18 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.offset = 65 : i32} : () -> !ttg.memdesc<128x1xf32, #tmem, #ttng.tensor_memory, mutable>
     // Epilogue-store SMEM scratch (%3,%4) each get a true/false pair.
@@ -191,12 +194,15 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %qk_0, %qk_0_32 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0, 1, 5>} : () -> (!ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable>, !ttg.async.token)
       %qk_1, %qk_1_33 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0, 1, 4>} : () -> (!ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable>, !ttg.async.token)
       // The acc_0 / acc_1 init stores reuse the gated ACC0/ACC1 EMPTY carriers
-      // (no re-acquire here) and write zero into the point-of-use buffer.
+      // (no re-acquire here), write zero into the point-of-use buffer, and
+      // release the EMPTY gate forward to the per-iteration in-loop acquire.
       // CHECK:           [[ACC0_BUF0:%.*]] = nvws.semaphore.buffer [[ACC0_E]], [[C_ACC0]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
       // CHECK:           ttng.tmem_store %{{.*}}, [[ACC0_BUF0]], %{{.*}} {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+      // CHECK:           nvws.semaphore.release [[ACC0_E]], [[C_ACC0]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
       %acc_0, %acc_0_34 = ttng.tmem_alloc %cst_0 {buffer.copy = 1 : i32, buffer.id = 2 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #linear>) -> (!ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable>, !ttg.async.token)
       // CHECK:           [[ACC1_BUF0:%.*]] = nvws.semaphore.buffer [[ACC1_E]], [[C_ACC1]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
       // CHECK:           ttng.tmem_store %{{.*}}, [[ACC1_BUF0]], %{{.*}} {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+      // CHECK:           nvws.semaphore.release [[ACC1_E]], [[C_ACC1]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
       %acc_1, %acc_1_35 = ttng.tmem_alloc %cst_0 {buffer.copy = 1 : i32, buffer.id = 3 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #linear>) -> (!ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable>, !ttg.async.token)
 
       // Outside the inner loop, the K/V FULL tokens consumed by the trailing
@@ -204,9 +210,10 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       // CHECK:           [[K_PRE:%.*]] = nvws.semaphore.acquire [[Q0_F]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
       // CHECK:           [[V_PRE:%.*]] = nvws.semaphore.acquire [[Q1_F]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
 
-      // Inner pipelined loop re-threads R5 and the ACC0/ACC1 tokens. The R4
+      // Inner pipelined loop re-threads only the R5 token; the ACC0/ACC1
+      // EMPTY gates are re-acquired at point of use each iteration. The R4
       // inner gate and the Q FULL tokens are loop-invariant captures.
-      // CHECK:           [[INNER:%.*]]:8 = scf.for {{.*}} iter_args({{.*}}, [[I_R5:%.*]] = [[C_R5]], [[I_ACC0:%.*]] = [[C_ACC0]], [[I_ACC1:%.*]] = [[C_ACC1]]) -> (i32, {{.*}}, !ttg.async.token, !ttg.async.token, !ttg.async.token)  : i32 {
+      // CHECK:           [[INNER:%.*]]:6 = scf.for {{.*}} iter_args({{.*}}, [[I_R5:%.*]] = [[C_R5]]) -> (i32, {{.*}}, !ttg.async.token)  : i32 {
       %offsetkv_y_40:9 = scf.for %offsetkv_y_88 = %c0_i32 to %c16384_i32 step %c128_i32 iter_args(%offset_y_89 = %offset_y_22, %arg12 = %cst_2, %arg13 = %cst_1, %qk_0_90 = %qk_0_32, %acc_91 = %acc_0_34, %arg16 = %cst_2, %arg17 = %cst_1, %qk_1_92 = %qk_1_33, %acc_93 = %acc_1_35) -> (i32, tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, !ttg.async.token, !ttg.async.token, tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, !ttg.async.token, !ttg.async.token)  : i32 {
         // K descriptor load: acquire EMPTY (K_E), point-of-use buffer, release FULL.
         // CHECK:             [[KIN_AE:%.*]] = nvws.semaphore.acquire [[K_E]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token
@@ -307,11 +314,14 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
           %l_ij_178 = arith.addf %l_ij_176, %l_ij_177 {ttg.partition = array<i32: 4>} : f32
           tt.reduce.return %l_ij_178 {ttg.partition = array<i32: 4>} : f32
         }) {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 4>, ttg.partition.outputs = [array<i32: 4>]} : (tensor<128x128xf32, #linear>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
-        // acc_0 tmem_load (partition 0) buffers the gated ACC0 carrier.
-        // CHECK:             [[ACC0_LD:%.*]] = nvws.semaphore.buffer [[ACC0_E]], [[I_ACC0]] {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+        // acc_0 tmem_load (partition 0) acquires the ACC0 EMPTY gate at point
+        // of use (arrival: init store on iteration 0, then the PV MMA release).
+        // CHECK:             [[ACC0_A:%.*]] = nvws.semaphore.acquire [[ACC0_E]] {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+        // CHECK:             [[ACC0_LD:%.*]] = nvws.semaphore.buffer [[ACC0_E]], [[ACC0_A]] {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
         // CHECK:             ttng.tmem_load [[ACC0_LD]][] {loop.cluster = 4 : i32, loop.stage = 0 : i32, tmem.end = array<i32: 8>, ttg.partition = array<i32: 0>}
         %acc_133, %acc_134 = ttng.tmem_load %acc_0[%acc_91] {loop.cluster = 4 : i32, loop.stage = 0 : i32, tmem.end = array<i32: 8>, ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear1>
-        // CHECK:             [[ACC1_LD:%.*]] = nvws.semaphore.buffer [[ACC1_E]], [[I_ACC1]] {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+        // CHECK:             [[ACC1_A:%.*]] = nvws.semaphore.acquire [[ACC1_E]] {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+        // CHECK:             [[ACC1_LD:%.*]] = nvws.semaphore.buffer [[ACC1_E]], [[ACC1_A]] {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
         // CHECK:             ttng.tmem_load [[ACC1_LD]][] {loop.cluster = 2 : i32, loop.stage = 1 : i32, tmem.end = array<i32: 11>, ttg.partition = array<i32: 0>}
         %acc_135, %acc_136 = ttng.tmem_load %acc_1[%acc_93] {loop.cluster = 2 : i32, loop.stage = 1 : i32, tmem.end = array<i32: 11>, ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear1>
         %18 = tt.reshape %acc_133 {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear1> -> tensor<128x2x64xf32, #linear2>
@@ -370,10 +380,10 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %acc_165 = ttng.tmem_alloc %p_163 {buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.offset = 0 : i32, loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 4>} : (tensor<128x128xf16, #linear>) -> !ttg.memdesc<128x128xf16, #tmem1, #ttng.tensor_memory>
         // acc_0 update store (partition 0) into the ACC0 carrier buffer, release ACC0_F.
         // CHECK:             ttng.tmem_store %{{.*}}, [[ACC0_LD]][], %{{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32, tmem.start = array<i32: 9>, ttg.partition = array<i32: 0>}
-        // CHECK:             nvws.semaphore.release [[ACC0_F]], [[I_ACC0]] [#nvws.async_op<none>] {arrive_count = 1 : i32, loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
+        // CHECK:             nvws.semaphore.release [[ACC0_F]], [[ACC0_A]] [#nvws.async_op<none>] {arrive_count = 1 : i32, loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
         %acc_166 = ttng.tmem_store %acc_160, %acc_0[%acc_134], %true {loop.cluster = 4 : i32, loop.stage = 0 : i32, tmem.start = array<i32: 9>, ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear> -> !ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable>
         // CHECK:             ttng.tmem_store %{{.*}}, [[ACC1_LD]][], %{{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32, tmem.start = array<i32: 12>, ttg.partition = array<i32: 0>}
-        // CHECK:             nvws.semaphore.release [[ACC1_F]], [[I_ACC1]] [#nvws.async_op<none>] {arrive_count = 1 : i32, loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
+        // CHECK:             nvws.semaphore.release [[ACC1_F]], [[ACC1_A]] [#nvws.async_op<none>] {arrive_count = 1 : i32, loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
         %acc_167 = ttng.tmem_store %acc_161, %acc_1[%acc_136], %true {loop.cluster = 2 : i32, loop.stage = 1 : i32, tmem.start = array<i32: 12>, ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear> -> !ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable>
         // PV MMA #1 (partition 1): buffer R4_F3 (p f16 view #4), acquire ACC0_F
         // FULL, acquire V_F FULL, tc5mma, release ACC0_E.
@@ -401,90 +411,84 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %l_i0_173 = arith.addf %l_i0, %l_ij {loop.cluster = 1 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 5>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
         %l_i0_174 = arith.addf %l_i0_172, %l_ij_132 {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 4>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
         %offsetkv_y_175 = arith.addi %offset_y_89, %c128_i32 {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 3>} : i32
-        // End-of-iteration re-acquires for R5 and the accumulator EMPTY tokens,
-        // carried into the next inner iteration via scf.yield.
+        // End-of-iteration re-acquire for R5 only, carried into the next inner
+        // iteration via scf.yield (ACC0/ACC1 re-acquire at point of use).
         // CHECK:             [[NX_R5:%.*]] = nvws.semaphore.acquire [[R5_F4]] {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : <[{{.*}}]> -> !ttg.async.token
-        // CHECK:             [[NX_ACC0:%.*]] = nvws.semaphore.acquire [[ACC0_E]] {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
-        // CHECK:             [[NX_ACC1:%.*]] = nvws.semaphore.acquire [[ACC1_E]] {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
-        // CHECK:             scf.yield {ttg.partition = array<i32: 0, 1, 3, 4, 5>} %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, [[NX_R5]], [[NX_ACC0]], [[NX_ACC1]] :
+        // CHECK:             scf.yield {ttg.partition = array<i32: 0, 1, 3, 4, 5>} %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, [[NX_R5]] :
         scf.yield {ttg.partition = array<i32: 0, 1, 3, 4, 5>} %offsetkv_y_175, %l_i0_173, %m_ij_113, %qk_104, %acc_170, %l_i0_174, %m_ij_114, %qk_107, %acc_171 : i32, tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, !ttg.async.token, !ttg.async.token, tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, !ttg.async.token, !ttg.async.token
       // Inner-loop close: pinned pipelining attrs.
-      // CHECK:           } {tt.data_partition_factor = 2 : i32, tt.merge_epilogue = true, tt.scheduled_max_stage = 1 : i32, tt.separate_epilogue_store = true, ttg.partition = array<i32: 0, 1, 3, 4, 5>, ttg.partition.outputs = {{\[}}array<i32: 3>, array<i32: 5>, array<i32: 5>, array<i32: 4>, array<i32: 4>, array<i32: 1>, array<i32: 0>, array<i32: 0>]}
+      // CHECK:           } {tt.data_partition_factor = 2 : i32, tt.merge_epilogue = true, tt.scheduled_max_stage = 1 : i32, tt.separate_epilogue_store = true, ttg.partition = array<i32: 0, 1, 3, 4, 5>, ttg.partition.outputs = {{\[}}array<i32: 3>, array<i32: 5>, array<i32: 5>, array<i32: 4>, array<i32: 4>, array<i32: 1>]}
       } {tt.data_partition_factor = 2 : i32, tt.merge_epilogue = true, tt.scheduled_max_stage = 1 : i32, tt.separate_epilogue_store = true, ttg.partition = array<i32: 0, 1, 3, 4, 5>, ttg.partition.outputs = [array<i32: 3>, array<i32: 5>, array<i32: 5>, array<i32: 1>, array<i32: 0>, array<i32: 4>, array<i32: 4>, array<i32: 1>, array<i32: 0>]}
 
       // Post-inner-loop epilogue (still inside the persistent outer loop). The
       // inner Q FULL tokens release back as EMPTY for the next outer iteration,
-      // R5's carried result and R4's point-of-use drain each fan out to two
-      // final FULL phases.
+      // R5's carried result and R4's point-of-use drain each hand off to a
+      // single merged FULL phase shared by that partition's two stats stores.
+      // The drain releases carry async_op<none>: the MMA writes are already
+      // certified through the in-loop tc5mma handoffs feeding R4_IN / R5_F4.
       // CHECK:           nvws.semaphore.release [[Q1_E]], [[V_PRE]] [#nvws.async_op<tc5mma>] {arrive_count = 1 : i32, loop.cluster = 3 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
       // CHECK:           nvws.semaphore.release [[Q0_E]], [[K_PRE]] [#nvws.async_op<tc5mma>] {arrive_count = 1 : i32, loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>, !ttg.async.token
-      // CHECK:           nvws.semaphore.release [[R5_F5]], [[INNER]]#5 [#nvws.async_op<tc5mma>] {arrive_count = 1 : i32, loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>}
-      // CHECK:           nvws.semaphore.release [[R5_F6]], [[INNER]]#5 [#nvws.async_op<tc5mma>] {arrive_count = 1 : i32, loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>}
+      // CHECK:           nvws.semaphore.release [[R5_F5]], [[INNER]]#5 [#nvws.async_op<none>] {arrive_count = 1 : i32, loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>}
 
-      // offsetkv_y_18 stats store (partition 4) lands in the R5_F5 phase:
-      // acquire, buffer #2, store.
+      // Both offsetkv stats stores (partition 4) share the merged R5_F5
+      // phase: one acquire, store #2 then #1, then release R5_F6. The old
+      // direct partition-4 arrival into R5_E is gone: it is covered by
+      // partition 0's reloads through R5_F6.
       // CHECK:           [[OK18_AF:%.*]] = nvws.semaphore.acquire [[R5_F5]] {ttg.partition = array<i32: 4>} : <[{{.*}}]> -> !ttg.async.token
       // CHECK:           [[OK18_BUF:%.*]]:5 = nvws.semaphore.buffer [[R5_F5]], [[OK18_AF]] {ttg.partition = array<i32: 4>} : <[{{.*}}]>, !ttg.async.token -> {{.*}}
       // CHECK:           ttng.tmem_store %{{.*}}, [[OK18_BUF]]#2, %{{.*}} {ttg.partition = array<i32: 4>} : tensor<128x1xf32, #linear> -> !ttg.memdesc<128x1xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x1>
       %offsetkv_y_41 = tt.expand_dims %offsetkv_y_40#6 {axis = 1 : i32, ttg.partition = array<i32: 4>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<128x1xf32, #linear>
       %offsetkv_y_42 = arith.constant {ttg.partition = array<i32: 4>} true
       ttng.tmem_store %offsetkv_y_41, %offsetkv_y_18, %offsetkv_y_42 {ttg.partition = array<i32: 4>} : tensor<128x1xf32, #linear> -> !ttg.memdesc<128x1xf32, #tmem, #ttng.tensor_memory, mutable>
-      // offsetkv_y_17 stats store (partition 4) lands in R5_F6: acquire,
-      // buffer #1, store, then release R5_F7 and R5_E.
-      // CHECK:           [[OK17_AF:%.*]] = nvws.semaphore.acquire [[R5_F6]] {ttg.partition = array<i32: 4>} : <[{{.*}}]> -> !ttg.async.token
-      // CHECK:           [[OK17_BUF:%.*]]:5 = nvws.semaphore.buffer [[R5_F6]], [[OK17_AF]] {ttg.partition = array<i32: 4>} : <[{{.*}}]>, !ttg.async.token -> {{.*}}
-      // CHECK:           ttng.tmem_store %{{.*}}, [[OK17_BUF]]#1, %{{.*}} {ttg.partition = array<i32: 4>} : tensor<128x1xf32, #linear> -> !ttg.memdesc<128x1xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x1>
-      // CHECK:           nvws.semaphore.release [[R5_F7]], [[OK17_AF]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 4>}
-      // CHECK:           nvws.semaphore.release [[R5_E]], [[OK17_AF]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 4>}
+      // CHECK:           ttng.tmem_store %{{.*}}, [[OK18_BUF]]#1, %{{.*}} {ttg.partition = array<i32: 4>} : tensor<128x1xf32, #linear> -> !ttg.memdesc<128x1xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x1>
+      // CHECK:           nvws.semaphore.release [[R5_F6]], [[OK18_AF]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 4>}
       %offsetkv_y_43 = tt.expand_dims %offsetkv_y_40#5 {axis = 1 : i32, ttg.partition = array<i32: 4>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<128x1xf32, #linear>
       %offsetkv_y_44 = arith.constant {ttg.partition = array<i32: 4>} true
       ttng.tmem_store %offsetkv_y_43, %offsetkv_y_17, %offsetkv_y_44 {ttg.partition = array<i32: 4>} : tensor<128x1xf32, #linear> -> !ttg.memdesc<128x1xf32, #tmem, #ttng.tensor_memory, mutable>
       // CHECK:           [[R4_DRAIN:%.*]] = nvws.semaphore.acquire [[R4_IN]] {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : <[{{.*}}]> -> !ttg.async.token
-      // CHECK:           nvws.semaphore.release [[R4_F4]], [[R4_DRAIN]] [#nvws.async_op<tc5mma>] {arrive_count = 1 : i32, loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>}
-      // CHECK:           nvws.semaphore.release [[R4_F5]], [[R4_DRAIN]] [#nvws.async_op<tc5mma>] {arrive_count = 1 : i32, loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>}
+      // CHECK:           nvws.semaphore.release [[R4_F4]], [[R4_DRAIN]] [#nvws.async_op<none>] {arrive_count = 1 : i32, loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>}
 
-      // offsetkv_y_16 stats store (partition 5) lands in R4_F4: acquire,
-      // buffer #2, store.
+      // Both offsetkv stats stores (partition 5) share the merged R4_F4
+      // phase: one acquire, store #2 then #1, then release R4_F5. As with
+      // R5, the direct partition-5 arrival into R4_E is covered by partition
+      // 0's reloads through R4_F5.
       // CHECK:           [[OK16_AF:%.*]] = nvws.semaphore.acquire [[R4_F4]] {ttg.partition = array<i32: 5>} : <[{{.*}}]> -> !ttg.async.token
       // CHECK:           [[OK16_BUF:%.*]]:5 = nvws.semaphore.buffer [[R4_F4]], [[OK16_AF]] {ttg.partition = array<i32: 5>} : <[{{.*}}]>, !ttg.async.token -> {{.*}}
       // CHECK:           ttng.tmem_store %{{.*}}, [[OK16_BUF]]#2, %{{.*}} {ttg.partition = array<i32: 5>} : tensor<128x1xf32, #linear> -> !ttg.memdesc<128x1xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x1>
       %offsetkv_y_45 = tt.expand_dims %offsetkv_y_40#2 {axis = 1 : i32, ttg.partition = array<i32: 5>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<128x1xf32, #linear>
       %offsetkv_y_46 = arith.constant {ttg.partition = array<i32: 5>} true
       ttng.tmem_store %offsetkv_y_45, %offsetkv_y_16, %offsetkv_y_46 {ttg.partition = array<i32: 5>} : tensor<128x1xf32, #linear> -> !ttg.memdesc<128x1xf32, #tmem, #ttng.tensor_memory, mutable>
-      // offsetkv_y stats store (partition 5): acquire R4_F5, buffer #1, store,
-      // then release R4_F6 and R4_E.
-      // CHECK:           [[OK_AF:%.*]] = nvws.semaphore.acquire [[R4_F5]] {ttg.partition = array<i32: 5>} : <[{{.*}}]> -> !ttg.async.token
-      // CHECK:           [[OK_BUF:%.*]]:5 = nvws.semaphore.buffer [[R4_F5]], [[OK_AF]] {ttg.partition = array<i32: 5>} : <[{{.*}}]>, !ttg.async.token -> {{.*}}
-      // CHECK:           ttng.tmem_store %{{.*}}, [[OK_BUF]]#1, %{{.*}} {ttg.partition = array<i32: 5>} : tensor<128x1xf32, #linear> -> !ttg.memdesc<128x1xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x1>
-      // CHECK:           nvws.semaphore.release [[R4_F6]], [[OK_AF]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 5>}
-      // CHECK:           nvws.semaphore.release [[R4_E]], [[OK_AF]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 5>}
+      // CHECK:           ttng.tmem_store %{{.*}}, [[OK16_BUF]]#1, %{{.*}} {ttg.partition = array<i32: 5>} : tensor<128x1xf32, #linear> -> !ttg.memdesc<128x1xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x1>
+      // CHECK:           nvws.semaphore.release [[R4_F5]], [[OK16_AF]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 5>}
       %offsetkv_y_47 = tt.expand_dims %offsetkv_y_40#1 {axis = 1 : i32, ttg.partition = array<i32: 5>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<128x1xf32, #linear>
       %offsetkv_y_48 = arith.constant {ttg.partition = array<i32: 5>} true
       ttng.tmem_store %offsetkv_y_47, %offsetkv_y, %offsetkv_y_48 {ttg.partition = array<i32: 5>} : tensor<128x1xf32, #linear> -> !ttg.memdesc<128x1xf32, #tmem, #ttng.tensor_memory, mutable>
-      // offsetkv_y reload (partition 0): acquire R4_F6, buffer, load #1.
-      // CHECK:           [[OKR_AF:%.*]] = nvws.semaphore.acquire [[R4_F6]] {ttg.partition = array<i32: 0>} : <[{{.*}}]> -> !ttg.async.token
-      // CHECK:           [[OKR_BUF:%.*]]:5 = nvws.semaphore.buffer [[R4_F6]], [[OKR_AF]] {ttg.partition = array<i32: 0>} : <[{{.*}}]>, !ttg.async.token -> {{.*}}
+      // offsetkv_y reload (partition 0): acquire R4_F5, buffer, load #1.
+      // CHECK:           [[OKR_AF:%.*]] = nvws.semaphore.acquire [[R4_F5]] {ttg.partition = array<i32: 0>} : <[{{.*}}]> -> !ttg.async.token
+      // CHECK:           [[OKR_BUF:%.*]]:5 = nvws.semaphore.buffer [[R4_F5]], [[OKR_AF]] {ttg.partition = array<i32: 0>} : <[{{.*}}]>, !ttg.async.token -> {{.*}}
       // CHECK:           ttng.tmem_load [[OKR_BUF]]#1[] {ttg.partition = array<i32: 0>}
       %offsetkv_y_49, %offsetkv_y_50 = ttng.tmem_load %offsetkv_y[] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x1xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x1xf32, #linear5>
       %offsetkv_y_51 = tt.reshape %offsetkv_y_49 {ttg.partition = array<i32: 0>} : tensor<128x1xf32, #linear5> -> tensor<128xf32, #linear6>
       %offsetkv_y_52 = ttg.convert_layout %offsetkv_y_51 {ttg.partition = array<i32: 0>} : tensor<128xf32, #linear6> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
       %m_i0 = math.log2 %offsetkv_y_52 {ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
-      // offsetkv_y_17 reload (partition 0): acquire R5_F7, buffer, load #1.
-      // CHECK:           [[OK17R_AF:%.*]] = nvws.semaphore.acquire [[R5_F7]] {ttg.partition = array<i32: 0>} : <[{{.*}}]> -> !ttg.async.token
-      // CHECK:           [[OK17R_BUF:%.*]]:5 = nvws.semaphore.buffer [[R5_F7]], [[OK17R_AF]] {ttg.partition = array<i32: 0>} : <[{{.*}}]>, !ttg.async.token -> {{.*}}
+      // offsetkv_y_17 reload (partition 0): acquire R5_F6, buffer, load #1.
+      // CHECK:           [[OK17R_AF:%.*]] = nvws.semaphore.acquire [[R5_F6]] {ttg.partition = array<i32: 0>} : <[{{.*}}]> -> !ttg.async.token
+      // CHECK:           [[OK17R_BUF:%.*]]:5 = nvws.semaphore.buffer [[R5_F6]], [[OK17R_AF]] {ttg.partition = array<i32: 0>} : <[{{.*}}]>, !ttg.async.token -> {{.*}}
       // CHECK:           ttng.tmem_load [[OK17R_BUF]]#1[] {ttg.partition = array<i32: 0>}
       %offsetkv_y_53, %offsetkv_y_54 = ttng.tmem_load %offsetkv_y_17[] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x1xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x1xf32, #linear5>
       %offsetkv_y_55 = tt.reshape %offsetkv_y_53 {ttg.partition = array<i32: 0>} : tensor<128x1xf32, #linear5> -> tensor<128xf32, #linear6>
       %offsetkv_y_56 = ttg.convert_layout %offsetkv_y_55 {ttg.partition = array<i32: 0>} : tensor<128xf32, #linear6> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
       %m_i0_57 = math.log2 %offsetkv_y_56 {ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
-      // offsetkv_y_16 reload (partition 0): load #2 from the R4_F6 buffer, release R4_E.
+      // offsetkv_y_16 reload (partition 0): load #2 from the R4_F5 buffer,
+      // then the sole arrival into R4_E.
       // CHECK:           ttng.tmem_load [[OKR_BUF]]#2[] {ttg.partition = array<i32: 0>}
       // CHECK:           nvws.semaphore.release [[R4_E]], [[OKR_AF]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>}
       %offsetkv_y_58, %offsetkv_y_59 = ttng.tmem_load %offsetkv_y_16[] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x1xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x1xf32, #linear5>
       %offsetkv_y_60 = tt.reshape %offsetkv_y_58 {ttg.partition = array<i32: 0>} : tensor<128x1xf32, #linear5> -> tensor<128xf32, #linear6>
       %offsetkv_y_61 = ttg.convert_layout %offsetkv_y_60 {ttg.partition = array<i32: 0>} : tensor<128xf32, #linear6> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
       %m_i0_62 = arith.addf %offsetkv_y_61, %m_i0 {ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
-      // offsetkv_y_18 reload (partition 0): load #2 from the R5_F7 buffer, release R5_E.
+      // offsetkv_y_18 reload (partition 0): load #2 from the R5_F6 buffer,
+      // then the sole arrival into R5_E.
       // CHECK:           ttng.tmem_load [[OK17R_BUF]]#2[] {ttg.partition = array<i32: 0>}
       // CHECK:           nvws.semaphore.release [[R5_E]], [[OK17R_AF]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>}
       %offsetkv_y_63, %offsetkv_y_64 = ttng.tmem_load %offsetkv_y_18[] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x1xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x1xf32, #linear5>
@@ -495,13 +499,16 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %acc0_68 = tt.expand_dims %offsetkv_y_56 {axis = 1 : i32, ttg.partition = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<128x1xf32, #linear>
       %acc0_69 = tt.broadcast %acc0 {ttg.partition = array<i32: 0>} : tensor<128x1xf32, #linear> -> tensor<128x128xf32, #linear>
       %acc0_70 = tt.broadcast %acc0_68 {ttg.partition = array<i32: 0>} : tensor<128x1xf32, #linear> -> tensor<128x128xf32, #linear>
-      // Final acc_0 readout (partition 0): buffer the gated ACC0 carrier, load.
-      // CHECK:           [[ACCF0_BUF:%.*]] = nvws.semaphore.buffer [[ACC0_E]], [[INNER]]#6 {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+      // Final acc_0 readout (partition 0): acquire the ACC0 EMPTY gate (last
+      // PV MMA release), buffer, load. The token is carried to the outer yield.
+      // CHECK:           [[ACCF0_A:%.*]] = nvws.semaphore.acquire [[ACC0_E]] {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+      // CHECK:           [[ACCF0_BUF:%.*]] = nvws.semaphore.buffer [[ACC0_E]], [[ACCF0_A]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
       // CHECK:           ttng.tmem_load [[ACCF0_BUF]][] {tmem.end = array<i32: 10>, ttg.partition = array<i32: 0>}
       %acc, %acc_71 = ttng.tmem_load %acc_0[%offsetkv_y_40#4] {tmem.end = array<i32: 10>, ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear1>
       %acc_72 = ttg.convert_layout %acc {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear1> -> tensor<128x128xf32, #linear>
-      // Final acc_1 readout (partition 0): buffer the gated ACC1 carrier, load.
-      // CHECK:           [[ACCF1_BUF:%.*]] = nvws.semaphore.buffer [[ACC1_E]], [[INNER]]#7 {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
+      // Final acc_1 readout (partition 0) mirrors acc_0.
+      // CHECK:           [[ACCF1_A:%.*]] = nvws.semaphore.acquire [[ACC1_E]] {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+      // CHECK:           [[ACCF1_BUF:%.*]] = nvws.semaphore.buffer [[ACC1_E]], [[ACCF1_A]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
       // CHECK:           ttng.tmem_load [[ACCF1_BUF]][] {tmem.end = array<i32: 13>, ttg.partition = array<i32: 0>}
       %acc_73, %acc_74 = ttng.tmem_load %acc_1[%offsetkv_y_40#8] {tmem.end = array<i32: 13>, ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear1>
       %acc_75 = ttg.convert_layout %acc_73 {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear1> -> tensor<128x128xf32, #linear>
@@ -558,7 +565,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       // CHECK:           [[OX_R4:%.*]] = nvws.semaphore.acquire [[R4_E]] {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : <[{{.*}}]> -> !ttg.async.token
       // CHECK:           nvws.semaphore.release [[R4_IN]], [[OX_R4]] [#nvws.async_op<none>] {arrive_count = 2 : i32, loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>}
       // CHECK:           [[OX_R5:%.*]] = nvws.semaphore.acquire [[R5_E]] {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : <[{{.*}}]> -> !ttg.async.token
-      // CHECK:           scf.yield {ttg.partition = array<i32: 0, 1, 2, 3, 4, 5>} %{{.*}}, [[OX_R5]], [[INNER]]#6, [[INNER]]#7 : i32, !ttg.async.token, !ttg.async.token, !ttg.async.token
+      // CHECK:           scf.yield {ttg.partition = array<i32: 0, 1, 2, 3, 4, 5>} %{{.*}}, [[OX_R5]], [[ACCF0_A]], [[ACCF1_A]] : i32, !ttg.async.token, !ttg.async.token, !ttg.async.token
       scf.yield {ttg.partition = array<i32: 0, 1, 2, 3, 4, 5>} %tile_idx_87 : i32
     // Outer-loop close: pinned warp-specialize attrs (stages, tag, types).
     // CHECK:           } {tt.data_partition_factor = 2 : i32, tt.merge_epilogue = true, tt.separate_epilogue_store = true, tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2, 3, 4, 5>, ttg.partition.outputs = {{.*}}, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["correction", "gemm", "epilogue_store", "load", "computation", "computation"], ttg.warp_specialize.tag = 0 : i32}
