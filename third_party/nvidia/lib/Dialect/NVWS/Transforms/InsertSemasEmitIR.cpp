@@ -380,12 +380,9 @@ static void rewriteSignatures(EmitCtx &ctx, MutableArrayRef<GroupDag> groups) {
   llvm::MapVector<Operation *, SmallVector<Want, 2>> wanted;
   for (GroupDag &g : groups) {
     forEachNode(g, [&](Node *n) {
-      if (n->isRegion())
-        for (const Crossing &c : n->crossings) {
-          if (n->kind == Node::For && !c.hold.threadsToken())
-            continue;
-          wanted[n->op].push_back(Want{&g, c.tokenOwner});
-        }
+      if (n->flow &&
+          (n->kind != Node::For || n->flow->threadsToken()))
+        wanted[n->op].push_back(Want{&g, n->flow->owner});
     });
   }
   SmallVector<Operation *> ops;
@@ -613,9 +610,9 @@ static Operation *renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
 
 static void renderRegion(EmitCtx &ctx, GroupDag &g, Node *n, RenderState &rs,
                          DenseMap<Node *, Value> &emitted) {
-  for (const Crossing &c : n->crossings) {
-    if (n->kind == Node::For && !c.hold.threadsToken())
-      continue; // native point-of-use: no slot (plan M2)
+  if (n->flow &&
+      (n->kind != Node::For || n->flow->threadsToken())) {
+    const RegionFlow &c = *n->flow;
     unsigned idx = slotIndexFor(ctx, n->op, &g);
     const RenderState::Token *lastToken = rs.lastToken();
     Value incoming = lastToken ? lastToken->value : Value();
@@ -635,25 +632,27 @@ static void renderRegion(EmitCtx &ctx, GroupDag &g, Node *n, RenderState &rs,
   if (auto forOp = dyn_cast<scf::ForOp>(n->op)) {
     RenderState body = rs.nested();
     seedRegionEntry(body, n->children[0]);
-    for (const Crossing &c : n->crossings) {
-      if (!c.hold.threadsToken()) {
+    if (n->flow) {
+      const RegionFlow &c = *n->flow;
+      if (!c.threadsToken()) {
         body.clearTokens();
-        continue;
+      } else {
+        unsigned idx = slotIndexFor(ctx, n->op, &g);
+        body.replaceLastToken(forOp.getRegionIterArg(idx), c.owner);
       }
-      unsigned idx = slotIndexFor(ctx, n->op, &g);
-      body.replaceLastToken(forOp.getRegionIterArg(idx), c.tokenOwner);
     }
     renderChain(ctx, g, n->children[0], body, emitted);
     auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-    for (const Crossing &c : n->crossings) {
-      if (!c.hold.threadsToken()) {
+    if (n->flow) {
+      const RegionFlow &c = *n->flow;
+      if (!c.threadsToken()) {
         rs.clearTokens(); // token died in the body; nothing flows out
-        continue;
+      } else {
+        unsigned idx = slotIndexFor(ctx, n->op, &g);
+        const RenderState::Token *bodyToken = body.lastToken();
+        yield->setOperand(idx, bodyToken ? bodyToken->value : Value());
+        rs.replaceLastToken(forOp.getResult(idx), c.owner);
       }
-      unsigned idx = slotIndexFor(ctx, n->op, &g);
-      const RenderState::Token *bodyToken = body.lastToken();
-      yield->setOperand(idx, bodyToken ? bodyToken->value : Value());
-      rs.replaceLastToken(forOp.getResult(idx), c.tokenOwner);
     }
     rs.clearViews();
     return;
@@ -666,7 +665,8 @@ static void renderRegion(EmitCtx &ctx, GroupDag &g, Node *n, RenderState &rs,
   renderChain(ctx, g, n->children[0], thenSt, emitted);
   if (n->children.size() > 1 && n->children[1])
     renderChain(ctx, g, n->children[1], elseSt, emitted);
-  for (const Crossing &c : n->crossings) {
+  if (n->flow) {
+    const RegionFlow &c = *n->flow;
     unsigned idx = slotIndexFor(ctx, n->op, &g);
     const RenderState::Token *lastToken = rs.lastToken();
     Value incoming = lastToken ? lastToken->value : Value();
@@ -674,17 +674,24 @@ static void renderRegion(EmitCtx &ctx, GroupDag &g, Node *n, RenderState &rs,
       incoming = ctx.poison;
     const RenderState::Token *thenToken = thenSt.lastToken();
     const RenderState::Token *elseToken = elseSt.lastToken();
-    Value thenV = c.finals[0]
-                      ? (thenToken ? thenToken->value : Value())
-                      : incoming;
-    Value elseV = (c.finals.size() > 1 && c.finals[1])
-                      ? (elseToken ? elseToken->value : Value())
-                      : incoming;
+    auto exitValue = [&](unsigned branch,
+                         const RenderState::Token *token) -> Value {
+      RegionFlow::ExitToken source =
+          branch < c.exitTokens.size() ? c.exitTokens[branch]
+                                       : RegionFlow::ExitToken::INPUT;
+      if (source == RegionFlow::ExitToken::INPUT)
+        return incoming;
+      if (source == RegionFlow::ExitToken::CURRENT)
+        return token ? token->value : Value();
+      return ctx.poison;
+    };
+    Value thenV = exitValue(0, thenToken);
+    Value elseV = exitValue(1, elseToken);
     auto thenYield = cast<scf::YieldOp>(ifOp.thenBlock()->getTerminator());
     thenYield->setOperand(idx, thenV);
     auto elseYield = cast<scf::YieldOp>(ifOp.elseBlock()->getTerminator());
     elseYield->setOperand(idx, elseV);
-    rs.replaceLastToken(ifOp.getResult(idx), c.tokenOwner);
+    rs.replaceLastToken(ifOp.getResult(idx), c.owner);
   }
   rs.clearViews();
 }
