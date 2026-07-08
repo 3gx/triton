@@ -795,6 +795,7 @@ static std::optional<Owner> firstAccessOwnerOfComp(GroupDag &g, Node *head) {
 
 static Node *assignTokenSources(GroupDag &g);
 static bool summarizeRegionFlow(GroupDag &g, Node *region, RegionFlow &crossing);
+static std::optional<SemaId> concreteExitSema(const RegionFlow &flow);
 // The entry acquire follows from the one rule: it is created only when the
 // token sweep finds an event with no incoming token. A threading loop
 // demands its own recurrence channel (its semaphore starts released and the
@@ -827,8 +828,19 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
         summarizeRegionFlow(g, p, *p->flow);
   };
   Owner tokenOwner = unsupplied->flow ? unsupplied->flow->owner : *entryTokenOwner;
-  if (unsupplied->isRegion() && unsupplied->flow && unsupplied->flow->resultSema) {
-    SemaId sid = *unsupplied->flow->resultSema;
+  // The entry rides the chain's recurrence channel when one exists: the
+  // demanding region's own, or the last threading loop's in the top chain.
+  std::optional<SemaId> channel;
+  if (unsupplied->isRegion() && unsupplied->flow)
+    channel = unsupplied->flow->resultSema;
+  if (!channel)
+    for (Node *n : llvm::reverse(nodes))
+      if (n->kind == Node::For && n->flow) {
+        channel = concreteExitSema(*n->flow);
+        break;
+      }
+  if (channel) {
+    SemaId sid = *channel;
     Sema &s = g.semas[sid];
     s.isEntry = true; // first event in chain order is this acquire
     s.entryTokenOwner = tokenOwner;
@@ -1085,22 +1097,34 @@ static void seedEntryTokens(TokenEnv &env, Node *head) {
   else
     env.clear();
 }
-// The render channel a region result carries: the incoming record's
-// semaphore when one exists, otherwise the first branch final's concrete
-// semaphore (an acquire's own, or the nested region's already-resolved one).
-static std::optional<SemaId> resolveResultSema(
-    const std::optional<TokenEnv::Record> &incoming, const RegionFlow &flow) {
-  if (incoming)
-    return incoming->sema;
+// The first concrete acquire reachable through the region's finals: the
+// recurrence channel of the structure, independent of walk order.
+static std::optional<SemaId> concreteExitSema(const RegionFlow &flow) {
   for (Node *final : flow.exits) {
     if (!final)
       continue;
     if (final->kind == Node::Acquire)
       return final->sema;
-    if (final->isRegion() && final->flow && final->flow->resultSema)
-      return final->flow->resultSema;
+    if (final->isRegion() && final->flow)
+      if (std::optional<SemaId> nested = concreteExitSema(*final->flow))
+        return nested;
   }
   return std::nullopt;
+}
+// The render channel a region result carries: the incoming record's
+// semaphore when one exists — unless that record is the function entry on a
+// different channel, in which case (and when there is no incoming at all)
+// the recurrence channel is the structure's own concrete exit semaphore.
+static std::optional<SemaId> resolveResultSema(
+    GroupDag &g, const std::optional<TokenEnv::Record> &incoming,
+    const RegionFlow &flow) {
+  if (incoming && (!g.semas[incoming->sema].isEntry ||
+                   incoming->producer->kind != Node::Acquire ||
+                   incoming->producer->owner))
+    return incoming->sema;
+  if (std::optional<SemaId> concrete = concreteExitSema(flow))
+    return concrete;
+  return incoming ? std::optional<SemaId>(incoming->sema) : std::nullopt;
 }
 static void assignTokenChain(GroupDag &g, Node *head, TokenEnv &env,
                              Node *&unsupplied);
@@ -1119,7 +1143,7 @@ static void assignTokenRegion(GroupDag &g, Node *n, TokenEnv &env,
   if (n->kind == Node::For) {
     TokenEnv body = env;
     if (n->flow) { // the carrier: the loop region node is the body's producer
-      n->flow->resultSema = resolveResultSema(incoming, *n->flow);
+      n->flow->resultSema = resolveResultSema(g, incoming, *n->flow);
       body.keepOnly(TokenEnv::Record{n->flow->owner, n,
                                      n->flow->resultSema.value_or(0)});
     } else {
@@ -1139,7 +1163,7 @@ static void assignTokenRegion(GroupDag &g, Node *n, TokenEnv &env,
   if (n->children.size() > 1 && n->children[1])
     assignTokenChain(g, n->children[1], elseEnv, unsupplied);
   if (n->flow) {
-    n->flow->resultSema = resolveResultSema(incoming, *n->flow);
+    n->flow->resultSema = resolveResultSema(g, incoming, *n->flow);
     env.keepOnly(TokenEnv::Record{n->flow->owner, n,
                                   n->flow->resultSema.value_or(0)});
   }
