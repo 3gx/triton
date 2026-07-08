@@ -609,8 +609,9 @@ static unsigned arrivalContribution(ArrayRef<EdgeRec> edges) {
       });
 }
 
+// Consumes the already-reduced edge list; edge reduction happens in
+// buildSyncDag before any backing or protocol decision.
 static LogicalResult buildEdgesAndSemas(GroupDag &g, SmallVector<EdgeRec> &edges) {
-  reduceEdges(g, edges);
   struct Handoff {
     Node *dst = nullptr;
     Owner owner;
@@ -1442,10 +1443,13 @@ static FailureOr<std::optional<int>> getPlannedBufferCopy(GroupDag &g) {
 }
 
 // Doc: sync-dag.md#backing-copies
-LogicalResult computeBackingPlan(GroupDag &g, bool useMetaPartitioner, int lowerSemaphoreNumStages,
-                                 int &numTmemBlocks) {
+// Early half: the buffer copy count depends only on the reduced edges (is the
+// group synchronized at all?) and the members, so it is decided before any
+// acquire or release exists.
+static LogicalResult computeBackingCopies(GroupDag &g, ArrayRef<EdgeRec> edges,
+                                          bool useMetaPartitioner, int &numTmemBlocks) {
   g.numCopies = 1;
-  bool synchronized = !g.semas.empty();
+  bool synchronized = !edges.empty();
   FailureOr<std::optional<int>> planned = getPlannedBufferCopy(g);
   if (failed(planned))
     return failure();
@@ -1455,20 +1459,28 @@ LogicalResult computeBackingPlan(GroupDag &g, bool useMetaPartitioner, int lower
   else if (synchronized && g.isTmem() && !useMetaPartitioner &&
            isMultiBufferedGroup(g, numTmemBlocks))
     g.numCopies = 2;
-  g.numSemaphoreCopies = g.numCopies;
-  bool hasProducerLoad = false;
-  forEachNode(g, [&](Node *node) {
-    if (node->kind == Node::Release && llvm::is_contained(node->payloads, AsyncOp::TMALoad))
-      hasProducerLoad = true;
-  });
-  if (synchronized && g.isLocal() && !plannedCopy && hasProducerLoad)
-    g.numSemaphoreCopies = std::max(1, lowerSemaphoreNumStages);
   if (synchronized && g.isTmem())
     for (const Member &m : g.pieceTable.members) {
       auto shape = m.type.getShape();
       if (shape.size() >= 2)
         numTmemBlocks += shape[0] * shape[1] * g.numCopies;
     }
+  return success();
+}
+// Late half: semaphore copies read the placed releases (producer-load payload)
+// and so run after protocol creation.
+static LogicalResult computeSemaphoreCopies(GroupDag &g, int lowerSemaphoreNumStages) {
+  g.numSemaphoreCopies = g.numCopies;
+  FailureOr<std::optional<int>> planned = getPlannedBufferCopy(g);
+  if (failed(planned))
+    return failure();
+  bool hasProducerLoad = false;
+  forEachNode(g, [&](Node *node) {
+    if (node->kind == Node::Release && llvm::is_contained(node->payloads, AsyncOp::TMALoad))
+      hasProducerLoad = true;
+  });
+  if (!g.semas.empty() && g.isLocal() && !*planned && hasProducerLoad)
+    g.numSemaphoreCopies = std::max(1, lowerSemaphoreNumStages);
   return success();
 }
 
@@ -2290,6 +2302,9 @@ LogicalResult buildSyncDag(GroupDag &g, bool useMetaPartitioner,
     ChainState top; // function chain: games start at bottom (first-touch)
     ChainWalker(g, top, edges, /*underFor=*/false).run(g.root->children[0]);
   }
+  reduceEdges(g, edges);
+  if (failed(computeBackingCopies(g, edges, useMetaPartitioner, numTmemBlocks)))
+    return failure();
   if (failed(buildEdgesAndSemas(g, edges)))
     return failure();
   if (failed(insertEntryAcquires(g)))
@@ -2300,7 +2315,7 @@ LogicalResult buildSyncDag(GroupDag &g, bool useMetaPartitioner,
     planRegionFlows(g, g.root->children[0]);
     computeRequiredParts(g.root->children[0]);
   }
-  if (failed(computeBackingPlan(g, useMetaPartitioner, lowerSemaphoreNumStages, numTmemBlocks)))
+  if (failed(computeSemaphoreCopies(g, lowerSemaphoreNumStages)))
     return failure();
   if (!g.semas.empty())
     for (Operation *alloc : g.ttDescriptorFedMembers)
