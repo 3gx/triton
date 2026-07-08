@@ -2435,7 +2435,7 @@ shift from the current stage of its backing buffer. The shift is applied modulo
 `buffer.copy`: `0` selects the current stage, `-1` the preceding stage, and
 `+1` the following stage.
 
-`analyzeSyncSchedule` runs one physical-stage analysis for circular
+`finalizeSyncSchedule` runs one physical-stage analysis for circular
 groups and non-circular aliased backings. It replays the fresh-write cursor
 that ASP will use: a write records the cursor ordinal as the group's current
 value, and a read uses the latest ordinal recorded for its group. The analysis
@@ -2654,7 +2654,7 @@ crossing releases likewise receive `stage-offset=1`.
 - `assignCircularStageOffsets`, `assignAliasedHandoffStageOffsets`,
   `PhysicalSchedules`, `replaySlots`, `computeSlotSchedule`,
   `computeLoopCarriedDistance`,
-  `addSyncScheduleEdges`, `legalizeLoopSchedule`, `analyzeSyncSchedule`,
+  `addSyncScheduleEdges`, `legalizeLoopSchedule`,
   `scheduleAtOwnerBoundary`, `assignSyncScheduleChain`, and
   `finalizeSyncSchedule`
 - `buildSyncDag`
