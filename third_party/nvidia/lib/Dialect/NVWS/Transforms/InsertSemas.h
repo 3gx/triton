@@ -68,48 +68,27 @@ struct Touch {
 
 struct Node;
 
-// Static identity of one semaphore capability.  The group is implicit in the
-// GroupDag being processed; producer identifies the token SSA (an acquire or a
-// region carrier), while that token preserves its dynamic physical-slot
-// lineage. `sema` is the selected render channel; region results preserve an
-// incoming channel when one exists, otherwise use a deterministic fallback.
-// The exact producer may have acquired another channel in the same GroupDag.
-struct CapabilityRef {
+// Static identity of one token.  The group is implicit in the GroupDag being
+// processed; producer identifies the token SSA (an acquire or a region
+// carrier), while that token preserves its dynamic physical-slot lineage.
+// `sema` is the selected render channel; region results preserve an incoming
+// channel when one exists, otherwise use a deterministic fallback. The exact
+// producer may have acquired another channel in the same GroupDag.
+struct TokenRef {
   Node *producer = nullptr;
   SemaId sema = 0;
   Owner owner;
 };
-struct SemaTransfer {
-  // passesInput describes SSA provenance; concrete is the fallback render
-  // channel when the region has no incoming capability.
-  bool valid = false, passesInput = false;
-  std::optional<SemaId> concrete;
-};
-
+// A region that threads a token: each exit path names the boundary owner's
+// last token producer inside that path, or nullptr to pass the ENTER token
+// through unchanged.
 struct RegionFlow {
-  enum class Mode { CARRIED, POINT_OF_USE, CHILD_OWNS };
-  enum class Blocker { NONE, TRAILING_USE, RESULT_CONSUMED };
   Owner owner;
-  SmallVector<Node *, 2> exits;
-  SemaTransfer semaTransfer;
-  bool ownersCompatible = true;
-  bool transparent = false;
-  bool completionUniform = true, completionUsesInput = true;
-  bool completionHasFallback = false;
-  gpu::StageCluster completionSchedule;
+  SmallVector<Node *, 2> exits; // nullptr means pass the ENTER token
   // Render channel of the region's token result, resolved directly by the
   // token sweep: the incoming record's semaphore when one exists, otherwise
   // the first branch final's concrete semaphore.
   std::optional<SemaId> resultSema;
-  Mode mode = Mode::CARRIED;
-  Blocker blocker = Blocker::NONE;
-  Node *entryAcquire = nullptr, *closingRelease = nullptr;
-  Node *firstToucher = nullptr;
-  Node *postLoopAcquire = nullptr, *bridgeAcquire = nullptr, *bridgeRelease = nullptr;
-  bool threadsToken() const { return mode == Mode::CARRIED; }
-  bool isPointOfUse() const { return mode == Mode::POINT_OF_USE; }
-  bool isChildOwned() const { return mode == Mode::CHILD_OWNS; }
-  Node *exit() const { return exits.empty() ? nullptr : exits.front(); }
 };
 
 struct Node {
@@ -124,14 +103,10 @@ struct Node {
   DenseMap<PieceId, PieceInfo> pieceInfo;
   SemaId sema = 0;
   unsigned count = 0;
-  bool postLoopAcquire = false;
   SmallVector<AsyncOp, 1> payloads;
   gpu::StageCluster stageCluster;
   std::optional<int64_t> stageOffset;
   std::optional<int64_t> bufferStageOffset;
-  // Explicit distance for a planned recurrence demand. Schedule analysis
-  // consumes this fact directly instead of recognizing a placement shape.
-  std::optional<int64_t> recurrenceDistance;
   // The SYNC-DAG proved that this node can reuse its owner's earlier token in
   // the same chain without a fresh handoff. EmitIR renders this fact; it does
   // not infer token-reuse eligibility on its own.

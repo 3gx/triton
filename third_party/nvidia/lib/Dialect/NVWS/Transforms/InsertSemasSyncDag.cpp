@@ -860,31 +860,9 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
   refreshEnclosingFlows(acq);
   return success();
 }
-// Doc: sync-dag.md#the-decision-per-region
-using SemaExpr = SemaTransfer;
-static SemaExpr inputSema() { return {true, true, std::nullopt}; }
-static SemaExpr concreteSema(SemaId sema) { return {true, false, sema}; }
-static SemaExpr joinSemaExpr(SemaExpr a, SemaExpr b) {
-  if (!a.valid || !b.valid)
-    return {};
-  bool passesInput = a.passesInput || b.passesInput;
-  return {true, passesInput, a.concrete ? a.concrete : b.concrete};
-}
-static SemaExpr applyFlow(const RegionFlow &flow, SemaExpr input) {
-  const SemaExpr &transfer = flow.semaTransfer;
-  if (!transfer.valid || !input.valid)
-    return {};
-  return transfer.passesInput ? input : transfer;
-}
-static std::optional<SemaId> resolveFlowSema(const RegionFlow &flow, SemaId input) {
-  return flow.semaTransfer.valid ? std::optional<SemaId>(input) : std::nullopt;
-}
-
 struct ChainBoundary {
   Node *final = nullptr;
   Owner owner;
-  SemaExpr sema = inputSema();
-  bool eventAfterFinal = false;
 };
 // The boundary owner's token survives trailing foreign work: when the
 // region has a boundary owner, its final is that owner's LAST token
@@ -897,8 +875,6 @@ static ChainBoundary summarizeChainBoundary(GroupDag &g, Node *head,
     if (n->kind == Node::Acquire) {
       result.final = n;
       result.owner = n->owner;
-      result.sema = concreteSema(n->sema);
-      result.eventAfterFinal = false;
       if (preferOwner) {
         const Sema &s = getSema(g, n);
         Owner tokenOwner = s.isEntry && !n->owner ? s.entryTokenOwner : n->owner;
@@ -908,98 +884,33 @@ static ChainBoundary summarizeChainBoundary(GroupDag &g, Node *head,
     } else if (n->isRegion() && n->flow) {
       result.final = n;
       result.owner = n->flow->owner;
-      result.sema = applyFlow(*n->flow, result.sema);
-      result.eventAfterFinal = false;
       if (preferOwner && sameOwner(n->flow->owner, *preferOwner))
         preferred = n;
-    } else if (n->isProtocol() || nodeInvolvesComp(g, n)) {
-      result.eventAfterFinal = true;
     }
   }
   if (preferred && result.final != preferred) {
     result.final = preferred;
     result.owner = *preferOwner;
-    if (preferred->kind == Node::Acquire)
-      result.sema = concreteSema(preferred->sema);
   }
   return result;
-}
-static bool exportsToken(const Node *final) {
-  if (!final)
-    return false;
-  if (final->kind == Node::Acquire)
-    return true;
-  return final->isRegion() && final->flow &&
-         (final->kind != Node::For || final->flow->threadsToken());
-}
-struct CompletionExpr {
-  bool valid = true;
-  bool usesInput = true, hasFallback = false;
-  gpu::StageCluster schedule;
-};
-static CompletionExpr concreteCompletion(gpu::StageCluster schedule) {
-  return {true, false, true, schedule};
-}
-static CompletionExpr applyCompletion(const RegionFlow &flow, CompletionExpr input) {
-  if (!input.valid || !flow.completionUniform)
-    return {false};
-  if (!flow.completionUsesInput)
-    return concreteCompletion(flow.completionSchedule);
-  if (flow.completionHasFallback && input.hasFallback && flow.completionSchedule != input.schedule)
-    return {false};
-  return {true, input.usesInput,
-          flow.completionHasFallback || input.hasFallback,
-          input.hasFallback ? input.schedule : flow.completionSchedule};
-}
-static CompletionExpr joinCompletion(CompletionExpr a, CompletionExpr b) {
-  if (!a.valid || !b.valid || (a.hasFallback && b.hasFallback && a.schedule != b.schedule))
-    return {false};
-  return {true, a.usesInput || b.usesInput,
-          a.hasFallback || b.hasFallback, a.hasFallback ? a.schedule : b.schedule};
-}
-static CompletionExpr completionAfterChain(Node *head, const Owner &owner,
-                                           CompletionExpr state = {}) {
-  for (Node *n = head; n; n = n->next) {
-    if (n->kind == Node::Access && sameOwner(n->owner, owner)) {
-      Operation *completion = n->completionAnchor ? n->completionAnchor : n->op;
-      state = concreteCompletion(gpu::getStageCluster(completion));
-      continue;
-    }
-    if (!n->isRegion() || !n->flow || (n->kind == Node::For && gpu::hasWarpSpecializeTag(n->op)))
-      continue;
-    const RegionFlow &nested = *n->flow;
-    if (sameOwner(nested.owner, owner))
-      state = applyCompletion(nested, state);
-  }
-  return state;
 }
 static bool summarizeRegionFlow(GroupDag &g, Node *region, RegionFlow &crossing) {
   crossing.exits.clear();
   crossing.owner = std::nullopt;
-  crossing.ownersCompatible = true;
-  bool live = false;
-  bool sawOwner = false;
-  bool transparent = true;
   std::optional<Owner> entryOwner = uniformPieceOwner(region);
-  std::optional<SemaExpr> joined;
+  bool live = false, sawOwner = false, compatible = true;
   auto joinOwner = [&](const Owner &owner) {
     if (!sawOwner) {
       crossing.owner = owner;
       sawOwner = true;
     } else if (!sameOwner(crossing.owner, owner)) {
-      crossing.ownersCompatible = false;
-      transparent = false;
+      compatible = false;
     }
   };
   for (Node *child : region->children) {
     ChainBoundary branch = summarizeChainBoundary(g, child, entryOwner);
-    Node *final = branch.final;
-    crossing.exits.push_back(final);
-    joined = joined ? std::optional(joinSemaExpr(*joined, branch.sema))
-                    : std::optional(branch.sema);
-    if (branch.eventAfterFinal)
-      transparent = false;
-    if (!final) {
+    crossing.exits.push_back(branch.final);
+    if (!branch.final) {
       if (entryOwner)
         joinOwner(*entryOwner);
       continue;
@@ -1010,31 +921,9 @@ static bool summarizeRegionFlow(GroupDag &g, Node *region, RegionFlow &crossing)
   bool hasImplicitInputPath =
       region->kind == Node::For ||
       (region->kind == Node::If && region->children.size() < 2);
-  if (hasImplicitInputPath) {
-    joined = joined ? std::optional<SemaExpr>(joinSemaExpr(*joined, inputSema()))
-                    : std::optional<SemaExpr>(inputSema());
-    if (entryOwner)
-      joinOwner(*entryOwner);
-  }
-  SemaExpr output = joined.value_or(SemaExpr{});
-  crossing.semaTransfer = output;
-  crossing.transparent = transparent && entryOwner && crossing.owner &&
-      sameOwner(*entryOwner, crossing.owner);
-  CompletionExpr completion;
-  bool firstCompletion = true;
-  for (Node *child : region->children) {
-    CompletionExpr branch = completionAfterChain(child, crossing.owner);
-    completion = firstCompletion ? branch : joinCompletion(completion, branch);
-    firstCompletion = false;
-  }
-  if (hasImplicitInputPath)
-    completion = firstCompletion ? CompletionExpr{}
-                                 : joinCompletion(completion, {});
-  crossing.completionUniform = completion.valid;
-  crossing.completionUsesInput = completion.usesInput;
-  crossing.completionHasFallback = completion.hasFallback;
-  crossing.completionSchedule = completion.schedule;
-  return live;
+  if (hasImplicitInputPath && entryOwner)
+    joinOwner(*entryOwner);
+  return live && compatible;
 }
 
 static void buildRegionFlows(GroupDag &g, Node *head) {
@@ -1229,25 +1118,17 @@ static void assignTokenRegion(GroupDag &g, Node *n, TokenEnv &env,
   }
   if (n->kind == Node::For) {
     TokenEnv body = env;
-    if (n->flow) {
-      if (!n->flow->threadsToken()) {
-        body.clear();
-      } else { // the carrier: the loop region node is the body's producer
-        n->flow->resultSema = resolveResultSema(incoming, *n->flow);
-        body.keepOnly(TokenEnv::Record{n->flow->owner, n,
-                                       n->flow->resultSema.value_or(0)});
-      }
+    if (n->flow) { // the carrier: the loop region node is the body's producer
+      n->flow->resultSema = resolveResultSema(incoming, *n->flow);
+      body.keepOnly(TokenEnv::Record{n->flow->owner, n,
+                                     n->flow->resultSema.value_or(0)});
     } else {
       seedEntryTokens(body, n->children[0]);
     }
     assignTokenChain(g, n->children[0], body, unsupplied);
-    if (n->flow) {
-      if (!n->flow->threadsToken())
-        env.clear();
-      else
-        env.keepOnly(TokenEnv::Record{n->flow->owner, n,
-                                      n->flow->resultSema.value_or(0)});
-    }
+    if (n->flow)
+      env.keepOnly(TokenEnv::Record{n->flow->owner, n,
+                                    n->flow->resultSema.value_or(0)});
     return;
   }
   TokenEnv thenEnv = env, elseEnv = env;
@@ -1445,15 +1326,16 @@ static LogicalResult verifySyncDag(GroupDag &g) {
     if (!n->isRegion() || !n->flow)
       return success();
     const RegionFlow &c = *n->flow;
-    if (!c.ownersCompatible)
-      return semaError(n->op) << "region paths export capabilities owned by different partitions";
     if (c.exits.size() != n->children.size())
       return semaError(n->op) << "region flow does not cover every exit path";
-    for (Node *final : c.exits)
-      if (c.threadsToken() && final && !exportsToken(final))
-        return semaError(n->op) << "carried region path exports no SSA capability";
-    if (c.threadsToken() && !c.semaTransfer.valid)
-      return semaError(n->op) << "region paths export incompatible semaphore capabilities";
+    for (Node *final : c.exits) {
+      if (!final)
+        continue;
+      bool producer = final->kind == Node::Acquire ||
+                      (final->isRegion() && final->flow);
+      if (!producer)
+        return semaError(n->op) << "region path exports no token";
+    }
     return success();
   };
   auto verifyNode = [&](Node *n) -> LogicalResult {
@@ -1956,25 +1838,18 @@ static LogicalResult addSyncScheduleEdges(PhysicalSchedules &physical,
         return success();
       int64_t distance = 0;
       if (!precedesInChain(release, acquire)) {
-        bool exactPlannedRecurrence = acquire->recurrenceDistance &&
-            release->parent == acquire->parent && acquire->parent &&
-            acquire->parent->op == loop.getOperation();
-        if (exactPlannedRecurrence) {
-          distance = *acquire->recurrenceDistance;
-        } else {
-          const SlotSchedule &slots = getSlotSchedule(physical, group, loop);
-          std::optional<int64_t> loopCarriedDistance = computeLoopCarriedDistance(
-                  slots, group.numSemaphoreCopies, release->scheduleAnchor,
-                  acquire->scheduleAnchor);
-          if (!loopCarriedDistance) {
-            InFlightDiagnostic diag = semaError(producerAnchor)
-                << "cannot determine loop-carried dependency distance for a "
-                   "physical buffer slot";
-            diag.attachNote(consumerAnchor->getLoc()) << "next token ownership starts here";
-            return failure();
-          }
-          distance = *loopCarriedDistance;
+        const SlotSchedule &slots = getSlotSchedule(physical, group, loop);
+        std::optional<int64_t> loopCarriedDistance = computeLoopCarriedDistance(
+                slots, group.numSemaphoreCopies, release->scheduleAnchor,
+                acquire->scheduleAnchor);
+        if (!loopCarriedDistance) {
+          InFlightDiagnostic diag = semaError(producerAnchor)
+              << "cannot determine loop-carried dependency distance for a "
+                 "physical buffer slot";
+          diag.attachNote(consumerAnchor->getLoc()) << "next token ownership starts here";
+          return failure();
         }
+        distance = *loopCarriedDistance;
       }
       modelsByLoop[loop.getOperation()].ownerConstraints.push_back(
           OwnerScheduleConstraint{release->owner, acquire->owner,
@@ -2091,7 +1966,7 @@ static void assignSyncScheduleChain(Node *head, ScheduleCache &cache) {
     switch (n->kind) {
     case Node::Acquire:
       if (n->owner) {
-        Operation *anchor = n->postLoopAcquire ? nullptr : findScheduleAnchor(n->next);
+        Operation *anchor = findScheduleAnchor(n->next);
         n->stageCluster =
             anchor ? gpu::getStageCluster(anchor)
                    : scheduleAtOwnerBoundary(
@@ -2210,17 +2085,13 @@ static void printYieldInfo(llvm::raw_ostream &os, GroupDag &g,
     return;
   os << " yield{";
   const RegionFlow &c = *region->flow;
-  if (!c.threadsToken()) { // native/child-owned: no slot
-    os << (c.isChildOwned() ? "drop" : "native");
-  } else {
-    Node *f = chainIdx < c.exits.size() ? c.exits[chainIdx] : nullptr;
-    if (!f)
-      os << "pass";
-    else if (f->kind == Node::Acquire || f->kind == Node::Release)
-      os << (f->kind == Node::Acquire ? "a " : "r ") << getSema(g, f).name;
-    else
-      os << (f->kind == Node::For ? "scf.for" : "scf.if");
-  }
+  Node *f = chainIdx < c.exits.size() ? c.exits[chainIdx] : nullptr;
+  if (!f)
+    os << "pass";
+  else if (f->kind == Node::Acquire || f->kind == Node::Release)
+    os << (f->kind == Node::Acquire ? "a " : "r ") << getSema(g, f).name;
+  else
+    os << (f->kind == Node::For ? "scf.for" : "scf.if");
   os << "}";
 }
 static void printEffects(llvm::raw_ostream &os, const Node *n) {

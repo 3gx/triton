@@ -17,27 +17,27 @@ struct EmitCtx {
 };
 
 struct RenderState {
-  struct Capability {
+  struct Token {
     Value value;
     Value sema;
-    CapabilityRef ref;
+    TokenRef ref;
   };
   // One exact capability per token known in this chain. The last record is
   // used by default; owner-marked nodes may instead use their owner's record.
-  SmallVector<Capability, 2> tokens;
+  SmallVector<Token, 2> tokens;
   DenseMap<MemberId, std::pair<Value, int64_t>> view;  // member view + owner
   void clearViews() { view.clear(); }
-  const Capability *lastToken() const {
+  const Token *lastToken() const {
     return tokens.empty() ? nullptr : &tokens.back();
   }
-  Capability *tokenForOwner(const Owner &owner) {
-    for (Capability &token : tokens)
+  Token *tokenForOwner(const Owner &owner) {
+    for (Token &token : tokens)
       if (sameOwner(token.ref.owner, owner) && token.value && token.sema)
         return &token;
     return nullptr;
   }
-  const Capability *tokenFor(const CapabilityRef &ref) const {
-    for (const Capability &token : tokens)
+  const Token *tokenFor(const TokenRef &ref) const {
+    for (const Token &token : tokens)
       if (token.ref.producer == ref.producer && token.ref.sema == ref.sema &&
           token.value && token.sema)
         return &token;
@@ -45,36 +45,35 @@ struct RenderState {
   }
   // Exact routing: the record whose producer is the node's recorded token
   // source. No owner guessing.
-  const Capability *tokenForSource(const Node *producer) const {
-    for (const Capability &token : tokens)
+  const Token *tokenForSource(const Node *producer) const {
+    for (const Token &token : tokens)
       if (token.ref.producer == producer && token.value && token.sema)
         return &token;
     return nullptr;
   }
-  Capability *tokenFor(const CapabilityRef &ref) {
-    return const_cast<Capability *>(
-        std::as_const(*this).tokenFor(ref));
+  Token *tokenFor(const TokenRef &ref) {
+    return const_cast<Token *>(std::as_const(*this).tokenFor(ref));
   }
-  Capability *tokenForProducer(Node *producer, const Owner &owner) {
+  Token *tokenForProducer(Node *producer, const Owner &owner) {
     // Producer selects phase/slot lineage. The region result separately names
     // its static render channel, so the source acquire's semaphore may differ.
-    for (Capability &token : tokens)
+    for (Token &token : tokens)
       if (token.ref.producer == producer &&
           sameOwner(token.ref.owner, owner))
         return &token;
     return nullptr;
   }
-  void recordToken(Value value, Value sema, const CapabilityRef &ref) {
+  void recordToken(Value value, Value sema, const TokenRef &ref) {
     for (auto it = tokens.begin(); it != tokens.end();) {
       if (!it->ref.owner || sameOwner(it->ref.owner, ref.owner))
         it = tokens.erase(it);
       else
         ++it;
     }
-    tokens.push_back(Capability{value, sema, ref});
+    tokens.push_back(Token{value, sema, ref});
   }
-  void keepOnly(const Capability &token) {
-    Capability copy = token;
+  void keepOnly(const Token &token) {
+    Token copy = token;
     tokens.clear();
     tokens.push_back(copy);
   }
@@ -398,8 +397,7 @@ static void rewriteSignatures(EmitCtx &ctx, MutableArrayRef<GroupDag> groups) {
   llvm::MapVector<Operation *, SmallVector<Want, 2>> wanted;
   for (GroupDag &g : groups) {
     forEachNode(g, [&](Node *n) {
-      if (n->flow &&
-          (n->kind != Node::For || n->flow->threadsToken()))
+      if (n->flow)
         wanted[n->op].push_back(Want{&g, n->flow->owner});
     });
   }
@@ -525,7 +523,7 @@ static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs, Node *node,
         types.push_back(localViewType(g, static_cast<MemberId>(mi), {&t}, bt));
     }
     bool reusesToken = nodeReusesToken(node, owner);
-    const RenderState::Capability *token =
+    const RenderState::Token *token =
         node->tokenSource ? rs.tokenForSource(node->tokenSource) : rs.lastToken();
     assert(token && "no capability for the recorded token source");
     Value tok = token->value;
@@ -573,10 +571,10 @@ static void seedRegionEntry(RenderState &state, Node *head) {
   }
   if (owner->has_value() && state.lastToken() &&
       !state.lastToken()->ref.owner) {
-    RenderState::Capability adopted = *state.lastToken();
+    RenderState::Token adopted = *state.lastToken();
     adopted.ref.owner = *owner;
     state.keepOnly(adopted);
-  } else if (RenderState::Capability *token = state.tokenForOwner(*owner)) {
+  } else if (RenderState::Token *token = state.tokenForOwner(*owner)) {
     state.keepOnly(*token);
   } else {
     state.clearTokens();
@@ -636,7 +634,7 @@ static Operation *renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
 static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
                                   RenderState &rs,
                                   DenseMap<Node *, Value> &emitted) {
-  std::optional<RenderState::Capability> incoming;
+  std::optional<RenderState::Token> incoming;
   if (n->flow) {
     if (n->flow->owner && rs.lastToken() &&
         !rs.lastToken()->ref.owner) {
@@ -646,12 +644,12 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
       incoming = *token;
     }
   }
-  std::optional<CapabilityRef> resultRef;
-  if (n->flow && (n->kind != Node::For || n->flow->threadsToken())) {
+  std::optional<TokenRef> resultRef;
+  if (n->flow) {
     if (!n->flow->resultSema)
       return semaError(n->op)
              << "region has no statically selected semaphore channel";
-    resultRef = CapabilityRef{n, *n->flow->resultSema, n->flow->owner};
+    resultRef = TokenRef{n, *n->flow->resultSema, n->flow->owner};
   }
   if (!n->requiredParts.empty() && gpu::hasPartition(n->op)) {
     SetVector<int> set = gpu::getPartitionIds(n->op);
@@ -664,20 +662,15 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
   if (auto forOp = dyn_cast<scf::ForOp>(n->op)) {
     RenderState body = rs.nested();
     if (n->flow) {
-      const RegionFlow &c = *n->flow;
-      if (!c.threadsToken()) {
-        body.clearTokens();
-      } else {
-        if (!resultRef || !incoming)
-          return semaError(n->op)
-                 << "carried loop lacks an exact zero-trip capability";
-        unsigned idx = slotIndexFor(ctx, n->op, &g);
-        forOp.getInitsMutable()[idx].assign(incoming->value);
-        RenderState::Capability carrier{
-            forOp.getRegionIterArg(idx), g.semas[resultRef->sema].create,
-            *resultRef};
-        body.keepOnly(carrier);
-      }
+      if (!resultRef || !incoming)
+        return semaError(n->op)
+               << "carried loop lacks an exact zero-trip token";
+      unsigned idx = slotIndexFor(ctx, n->op, &g);
+      forOp.getInitsMutable()[idx].assign(incoming->value);
+      RenderState::Token carrier{
+          forOp.getRegionIterArg(idx), g.semas[resultRef->sema].create,
+          *resultRef};
+      body.keepOnly(carrier);
     } else {
       seedRegionEntry(body, n->children[0]);
     }
@@ -686,29 +679,21 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
     auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
     if (n->flow) {
       const RegionFlow &c = *n->flow;
-      if (!c.threadsToken()) {
-        rs.clearTokens(); // token died in the body; nothing flows out
-      } else {
-        unsigned idx = slotIndexFor(ctx, n->op, &g);
-        const RenderState::Capability *bodyToken = nullptr;
-        Node *final = c.exits.empty() ? nullptr : c.exits.front();
-        if (!final)
-          bodyToken = body.tokenFor(*resultRef);
-        else if (final->kind == Node::Acquire ||
-                 (final->isRegion() && final->flow &&
-                  (final->kind != Node::For ||
-                   final->flow->threadsToken()))) {
-          bodyToken = body.tokenForProducer(final, resultRef->owner);
-        }
-        if (!bodyToken)
-          return semaError(n->op)
-                 << "loop body exports no exact carried capability";
-        yield->setOperand(idx, bodyToken->value);
-        RenderState::Capability result{
-            forOp.getResult(idx), g.semas[resultRef->sema].create,
-            *resultRef};
-        rs.keepOnly(result);
-      }
+      unsigned idx = slotIndexFor(ctx, n->op, &g);
+      const RenderState::Token *bodyToken = nullptr;
+      Node *final = c.exits.empty() ? nullptr : c.exits.front();
+      if (!final)
+        bodyToken = body.tokenFor(*resultRef);
+      else if (final->kind == Node::Acquire ||
+               (final->isRegion() && final->flow))
+        bodyToken = body.tokenForProducer(final, resultRef->owner);
+      if (!bodyToken)
+        return semaError(n->op) << "loop body exports no exact carried token";
+      yield->setOperand(idx, bodyToken->value);
+      RenderState::Token result{
+          forOp.getResult(idx), g.semas[resultRef->sema].create,
+          *resultRef};
+      rs.keepOnly(result);
     }
     rs.clearViews();
     return success();
@@ -729,18 +714,17 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
       return semaError(n->op) << "threaded if lacks an exact result capability";
     unsigned idx = slotIndexFor(ctx, n->op, &g);
     auto exitCapability = [&](unsigned branch, RenderState &state)
-        -> const RenderState::Capability * {
+        -> const RenderState::Token * {
       Node *final = branch < c.exits.size() ? c.exits[branch] : nullptr;
       if (!final)
         return incoming ? &*incoming : nullptr;
       if (final->kind != Node::Acquire &&
-          !(final->isRegion() && final->flow &&
-            (final->kind != Node::For || final->flow->threadsToken())))
+          !(final->isRegion() && final->flow))
         return nullptr;
       return state.tokenForProducer(final, resultRef->owner);
     };
-    const RenderState::Capability *thenToken = exitCapability(0, thenSt);
-    const RenderState::Capability *elseToken = exitCapability(1, elseSt);
+    const RenderState::Token *thenToken = exitCapability(0, thenSt);
+    const RenderState::Token *elseToken = exitCapability(1, elseSt);
     if (!thenToken || !elseToken)
       return semaError(n->op)
              << "if path exports no exact compatible capability";
@@ -748,7 +732,7 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
     thenYield->setOperand(idx, thenToken->value);
     auto elseYield = cast<scf::YieldOp>(ifOp.elseBlock()->getTerminator());
     elseYield->setOperand(idx, elseToken->value);
-    RenderState::Capability result{ifOp.getResult(idx),
+    RenderState::Token result{ifOp.getResult(idx),
                                    g.semas[resultRef->sema].create,
                                    *resultRef};
     rs.keepOnly(result);
@@ -763,9 +747,9 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
   Operation *lastReal = nullptr;
   for (Node *n = head; n; n = n->next) {
     if (n->kind == Node::Access || n->kind == Node::Release) {
-      RenderState::Capability *owned = n->owner
+      RenderState::Token *owned = n->owner
           ? rs.tokenForOwner(n->owner) : nullptr;
-      const RenderState::Capability *active = rs.lastToken();
+      const RenderState::Token *active = rs.lastToken();
       bool consumes = n->kind == Node::Release || nodeTouchesGroup(g, n);
       if (n->reuseTokenOwner && !owned)
         return semaError(n->op ? n->op : g.root->op)
@@ -789,7 +773,7 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
           sema.isEntry && !n->owner ? sema.entryTokenOwner : n->owner;
       if (Value v = emitted.lookup(n)) { // pre-rendered entry instance
         rs.recordToken(v, sema.create,
-                       CapabilityRef{n, n->sema, tokenOwner});
+                       TokenRef{n, n->sema, tokenOwner});
         rs.clearViews();
         break;
       }
@@ -812,13 +796,13 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
         acq.setStage(materializeI32Before(acq, *n->stageOffset));
       emitted[n] = acq.getToken();
       rs.recordToken(acq.getToken(), sema.create,
-                     CapabilityRef{n, n->sema, tokenOwner});
+                     TokenRef{n, n->sema, tokenOwner});
       rs.clearViews();
       lastReal = acq;
       break;
     }
     case Node::Release: {
-      const RenderState::Capability *source =
+      const RenderState::Token *source =
           n->tokenSource ? rs.tokenForSource(n->tokenSource) : rs.lastToken();
       assert(source && "release without a live token for its recorded source");
       Value tok = source->value;
@@ -1485,7 +1469,7 @@ LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups) {
         Owner owner =
             sema.isEntry && !n->owner ? sema.entryTokenOwner : n->owner;
         rs.recordToken(emitted.lookup(n), sema.create,
-                       CapabilityRef{n, n->sema, owner});
+                       TokenRef{n, n->sema, owner});
       }
     if (failed(renderChain(ctx, g, g.root->children[0], rs, emitted)))
       return failure();
