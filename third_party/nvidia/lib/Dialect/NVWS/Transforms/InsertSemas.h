@@ -68,27 +68,33 @@ struct Touch {
 
 struct Node;
 
-struct Hold {
-  enum class Outcome { THREADED, POINT_OF_USE, CHILD_OWNS };
+struct RegionFlow {
+  enum class Mode { CARRIED, POINT_OF_USE, CHILD_OWNS };
   enum class Blocker { NONE, TRAILING_USE, RESULT_CONSUMED };
-  Outcome outcome = Outcome::THREADED;
+  enum class ExitToken { INPUT, CURRENT, NONE };
+  // A region is compiled once into a transfer relative to its incoming
+  // capability.  INPUT_OR_CONCRETE represents a path choice between passing
+  // that input and returning the named semaphore; INVALID means the paths do
+  // not export one compatible capability.
+  enum class SemaTransfer { INPUT, CONCRETE, INPUT_OR_CONCRETE, INVALID };
+  Owner owner;
+  SmallVector<Node *, 2> exits;
+  SmallVector<ExitToken, 2> exitTokens;
+  SemaTransfer semaTransfer = SemaTransfer::INVALID;
+  SemaId concreteSema = 0;
+  bool ownersCompatible = true;
+  bool transparent = false;
+  bool completionUsesInput = true, completionHasFallback = false;
+  gpu::StageCluster completionSchedule;
+  Mode mode = Mode::CARRIED;
   Blocker blocker = Blocker::NONE;
-  SmallVector<Node *, 4> nodes;
   Node *entryAcquire = nullptr, *closingRelease = nullptr;
-  Node *regain = nullptr, *firstToucher = nullptr;
-  Node *bridgeAcquire = nullptr;
-  bool needsPostLoopAcquire = false, keepsEntryAcquire = false;
-  bool regionTail = false;
-  bool threadsToken() const { return outcome == Outcome::THREADED; }
-  bool isPointOfUse() const { return outcome == Outcome::POINT_OF_USE; }
-  bool isChildOwns() const { return outcome == Outcome::CHILD_OWNS; }
-};
-
-struct Crossing {
-  Owner tokenOwner;
-  SmallVector<Node *, 2> finals;
-  Hold hold;
+  Node *firstToucher = nullptr;
   Node *postLoopAcquire = nullptr, *bridgeAcquire = nullptr, *bridgeRelease = nullptr;
+  bool threadsToken() const { return mode == Mode::CARRIED; }
+  bool isPointOfUse() const { return mode == Mode::POINT_OF_USE; }
+  bool isChildOwned() const { return mode == Mode::CHILD_OWNS; }
+  Node *exit() const { return exits.empty() ? nullptr : exits.front(); }
 };
 
 struct Node {
@@ -108,13 +114,16 @@ struct Node {
   gpu::StageCluster stageCluster;
   std::optional<int64_t> stageOffset;
   std::optional<int64_t> bufferStageOffset;
+  // Explicit distance for a planned recurrence demand. Schedule analysis
+  // consumes this fact directly instead of recognizing a placement shape.
+  std::optional<int64_t> recurrenceDistance;
   // The SYNC-DAG proved that this node can reuse its owner's earlier token in
   // the same chain without a fresh handoff. EmitIR renders this fact; it does
   // not infer token-reuse eligibility on its own.
   std::optional<int64_t> reuseTokenOwner;
   Node *sat = nullptr;
   Node *scheduleAnchor = nullptr;
-  SmallVector<Crossing, 1> crossings;
+  std::optional<RegionFlow> flow;
   SmallVector<int, 2> requiredParts;
   bool isRegion() const { return kind == For || kind == If; }
   bool isProtocol() const { return kind == Acquire || kind == Release; }
