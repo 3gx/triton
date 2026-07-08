@@ -3,8 +3,8 @@
 ## Rule
 
 EMIT-IR materializes the finalized SYNC-DAG. It does not rediscover owners,
-edges, holds, token-reuse decisions, pending counts, or stage offsets. A
-`Node::reuseTokenOwner` mark is a decision to render, not a decision EMIT-IR
+edges, region-flow modes, token-reuse decisions, pending counts, or stage
+offsets. A `Node::reuseTokenOwner` mark is a decision to render, not a decision EMIT-IR
 may make. Its one schedule exception is the loop-scheduler
 workaround (`workaroundLoopScheduler`), which
 splits qualifying `scf.if` operations so a release leading a branch is
@@ -42,8 +42,8 @@ block. Model terms are defined in the
 2. Allocate the planned multi-buffered backing and create semaphores with the
    DAG's initially-released and pending-count facts.
 3. Emit the entry acquires.
-4. Extend `scf.for`/`scf.if` signatures once for crossings that require a
-   token result.
+4. Extend `scf.for`/`scf.if` signatures once for finalized region flows that
+   require a token result.
 5. Walk the SYNC-DAG and render accesses, acquires, releases, and region
    yields.
 6. Fold the split groups that share one planned `buffer.id` — the circular
@@ -55,14 +55,17 @@ block. Model terms are defined in the
    release, and at most one semaphore token in a loop's iter-args per group.
 
 For each group, the rendering walk's `RenderState` keeps one ordered list of
-token records — token value, semaphore, and optional owner — plus buffer views
-cached by member and owner. The last token is used by default. An acquire
-replaces any earlier record for its resolved owner and appends its result. A
-node marked with `reuseTokenOwner` may instead use its owner's record without
-changing the order. At a region boundary, only the token selected for
-threading remains. A loop hold with no token iter-arg or result passes no token
-through its boundary; a region with no crossing leaves the outer state
-unchanged.
+token records plus buffer views cached by member and owner. Each record stores
+the token, semaphore, exact producer, and owner. A branch returns either its
+input token or a fresh token; the region result uses the input semaphore when
+present and the recorded semaphore otherwise.
+
+The last token record is used by default. An acquire replaces any earlier record
+for its resolved owner and appends its result. A node marked with
+`reuseTokenOwner` may instead use its owner's record without changing the
+order. At a carried region boundary, only the selected result token
+remains. A `POINT_OF_USE` or `CHILD_OWNS` loop passes no token through its
+boundary; a region with no flow leaves the outer state unchanged.
 
 ## Node mapping
 
@@ -72,16 +75,14 @@ unchanged.
 | `Release` | `nvws.semaphore.release` with the assigned completion kind and `arrive_count`; a marked node uses its owner's token when that token is not last |
 | `Access` | `nvws.semaphore.buffer`, replayed view chain, and the retargeted access; a marked node builds the view from its owner's token, otherwise from the last token |
 | sourceful alloc | explicit SMEM/TMEM store into the semaphore buffer view |
-| `For`/`If` crossing | token init/result/yield position when the hold crosses the boundary |
+| carried `For` or live `If` flow | token init/result/yield position selected by the finalized `RegionFlow` |
 | `ENTER`/`EXIT` | no operation of their own; the token iter-args, results, and yields added on the parent `for`/`if` realize the boundary |
 
-POINT_OF_USE loop holds — acquires moved to the first body access — receive
-no token iter-arg: their moved acquire creates the token in the body and the
-closing release uses it there. If SYNC-DAG instead keeps a token iter-arg and
-result because an eligibility check fails — printed as bare
-`holdrule{gated}` unless the blocker is `trailing-use` or `result-consumed` —
-signature rewriting adds the ordinary loop token slot. EMIT-IR performs no
-stage comparison of its own.
+`POINT_OF_USE` loops have no semaphore iter-arg or result; EMIT-IR renders the
+acquire and closing release in the body, plus any acquire after the loop
+already inserted by SYNC-DAG. `CARRIED` loops get the ordinary token slot. See
+[Region flows](sync-dag.md#region-flows). EMIT-IR does not choose placement or
+compare stages.
 
 ## Schedule preservation
 

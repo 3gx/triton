@@ -43,7 +43,7 @@ OWNER-DAG
       |
 SYNC-DAG
   derive required memory edges, token-supply edges, semaphores, token reuse,
-  region token policy, buffer-stage schedule
+  region flows, loop token decisions, buffer-stage schedule
       |
 EMIT-IR
   materialize the already-decided protocol
@@ -72,7 +72,7 @@ use these terms with exactly these meanings.
   — one connected component; `buildAccessDag` rejects the group otherwise
   (see [ACCESS-DAG](access-dag.md#pieces-must-connect)). The group is therefore the unit
   of synchronization — one set of semaphores, tokens scoped to the group
-  (never to a piece), one set of crossings and holds — while
+  (never to a piece), and one set of region flows — while
   source/use state is tracked per piece.
 - **Node** (`Node`): one entry of a group's program-order graph. Kinds:
   `Func` (the root of the graph), `Access` (a real operation touching group
@@ -104,24 +104,18 @@ use these terms with exactly these meanings.
   are group-scoped, not piece-scoped. Within a chain, the pass keeps known
   owner tokens in deterministic order and uses the last token by default. A
   node marked with `reuseTokenOwner` instead uses that owner's earlier token.
-  The region token policy resets this chain-local reuse state; EMIT-IR renders
-  the mark and never infers reuse.
-- **Crossing** (`Crossing`): a record that a `for` or `if` may need to return a
-  token. Its `tokenOwner` is the owner of that boundary token. An unused `if`
-  crossing is removed; a surviving one returns a token.
-- **Hold** (`Hold`): the region token policy for one loop crossing. It either
-  threads a token through the loop (`THREADED`), moves the acquire to the first
-  protected access (`POINT_OF_USE`), or removes the outer token slot because
-  the final child owns the protocol (`CHILD_OWNS`). Its materialized span runs
-  from acquire through protected accesses to closing release. Other
-  owner-indexed tokens may coexist inside the chain; the policy decides which
-  single token, if any, crosses the region boundary.
+  A region flow selects which token, if any, survives its boundary and
+  resets this chain-local reuse state; EMIT-IR renders the mark and never
+  infers reuse.
+- **Capability reference** (`CapabilityRef`): token producer, semaphore, and
+  owner.
+- **Semaphore transfer** (`SemaTransfer`): whether a path returns the input
+  token or a token from a named semaphore.
+- **Region flow** (`RegionFlow`): the token returned by each `for`/`if` path
+  and, for loops, the `CARRIED`, `POINT_OF_USE`, or `CHILD_OWNS` choice.
 
-One hold-placement safety check preserves the loop-carried form. For a plain
-inner loop in a WS scope, if moving the acquire to the first body access also
-needs an acquire after the loop, and those two acquires would have different
-`loop.stage` values, SYNC-DAG keeps the loop-carried form and the dump prints
-bare `gated`. Equal or unknown stages do not trigger this check.
+The loop decision rules and dump labels are explained in
+[SYNC-DAG's Region flows section](sync-dag.md#region-flows).
 
 For supported accesses, owner resolution is:
 

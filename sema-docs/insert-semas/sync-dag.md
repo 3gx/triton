@@ -18,14 +18,18 @@
   - [Example: a loop-closing edge is dropped](#example-a-loop-closing-edge-is-dropped)
   - [The deletion conditions, in full](#the-deletion-conditions-in-full)
     - [Implied ordering (`reduceEdges`)](#1-implied-ordering-reduceedges)
-    - [Repeats from one sender (`collapseEdges`)](#2-repeats-from-one-sender-collapseedges)
+    - [Repeats from one sender (`buildEdgesAndSemas`)](#2-repeats-from-one-sender-buildedgesandsemas)
   - [One destination node, one semaphore](#one-destination-node-one-semaphore)
   - [Composition: why loop entry and loop recurrence share one semaphore](#composition-why-loop-entry-and-loop-recurrence-share-one-semaphore)
-- [Crossings and holds](#crossings-and-holds)
-  - [Why this machinery exists](#why-this-machinery-exists)
-  - [The decision, per region](#the-decision-per-region)
-  - [Future investigation: replace a consumed loop result](#future-investigation-replace-a-consumed-loop-result)
-  - [Composition: apply the hold rule from inner to outer](#composition-apply-the-hold-rule-from-inner-to-outer)
+- [Region flows](#region-flows)
+  - [Why this is needed](#why-this-is-needed)
+  - [Region summaries](#region-summaries)
+  - [The loop decision](#the-loop-decision)
+  - [Point of use](#point-of-use)
+  - [Trailing use](#trailing-use)
+  - [Use after the loop](#use-after-the-loop)
+  - [Nested loops](#nested-loops)
+  - [Dump labels](#dump-labels)
 - [Backing copies](#backing-copies)
 - [Pipeline schedule](#pipeline-schedule)
   - [Minimal pipeliner model](#minimal-pipeliner-model)
@@ -48,7 +52,8 @@ The design has five moving parts:
 2. each piece has a **source** plus a **uses** map from owner to node;
 3. each chain has an ordered list of known **tokens**;
 4. an **edge** records one required wait or token handoff between nodes;
-5. the **region token policy** decides how one token crosses a `for` or `if`.
+5. a **region flow** summarizes the token returned by a `for` or `if` and
+   records the loop token decision.
 
 `Owner`, `Piece`, and `Effect` are attributes of those objects. Acquires,
 releases, and semaphores are the generated representation of edges, not a
@@ -57,7 +62,7 @@ second correctness model.
 ```text
 input IR ─► ACCESS-DAG ─► OWNER-DAG ─► SYNC-DAG ─► EMIT-IR ─► output IR
             memory facts   owners      edges, semaphores,   render
-                                       token holds, schedule
+                                       region flows, schedule
 ```
 
 The whole step is four moves; this page is those moves in order, each with
@@ -71,9 +76,9 @@ a worked example:
    edge's tail becomes a release. Each completion kind carried by an edge
    counts as one release; an edge with no completion kind also counts as one.
    The acquire's pending count is the total number of those releases
-4. loops: seed iteration zero, decide how tokens cross for/if boundaries
-   (holds), choose the number of backing copies, then extend the pipeline
-   schedule with the semaphore dependencies
+4. summarize `for`/`if` boundaries, select carried, point-of-use, or
+   child-owned loop handling, choose the number of backing copies, then
+   extend the pipeline schedule with the semaphore dependencies
 ```
 
 ## Notation
@@ -119,12 +124,13 @@ tokens        the chain's known owner tokens in deterministic order; the last
               owner-specific token reuse supplies one
 token reuse   a node-level proof (`reuseTokenOwner`) that an access or release
               may use its owner's earlier token without changing token order
-hold          acquire -> accesses -> closing release, all by one owner: the
-              ordinary span protected by that token; read spans may overlap,
-              and an owner token may be reused later when SYNC-DAG proves it
-regain        the acquire at the bottom of a loop body through which the
-              body re-acquires the group's semaphore for the next iteration
-              (`Hold::regain`)
+hold          acquire -> protected operations -> closing release for one
+              owner; an explicitly marked owner token may be reused later
+regain        the acquire near the end of a loop body that supplies the
+              next iteration
+region flow   the token returned by each `for`/`if` path and, for a loop,
+              whether it carries the token, acquires at the first use, or
+              leaves token handling to its final child
 chain         the group's node sequence of one block, in program order; a
               region node holds child chains
 ```
@@ -144,18 +150,18 @@ Dump notation:
                             access, or a region containing one (immediately
                             above the loop when the loop is that first node)
 pieces{P0:W:{0}}            region node: per-piece merged effect and owner
-thread{{0}}                 region node: this region has a crossing; a surviving
-                            `if` crossing returns a token, while a loop's hold
-                            decides whether it has a token iter-arg and result
-holdrule{...}               loop node: the crossing's hold outcome (its values
-                            are explained in "Crossings and holds")
-yield{X}                    EXIT node: what this chain returns for the
-                            crossing — a S<n> = that acquire's token;
+thread{{0}}                 region node: a RegionFlow summary exists for owner
+                            {0}; only CARRIED loops necessarily add a token
+                            iter-arg and result
+holdrule{...}               loop node: selected mode and any placement
+                            details, explained in "Region flows"
+yield{X}                    EXIT node: what this chain returns for its
+                            region flow — a S<n> = that acquire's token;
                             native = no token crosses (protocol lives
                             inside); drop = this loop has no token result
                             because its final nested loop returns none; pass =
-                            this branch has no acquire or nested region with a
-                            crossing, so it returns the token available before
+                            this branch has no acquire or nested region flow,
+                            so it returns the token available before
                             the `if`;
                             scf.for/scf.if =
                             the actual yield operand is the token result of
@@ -165,17 +171,16 @@ S<n> / E<n>                 semaphore names; E<n> = dedicated entry semaphore
 SEMAS: S1{count=1 entry inherit={@0.0}}   per-semaphore summary; entry =
                             created initially released; inherit={...} = the
                             owner recorded on that initially released state
-                            (its `entryTokenOwner`) — read by the hold decision
-                            (as an entry feed's owner, buildUniformHold) and
-                            by the verifier that checks token reuse;
+                            (its `entryTokenOwner`) — read while finding the
+                            loop's input acquire and by token verification;
                             EMIT-IR also uses it as
                             the owner of an unpartitioned entry acquire when
                             recording the acquired token — which is one
                             of three: the owner of the group's
-                            first real access (insertEntryAcquires, both of
-                            its paths), the retargeted EXIT-handoff
-                            acquire's owner (buildEdgesAndSemas), or the
-                            hold owner (applyHoldRulePlacement)
+                            first real access (`insertEntryAcquires`, both of
+                            its paths), the retargeted EXIT-handoff acquire's
+                            owner (`buildEdgesAndSemas`), or the owner selected
+                            by point-of-use lowering
 BACKING: numCopies=N        copies chosen for the backing allocation
 ```
 
@@ -195,7 +200,7 @@ EMIT-IR never infers that exception on its own.
 ## The walk: accesses to edges
 
 The walk runs once per group, in program order over its chains
-(`ChainWalker::run`, entered through `walkChain`). At each access it first
+(`ChainWalker::run`). At each access it first
 applies two memory rules:
 
 1. **Read after write (RAW)** — a new reader waits for the piece's version
@@ -324,15 +329,15 @@ for (%t = %t0) {                 ;   initially released
   %t1 = a S0 {1}
   R m0 [%t1] ttg.local_load {1}
   r  S1 %t1 {1}                  ; e2: buffer free for the next iteration
-  %t2 = a S1 {0}                 ; regain: acquires the NEXT iteration's token
+  %t2 = a S1 {0}                 ; recurrence acquire for the NEXT iteration
   yield %t2                      ; carried out through the iter-arg
 }
 ```
 
-The pass then decided this loop out of the carried shape — the pre-loop
-acquire is gone and the regain sits at the store instead (the node's
-`holdrule{pointofuse->...}` label; the decision itself is
-[Crossings and holds](#crossings-and-holds)). The resulting SYNC-DAG:
+The pass then selects POINT_OF_USE — the pre-loop acquire is gone and the
+recurrence acquire sits at the store instead (the node's
+`holdrule{pointofuse->...}` label; the decision itself is explained in
+[Region flows](#region-flows)). The resulting SYNC-DAG:
 
 ```text
 |- scf.for (WS, tag=0) pieces{P0:W:{0}} thread{{0}} holdrule{pointofuse->ttg.local_store}
@@ -903,13 +908,15 @@ is shown later in
 
 ## Edges to semaphores
 
-After redundant edges are deleted, `collapseEdges` merges edges with the same
-source owner and destination and unions their completion kinds. Each remaining
-edge's tail becomes one release carrying those completion kinds. Each carried
+After redundant edges are deleted, `buildEdgesAndSemas` groups edges with the
+same destination and destination owner. Within one group, repeats from the
+same source owner are merged at that owner's later source node and their
+completion kinds are unioned. Each resulting incoming edge's tail becomes one
+release carrying those completion kinds. Each carried
 completion kind counts as one release; an edge carrying no completion kind
 counts as one release. The destination becomes one acquire whose pending count
 is the total number of releases from its incoming edges. An edge entering a
-loop node can instead reuse the loop's regain semaphore and inherit its count —
+loop node can instead reuse the loop's recurrence semaphore and inherit its count —
 the composition case below.
 
 Placement needs no extra information, because the walk never produced a
@@ -926,13 +933,14 @@ create   ->  before the WS loop; its position carries no synchronization
 Token reuse remains an explicit SYNC-DAG fact during this conversion. If an
 edge leaves an access marked with `reuseTokenOwner`, its inserted release is
 marked for the same owner, so both nodes use that owner's earlier token.
-`verifyTokenLocality` checks that the named token exists and applies the same
-region token resets. EMIT-IR only renders these marks; it does not decide that
-another node is eligible.
+`verifySyncDag` checks the resulting token and structural invariants; EMIT-IR
+checks that the named owner still has a live token. EMIT-IR only renders these
+marks; it does not decide that another node is eligible.
 
 Before conversion, `buildEdgesAndSemas` first deletes ordering already
-implied by other edges (`reduceEdges`), then coalesces repeats from one sender
-(`collapseEdges`). Reduction is a monotonic trace over permanently kept edges;
+implied by other edges (`reduceEdges`), then groups each destination and
+coalesces repeats from one sender while building that handoff. Reduction is a
+monotonic trace over permanently kept edges;
 the complete conditions follow the two worked examples as fine print.
 
 ### Example: a redundant edge is dropped
@@ -1018,7 +1026,7 @@ still receive a token in time.
   wrap-around reducer protects it as the close into first-access owner `{0}`.
 
 In the raw DAG, `e5` ends at `EXIT(i) {0}` and represents the handoff to the
-next iteration. Hold placement puts its acquire immediately before
+next iteration. Region-flow placement puts its acquire immediately before
 `W m0 {0}`.
 
 The result is:
@@ -1087,9 +1095,9 @@ in-body ring, while S3 carries `e5` to the next iteration:
 
 `S3`'s acquire sits at the top of the body rather than above the loop —
 that placement is what the node's `holdrule{pointofuse->...}` label stands
-for, decided in [Crossings and holds](#crossings-and-holds) below.
+for, decided in [Region flows](#region-flows) below.
 Contrast `@fanout_not_reduced` above, `holdrule{gated}`: its `S2`
-stays a pre-loop root entry, the carried default of the same section.
+stays a pre-loop root entry and the loop uses CARRIED mode.
 
 And contrast the semaphore count: `@fanout_not_reduced` has two RAW fan-out
 edges plus two recurrence edges sharing one destination. Its four kept
@@ -1114,7 +1122,8 @@ footprints: an access through m0 touches P0 and P1; through m1, P1 and P2
 The walk raises the same in-body ring as before — kept `e1 {0}->{1}`,
 `e2 {1}->{2}`, `e3 {2}->{0}` (a raw `{0}->{2}` drops exactly the way the
 previous example's `e2` did; and `R m1 {0}` raises its edge through P1 and
-P2 at once, counted once by `collapseEdges`). At `EXIT` two closes are
+P2 at once, counted once when `buildEdgesAndSemas` groups the handoff). At
+`EXIT` two closes are
 raised:
 
 ```text
@@ -1296,13 +1305,14 @@ edges already committed to the kept set; a later deletion cannot invalidate
 that proof. `reduceStraightEdges` decides ordinary candidates first, then
 `reduceLoopCloses` sees those decisions as permanent and applies each kept
 close before considering the next one. `verifySyncDag` still checks the
-resulting token, hold, semaphore-count, and structural invariants; it does not
-replay the reducer.
+resulting token, region-flow, semaphore-count, and structural invariants;
+it does not replay the reducer.
 
-#### 2. Repeats from one sender (`collapseEdges`)
+#### 2. Repeats from one sender (`buildEdgesAndSemas`)
 
-`reduceEdges` has finished. `collapseEdges` now handles two kept edges that have
-the same sending owner and destination but leave from different nodes.
+`reduceEdges` has finished. While `buildEdgesAndSemas` groups a destination,
+it handles two kept edges that have the same sending owner and destination but
+leave from different nodes.
 
 Use this minimal conceptual loop; no lit test dumps this exact shape. `m0`
 touches P0 and P1, while `m1` touches only P1:
@@ -1320,7 +1330,7 @@ at EXIT:
 ```
 
 Both closes survive `reduceEdges` because they return to `{0}`, owner of the
-chain's first partition-owned access. The raw DAG entering `collapseEdges` is:
+chain's first partition-owned access. The raw DAG entering handoff grouping is:
 
 ```text
                             W m0 {0}
@@ -1339,8 +1349,9 @@ chain's first partition-owned access. The raw DAG entering `collapseEdges` is:
 
 `e2` and `e3` have the same sending owner `{1}` and the same destination
 `EXIT(i) {0}`. `R m1 {1}` follows `R m0 {1}` in the same owner's walk, so one
-release after `R m1 {1}` is also after `R m0 {1}`. `collapseEdges` combines
-the two closes at that later node and unions their completion payloads. Piece
+release after `R m1 {1}` is also after `R m0 {1}`.
+`buildEdgesAndSemas` combines the two closes at that later node and unions
+their completion payloads. Piece
 identities have already served reduction and are not propagated into the
 semaphore record; `P0,P1` below is explanatory:
 
@@ -1506,7 +1517,7 @@ The full converted protocol is:
 |  |- W m0  ttg.local_store {3}
 |  |- r  S0(2)  {3} [none]        ; e1 tail: one edge, release count 2
 |  |- a  S0(2)  {2}               ; e1 head: initial inner-loop token
-|  |- scf.for ... holdrule{gated(result-consumed)}
+|  |- scf.for ... holdrule{gated}
 |  |  |- r  S1  {2} [none]        ; e3 tail: ENTER has no op, so this starts the child chain
 |  |  |- R m0  ttg.local_load {2}
 |  |  |- r  S2  {2} [none]        ; e4 tail
@@ -1610,541 +1621,396 @@ child protocol DAG
                               ENTER inner(i+1) {2}
 ```
 
-## Crossings and holds
+## Region flows
 
-### Why this machinery exists
+### Why this is needed
 
-When a token must cross a loop, the unimproved way through is the carried
-shape — this loop, complete:
+After edges become acquires and releases, a `for` or `if` may have a token at
+its entry and a token on each exit. `RegionFlow` summarizes those tokens so the
+parent can handle the region as one node. The parent does not walk the child's
+operations again.
+
+For a loop, the same summary also records one of three decisions:
 
 ```text
-%t0 = a S root                    ; entry, seeds iteration 0
-%tN = for (%t = %t0) {            ; token in through the iter-arg
-  W buf [%t] {0}                  ; the body works under the carried token
-  r  S %t {0}
-  %t1 = a S {0}                   ; regain: acquires the NEXT iteration's token
-  yield %t1                       ; carries it out
-}                                 ; %tN unused below
+mode           dump label                    planned loop token
+CARRIED        gated(...) or gated           iter-arg and result
+POINT_OF_USE   pointofuse->op                none
+CHILD_OWNS     passthrough-drop              none; final child owns the protocol
 ```
 
-Always correct—but potentially suboptimal, because the token may be held
-across more of the loop than necessary. We therefore try to shorten that
-hold by moving the acquire that produces `%t1` to the next iteration's first
-access. For this to be legal, `%t1` must be used only to reach that access.
-We verify this by tracing every use of `%t1`, including its continuation as
-the loop result `%tN`:
+Later dead-token cleanup can remove a CARRIED slot if both its iter-arg and
+result become dead. `thread{{...}}` only says the region has a `RegionFlow`;
+it does not by itself mean that a loop carries a token.
+
+A loop with no internal acquire and no child flow needs none of these
+decisions. One hold can cover the whole loop:
 
 ```text
-W buf [%t] {0}       no  — runs under %t, the previous token
-r  S %t {0}          no  — consumes %t
-nodes after the regain, before the yield:   none
-yield %t1            yes — but only to deliver it to the NEXT
-                           iteration's first access
-%tN, after the loop:                        unused
-```
-
-`%t1` has exactly one real customer: the next iteration's first access. A
-token whose only job is to be delivered somewhere can be acquired *there*
-instead — that is the move:
-
-```text
-for ... {                         ; no token iter-arg
-  %t = a S {0}                    ; the same acquire, at the first access; S is
-                                  ;   created initially released, seeds iter 0
-  W buf [%t] {0}
-  r  S %t {0}                     ; released inside
+%t = a S0 {1}
+for {
+  W acc [%t] {1}
 }
+r S1 %t {1}
 ```
 
-Two important token uses block the move. The first is an in-body use of
-`%t1`:
+### Region summaries
+
+`summarizeRegionFlow` runs from inner regions to outer regions. It records one
+boundary owner, each path's returned token or input pass, the semaphore to use
+when no input token exists, and the combined schedule needed by the later
+stage check. For a loop it also records the decision from the table above.
+
+If the region has an input token, EMIT-IR uses its semaphore for the result.
+Without an input token, it uses the semaphore recorded for a fresh result.
+This supports an `if` whose branches return fresh tokens from different
+semaphores, and an `if` whose one branch returns a fresh token while the other
+passes the input. A pass-through path without an input token is invalid.
+
+Consider `test/NVWS/insert_semas_conditional_multi_result.mlir`
+`@conditional_multi_result_if_token`. Its trimmed OWNER-DAG is:
 
 ```text
-%t1 = a S {0}
-R m0 [%t1] {0}                  ; still needs %t1 here: cannot move it
-yield %t1
-```
-
-Using the loop result also blocks it:
-
-```text
-%tN = for ... {
-  ...
-  %t1 = a S {0}
-  yield %t1
-}
-R m0 [%tN] root                 ; still needs the returned token
-```
-
-Direct POINT_OF_USE requires the acquire feeding loop entry and the acquire at
-loop re-entry to use the same semaphore. In one supported nested-composition
-shape, a post-loop acquire and bridge first normalize a different incoming
-semaphore, so the outside code no longer uses `%tN`.
-
-`buildUniformHold` constructs the result, and `classifyHold` records it in the
-crossing before emission:
-
-```text
-move succeeded                           holdrule{pointofuse->op}
-trailing use                             holdrule{gated(trailing-use)}
-same-semaphore result used afterward     holdrule{gated(result-consumed)}
-other eligibility failure                holdrule{gated}
-```
-
-A hold is one owner's accesses covered by one acquired token:
-
-```text
-%t = a S {0}                    ; acquire before the first access
-W m0 [%t] {0}                   ; first access
-R m1 [%t] {0}                   ; last access
-r S %t {0}                      ; release after the last access
-```
-
-### The decision, per region
-
-**Before the searches: does a token have to cross this region at all?**
-If the body contains no acquire of the group and no nested region that
-already has a crossing, no token passes through the boundary — there is no
-crossing, and nothing below applies (a body holding only releases records
-none).
-One hold simply covers the whole loop: acquired before it, every
-iteration's accesses run under that one token (its value dominates the
-body), released after it. The dump line for such a loop carries no
-`thread{}` and no `holdrule{}`. The accumulator loop of a plain matmul is
-this shape (pseudo-IR; no lit test covers it):
-
-```text
-%t = a S0 {0}                   ; acquire, before the loop; S0 is created
-for k {                         ;   initially released, seeding this wait
-  W buf [%t] {0}                ; every iteration, under the same token
-}                               ;   single owner, no protocol inside
-r  S1 %t {0} [tc5mma]           ; release, after the loop
-%u = a S1 root                  ; epilogue acquire, satisfied by that release
-R  buf [%u] root                ; epilogue read
-```
-
-Otherwise a *crossing* is recorded: the region may need to return a token.
-
-**For an `if`, only use after the `if` matters.** If nothing afterward uses
-the token returned by the `if`, and no enclosing region needs it, the crossing
-is removed and the `if` returns no token (`pruneDeadIfCrossings`). Otherwise,
-the crossing remains. In `test/NVWS/insert_semas_raw_if_token.mlir`
-`@raw_edge_token_carried_if`, the store after the `if` uses the returned token:
-
-```text
-|  |- scf.if pieces{P0:R:{0}} parts{0, 1} thread{{0}}
+|- scf.for pieces{P0:W:{1}}
+|  |- ENTER pieces{P0:W:{1}}
+|  |- W m0  ttng.tc_gen5_mma {1}
+|  |- scf.if pieces{P0:R:{1}}
 |  |  |- then
-|  |  |  |- ENTER pieces{P0:R:{0}}
-|  |  |  |- r  S0  {0} [none]
-|  |  |  |- a  S0  {1}
-|  |  |  |- R m0  ttng.tmem_load {1}
-|  |  |  |- r  S1  {1} [none]
-|  |  |  |- a  S1  {0}
-|  |  |  |- EXIT pieces{P0:R:{0}} yield{a S1}
+|  |  |  |- ENTER pieces{P0:R:{1}}
+|  |  |  |- R m0  ttng.tmem_load {0}
+|  |  |  |- EXIT pieces{P0:R:{1}}
 |  |  |- else
 |  |  |  |- ENTER
-|  |  |  |- EXIT yield{pass}      <- this branch returns the token that was
-|  |  |                              available before the if
-|  |- W m0  ttng.tmem_store {0}   <- the consumer: this is what keeps the
-                                     crossing alive
+|  |  |  |- EXIT
+|  |- EXIT pieces{P0:W:{1}}
 ```
 
-`yield{pass}` means that this branch contains no acquire or nested region with
-a crossing, so it returns the token already available before the `if`.
-
-**For a loop, the decision checks two kinds of use of the regain's token**
-(`buildUniformHold`). Structural checks can stop the decision earlier, and an
-inside use stops it before the outside check. At a single level — judging this
-loop's own nodes — the trace has two outcomes; nested regions are handled by
-composition in the next subsection.
-
-**Both searches empty → POINT_OF_USE.**
-`test/NVWS/insert_semas.mlir` `@local_reg_and_smem_use`. What the default
-would emit — carried, full protocol:
+The `if` is owned by `{1}` at its boundary even though its then branch hands
+the buffer to `{0}`. The matching SYNC-DAG shows the handoff back to `{1}`:
 
 ```text
-%t0 = a S2 root                      ; entry, seeds iteration 0
+|- a S1 {1}
+|- W m0  ttng.tc_gen5_mma {1}
+|- scf.if pieces{P0:R:{1}} thread{{1}}
+|  |- then
+|  |  |- ENTER pieces{P0:R:{1}}
+|  |  |- r S0 {1}
+|  |  |- a S0 {0}
+|  |  |- R m0  ttng.tmem_load {0}
+|  |  |- r S1 {0}
+|  |  |- a S1 {1}
+|  |  |- EXIT pieces{P0:R:{1}} yield{a S1}
+|  |- else
+|  |  |- ENTER
+|  |  |- EXIT yield{pass}
+|- r S1 {1}
+```
+
+The parent sees one `if` node returning owner `{1}`: a fresh token on the then
+path and the input token on the else path. The child owns the
+`{1}->{0}->{1}` handoff. The parent may still emit its ordinary closing
+release after the `if`, as above.
+
+A region is `transparent` only when the boundary owner is restored and no
+group access or protocol node follows the final returned token on any path.
+That lets a parent use the child as its final recurrence node. Different
+returned owners, a non-empty final node that cannot return a token, or an
+invalid transfer are hard verification errors. An empty path may pass the
+input token. These cases are not changed to CARRIED. The recorded schedule is
+consulted only by the stage check described below.
+
+<a id="the-decision-per-region"></a>
+
+### The loop decision
+
+`planLoopFlow` makes the decision from the loop's `RegionFlow` and its direct
+chain. It does not inspect child operations.
+
+1. The loop must be in an eligible tagged WS scope, and its enclosing regions
+   must allow the token slot to be removed.
+2. The final token must come from an acquire or a transparent child region. If
+   the final child loop already owns the protocol, choose CHILD_OWNS.
+3. If a group access, release, or child flow follows that final token, choose
+   CARRIED and print `gated(trailing-use)`.
+4. The pass must find an input acquire with the same owner. If operations
+   before the loop still use that token, the plan must have one copy.
+5. The input and body semaphores must match, or the pass must be able to add
+   the required release.
+6. The pass must find the first body use. If the final token comes from an
+   acquire, its closing release must exist; if it comes from a child, the pass
+   adds one.
+7. When a plain inner loop also needs an acquire after the loop, its known body
+   and exit stages must agree.
+8. Otherwise the pass places the acquire before the first use, removes the
+   loop token, and adds any required acquire or release immediately outside
+   the loop.
+
+A failed check keeps CARRIED. `trailing-use` and the nested-exit
+`result-consumed` case are named in the dump; other failures print bare
+`gated`. Invalid returned tokens or owners fail verification instead.
+
+### Point of use
+
+`test/NVWS/insert_semas.mlir` `@local_reg_and_smem_use` starts with this
+carried protocol:
+
+```text
+%t0 = a S2 root
 for (%t = %t0) {
   W m0 [%t]  ttg.local_store {0}
-  r  S0 %t  {0}
+  r S0 %t {0}
   %t1 = a S0 {1}
   R m0 [%t1] ttg.local_load {1}
-  r  S1 %t1 {1}
+  r S1 %t1 {1}
   %t2 = a S1 {2}
   W m0 [%t2] use_smem {2}
-  r  S2 %t2 {2}
-  %t3 = a S2 {0}                     ; regain at the bottom
-  yield %t3
-}
-```
-
-Trace the regain's token `%t3`: between the regain and the yield —
-nothing; the loop's result — unused. Both searches are empty and the move's
-safety checks pass. The move deletes the regain, the yield's token,
-and the iter-arg, and acquires directly before the first access instead;
-the pass emitted:
-
-```text
-|- scf.for (WS, tag=0) ... holdrule{pointofuse->ttg.local_store}
-|  |- a  S2  {0}                 ; the moved acquire, at the first access
-|  |- W m0  ttg.local_store {0}
-|  |- r  S0  {0} [none]
-|  |- a  S0  {1}
-|  |- R m0  ttg.local_load {1}
-|  |- r  S1  {1} [none]
-|  |- a  S1  {2}
-|  |- W m0  use_smem {2}
-|  |- r  S2  {2} [none]          ; closing release, in the body
-|  |- EXIT ... yield{native}     ; no token crosses the boundary
-SEMAS: S0{count=1} S1{count=1} S2{count=1 entry inherit={@0.0}}
-```
-
-`S2` is created initially released so iteration zero's in-body acquire
-succeeds.
-
-**An inside use keeps the token iter-arg and result, as does any use of the
-result outside the loop.** In one supported shape, the pass inserts an acquire
-after the loop and the outside code uses that token instead. The loop result
-then has no outside use. The two searches are:
-
-- *inside the body*, between the regain and the yield: an access to the
-  group's memory, a release of one of the group's semaphores, or a nested
-  `for`/`if` with a crossing (`hasTrailingCompUse`). An access or release still
-  uses the token at the bottom; any nested crossing is conservatively treated
-  as a trailing use, so the dump prints `gated(trailing-use)`;
-- *outside the loop*, through the result: something after the loop
-  consumes the token the loop returns (`regionResultConsumedAfter`). If the
-  feeding and regain semaphores are the same, the dump prints
-  `gated(result-consumed)`. If they differ, the pass may insert the replacement
-  acquire after the loop; if it cannot, the loop stays gated.
-
-**Inside search fails — `trailing-use`.**
-`test/NVWS/insert_semas_per_edge_tmem.mlir`
-`@tmem_single_producer_multi_consumer_fanout` has one writer and two readers:
-
-```text
-%t0 = a S2(2) root                ; S2 is initially released
-for (%t = %t0) {
-  W buf [%t] {0}
-  r  S0 %t {0}
-  r  S1 %t {0}
-
-  %r1 = a S0 {1}
-  R buf [%r1] {1}
-  r  S2 %r1 {1}
-
-  %r2 = a S1 {2}
-  R buf [%r2] {2}
-  r  S2 %r2 {2}
-
-  %t1 = a S2(2) {0}              ; waits for BOTH readers
-  W buf [%t1] {0}                 ; trailing use
-  yield %t1
-}
-```
-
-Here `%t1` covers both the trailing `{0}` write and the first `{0}` write of
-the next iteration. Removing the token iter-arg and result would require
-keeping `a S2(2)` before the trailing write, then adding a release after that
-write and another acquire at the next iteration's first write. Carrying `%t1`
-across the loop is precisely what eliminates that same-owner release/acquire
-pair. The POINT_OF_USE optimization does not add the pair back, so it cannot
-remove the token carry in this shape.
-
-**Outside search fails — `result-consumed`.**
-The failure is easiest to see when the loop result hands the completed cycle
-to a third owner:
-
-```text
-%e = a S0 {1}                    ; S0 is initially released
-W buf [%e] {1}
-r  S1 %e {1}
-%t0 = a S1 {2}
-
-%tN = for (%t = %t0) {
-  R buf [%t] {2}
-  r  S2 %t {2}
-
-  %u = a S2 {1}
-  W buf [%u] {1}
-  r  S1 %u {1}
-
-  %t1 = a S1 {2}                 ; waits for {1}'s write
-  yield %t1
-}
-
-r  S3 %tN {2}                    ; hands the completed cycle to {3}
-%v = a S3 {3}
-R buf [%v] {3}
-```
-
-On every iteration, the bottom `a S1 {2}` waits for `{1}`'s write. Its yielded
-token supplies the next iteration. After the final iteration, the returned
-`%tN` is instead consumed by `r S3`: `{3}` cannot pass `a S3` until `{1}`'s
-final write has completed.
-
-This outside use is why the loop reports `gated(result-consumed)` and keeps
-its token iter-arg and result. If that check were ignored, POINT_OF_USE would
-remove the iter-arg and result and move the bottom `a S1` to the next
-iteration's first `{2}` read. `r S3` would then have no token: a token acquired
-inside the loop body cannot be used after the loop unless the loop returns it.
-Moving `r S3` into the body would not preserve the program either. It would
-release `S3` on every iteration, so `{3}` could consume the first release and
-read `buf` while later iterations were still writing it. Adding a new
-`a S1 {2}` before `r S3` could provide one token after the loop, but that would
-be a different same-semaphore transformation; the `result-consumed` case
-described here does not perform it.
-
-### Future investigation: replace a consumed loop result
-
-The same-semaphore `result-consumed` case may be able to use POINT_OF_USE if
-the pass creates one acquire after the loop to replace the token it no longer
-returns:
-
-```text
-for {
-  %t = a S1 {2}                  ; point-of-use acquire
-  R buf [%t] {2}
-  r  S2 %t {2}
-
-  %u = a S2 {1}
-  W buf [%u] {1}
-  r  S1 %u {1}
-}
-
-%tok = a S1 {2}                 ; waits for the final iteration's r S1
-r  S3 %tok {2}                  ; the once-after-loop handoff still has a token
-%v = a S3 {3}
-R buf [%v] {3}
-```
-
-The post-loop acquire would consume the final iteration's `S1` release; for a
-zero-trip loop, it would consume the release that originally fed `%t0`. This
-would preserve the single handoff to `{3}` while allowing the loop to have no
-token iter-arg or result.
-
-Before adopting this transformation, future work must prove correct semaphore
-phase and count behavior, including the zero-trip case; teach SYNC-DAG to
-represent the pre-loop release feeding either the first in-loop acquire or the
-post-loop acquire; verify that the final handoff to `{3}` remains correctly
-ordered; and measure the performance impact. Until those checks are complete,
-the pass keeps `gated(result-consumed)`.
-
-### Composition: apply the hold rule from inner to outer
-
-Nested loops use the same hold rule already described for one loop. Apply it
-from the innermost loop outward:
-
-```text
-1. Decide the inner loop.
-2. Represent the decided inner loop as one node in the outer loop:
-     POINT_OF_USE -> no token enters or leaves the node
-     gated        -> a token enters and leaves the node
-3. Apply the same hold rule to the outer loop.
-4. Repeat for each enclosing loop.
-```
-
-**Example 1: the inner loop becomes POINT_OF_USE.**
-`test/NVWS/insert_semas_nested_ws_inner_loop.mlir` `@nested_ws_inner_loop`.
-Before applying POINT_OF_USE, both loops carry the token:
-
-```text
-%t0 = a S1 root                      ; entry, seeds iteration 0
-for outer (%t = %t0) {
-  %ti = for inner (%u = %t) {
-    W m0 [%u]  ttng.tc_gen5_mma {1}
-    r  S0 %u  {1} [tc5mma]
-    %u1 = a S0  {0}
-    R m0 [%u1] ttng.tmem_load {0}
-    r  S1 %u1 {0}
-    %u2 = a S1  {1}                  ; inner regain
-    yield %u2
-  }
-  yield %ti                          ; the outer only forwards the inner's token
-}
-```
-
-Decide the inner loop first. No access or release uses `%u2` after its
-acquire. `%ti` is passed through the outer loop, but nothing after the outer
-loop consumes the resulting token. The single-level rule therefore moves
-`a S1 {1}` to the inner loop's first access and removes the inner loop's token
-iter-arg and result.
-
-The decided inner loop is now one node in the outer loop:
-
-```text
-inner loop node
-  token in:  none
-  token out: none
-```
-
-Now apply the same rule to the outer loop. For this buffer, its body contains
-only that inner-loop node. Because the node no longer takes or returns a
-token, the outer loop has no token left to carry. Its token iter-arg and result
-are removed too. The emitted dump is:
-
-```text
-|- scf.for (WS, tag=0) ... holdrule{passthrough-drop}
-|  |- scf.for ... holdrule{pointofuse->ttng.tc_gen5_mma}
-|  |  |- a  S1  {1}
-|  |  |- W m0  ttng.tc_gen5_mma {1}
-|  |  |- r  S0  {1} [tc5mma]
-|  |  |- a  S0  {0}
-|  |  |- R m0  ttng.tmem_load {0}
-|  |  |- r  S1  {0} [none]
-|  |  |- EXIT ... yield{native}
-|  |- EXIT ... yield{drop}          <- the outer loop has no token result
-```
-
-`passthrough-drop` is not another hold rule. It means that the outer loop
-previously carried a token only for the inner loop, and the decided inner loop
-no longer takes or returns that token.
-
-**Example 2: the inner loop remains gated, but the enclosing loop becomes
-POINT_OF_USE.**
-`test/NVWS/insert_semas_uniform_hold_transparency.mlir`
-`@uniform_hold_s2_owner_change_cut`.
-
-First decide the inner loop. Its result `%innerN` is used by the following
-`{2}` read:
-
-```text
-%inner0 = a S0 {2}
-%innerN = for inner (%v = %inner0) {
-  R buf [%v] {2}
-  r  S1 %v {2}
-  %w = a S1 {1}
-  W buf [%w] {1}
-  r  S0 %w {1}
-  %innerNext = a S0 {2}
-  yield %innerNext
-}
-R buf [%innerN] {2}                  ; consumes the inner result
-```
-
-The inner loop therefore remains `gated(result-consumed)`. At the enclosing
-level it is now one decided node:
-
-```text
-inner-loop node
-  token in:  %inner0
-  token out: %innerN
-```
-
-Now place that node in the enclosing loop. Before applying POINT_OF_USE to the
-enclosing loop, its shape is:
-
-```text
-%outer0 = a S2 root                  ; seeds the first enclosing iteration
-%outerN = for outer (%t = %outer0) {
-  W buf [%t] {1}
-  r  S0 %t {1}
-  %inner0 = a S0 {2}
-
-  %innerN = for inner (%v = %inner0) ...
-             ; one gated node: token in=%inner0, token out=%innerN
-
-  R buf [%innerN] {2}
-  r  S2 %innerN {2}
-  %next = a S2 {1}
+  r S2 %t2 {2}
+  %next = a S2 {0}
   yield %next
 }
 ```
 
-Nothing uses `%next` after its acquire, and no access or release consumes
-`%outerN` after the loop. Apply the same single-level move: put `a S2 {1}` at
-the next iteration's first `{1}` store and remove `%outer0`, `%outerN`, and the
-outer token iter-arg and yield. The already-decided inner node does not change:
+Nothing uses `%next` at the end of this iteration. Its first use is the store
+at the head of the next iteration. The pass moves `a S2` there and removes the
+loop token:
 
 ```text
-for outer {                           ; pointofuse->ttg.local_store
-  %t = a S2 {1}
-  W buf [%t] {1}
-  r  S0 %t {1}
-  %inner0 = a S0 {2}
+|- scf.for (WS, tag=0) ... holdrule{pointofuse->ttg.local_store}
+|  |- a S2 {0}
+|  |- W m0  ttg.local_store {0}
+|  |- r S0 {0} [none]
+|  |- a S0 {1}
+|  |- R m0  ttg.local_load {1}
+|  |- r S1 {1} [none]
+|  |- a S1 {2}
+|  |- W m0  use_smem {2}
+|  |- r S2 {2} [none]
+|  |- EXIT ... yield{native}
+SEMAS: S0{count=1} S1{count=1} S2{count=1 entry inherit={@0.0}}
+```
 
-  %innerN = for inner (%v = %inner0) ...
-             ; same gated node: token in=%inner0, token out=%innerN
+`S2` is initially released for iteration zero. Each iteration's `r S2`
+supplies the next iteration's in-body acquire.
 
-  R buf [%innerN] {2}
-  r  S2 %innerN {2}
+### Trailing use
+
+In `test/NVWS/insert_semas_per_edge_tmem.mlir`
+`@tmem_single_producer_multi_consumer_fanout`, owner `{0}` writes, owners
+`{1}` and `{2}` read, and `{0}` then writes again:
+
+```text
+%t0 = a S2(2) root
+for (%t = %t0) {
+  W buf [%t] {0}
+  r S0 %t {0}
+  r S1 %t {0}
+
+  %r1 = a S0 {1}
+  R buf [%r1] {1}
+  r S2 %r1 {1}
+
+  %r2 = a S1 {2}
+  R buf [%r2] {2}
+  r S2 %r2 {2}
+
+  %next = a S2(2) {0}
+  W buf [%next] {0}
+  yield %next
 }
 ```
 
-A gated inner loop therefore does not force its enclosing loop to remain
-gated. It tells the enclosing loop only that this one node takes and returns a
-token; the enclosing loop still makes its own hold decision.
-
-**Example 3: both loops remain gated.**
-`test/NVWS/insert_semas_nested_carrier.mlir`
-`@outer_sourceful_alloc_inner_loop_reentry`.
-
-Again, decide the inner loop first. The node immediately after it is
-`r S2 {1}`, which uses the token returned by the inner loop:
+`%next` protects both the last `{0}` write in iteration `i` and the first
+`{0}` write in iteration `i+1`. Splitting the hold at the loop boundary would
+add a same-owner release/acquire pair:
 
 ```text
-|- scf.for ... holdrule{gated(result-consumed)}
-|  |- W m0  ttng.tc_gen5_mma {1}
-|  |- r  S1  {1} [tc5mma]
-|  |- a  S1  {0}
-|  |- R m0  ttng.tmem_load {0}
-|  |- r  S0  {0} [none]
-|  |- a  S0  {1}
-|  |- EXIT ... yield{a S0}
-|- r  S2  {1} [tc5mma]              <- uses the inner loop's result
+What removing the loop token would add. Only the end of iteration i and start
+of iteration i+1 are shown. V is illustrative and is not created.
+
+                    %next = a S2(2) {0} at i
+                                  | walk
+                                  v
+                        W buf [%next] {0}
+                                  | walk
+                                  v
+                         r V %next {0}
+                           +------+------------------+
+                      walk |                         | V
+                           v                         |
+                        EXIT(i)                      |
+                           | next iteration           |
+                           v                         |
+                       ENTER(i+1)                    |
+                      walk |                         |
+                           +-----------+-------------+
+                                       v
+                                  %t = a V {0}
+                                       | walk
+                                       v
+                                W buf [%t] {0}
 ```
 
-The inner result is consumed, so the single-level rule produces
-`gated(result-consumed)`. The decided inner loop is therefore one node with a
-token entering and leaving it:
+Carrying `%next` removes that pair:
 
 ```text
-inner loop node
-  token in:  yes
-  token out: yes
+What the pass emits for the same two operations.
+
+                    %next = a S2(2) {0} at i
+                                  | walk
+                                  v
+                        W buf [%next] {0}
+                                  | walk
+                                  v
+                       EXIT(i) yield %next
+                                  | next iteration
+                                  | carried token
+                                  v
+                  ENTER(i+1) iter-arg %t = %next
+                                  | walk
+                                  v
+                           W buf [%t] {0}
 ```
 
-Place that node in the outer loop and apply the same single-level rule. The
-outer loop's bottom `a S2 {0}` is followed by `R m0 {0}`, so that token still
-has an in-loop use. This is the already-described `trailing-use` case, and the
-outer loop remains gated too:
+The pass therefore emits CARRIED directly:
 
 ```text
-|- a  S2  root  ; entry
+|- a S2(2) root ; entry
 |- scf.for (WS, tag=0) ... holdrule{gated(trailing-use)}
-|  |- W m0  ttng.tmem_alloc {0}
-|  |- r  S0  {0} [none]
-|  |- a  S0  {1}
-|  |- scf.for ... holdrule{gated(result-consumed)}
-|  |  |- W m0  ttng.tc_gen5_mma {1}
-|  |  |- r  S1  {1} [tc5mma]
-|  |  |- a  S1  {0}
-|  |  |- R m0  ttng.tmem_load {0}
-|  |  |- r  S0  {0} [none]
-|  |  |- a  S0  {1}
-|  |  |- EXIT ... yield{a S0}      <- the regain's token IS the loop result
-|  |- r  S2  {1} [tc5mma]          <- the parent CONSUMES that result: the
-                                      inner loop cannot stop yielding, so
-                                      gated(result-consumed)
-|  |- a  S2  {0}                   <- the outer loop's regain
-|  |- R m0  ttng.tmem_load {0}     <- an access AFTER it: the regain still
-                                      does work this iteration, so
-                                      gated(trailing-use)
+|  |- W m0  ttng.tmem_store {0}
+|  |- r S0 {0}
+|  |- r S1 {0}
+|  |- a S0 {1}
+|  |- R m0  ttng.tmem_load {1}
+|  |- r S2 {1}
+|  |- a S1 {2}
+|  |- R m0  ttng.tmem_load {2}
+|  |- r S2 {2}
+|  |- a S2(2) {0}
+|  |- W m0  ttng.tmem_store {0}
 |  |- EXIT ... yield{a S2}
 ```
 
-Examples 2 and 3 both have a gated inner loop. In Example 2, the enclosing
-loop needs its next token only at the next iteration's first access, so it
-becomes POINT_OF_USE. In Example 3, an access still uses the enclosing loop's
-bottom token in the current iteration, so it remains gated. That is the
-complete composition rule: decide the inner loop, represent it as one node
-with its decided token input and result, and apply the same hold rule to the
-next enclosing loop.
+`hasTrailingCompUse` checks for any group access, release, or child flow after
+the final token, so `gated(trailing-use)` names the check; it does not by itself
+prove the same-owner shape above.
 
-If POINT_OF_USE cannot be proven safe, the loop keeps its token iter-arg and
-result. The dump prints `gated(trailing-use)` or `gated(result-consumed)` for
-the two token-use blockers above; every other eligibility failure is printed
-as bare `gated`. All three use the same carried-token fallback.
+`S2` is the real count-two fan-in from the two readers. The illustrative `V`
+must not be folded into `S2`; doing so would change the pending count.
+
+### Use after the loop
+
+Using the loop result after the loop does not always require CARRIED. The pass
+can add one acquire after a POINT_OF_USE loop:
+
+```text
+%entry = a S0 {1}
+W buf [%entry] {1}
+r S1 %entry {1}
+
+for {
+  %t = a S1 {2}
+  R buf [%t] {2}
+  r S2 %t {2}
+
+  %u = a S2 {1}
+  W buf [%u] {1}
+  r S1 %u {1}
+}
+
+%final = a S1 {2}              ; postLoopAcquire
+r S3 %final {2}                ; once, after the loop
+%v = a S3 {3}
+R buf [%v] {3}
+```
+
+For a non-empty loop, `%final` waits for the last iteration's `r S1`. For a
+zero-trip loop, it waits for the `r S1` placed before the loop.
+
+When the final token comes from a child and the same semaphore is also needed
+after the loop, the pass keeps the loop token and prints
+`gated(result-consumed):nestedExit`. Other failed checks print bare `gated`.
+
+### Nested loops
+
+Region flows are decided from inner to outer. After an inner loop is decided,
+the parent sees only its updated summary.
+
+In `test/NVWS/insert_semas_nested_ws_inner_loop.mlir`
+`@nested_ws_inner_loop`, the inner loop becomes POINT_OF_USE. The outer loop
+had only forwarded that token, so it chooses CHILD_OWNS and drops its slot:
+
+```text
+|- scf.for (WS, tag=0) ... holdrule{passthrough-drop:nestedExit}
+|  |- scf.for ... holdrule{pointofuse->ttng.tc_gen5_mma}
+|  |  |- a S1 {1}
+|  |  |- W m0  ttng.tc_gen5_mma {1}
+|  |  |- r S0 {1} [tc5mma]
+|  |  |- a S0 {0}
+|  |  |- R m0  ttng.tmem_load {0}
+|  |  |- r S1 {0} [none]
+|  |  |- EXIT ... yield{native}
+|  |- EXIT ... yield{drop}
+```
+
+`@nested_ws_inner_loop_parent_continuation` adds a read after the inner loop.
+The inner acquire stays at the MMA. The post-loop `a S1` starts the handoff to
+the outer read; `a S2` supplies the token used by that read. The final `r S1`
+supplies the next outer iteration:
+
+```text
+|- func @nested_ws_inner_loop_parent_continuation
+|  |- a S3 root ; entry
+|  |- scf.for (WS, tag=1) ... holdrule{gated(trailing-use)}
+|  |  |- scf.for ... holdrule{pointofuse->ttng.tc_gen5_mma:postLoopAcquire:entryBridge}
+|  |  |  |- a S1 {1}
+|  |  |  |- W m0  ttng.tc_gen5_mma {1}
+|  |  |  |- r S0 {1} [tc5mma]
+|  |  |  |- a S0 {0}
+|  |  |  |- R m0  ttng.tmem_load {0}
+|  |  |  |- r S1 {0} [none]
+|  |  |  |- EXIT ... yield{native}
+|  |  |- a S1 {1}                 ; postLoopAcquire
+|  |  |- r S2 {1} [tc5mma]
+|  |  |- a S2 {0}
+|  |  |- R m0  ttng.tmem_load {0}
+|  |  |- r S3 {0} [none]
+|  |  |- a S3 {1}
+|  |  |- r S1 {1} [none]          ; entryBridge
+|  |  |- EXIT ... yield{a S3}
+```
+
+The inner and outer decisions are independent: the inner loop is
+POINT_OF_USE; the outer loop keeps its carried token because it has a trailing
+use.
+
+### Dump labels
+
+`holdrule` prints the loop decision:
+
+```text
+pointofuse->op
+    acquire moved to the first use; no loop token
+
+passthrough-drop
+    CHILD_OWNS; the parent returns no token because its final child returns none
+
+gated(trailing-use)
+    CARRIED; an access, release, or child flow follows the final token
+
+gated(result-consumed)
+    CARRIED; the nested final node needs an acquire after the loop
+
+gated
+    CARRIED; another check failed
+```
+
+Suffixes add details to any mode:
+
+```text
+:nestedExit          final token comes from a child region
+:postLoopAcquire     an acquire was added after the loop
+:entryBridge         a release was added to supply the first body acquire
+```
 
 ## Backing copies
 
@@ -2363,7 +2229,7 @@ schedule is valid, and no cluster changes.
 
 ### Finalizing one handoff
 
-Protocol construction and hold placement have already decided where the
+Protocol construction and region-flow placement have already decided where the
 release and acquire go. An ordinary handoff now has one of these two shapes:
 
 ```text
@@ -2739,21 +2605,23 @@ crossing releases likewise receive `stage-offset=1`.
 
 [`InsertSemasSyncDag.cpp`](../../third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemasSyncDag.cpp):
 
-- `ChainWalker`, `walkChain`, `applyTouch`, `VersionSource`, `ActiveUse`,
+- `ChainWalker::run`, `applyTouch`, `VersionSource`, `ActiveUse`,
   `PieceState`, `Tokens`, and `canReuseTokenForPiece`
-- `reduceStraightEdges`, `reduceLoopCloses`, `reduceEdges`, `collapseEdges`,
-  and `buildEdgesAndSemas`
-- `insertEntryAcquires` and `computeCrossings`
-- `computeHoldRules`, `planHoldRules`, `buildUniformHold`, `matchHoldPrefix`,
-  and `applyHoldRulePlacement` (`verifyTokenLocality` and `HoldPrefix` are
-  file-local here; `markTokenReuse`, `nodeReusesToken`, and `Hold` are in
-  `InsertSemas.h`)
-- `ownerCompletionScheduleAtLoopExit`
+- `collectEdges`, `reduceStraightEdges`, `reduceLoopCloses`, `reduceChain`,
+  `reduceEdges`, and `buildEdgesAndSemas`
+- `insertEntryAcquires`
+- `summarizeChainBoundary`, `summarizeRegionFlow`, `buildRegionFlows`, and
+  `pruneDeadIfFlows`
+- `findInputAcquire`, `matchDemandPrefix`, `planLoopFlow`,
+  `lowerPointOfUse`, `planRegionFlows`, and `verifyPointOfUseFlow`
+- `CapabilityRef`, `SemaTransfer`, and `RegionFlow` are defined in
+  `InsertSemas.h`
 - `computeBackingPlan`
 - `assignCircularStageOffsets`, `assignAliasedHandoffStageOffsets`,
-  `computeSlotSchedule`, `computeLoopCarriedDistance`,
+  `PhysicalSchedules`, `replaySlots`, `computeSlotSchedule`,
+  `computeLoopCarriedDistance`,
   `addSyncScheduleEdges`, `legalizeLoopSchedule`, `analyzeSyncSchedule`,
-  `validateSyncSchedule`, `assignSyncScheduleChain`, and
+  `scheduleAtOwnerBoundary`, `assignSyncScheduleChain`, and
   `finalizeSyncSchedule`
 - `buildSyncDag`
 - the DAG dump used throughout: `NVWS_INSERT_SEMA_DUMP_DAG=1`

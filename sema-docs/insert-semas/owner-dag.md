@@ -92,7 +92,9 @@ The backward scan from the operation before the `if` stops at the
 the effect is `R` because nothing in the body writes P0. The read inside
 still resolves its own owner `{1}` — the region boundary records who owns
 the piece *at the boundary*, and SYNC-DAG's child walk then derives the
-`{0}` to `{1}` handoff inside.
+`{0}` to `{1}` handoff inside. Matching boundary owners therefore do not mean
+ownership stayed fixed inside the region. They record the owner seen by the
+parent; SYNC-DAG still checks the token returned by each child path.
 
 ## `ENTER` and `EXIT` records
 
@@ -118,9 +120,11 @@ piece. The child keeps the logical producer known before the region, but uses
 readers therefore fan out from `ENTER`, not from a previous child reader or
 directly from the outer version's source node. At `EXIT`, the recorded owner
 is the target of any handoff needed by the next loop iteration or by a later
-access. The later
-hold analysis decides whether a semaphore token must pass through the
-boundary; OWNER-DAG does not create or thread tokens.
+access.
+
+SYNC-DAG uses the boundary owner and the token returned by each child path to
+decide whether a loop carries a token or acquires at its first use. OWNER-DAG
+does not make that decision or create or thread tokens.
 
 ## Code map
 
