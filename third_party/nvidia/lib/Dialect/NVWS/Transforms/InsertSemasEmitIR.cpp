@@ -43,6 +43,14 @@ struct RenderState {
         return &token;
     return nullptr;
   }
+  // Exact routing: the record whose producer is the node's recorded token
+  // source. No owner guessing.
+  const Capability *tokenForSource(const Node *producer) const {
+    for (const Capability &token : tokens)
+      if (token.ref.producer == producer && token.value && token.sema)
+        return &token;
+    return nullptr;
+  }
   Capability *tokenFor(const CapabilityRef &ref) {
     return const_cast<Capability *>(
         std::as_const(*this).tokenFor(ref));
@@ -516,17 +524,12 @@ static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs, Node *node,
       else
         types.push_back(localViewType(g, static_cast<MemberId>(mi), {&t}, bt));
     }
-    const RenderState::Capability *lastToken = rs.lastToken();
-    Value tok = lastToken ? lastToken->value : Value();
-    Value semaVal = lastToken ? lastToken->sema : Value();
     bool reusesToken = nodeReusesToken(node, owner);
-    if (reusesToken &&
-        (!lastToken || !sameOwner(lastToken->ref.owner, owner))) {
-      RenderState::Capability *token = rs.tokenForOwner(owner);
-      assert(token && "token-reuse DAG fact without token");
-      tok = token->value;
-      semaVal = token->sema;
-    }
+    const RenderState::Capability *token =
+        node->tokenSource ? rs.tokenForSource(node->tokenSource) : rs.lastToken();
+    assert(token && "no capability for the recorded token source");
+    Value tok = token->value;
+    Value semaVal = token->sema;
     assert(tok && "no token for view");
     assert(semaVal && "no semaphore for token");
     auto buf = emitInto<nvws::SemaphoreBufferOp>(
@@ -818,14 +821,10 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
       break;
     }
     case Node::Release: {
-      const RenderState::Capability *lastToken = rs.lastToken();
-      Value tok = lastToken ? lastToken->value : Value();
-      if (nodeReusesToken(n, n->owner) &&
-          (!lastToken || !sameOwner(lastToken->ref.owner, n->owner))) {
-        RenderState::Capability *token = rs.tokenForOwner(n->owner);
-        assert(token && "token-reuse release without token");
-        tok = token->value;
-      }
+      const RenderState::Capability *source =
+          n->tokenSource ? rs.tokenForSource(n->tokenSource) : rs.lastToken();
+      assert(source && "release without a live token for its recorded source");
+      Value tok = source->value;
       assert(tok && "release without token");
       OpBuilder b(ctx.func);
       if (lastReal)

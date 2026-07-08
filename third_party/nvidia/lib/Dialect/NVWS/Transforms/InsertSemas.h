@@ -132,6 +132,10 @@ struct Node {
   // the same chain without a fresh handoff. EmitIR renders this fact; it does
   // not infer token-reuse eligibility on its own.
   std::optional<int64_t> reuseTokenOwner;
+  // Exact token producer for this access or release: the acquire, region, or
+  // inherited record whose token this node consumes. Assigned by the SYNC-DAG
+  // token sweep; EmitIR routes by this fact and never guesses by owner.
+  Node *tokenSource = nullptr;
   Node *sat = nullptr;
   Node *scheduleAnchor = nullptr;
   std::optional<RegionFlow> flow;

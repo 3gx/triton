@@ -1353,6 +1353,123 @@ static void planRegionFlows(GroupDag &g, Node *head) {
   }
 }
 
+// Doc: sync-dag.md#the-walk-accesses-to-edges
+// Pass tokens through chains, ENTER, and EXIT once every acquire and release
+// has its final place, and record on each access and release the exact node
+// whose token it consumes. Producers are acquires and token-returning
+// regions; region entry inherits the incoming producer unchanged.
+struct TokenEnv {
+  struct Record {
+    Owner owner;
+    Node *producer = nullptr;
+  };
+  SmallVector<Record, 2> live;
+  const Record *last() const { return live.empty() ? nullptr : &live.back(); }
+  Node *findOwner(const Owner &owner) {
+    for (Record &r : live)
+      if (sameOwner(r.owner, owner))
+        return r.producer;
+    return nullptr;
+  }
+  void record(const Owner &owner, Node *producer) {
+    llvm::erase_if(live, [&](const Record &r) {
+      return !r.owner || sameOwner(r.owner, owner);
+    });
+    live.push_back(Record{owner, producer});
+  }
+  void keepOnly(const Record &r) { live.assign(1, r); }
+  void clear() { live.clear(); }
+};
+// Mirror of EmitIR's per-node token selection: the last live token by
+// default; the owner's retained token when the DAG proved reuse.
+static Node *selectTokenSource(TokenEnv &env, Node *n) {
+  const TokenEnv::Record *last = env.last();
+  if (n->owner && nodeReusesToken(n, n->owner) &&
+      (!last || !sameOwner(last->owner, n->owner)))
+    return env.findOwner(n->owner);
+  return last ? last->producer : nullptr;
+}
+static void seedEntryTokens(TokenEnv &env, Node *head) {
+  if (!head || head->pieceInfo.empty())
+    return;
+  std::optional<Owner> owner = uniformPieceOwner(head);
+  if (!owner) {
+    env.clear();
+    return;
+  }
+  const TokenEnv::Record *last = env.last();
+  if (owner->has_value() && last && !last->owner)
+    env.keepOnly(TokenEnv::Record{*owner, last->producer}); // adopt root token
+  else if (Node *producer = env.findOwner(*owner))
+    env.keepOnly(TokenEnv::Record{*owner, producer});
+  else
+    env.clear();
+}
+static void assignTokenChain(GroupDag &g, Node *head, TokenEnv &env);
+static void assignTokenRegion(GroupDag &g, Node *n, TokenEnv &env) {
+  if (n->kind == Node::For) {
+    TokenEnv body = env;
+    if (n->flow) {
+      if (!n->flow->threadsToken())
+        body.clear();
+      else // the carrier: the loop region node is the body's producer
+        body.keepOnly(TokenEnv::Record{n->flow->owner, n});
+    } else {
+      seedEntryTokens(body, n->children[0]);
+    }
+    assignTokenChain(g, n->children[0], body);
+    if (n->flow) {
+      if (!n->flow->threadsToken())
+        env.clear();
+      else
+        env.keepOnly(TokenEnv::Record{n->flow->owner, n});
+    }
+    return;
+  }
+  TokenEnv thenEnv = env, elseEnv = env;
+  seedEntryTokens(thenEnv, n->children[0]);
+  if (n->children.size() > 1 && n->children[1])
+    seedEntryTokens(elseEnv, n->children[1]);
+  assignTokenChain(g, n->children[0], thenEnv);
+  if (n->children.size() > 1 && n->children[1])
+    assignTokenChain(g, n->children[1], elseEnv);
+  if (n->flow)
+    env.keepOnly(TokenEnv::Record{n->flow->owner, n});
+}
+static void assignTokenChain(GroupDag &g, Node *head, TokenEnv &env) {
+  for (Node *n = head; n; n = n->next) {
+    switch (n->kind) {
+    case Node::Acquire: {
+      const Sema &s = getSema(g, n);
+      Owner tokenOwner = s.isEntry && !n->owner ? s.entryTokenOwner : n->owner;
+      env.record(tokenOwner, n);
+      break;
+    }
+    case Node::Release:
+      n->tokenSource = selectTokenSource(env, n);
+      break;
+    case Node::Access:
+      if (nodeTouchesGroup(g, n))
+        n->tokenSource = selectTokenSource(env, n);
+      break;
+    case Node::For:
+    case Node::If:
+      assignTokenRegion(g, n, env);
+      break;
+    case Node::Enter:
+    case Node::Exit:
+    case Node::Func:
+      break;
+    }
+  }
+}
+static void assignTokenSources(GroupDag &g) {
+  if (g.semas.empty() || g.root->children.empty())
+    return;
+  TokenEnv env;
+  assignTokenChain(g, g.root->children[0], env);
+}
+
 static void addPart(SmallVectorImpl<int> &parts, int part) {
   if (!llvm::is_contained(parts, part))
     parts.push_back(part);
@@ -2314,6 +2431,7 @@ LogicalResult buildSyncDag(GroupDag &g, bool useMetaPartitioner,
     pruneDeadIfFlows(g, g.root->children[0], /*region=*/nullptr);
     planRegionFlows(g, g.root->children[0]);
     computeRequiredParts(g.root->children[0]);
+    assignTokenSources(g);
   }
   if (failed(computeSemaphoreCopies(g, lowerSemaphoreNumStages)))
     return failure();
