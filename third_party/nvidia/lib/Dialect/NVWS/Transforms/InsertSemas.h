@@ -68,23 +68,34 @@ struct Touch {
 
 struct Node;
 
+// Static identity of one semaphore capability.  The group is implicit in the
+// GroupDag being processed; producer identifies the token SSA (an acquire or a
+// region carrier), while that token preserves its dynamic physical-slot
+// lineage. `sema` is the selected render channel; region results preserve an
+// incoming channel when one exists, otherwise use a deterministic fallback.
+// The exact producer may have acquired another channel in the same GroupDag.
+struct CapabilityRef {
+  Node *producer = nullptr;
+  SemaId sema = 0;
+  Owner owner;
+};
+struct SemaTransfer {
+  // passesInput describes SSA provenance; concrete is the fallback render
+  // channel when the region has no incoming capability.
+  bool valid = false, passesInput = false;
+  std::optional<SemaId> concrete;
+};
+
 struct RegionFlow {
   enum class Mode { CARRIED, POINT_OF_USE, CHILD_OWNS };
   enum class Blocker { NONE, TRAILING_USE, RESULT_CONSUMED };
-  enum class ExitToken { INPUT, CURRENT, NONE };
-  // A region is compiled once into a transfer relative to its incoming
-  // capability.  INPUT_OR_CONCRETE represents a path choice between passing
-  // that input and returning the named semaphore; INVALID means the paths do
-  // not export one compatible capability.
-  enum class SemaTransfer { INPUT, CONCRETE, INPUT_OR_CONCRETE, INVALID };
   Owner owner;
   SmallVector<Node *, 2> exits;
-  SmallVector<ExitToken, 2> exitTokens;
-  SemaTransfer semaTransfer = SemaTransfer::INVALID;
-  SemaId concreteSema = 0;
+  SemaTransfer semaTransfer;
   bool ownersCompatible = true;
   bool transparent = false;
-  bool completionUsesInput = true, completionHasFallback = false;
+  bool completionUniform = true, completionUsesInput = true;
+  bool completionHasFallback = false;
   gpu::StageCluster completionSchedule;
   Mode mode = Mode::CARRIED;
   Blocker blocker = Blocker::NONE;
