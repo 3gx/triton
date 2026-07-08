@@ -8,12 +8,6 @@ namespace mlir::triton::nvws_semas {
 using Payloads = SmallVector<AsyncOp, 1>;
 using PieceEffects = std::map<PieceId, Effect>;
 
-struct PieceExitFacts {
-  Payloads payloads;
-  SmallVector<int64_t, 2> mustOrderedBefore;
-};
-using ExitFacts = std::map<PieceId, PieceExitFacts>;
-
 // Doc: sync-dag.md#the-walk-accesses-to-edges
 struct ActiveUse {
   Owner owner;
@@ -22,6 +16,7 @@ struct ActiveUse {
   // Owners whose existing dependency already orders this node before them.
   SmallVector<int64_t, 2> orderedBefore;
 };
+using ExitFacts = std::map<PieceId, ActiveUse>;
 
 struct VersionSource {
   Owner producer;    // logical producer of the current version
@@ -37,10 +32,20 @@ struct PieceState {
   SmallVector<ActiveUse, 2> uses;
   bool initialized() const { return source.node != nullptr; }
   ActiveUse *useFor(const Owner &owner) {
-    auto it = llvm::find_if(uses, [&](const ActiveUse &use) {
-      return sameOwner(use.owner, owner);
+    for (ActiveUse &use : uses)
+      if (sameOwner(use.owner, owner))
+        return &use;
+    return nullptr;
+  }
+  bool canReuseToken(const Owner &owner, Effect effect) {
+    if (!initialized())
+      return false;
+    if (effect == Effect::R)
+      return useFor(owner);
+    return llvm::all_of(uses, [&](const ActiveUse &use) {
+      return sameOwner(use.owner, owner) ||
+             llvm::is_contained(use.orderedBefore, ownerKey(owner));
     });
-    return it == uses.end() ? nullptr : &*it;
   }
   void startVersion(const Owner &producer, const Owner &sourceOwner, Node *node,
                     const Payloads &payloads) {
@@ -61,14 +66,12 @@ struct Tokens {
   const Token *find(const Owner &owner) const {
     if (!owner)
       return nullptr;
-    auto it = llvm::find_if(live, [&](const Token &token) {
-      return sameOwner(token.owner, owner);
-    });
-    return it == live.end() ? nullptr : &*it;
+    for (const Token &token : live)
+      if (sameOwner(token.owner, owner))
+        return &token;
+    return nullptr;
   }
-  const Token *last() const {
-    return !live.empty() && live.back().node ? &live.back() : nullptr;
-  }
+  const Token *last() const { return !live.empty() && live.back().node ? &live.back() : nullptr; }
   void remember(const Owner &owner) {
     if (owner && !find(owner))
       live.push_back(Token{owner, nullptr, {}});
@@ -87,8 +90,21 @@ struct EdgeRec {
   Owner srcOwner, dstOwner;
   Payloads payloads;
   SmallVector<PieceId, 2> pieces;
+  bool preserve = false;
 };
 using EdgeList = SmallVector<EdgeRec>;
+static bool hasAsyncPayload(ArrayRef<AsyncOp> payloads) {
+  return llvm::any_of(payloads,
+                      [](AsyncOp payload) { return payload != AsyncOp::NONE; });
+}
+static bool coveredByLiveUse(const PieceState &piece, const ActiveUse &use) {
+  if (use.node != piece.source.node)
+    return false;
+  return llvm::any_of(piece.uses, [&](const ActiveUse &other) {
+    return &other != &use &&
+           llvm::is_contained(use.orderedBefore, ownerKey(other.owner));
+  });
+}
 static void unionPayloads(Payloads &into, const Payloads &from) {
   for (AsyncOp payload : from)
     if (!llvm::is_contained(into, payload))
@@ -111,10 +127,8 @@ static bool knownNonEmptyLoop(Node *node) {
     return false;
   if (forOp->hasAttr("ttg.must-execute"))
     return true;
-  std::optional<APInt> tripCount = forOp.getStaticTripCount();
-  if (!tripCount)
-    return false;
-  return forOp.getUnsignedCmp() ? tripCount->ugt(0) : tripCount->sgt(0);
+  auto count = forOp.getStaticTripCount();
+  return count && (forOp.getUnsignedCmp() ? count->ugt(0) : count->sgt(0));
 }
 
 // Doc: sync-dag.md#the-per-access-rules-in-full
@@ -131,7 +145,8 @@ static void applyTouch(PieceState &piece, PieceId id, const Owner &owner,
     for (const ActiveUse &use : piece.uses) {
       bool adoptedRoot = wsAdopt && !use.owner;
       bool alreadyOrdered = llvm::is_contained(use.orderedBefore, ownerKey(owner));
-      if (!sameOwner(use.owner, owner) && !adoptedRoot && !alreadyOrdered)
+      if (!sameOwner(use.owner, owner) && !adoptedRoot && !alreadyOrdered &&
+          !coveredByLiveUse(piece, use))
         edges.push_back(
             EdgeRec{use.node, node, use.owner, owner, use.payloads, {id}});
     }
@@ -147,28 +162,19 @@ static void applyTouch(PieceState &piece, PieceId id, const Owner &owner,
   assert(piece.source.node && "initialized piece without a version source");
   bool adoptedRoot = wsAdopt && !piece.source.sourceOwner;
   if (!adoptedRoot && !sameOwner(piece.source.sourceOwner, owner)) {
+    ActiveUse *source = piece.useFor(piece.source.sourceOwner);
+    bool exactSource = source && source->node == piece.source.node;
     edges.push_back(EdgeRec{piece.source.node,
-                            node, piece.source.sourceOwner, owner, piece.source.payloads, {id}});
+                            node, piece.source.sourceOwner, owner,
+                            piece.source.payloads, {id},
+                            exactSource && hasAsyncPayload(piece.source.payloads)});
     // The source edge covers the source use only while it still names that
     // node; a later reread must retain its own WAR obligation.
-    if (ActiveUse *source = piece.useFor(piece.source.sourceOwner))
-      if (source->node == piece.source.node &&
-          !llvm::is_contained(source->orderedBefore, ownerKey(owner)))
-        source->orderedBefore.push_back(ownerKey(owner));
+    if (exactSource &&
+        !llvm::is_contained(source->orderedBefore, ownerKey(owner)))
+      source->orderedBefore.push_back(ownerKey(owner));
   }
   piece.uses.push_back(ActiveUse{owner, node, payloads, {}});
-}
-static bool canReuseTokenForPiece(ChainState &state, PieceId id,
-                                  const Owner &owner, Effect effect) {
-  auto it = state.find(id);
-  if (it == state.end() || !it->second.initialized())
-    return false;
-  PieceState &piece = it->second;
-  if (effect == Effect::R)
-    return piece.useFor(owner);
-  return llvm::all_of(piece.uses, [&](const ActiveUse &use) {
-    return sameOwner(use.owner, owner) || llvm::is_contained(use.orderedBefore, ownerKey(owner));
-  });
 }
 static bool nodeTouchesPiece(GroupDag &g, Node *node, PieceId piece) {
   if (node->kind == Node::Access)
@@ -223,7 +229,7 @@ private:
     const Tokens::Token *last = tokens.last();
     bool ownerDiffers = last && node->owner && !sameOwner(last->owner, node->owner);
     bool canReuse = tokens.find(node->owner) && llvm::all_of(effects, [&](const auto &item) {
-                      return canReuseTokenForPiece(state, item.first, node->owner, item.second);
+                      return state[item.first].canReuseToken(node->owner, item.second);
                     });
     size_t edgeStart = edges.size();
     Payloads payloads{asyncPayloadOf(node->op)};
@@ -292,8 +298,7 @@ private:
     for (auto [id, info] : infos)
       applyTouch(state[id], id, info.owner, info.effect, node, none, edges, wsAdopt);
     ExitFacts returned;
-    bool firstChild = true;
-    for (Node *childHead : node->children) {
+    for (auto [branch, childHead] : llvm::enumerate(node->children)) {
       ChainState child;
       for (auto [id, info] : sortedPieceInfo(childHead)) {
         auto before = incoming.find(id);
@@ -310,26 +315,20 @@ private:
       for (auto [id, info] : infos) {
         SmallVector<int64_t, 2> branchOrder = incomingOrder[id];
         if (auto it = childFacts.find(id); it != childFacts.end())
-          branchOrder = it->second.mustOrderedBefore;
-        if (firstChild)
-          returned[id].mustOrderedBefore = std::move(branchOrder);
-        else
-          returned[id].mustOrderedBefore = intersectOrderFacts(
-              returned[id].mustOrderedBefore, branchOrder);
+          branchOrder = it->second.orderedBefore;
+        auto &order = returned[id].orderedBefore;
+        order = branch == 0 ? std::move(branchOrder)
+                            : intersectOrderFacts(order, branchOrder);
       }
-      firstChild = false;
     }
     // A loop body does not establish a fact on its zero-trip path. Likewise,
     // an absent else branch carries the incoming fact unchanged.
-    if (node->kind == Node::For && !knownNonEmptyLoop(node)) {
+    bool hasBypass = (node->kind == Node::For && !knownNonEmptyLoop(node)) ||
+                     (node->kind == Node::If && node->children.size() < 2);
+    if (hasBypass)
       for (auto [id, info] : infos)
-        returned[id].mustOrderedBefore = intersectOrderFacts(
-            returned[id].mustOrderedBefore, incomingOrder[id]);
-    } else if (node->kind == Node::If && node->children.size() < 2) {
-      for (auto [id, info] : infos)
-        returned[id].mustOrderedBefore = intersectOrderFacts(
-            returned[id].mustOrderedBefore, incomingOrder[id]);
-    }
+        returned[id].orderedBefore =
+            intersectOrderFacts(returned[id].orderedBefore, incomingOrder[id]);
     for (auto [id, info] : infos) {
       auto facts = returned.find(id);
       ActiveUse *use = state[id].useFor(info.owner);
@@ -338,7 +337,7 @@ private:
       if (!facts->second.payloads.empty())
         use->payloads = facts->second.payloads;
       if (use->node == node)
-        for (int64_t owner : facts->second.mustOrderedBefore)
+        for (int64_t owner : facts->second.orderedBefore)
           if (!llvm::is_contained(use->orderedBefore, owner))
             use->orderedBefore.push_back(owner);
       if (state[id].source.node == node && !facts->second.payloads.empty())
@@ -359,7 +358,8 @@ private:
       if (underFor || pieceTouchedAfter(group, node->parent, id))
         for (const ActiveUse &use : piece.uses)
           if (!sameOwner(use.owner, info.owner) &&
-              !llvm::is_contained(use.orderedBefore, ownerKey(info.owner)))
+              !llvm::is_contained(use.orderedBefore, ownerKey(info.owner)) &&
+              !coveredByLiveUse(piece, use))
             edges.push_back(EdgeRec{
                 use.node, node, use.owner, info.owner, use.payloads, {id}});
       ActiveUse carried{info.owner, node, {AsyncOp::NONE}, {}};
@@ -373,16 +373,11 @@ private:
     if (head->kind != Node::Enter)
       return result;
     for (auto [id, info] : sortedPieceInfo(head)) {
-      PieceExitFacts facts;
-      facts.payloads.push_back(AsyncOp::NONE);
-      auto it = state.find(id);
-      if (it != state.end())
-        if (ActiveUse *use = it->second.useFor(info.owner)) {
-          if (!use->payloads.empty())
-            facts.payloads = use->payloads;
-          facts.mustOrderedBefore = use->orderedBefore;
-        }
-      result.emplace(id, std::move(facts));
+      ActiveUse &facts = result[id];
+      if (ActiveUse *use = state[id].useFor(info.owner))
+        facts = *use;
+      if (facts.payloads.empty())
+        facts.payloads.push_back(AsyncOp::NONE);
     }
     return result;
   }
@@ -496,7 +491,8 @@ static void reduceStraightEdges(Node *head, const Positions &positions,
         int64_t dk = ownerKey(e.dstOwner);
         unsigned srcIdx = positions.lookup(e.src);
         bool hasToken = !tokenOwners.empty() && tokenOwners.back() == dk;
-        if (order.covers(e, srcIdx) && hasToken && e.dst->kind == Node::Access) {
+        if (!e.preserve && order.covers(e, srcIdx) && hasToken &&
+            e.dst->kind == Node::Access) {
           drop[ei] = true;
           continue;
         }
