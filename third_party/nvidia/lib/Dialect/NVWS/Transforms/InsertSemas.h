@@ -97,6 +97,10 @@ struct RegionFlow {
   bool completionUniform = true, completionUsesInput = true;
   bool completionHasFallback = false;
   gpu::StageCluster completionSchedule;
+  // Render channel of the region's token result, resolved directly by the
+  // token sweep: the incoming record's semaphore when one exists, otherwise
+  // the first branch final's concrete semaphore.
+  std::optional<SemaId> resultSema;
   Mode mode = Mode::CARRIED;
   Blocker blocker = Blocker::NONE;
   Node *entryAcquire = nullptr, *closingRelease = nullptr;

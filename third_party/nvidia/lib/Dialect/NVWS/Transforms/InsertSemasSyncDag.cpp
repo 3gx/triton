@@ -1362,20 +1362,21 @@ struct TokenEnv {
   struct Record {
     Owner owner;
     Node *producer = nullptr;
+    SemaId sema = 0;
   };
   SmallVector<Record, 2> live;
   const Record *last() const { return live.empty() ? nullptr : &live.back(); }
-  Node *findOwner(const Owner &owner) {
-    for (Record &r : live)
+  const Record *findOwner(const Owner &owner) const {
+    for (const Record &r : live)
       if (sameOwner(r.owner, owner))
-        return r.producer;
+        return &r;
     return nullptr;
   }
-  void record(const Owner &owner, Node *producer) {
+  void record(const Owner &owner, Node *producer, SemaId sema) {
     llvm::erase_if(live, [&](const Record &r) {
       return !r.owner || sameOwner(r.owner, owner);
     });
-    live.push_back(Record{owner, producer});
+    live.push_back(Record{owner, producer, sema});
   }
   void keepOnly(const Record &r) { live.assign(1, r); }
   void clear() { live.clear(); }
@@ -1386,7 +1387,8 @@ static Node *selectTokenSource(TokenEnv &env, Node *n) {
   const TokenEnv::Record *last = env.last();
   if (n->owner && nodeReusesToken(n, n->owner) &&
       (!last || !sameOwner(last->owner, n->owner)))
-    return env.findOwner(n->owner);
+    if (const TokenEnv::Record *r = env.findOwner(n->owner))
+      return r->producer;
   return last ? last->producer : nullptr;
 }
 static void seedEntryTokens(TokenEnv &env, Node *head) {
@@ -1399,21 +1401,49 @@ static void seedEntryTokens(TokenEnv &env, Node *head) {
   }
   const TokenEnv::Record *last = env.last();
   if (owner->has_value() && last && !last->owner)
-    env.keepOnly(TokenEnv::Record{*owner, last->producer}); // adopt root token
-  else if (Node *producer = env.findOwner(*owner))
-    env.keepOnly(TokenEnv::Record{*owner, producer});
+    env.keepOnly(TokenEnv::Record{*owner, last->producer, last->sema});
+  else if (const TokenEnv::Record *r = env.findOwner(*owner))
+    env.keepOnly(TokenEnv::Record{*owner, r->producer, r->sema});
   else
     env.clear();
 }
+// The render channel a region result carries: the incoming record's
+// semaphore when one exists, otherwise the first branch final's concrete
+// semaphore (an acquire's own, or the nested region's already-resolved one).
+static std::optional<SemaId> resolveResultSema(
+    const std::optional<TokenEnv::Record> &incoming, const RegionFlow &flow) {
+  if (incoming)
+    return incoming->sema;
+  for (Node *final : flow.exits) {
+    if (!final)
+      continue;
+    if (final->kind == Node::Acquire)
+      return final->sema;
+    if (final->isRegion() && final->flow && final->flow->resultSema)
+      return final->flow->resultSema;
+  }
+  return std::nullopt;
+}
 static void assignTokenChain(GroupDag &g, Node *head, TokenEnv &env);
 static void assignTokenRegion(GroupDag &g, Node *n, TokenEnv &env) {
+  std::optional<TokenEnv::Record> incoming;
+  if (n->flow) {
+    const TokenEnv::Record *last = env.last();
+    if (n->flow->owner && last && !last->owner)
+      incoming = TokenEnv::Record{n->flow->owner, last->producer, last->sema};
+    else if (const TokenEnv::Record *r = env.findOwner(n->flow->owner))
+      incoming = *r;
+  }
   if (n->kind == Node::For) {
     TokenEnv body = env;
     if (n->flow) {
-      if (!n->flow->threadsToken())
+      if (!n->flow->threadsToken()) {
         body.clear();
-      else // the carrier: the loop region node is the body's producer
-        body.keepOnly(TokenEnv::Record{n->flow->owner, n});
+      } else { // the carrier: the loop region node is the body's producer
+        n->flow->resultSema = resolveResultSema(incoming, *n->flow);
+        body.keepOnly(TokenEnv::Record{n->flow->owner, n,
+                                       n->flow->resultSema.value_or(0)});
+      }
     } else {
       seedEntryTokens(body, n->children[0]);
     }
@@ -1422,7 +1452,8 @@ static void assignTokenRegion(GroupDag &g, Node *n, TokenEnv &env) {
       if (!n->flow->threadsToken())
         env.clear();
       else
-        env.keepOnly(TokenEnv::Record{n->flow->owner, n});
+        env.keepOnly(TokenEnv::Record{n->flow->owner, n,
+                                      n->flow->resultSema.value_or(0)});
     }
     return;
   }
@@ -1433,8 +1464,11 @@ static void assignTokenRegion(GroupDag &g, Node *n, TokenEnv &env) {
   assignTokenChain(g, n->children[0], thenEnv);
   if (n->children.size() > 1 && n->children[1])
     assignTokenChain(g, n->children[1], elseEnv);
-  if (n->flow)
-    env.keepOnly(TokenEnv::Record{n->flow->owner, n});
+  if (n->flow) {
+    n->flow->resultSema = resolveResultSema(incoming, *n->flow);
+    env.keepOnly(TokenEnv::Record{n->flow->owner, n,
+                                  n->flow->resultSema.value_or(0)});
+  }
 }
 static void assignTokenChain(GroupDag &g, Node *head, TokenEnv &env) {
   for (Node *n = head; n; n = n->next) {
@@ -1442,7 +1476,7 @@ static void assignTokenChain(GroupDag &g, Node *head, TokenEnv &env) {
     case Node::Acquire: {
       const Sema &s = getSema(g, n);
       Owner tokenOwner = s.isEntry && !n->owner ? s.entryTokenOwner : n->owner;
-      env.record(tokenOwner, n);
+      env.record(tokenOwner, n, n->sema);
       break;
     }
     case Node::Release:

@@ -648,13 +648,10 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
   }
   std::optional<CapabilityRef> resultRef;
   if (n->flow && (n->kind != Node::For || n->flow->threadsToken())) {
-    const SemaTransfer &transfer = n->flow->semaTransfer;
-    if (!transfer.valid || (transfer.passesInput && !incoming) ||
-        (!incoming && !transfer.concrete))
+    if (!n->flow->resultSema)
       return semaError(n->op)
              << "region has no statically selected semaphore channel";
-    SemaId sema = incoming ? incoming->ref.sema : *transfer.concrete;
-    resultRef = CapabilityRef{n, sema, n->flow->owner};
+    resultRef = CapabilityRef{n, *n->flow->resultSema, n->flow->owner};
   }
   if (!n->requiredParts.empty() && gpu::hasPartition(n->op)) {
     SetVector<int> set = gpu::getPartitionIds(n->op);
