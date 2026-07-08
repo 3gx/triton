@@ -609,13 +609,7 @@ static unsigned arrivalContribution(ArrayRef<EdgeRec> edges) {
       });
 }
 
-static bool hasPlannedSingleCopy(const GroupDag &g) {
-  return !g.pieceTable.members.empty() &&
-         llvm::all_of(g.pieceTable.members, [](const Member &member) {
-           auto copy = member.allocOp->getAttrOfType<IntegerAttr>(kBufferCopyAttrName);
-           return copy && copy.getInt() == 1;
-         });
-}
+static bool loopThreads(GroupDag &g, Node *forNode);
 // Consumes the already-reduced edge list; edge reduction happens in
 // buildSyncDag before any backing or protocol decision.
 static LogicalResult buildEdgesAndSemas(GroupDag &g, SmallVector<EdgeRec> &edges) {
@@ -702,41 +696,19 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SmallVector<EdgeRec> &edges
             firstTouch = r;
         }
       bool forBody = handoff.dst->parent && handoff.dst->parent->kind == Node::For;
-      // Same-owner conversion (the owner both starts and closes the cycle):
-      // on one planned slot the close pairs adjacent iterations at exactly
-      // distance one (recorded for the schedule solver). On unplanned
-      // groups the conversion must not cross pipeline stages in a scheduled
-      // loop — retiming would put the release behind its own acquire's wave
-      // and the cluster repair cycles; such closes keep their boundary.
-      // A TMEM cycle converts only on one planned slot: the one-time seed
-      // supplies exactly one slot phase, so a multibuffered accumulator
-      // re-entered by an enclosing loop would mispair its second slot; those
-      // keep the carried regain and thread their token instead. Local
-      // (staged SMEM) cycles convert unless the conversion crosses pipeline
-      // stages in a scheduled loop — retiming would put the release behind
-      // its own acquire's wave and the cluster repair cycles.
-      bool plannedSingle = forBody && hasPlannedSingleCopy(g);
-      bool tmemSingleMember = g.isTmem() && g.pieceTable.members.size() == 1;
-      bool sameOwnerConversion = forBody && (plannedSingle || !tmemSingleMember);
-      if (sameOwnerConversion && !plannedSingle && g.isTmem() && firstTouch) {
-        auto forOp = dyn_cast_or_null<scf::ForOp>(handoff.dst->parent->op);
-        if (forOp && forOp->hasAttr(triton::kScheduledMaxStageAttrName)) {
-          gpu::StageCluster point =
-              firstTouch->op ? gpu::getStageCluster(firstTouch->op)
-                             : gpu::StageCluster{};
-          for (const EdgeRec &edge : handoff.incoming) {
-            Operation *completion = edge.src->completionAnchor
-                                        ? edge.src->completionAnchor
-                                        : edge.src->op;
-            gpu::StageCluster srcStage =
-                completion ? gpu::getStageCluster(completion) : gpu::StageCluster{};
-            if (point && srcStage && point->first != srcStage->first)
-              sameOwnerConversion = false;
-          }
-        }
-      }
+      // A native loop-close (backedge) acquire is constructed at its owner's
+      // first body use — its point of use — with the semaphore initially
+      // released so iteration zero is supplied without a pre-loop acquire; the
+      // slot-distance schedule then expresses any multibuffering. A loop that
+      // threads a token (trailing use or a post-loop consumer) instead keeps
+      // its acquire at the backedge so the carried token stays fresh for the
+      // next iteration or the post-loop use. The same placement-independent
+      // predicate drives the token-flow decision in planLoopCarriers. An
+      // if-close acquire moves to the first use only when that use belongs to
+      // a different owner.
+      bool nativeLoop = forBody && !loopThreads(g, handoff.dst->parent);
       if (firstTouch &&
-          (sameOwnerConversion ||
+          (nativeLoop ||
            (firstAccessOwner && !sameOwner(firstAccessOwner, acquire->owner)))) {
         destination = firstTouch;
         sema.isEntry = true; // initially released; supplies iteration zero
@@ -828,17 +800,24 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
         summarizeRegionFlow(g, p, *p->flow);
   };
   Owner tokenOwner = unsupplied->flow ? unsupplied->flow->owner : *entryTokenOwner;
-  // The entry rides the chain's recurrence channel when one exists: the
-  // demanding region's own, or the last threading loop's in the top chain.
+  // The entry rides the chain's recurrence channel when one exists: the last
+  // acquire in a threading loop's body is the recurrence acquire, and the
+  // entry seeds that same semaphore so it supplies iteration zero. Reading
+  // the placed acquire directly is robust to the region-flow shape.
+  auto lastBodyAcquireSema = [](Node *loop) -> std::optional<SemaId> {
+    std::optional<SemaId> sema;
+    forEachNode(loop->children[0], [&](Node *m) {
+      if (m->kind == Node::Acquire)
+        sema = m->sema;
+    });
+    return sema;
+  };
   std::optional<SemaId> channel;
-  if (unsupplied->isRegion() && unsupplied->flow)
-    channel = unsupplied->flow->resultSema;
-  if (!channel)
-    for (Node *n : llvm::reverse(nodes))
-      if (n->kind == Node::For && n->flow) {
-        channel = concreteExitSema(*n->flow);
-        break;
-      }
+  for (Node *n : llvm::reverse(nodes))
+    if (n->kind == Node::For && n->flow) {
+      channel = lastBodyAcquireSema(n);
+      break;
+    }
   if (channel) {
     SemaId sid = *channel;
     Sema &s = g.semas[sid];
@@ -986,59 +965,94 @@ static bool pruneDeadIfFlows(GroupDag &g, Node *head, Node *region) {
         changed |= pruneDeadIfFlows(g, child, n);
   return changed;
 }
-// A loop threads its token only when the body token is needed again: by the
-// next iteration (the boundary owner's first body event rides the inherited
-// token) or by a consumer after the loop. Otherwise the per-iteration
-// acquire covers the body and the loop has no token result.
-static bool bodyRidesInheritedToken(GroupDag &g, Node *F, const Owner &owner) {
-  for (Node *n = F->children[0]; n; n = n->next) {
-    switch (n->kind) {
-    case Node::Acquire:
-      if (sameOwner(n->owner, owner))
-        return false;
-      break;
-    case Node::Release:
-      if (sameOwner(n->owner, owner))
-        return true;
-      break;
-    case Node::Access:
-      if (nodeTouchesGroup(g, n) && sameOwner(n->owner, owner))
-        return true;
-      break;
-    case Node::For:
-    case Node::If: {
-      bool ownerInRegion = false;
-      for (const auto &[piece, info] : n->pieceInfo)
-        ownerInRegion |= sameOwner(info.owner, owner);
-      if (ownerInRegion)
-        return true; // a region event consumes the inherited record
-      break;
-    }
-    case Node::Enter:
-    case Node::Exit:
-    case Node::Func:
-      break;
-    }
+// One comp use of the group at node n, with the touching owner. A region is
+// a use by its uniform owner (empty owner when the region is mixed).
+static bool groupUseOwner(GroupDag &g, Node *n, Owner &owner) {
+  if (n->kind == Node::Access && nodeTouchesGroup(g, n)) {
+    owner = n->owner;
+    return true;
+  }
+  if (n->isRegion() && !n->pieceInfo.empty()) {
+    if (std::optional<Owner> o = uniformPieceOwner(n))
+      owner = *o;
+    else
+      owner = std::nullopt;
+    return true;
   }
   return false;
 }
-// Thread exactly when the body rides the inherited token. A loop whose
-// owner's first body event is its own acquire is supplied per iteration
-// (with the seed or the pre-loop release covering iteration zero); a
-// threaded init on the same semaphore would consume that supply and
-// deadlock iteration zero, so such a loop never threads.
+// Whether a loop carries a token across its backedge — a placement-independent
+// property of the access structure, decided before any acquire is placed so
+// it drives both placement and flow the same way. A loop threads when either:
+// (a) trailing use — the boundary owner touches the group again after a
+//     handoff to another owner within the body, so the re-touch needs the
+//     token back and a native top-of-body acquire cannot supply it; or
+// (b) post-loop use — a later sibling of the loop reads the group before a
+//     fresh handoff, so the last iteration's token must survive the loop.
+// Otherwise the loop is native: a per-iteration point-of-use acquire covers
+// the body and nothing crosses the backedge.
+static bool loopThreads(GroupDag &g, Node *forNode) {
+  if (g.pieceTable.members.size() > 1)
+    return false; // multi-member (aliased): slot-anchored per buffer, native
+  std::optional<Owner> boundary = uniformPieceOwner(forNode);
+  if (!boundary)
+    return false;
+  Node *firstUse = nullptr;
+  bool hasHandoff = false, sawOther = false, trailing = false;
+  bool conditional = false, directOuterHandoff = false, innerThreads = false;
+  for (Node *n = forNode->children[0]; n; n = n->next) {
+    if (n->kind == Node::If && !n->pieceInfo.empty())
+      conditional = true; // an `if` touching the group is a conditional handoff
+    Owner owner;
+    if (!groupUseOwner(g, n, owner))
+      continue;
+    if (!firstUse)
+      firstUse = n;
+    bool boundaryOwned = sameOwner(owner, *boundary);
+    if (!boundaryOwned) {
+      hasHandoff = true;
+      sawOther = true;
+      if (n->kind == Node::Access)
+        directOuterHandoff = true;
+    } else if (sawOther) {
+      trailing = true; // boundary owner touches again after a handoff away
+    }
+    if (n->kind == Node::For && boundaryOwned && loopThreads(g, n))
+      innerThreads = true; // a nested loop that itself threads
+  }
+  // A conditional handoff hides inside an `if` (its uniform owner is the
+  // boundary), and a threading inner loop carries a token, so both force a
+  // thread before the same-owner shortcut can misfire.
+  if (conditional || innerThreads)
+    return true;
+  if (!hasHandoff)
+    return false; // same-owner loop: the token persists trivially, native
+  if (firstUse && firstUse->isRegion())
+    // First use is inside a nested region: the recurrence spans the nested
+    // body and cannot sit at a direct first use, so thread when the outer body
+    // also has a direct handoff; otherwise the inner region owns the whole
+    // cycle and the outer drops.
+    return directOuterHandoff;
+  if (trailing || conditional)
+    return true;
+  for (Node *n = forNode->next; n; n = n->next) {
+    Owner owner;
+    if (groupUseOwner(g, n, owner))
+      return true; // post-loop consumer needs the last iteration's token
+  }
+  return false;
+}
 static bool planLoopCarriers(GroupDag &g, Node *head) {
   bool changed = false;
   for (Node *n = head; n; n = n->next) {
     if (!n->isRegion())
       continue;
-    if (n->kind == Node::For && n->flow &&
-        !bodyRidesInheritedToken(g, n, n->flow->owner)) {
+    for (Node *child : n->children)
+      changed |= planLoopCarriers(g, child);
+    if (n->kind == Node::For && n->flow && !loopThreads(g, n)) {
       n->flow.reset();
       changed = true;
     }
-    for (Node *child : n->children)
-      changed |= planLoopCarriers(g, child);
   }
   return changed;
 }
