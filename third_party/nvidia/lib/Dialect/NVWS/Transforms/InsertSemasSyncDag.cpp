@@ -609,6 +609,13 @@ static unsigned arrivalContribution(ArrayRef<EdgeRec> edges) {
       });
 }
 
+static bool hasPlannedSingleCopy(const GroupDag &g) {
+  return !g.pieceTable.members.empty() &&
+         llvm::all_of(g.pieceTable.members, [](const Member &member) {
+           auto copy = member.allocOp->getAttrOfType<IntegerAttr>(kBufferCopyAttrName);
+           return copy && copy.getInt() == 1;
+         });
+}
 // Consumes the already-reduced edge list; edge reduction happens in
 // buildSyncDag before any backing or protocol decision.
 static LogicalResult buildEdgesAndSemas(GroupDag &g, SmallVector<EdgeRec> &edges) {
@@ -659,6 +666,14 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SmallVector<EdgeRec> &edges
       createSema(*source);
     handoff.sema = source->sema;
   }
+  // Placement: every acquire goes to its point of use.
+  //  - use destination (access or region): immediately before it;
+  //  - loop-close destination (a for-body EXIT): before the acquiring
+  //    owner's first body use, with the semaphore initially released to
+  //    supply iteration zero (a pre-loop acquire, when one exists on the
+  //    shared semaphore, consumes the pre-loop release instead).
+  // Releases land after their sources, branch-local by construction (a
+  // source inside a branch keeps its release there).
   DenseMap<Node *, Node *> lastAfter; // release insertion cursor per source
   for (Handoff &handoff : handoffs) {
     Sema &sema = g.semas[*handoff.sema];
@@ -686,9 +701,45 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g, SmallVector<EdgeRec> &edges
           if (!firstTouch && sameOwner(r->owner, acquire->owner))
             firstTouch = r;
         }
-      if (firstAccessOwner && !sameOwner(firstAccessOwner, acquire->owner) && firstTouch) {
+      bool forBody = handoff.dst->parent && handoff.dst->parent->kind == Node::For;
+      // Same-owner conversion (the owner both starts and closes the cycle):
+      // on one planned slot the close pairs adjacent iterations at exactly
+      // distance one (recorded for the schedule solver). On unplanned
+      // groups the conversion must not cross pipeline stages in a scheduled
+      // loop — retiming would put the release behind its own acquire's wave
+      // and the cluster repair cycles; such closes keep their boundary.
+      // A TMEM cycle converts only on one planned slot: the one-time seed
+      // supplies exactly one slot phase, so a multibuffered accumulator
+      // re-entered by an enclosing loop would mispair its second slot; those
+      // keep the carried regain and thread their token instead. Local
+      // (staged SMEM) cycles convert unless the conversion crosses pipeline
+      // stages in a scheduled loop — retiming would put the release behind
+      // its own acquire's wave and the cluster repair cycles.
+      bool plannedSingle = forBody && hasPlannedSingleCopy(g);
+      bool tmemSingleMember = g.isTmem() && g.pieceTable.members.size() == 1;
+      bool sameOwnerConversion = forBody && (plannedSingle || !tmemSingleMember);
+      if (sameOwnerConversion && !plannedSingle && g.isTmem() && firstTouch) {
+        auto forOp = dyn_cast_or_null<scf::ForOp>(handoff.dst->parent->op);
+        if (forOp && forOp->hasAttr(triton::kScheduledMaxStageAttrName)) {
+          gpu::StageCluster point =
+              firstTouch->op ? gpu::getStageCluster(firstTouch->op)
+                             : gpu::StageCluster{};
+          for (const EdgeRec &edge : handoff.incoming) {
+            Operation *completion = edge.src->completionAnchor
+                                        ? edge.src->completionAnchor
+                                        : edge.src->op;
+            gpu::StageCluster srcStage =
+                completion ? gpu::getStageCluster(completion) : gpu::StageCluster{};
+            if (point && srcStage && point->first != srcStage->first)
+              sameOwnerConversion = false;
+          }
+        }
+      }
+      if (firstTouch &&
+          (sameOwnerConversion ||
+           (firstAccessOwner && !sameOwner(firstAccessOwner, acquire->owner)))) {
         destination = firstTouch;
-        sema.isEntry = true; // initially released; no pre-loop entry instance
+        sema.isEntry = true; // initially released; supplies iteration zero
         sema.entryTokenOwner = acquire->owner;
       }
     }
@@ -733,14 +784,6 @@ static Node *singleCompChild(GroupDag &g, Node *region) {
   }
   return only;
 }
-static Node *lastAcquireOfCompInChain(Node *head) {
-  Node *found = nullptr;
-  forEachNode(head, [&](Node *n) {
-    if (n->kind == Node::Acquire)
-      found = n;
-  });
-  return found;
-}
 static std::optional<Owner> firstAccessOwnerOfComp(GroupDag &g, Node *head) {
   std::optional<Owner> owner;
   forEachNode(head, [&](Node *n) {
@@ -750,11 +793,19 @@ static std::optional<Owner> firstAccessOwnerOfComp(GroupDag &g, Node *head) {
   return owner;
 }
 
-// Doc:
-// sync-dag.md#composition-why-loop-entry-and-loop-recurrence-share-one-semaphore
+static Node *assignTokenSources(GroupDag &g);
+static bool summarizeRegionFlow(GroupDag &g, Node *region, RegionFlow &crossing);
+// The entry acquire follows from the one rule: it is created only when the
+// token sweep finds an event with no incoming token. A threading loop
+// demands its own recurrence channel (its semaphore starts released and the
+// root token is adopted by the boundary owner); any other unsupplied event
+// gets a fresh entry semaphore whose terminal release closes the chain.
 static LogicalResult insertEntryAcquires(GroupDag &g) {
   Node *top = g.root->children.empty() ? nullptr : g.root->children[0];
   if (!top || g.semas.empty())
+    return success();
+  Node *unsupplied = assignTokenSources(g);
+  if (!unsupplied)
     return success();
   SmallVector<Node *, 4> nodes = compNodesInChain(g, top);
   while (nodes.size() == 1 && nodes.front()->kind == Node::If) {
@@ -768,17 +819,23 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
   std::optional<Owner> entryTokenOwner = firstAccessOwnerOfComp(g, top);
   if (!entryTokenOwner)
     return semaError(g.root->op) << "group has no access nodes";
-  Node *regain = nullptr;
-  for (Node *node : llvm::reverse(nodes))
-    if (node->kind == Node::For && (regain = lastAcquireOfCompInChain(node->children[0])))
-      break;
-  if (regain) {
-    Sema &s = getSema(g, regain);
-    s.isEntry = true; // first event in chain order is an acquire
-    s.entryTokenOwner = *entryTokenOwner;
+  // A freshly spliced entry acquire may land inside a region (single-comp
+  // if descent); the enclosing summaries must see it as a token producer.
+  auto refreshEnclosingFlows = [&](Node *acq) {
+    for (Node *p = acq->parent; p && p->kind != Node::Func; p = p->parent)
+      if (p->isRegion() && p->flow)
+        summarizeRegionFlow(g, p, *p->flow);
+  };
+  Owner tokenOwner = unsupplied->flow ? unsupplied->flow->owner : *entryTokenOwner;
+  if (unsupplied->isRegion() && unsupplied->flow && unsupplied->flow->resultSema) {
+    SemaId sid = *unsupplied->flow->resultSema;
+    Sema &s = g.semas[sid];
+    s.isEntry = true; // first event in chain order is this acquire
+    s.entryTokenOwner = tokenOwner;
     Node *acq = newProtocolNode(g, Node::Acquire, nodes.front()->parent,
-                                std::nullopt, regain->sema, regain->count);
+                                std::nullopt, sid, s.count);
     spliceBefore(acq, nodes.front());
+    refreshEnclosingFlows(acq);
     return success();
   }
   SemaId sid = g.semas.size();
@@ -787,7 +844,7 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
   s.count = 1;
   s.isEntry = true;
   s.expectedArrivals = 1; // the terminal release
-  s.entryTokenOwner = *entryTokenOwner;
+  s.entryTokenOwner = tokenOwner;
   Node *acq = newProtocolNode(g, Node::Acquire, nodes.front()->parent, std::nullopt, sid, 1);
   spliceBefore(acq, nodes.front());
   Node *terminal = nodes.back();
@@ -800,6 +857,7 @@ static LogicalResult insertEntryAcquires(GroupDag &g) {
     anchor = anchor->next;
   spliceAfter(rel, anchor);
   g.semas.push_back(std::move(s));
+  refreshEnclosingFlows(acq);
   return success();
 }
 // Doc: sync-dag.md#the-decision-per-region
@@ -828,22 +886,41 @@ struct ChainBoundary {
   SemaExpr sema = inputSema();
   bool eventAfterFinal = false;
 };
-static ChainBoundary summarizeChainBoundary(GroupDag &g, Node *head) {
+// The boundary owner's token survives trailing foreign work: when the
+// region has a boundary owner, its final is that owner's LAST token
+// producer, not merely the chain's last token event.
+static ChainBoundary summarizeChainBoundary(GroupDag &g, Node *head,
+                                            const std::optional<Owner> &preferOwner) {
   ChainBoundary result;
+  Node *preferred = nullptr;
   for (Node *n = head; n; n = n->next) {
     if (n->kind == Node::Acquire) {
       result.final = n;
       result.owner = n->owner;
       result.sema = concreteSema(n->sema);
       result.eventAfterFinal = false;
+      if (preferOwner) {
+        const Sema &s = getSema(g, n);
+        Owner tokenOwner = s.isEntry && !n->owner ? s.entryTokenOwner : n->owner;
+        if (sameOwner(tokenOwner, *preferOwner))
+          preferred = n;
+      }
     } else if (n->isRegion() && n->flow) {
       result.final = n;
       result.owner = n->flow->owner;
       result.sema = applyFlow(*n->flow, result.sema);
       result.eventAfterFinal = false;
+      if (preferOwner && sameOwner(n->flow->owner, *preferOwner))
+        preferred = n;
     } else if (n->isProtocol() || nodeInvolvesComp(g, n)) {
       result.eventAfterFinal = true;
     }
+  }
+  if (preferred && result.final != preferred) {
+    result.final = preferred;
+    result.owner = *preferOwner;
+    if (preferred->kind == Node::Acquire)
+      result.sema = concreteSema(preferred->sema);
   }
   return result;
 }
@@ -915,7 +992,7 @@ static bool summarizeRegionFlow(GroupDag &g, Node *region, RegionFlow &crossing)
     }
   };
   for (Node *child : region->children) {
-    ChainBoundary branch = summarizeChainBoundary(g, child);
+    ChainBoundary branch = summarizeChainBoundary(g, child, entryOwner);
     Node *final = branch.final;
     crossing.exits.push_back(final);
     joined = joined ? std::optional(joinSemaExpr(*joined, branch.sema))
@@ -967,6 +1044,20 @@ static void buildRegionFlows(GroupDag &g, Node *head) {
       n->flow.emplace(std::move(crossing));
   });
 }
+// Re-summarize live flows against the current child flows; a region whose
+// paths no longer export a token loses its flow, which can cascade outward.
+static bool refreshRegionFlows(GroupDag &g, Node *head) {
+  bool changed = false;
+  forEachRegionPostOrder(head, [&](Node *n) {
+    if (!n->flow)
+      return;
+    if (!summarizeRegionFlow(g, n, *n->flow)) {
+      n->flow.reset();
+      changed = true;
+    }
+  });
+  return changed;
+}
 static bool tokenUsedBeforeNextAcquire(GroupDag &g, Node *start) {
   for (Node *n = start; n; n = n->next) {
     if (n->kind == Node::Acquire)
@@ -977,380 +1068,78 @@ static bool tokenUsedBeforeNextAcquire(GroupDag &g, Node *start) {
   }
   return false;
 }
-static void pruneDeadIfFlows(GroupDag &g, Node *head, Node *region) {
+static bool pruneDeadIfFlows(GroupDag &g, Node *head, Node *region) {
+  bool changed = false;
   SmallVector<Node *, 8> nodes;
   for (Node *n = head; n; n = n->next)
     nodes.push_back(n);
   for (Node *n : llvm::reverse(nodes))
-    if (n->kind == Node::If && !tokenUsedBeforeNextAcquire(g, n->next) &&
-        (!region || !region->flow))
+    if (n->kind == Node::If && n->flow && !tokenUsedBeforeNextAcquire(g, n->next) &&
+        (!region || !region->flow)) {
       n->flow.reset();
+      changed = true;
+    }
   for (Node *n : nodes)
     if (n->isRegion())
       for (Node *child : n->children)
-        pruneDeadIfFlows(g, child, n);
+        changed |= pruneDeadIfFlows(g, child, n);
+  return changed;
 }
-static scf::ForOp outerWSLoop(scf::ForOp loop);
-static bool exitsThroughRegion(const RegionFlow &flow) {
-  return flow.exit() && flow.exit()->isRegion();
-}
-static bool allEnclosersCanDrop(const Node *F) {
-  for (const Node *p = F; p; p = p->parent) {
-    if (p->kind == Node::Func)
-      return true;
-    if (p != F && p->kind == Node::If)
-      return false;
-    if (p->kind == Node::For && p->op &&
-        gpu::hasWarpSpecializeTag(p->op))
-      return true;
-  }
-  return true;
-}
-static bool regionResultConsumedAfter(GroupDag &g, Node *region) {
-  if (tokenUsedBeforeNextAcquire(g, region->next))
-    return true;
-  Node *p = region->parent;
-  if (!p || !p->isRegion())
-    return false;
-  if (p->flow && llvm::is_contained(p->flow->exits, region))
-    return regionResultConsumedAfter(g, p);
-  return false;
-}
-static bool prefixNodeIsSingleBufferView(Node *F, Node *bufferNode) {
-  if (!F || !F->op || gpu::hasWarpSpecializeTag(F->op))
-    return true;
-  if (!bufferNode || !bufferNode->op)
-    return false;
-  auto alloc = dyn_cast<nvidia_gpu::TMEMAllocOp>(bufferNode->op);
-  return !alloc || !alloc.getSrc();
-}
-static bool isAccessForComp(GroupDag &g, Node *n) {
-  return n->kind == Node::Access && nodeInvolvesComp(g, n);
-}
-static bool isRegionFlowForComp(const Node *n) {
-  return n && n->isRegion() && n->flow;
-}
-static bool isTokenEvent(GroupDag &g, Node *n) {
-  return n->isProtocol() || isAccessForComp(g, n) || isRegionFlowForComp(n);
-}
-static std::optional<SemaId>
-resolveExitSema(Node *final, SemaId incoming) {
-  if (!final)
-    return incoming;
-  if (final->kind == Node::Acquire)
-    return final->sema;
-  if (!final->isRegion())
-    return std::nullopt;
-  const RegionFlow *c = final->flow ? &*final->flow : nullptr;
-  if (!c)
-    return std::nullopt;
-  return resolveFlowSema(*c, incoming);
-}
-static bool isTransparentFlow(Node *region, Owner owner) {
-  const RegionFlow *rc = region->flow ? &*region->flow : nullptr;
-  return rc && rc->transparent && sameOwner(rc->owner, owner);
-}
-static bool childOwnsToken(const Node *region) {
-  const RegionFlow *child = region->flow ? &*region->flow : nullptr;
-  return child && !child->threadsToken();
-}
-static bool hasTrailingCompUse(GroupDag &g, Node *regain) {
-  for (Node *m = regain->next; m; m = m->next)
-    if (isAccessForComp(g, m) || isRegionFlowForComp(m) || m->kind == Node::Release)
-      return true;
-  return false;
-}
-static Node *findBridgeAcquireAfter(GroupDag &g, Node *F, SemaId feedSema, Owner owner) {
-  for (Node *m = F->next; m; m = m->next) {
-    if (m->kind != Node::Acquire || m->sema != feedSema || !sameOwner(m->owner, owner))
-      continue;
-    for (Node *tail = m->next; tail; tail = tail->next)
-      if (isTokenEvent(g, tail))
-        return nullptr;
-    return m;
-  }
-  return nullptr;
-}
-
-struct InputCapability {
-  Node *acquire = nullptr;
-  bool retainForPrefix = false;
-};
-static bool carrierPreservesFeed(Node *carrier, const Owner &owner,
-                                 SemaId sema) {
-  if (!carrier || carrier->kind != Node::For)
-    return false;
-  std::optional<Owner> boundaryOwner = uniformPieceOwner(carrier);
-  const RegionFlow *crossing = carrier->flow ? &*carrier->flow : nullptr;
-  if (!boundaryOwner || !sameOwner(*boundaryOwner, owner) || !crossing ||
-      !sameOwner(crossing->owner, owner))
-    return false;
-  std::optional<SemaId> returned = resolveFlowSema(*crossing, sema);
-  return returned && *returned == sema;
-}
-static bool feedDominatesThroughCarriers(GroupDag &g, Node *F, Node *feed,
-                                         const Owner &owner, SemaId sema) {
-  if (!feed || feed->kind != Node::Acquire || feed->sema != sema)
-    return false;
-  const Sema &feedSema = getSema(g, feed);
-  Owner feedOwner = feed->owner ? feed->owner : feedSema.entryTokenOwner;
-  if (!sameOwner(feedOwner, owner))
-    return false;
-  for (Node *cursor = F; cursor;) {
-    if (feed->parent == cursor->parent)
-      return precedesInChain(feed, cursor);
-    Node *carrier = cursor->parent;
-    if (!carrierPreservesFeed(carrier, owner, sema))
-      return false;
-    cursor = carrier;
-  }
-  return false;
-}
-static std::optional<InputCapability>
-findInputAcquire(GroupDag &g, Node *F, const RegionFlow &crossing) {
-  bool crossedPrefixUse = false;
-  for (Node *cur = F;; cur = cur->parent) {
-    bool originalChain = cur == F;
-    for (Node *m = cur->prev; m; m = m->prev) {
-      if (m->kind == Node::Acquire) {
-        const Sema &sema = getSema(g, m);
-        Owner owner = m->owner ? m->owner : sema.entryTokenOwner;
-        if (!sameOwner(owner, crossing.owner) ||
-            !feedDominatesThroughCarriers(g, F, m, crossing.owner, m->sema))
-          return std::nullopt;
-        return InputCapability{m, crossedPrefixUse};
-      }
-      if (m->isRegion() && nodeInvolvesComp(g, m))
-        return std::nullopt;
-      if (!isTokenEvent(g, m))
-        continue;
-      if (m->kind == Node::Access && originalChain && sameOwner(m->owner, crossing.owner) &&
-          (!m->reuseTokenOwner || *m->reuseTokenOwner == ownerKey(crossing.owner)) &&
-          asyncPayloadOf(m->op) == AsyncOp::NONE) {
-        crossedPrefixUse = true;
-        continue;
-      }
-      return std::nullopt;
-    }
-    if (!cur->parent || !cur->parent->isRegion())
-      return std::nullopt;
-    if (crossedPrefixUse && cur->parent->kind != Node::For)
-      return std::nullopt;
-  }
-}
-
-struct DemandPrefix {
-  Node *firstToucher = nullptr;
-  Node *closingRelease = nullptr;
-};
-static std::optional<DemandPrefix>
-matchDemandPrefix(GroupDag &g, Node *F, Owner tokenOwner, Node *regain, bool nestedExit) {
-  DemandPrefix p;
-  unsigned releases = 0;
-  for (Node *m = F->children[0]; m; m = m->next) {
-    if (nestedExit && m == regain)
+// A loop threads its token only when the body token is needed again: by the
+// next iteration (the boundary owner's first body event rides the inherited
+// token) or by a consumer after the loop. Otherwise the per-iteration
+// acquire covers the body and the loop has no token result.
+static bool bodyRidesInheritedToken(GroupDag &g, Node *F, const Owner &owner) {
+  for (Node *n = F->children[0]; n; n = n->next) {
+    switch (n->kind) {
+    case Node::Acquire:
+      if (sameOwner(n->owner, owner))
+        return false;
       break;
-    if (m->kind == Node::Acquire)
+    case Node::Release:
+      if (sameOwner(n->owner, owner))
+        return true;
       break;
-    if (isRegionFlowForComp(m)) {
-      if (!p.firstToucher || !isTransparentFlow(m, tokenOwner))
-        return std::nullopt;
-      continue;
+    case Node::Access:
+      if (nodeTouchesGroup(g, n) && sameOwner(n->owner, owner))
+        return true;
+      break;
+    case Node::For:
+    case Node::If: {
+      bool ownerInRegion = false;
+      for (const auto &[piece, info] : n->pieceInfo)
+        ownerInRegion |= sameOwner(info.owner, owner);
+      if (ownerInRegion)
+        return true; // a region event consumes the inherited record
+      break;
     }
-    if (isAccessForComp(g, m)) {
-      if (!p.firstToucher) {
-        if (releases)
-          return std::nullopt;
-        p.firstToucher = m;
-      }
-    }
-    if (m->kind == Node::Release) {
-      releases += std::max(1u, m->count);
-      if (!p.closingRelease)
-        p.closingRelease = m;
-    }
-  }
-  unsigned expectedReleases = nestedExit ? 0 : 1;
-  if (!p.firstToucher || releases != expectedReleases)
-    return std::nullopt;
-  return p;
-}
-static bool hasPlannedSingleCopy(const GroupDag &g) {
-  return !g.pieceTable.members.empty() &&
-         llvm::all_of(g.pieceTable.members, [](const Member &member) {
-           auto copy = member.allocOp->getAttrOfType<IntegerAttr>(kBufferCopyAttrName);
-           return copy && copy.getInt() == 1;
-         });
-}
-// Select the loop transport directly from its opaque boundary transfer.  The
-// child body has already been compiled; this function reads no child internals.
-static void planLoopFlow(GroupDag &g, Node *F, RegionFlow &flow, bool &needsPostLoopAcquire) {
-  auto carry = [&](RegionFlow::Blocker blocker = RegionFlow::Blocker::NONE) {
-    flow.mode = RegionFlow::Mode::CARRIED;
-    flow.blocker = blocker;
-  };
-  bool outputUsed = regionResultConsumedAfter(g, F);
-  auto forOp = dyn_cast_or_null<scf::ForOp>(F->op);
-  if (!forOp || !gpu::hasWarpSpecializeTag(outerWSLoop(forOp)) || !allEnclosersCanDrop(F))
-    return carry();
-  Node *regain = flow.exits.empty() ? nullptr : flow.exits[0];
-  if (!regain || regain->postLoopAcquire)
-    return carry();
-  if (regain->kind == Node::For && childOwnsToken(regain)) {
-    flow.mode = RegionFlow::Mode::CHILD_OWNS;
-    return;
-  }
-  bool nestedExit = regain->isRegion();
-  if ((nestedExit && !isTransparentFlow(regain, flow.owner)) ||
-      (!nestedExit && regain->kind != Node::Acquire))
-    return carry();
-  if (hasTrailingCompUse(g, regain))
-    return carry(RegionFlow::Blocker::TRAILING_USE);
-  std::optional<InputCapability> feed = findInputAcquire(g, F, flow);
-  if (!feed)
-    return carry();
-  // Moving an inherited regain across the backedge is currently modeled only
-  // for a planner-authored single physical slot. Unknown or multibuffered
-  // groups retain the existing threaded form so physical-slot distance remains
-  // derived by the normal schedule analysis.
-  if (feed->retainForPrefix && !hasPlannedSingleCopy(g))
-    return carry();
-  Node *entryAcquire = feed->acquire;
-  std::optional<SemaId> recurrenceSema =
-      nestedExit ? resolveExitSema(regain, entryAcquire->sema)
-                 : std::optional<SemaId>(regain->sema);
-  if (!recurrenceSema)
-    return carry();
-  needsPostLoopAcquire = outputUsed || feed->retainForPrefix;
-  bool sameSemaphore = entryAcquire->sema == *recurrenceSema;
-  if (sameSemaphore && needsPostLoopAcquire && nestedExit)
-    return carry(RegionFlow::Blocker::RESULT_CONSUMED);
-  Node *bridgeAcquire = feed->retainForPrefix ? entryAcquire : nullptr;
-  if (feed->retainForPrefix && nestedExit)
-    return carry();
-  if (!sameSemaphore) {
-    if (nestedExit || !needsPostLoopAcquire)
-      return carry();
-    const Sema &entrySema = getSema(g, entryAcquire);
-    Owner entryOwner = entryAcquire->owner ? entryAcquire->owner : entrySema.entryTokenOwner;
-    bridgeAcquire = findBridgeAcquireAfter(g, F, entryAcquire->sema, flow.owner);
-    if (!sameOwner(entryOwner, flow.owner) || !bridgeAcquire)
-      return carry();
-  }
-  std::optional<DemandPrefix> prefix = matchDemandPrefix(g, F, flow.owner, regain, nestedExit);
-  if (!prefix || !prefixNodeIsSingleBufferView(F, prefix->firstToucher))
-    return carry();
-  if (needsPostLoopAcquire && !gpu::hasWarpSpecializeTag(forOp) &&
-      sameOwner(prefix->firstToucher->owner, flow.owner)) {
-    if (!flow.completionUniform)
-      return carry();
-    gpu::StageCluster point = gpu::getStageCluster(prefix->firstToucher->op);
-    gpu::StageCluster exit = flow.completionSchedule;
-    if (point && exit && point->first != exit->first)
-      return carry();
-  }
-  flow.mode = RegionFlow::Mode::POINT_OF_USE;
-  flow.entryAcquire = entryAcquire;
-  flow.closingRelease = prefix->closingRelease;
-  flow.firstToucher = prefix->firstToucher;
-  flow.bridgeAcquire = bridgeAcquire;
-  return;
-}
-static void detachFromChain(Node *n) {
-  if (n->prev)
-    n->prev->next = n->next;
-  else if (n->parent)
-    for (Node *&child : n->parent->children)
-      if (child == n)
-        child = n->next;
-  if (n->next)
-    n->next->prev = n->prev;
-  n->prev = n->next = nullptr;
-}
-static void lowerPointOfUse(GroupDag &g, Node *loop, RegionFlow &flow, bool needsPostLoopAcquire) {
-  bool nestedExit = exitsThroughRegion(flow);
-  Node *recurrenceAcquire = nestedExit ? flow.entryAcquire : flow.exit();
-  if (needsPostLoopAcquire) {
-    flow.postLoopAcquire = newProtocolNode(
-        g, Node::Acquire, loop->parent, flow.owner, recurrenceAcquire->sema,
-        recurrenceAcquire->count);
-    flow.postLoopAcquire->postLoopAcquire = true;
-    spliceAfter(flow.postLoopAcquire, loop);
-    bool prefixCut = flow.bridgeAcquire == flow.entryAcquire &&
-                     flow.entryAcquire->sema == recurrenceAcquire->sema;
-    if (prefixCut) {
-      Node *cut = newProtocolNode(g, Node::Release, loop->parent, flow.owner,
-                                  recurrenceAcquire->sema, recurrenceAcquire->count);
-      cut->payloads.push_back(AsyncOp::NONE);
-      if (flow.owner)
-        markTokenReuse(cut, flow.owner);
-      spliceBefore(cut, loop);
-      getSema(g, cut).expectedArrivals += cut->count;
-      flow.bridgeRelease = cut;
-      if (!nestedExit)
-        flow.exit()->recurrenceDistance = 1;
-    } else if (flow.bridgeAcquire) {
-      Node *bridge = newProtocolNode(
-          g, Node::Release, flow.bridgeAcquire->parent, flow.owner,
-          recurrenceAcquire->sema, recurrenceAcquire->count);
-      bridge->payloads.push_back(AsyncOp::NONE);
-      spliceAfter(bridge, flow.bridgeAcquire);
-      getSema(g, bridge).expectedArrivals += bridge->count;
-      flow.bridgeRelease = bridge;
+    case Node::Enter:
+    case Node::Exit:
+    case Node::Func:
+      break;
     }
   }
-  if (nestedExit) {
-    Node *tail = flow.exits[0];
-    Node *pointAcquire = flow.entryAcquire;
-    Sema &s = getSema(g, pointAcquire);
-    pointAcquire->owner = flow.owner;
-    detachFromChain(pointAcquire);
-    pointAcquire->scheduleAnchor = flow.firstToucher;
-    spliceBefore(pointAcquire, flow.firstToucher);
-    Node *closing = newProtocolNode(g, Node::Release, tail->parent,
-                                    flow.owner, pointAcquire->sema, 1);
-    closing->payloads.push_back(AsyncOp::NONE);
-    closing->sat = pointAcquire;
-    closing->scheduleAnchor = tail;
-    spliceAfter(closing, tail);
-    s.expectedArrivals += closing->count;
-    flow.closingRelease = closing;
-  } else {
-    detachFromChain(recurrenceAcquire);
-    recurrenceAcquire->scheduleAnchor = flow.firstToucher;
-    spliceBefore(recurrenceAcquire, flow.firstToucher);
-    Sema &recurrenceSema = getSema(g, recurrenceAcquire);
-    if (flow.bridgeAcquire) {
-      recurrenceSema.isEntry = true;
-      recurrenceSema.entryTokenOwner = flow.owner;
-    } else {
-      detachFromChain(flow.entryAcquire);
-    }
-  }
+  return false;
 }
-// Regions are lowered from right to left and inner to outer.  A later sibling
-// therefore materializes its boundary supply before an earlier sibling asks
-// whether its result is live.  Child summaries are refreshed once after their
-// final placement; no mutation-driven global reclassification is required.
-static void planRegionFlows(GroupDag &g, Node *head) {
-  SmallVector<Node *, 8> nodes;
-  for (Node *n = head; n; n = n->next)
-    nodes.push_back(n);
-  for (Node *n : llvm::reverse(nodes)) {
+// Thread exactly when the body rides the inherited token. A loop whose
+// owner's first body event is its own acquire is supplied per iteration
+// (with the seed or the pre-loop release covering iteration zero); a
+// threaded init on the same semaphore would consume that supply and
+// deadlock iteration zero, so such a loop never threads.
+static bool planLoopCarriers(GroupDag &g, Node *head) {
+  bool changed = false;
+  for (Node *n = head; n; n = n->next) {
     if (!n->isRegion())
       continue;
+    if (n->kind == Node::For && n->flow &&
+        !bodyRidesInheritedToken(g, n, n->flow->owner)) {
+      n->flow.reset();
+      changed = true;
+    }
     for (Node *child : n->children)
-      planRegionFlows(g, child);
-    if (n->flow)
-      summarizeRegionFlow(g, n, *n->flow);
-    if (n->kind != Node::For || !n->flow)
-      continue;
-    RegionFlow &flow = *n->flow;
-    bool needsPostLoopAcquire = false;
-    planLoopFlow(g, n, flow, needsPostLoopAcquire);
-    if (flow.isPointOfUse())
-      lowerPointOfUse(g, n, flow, needsPostLoopAcquire);
+      changed |= planLoopCarriers(g, child);
   }
+  return changed;
 }
 
 // Doc: sync-dag.md#the-walk-accesses-to-edges
@@ -1424,8 +1213,10 @@ static std::optional<SemaId> resolveResultSema(
   }
   return std::nullopt;
 }
-static void assignTokenChain(GroupDag &g, Node *head, TokenEnv &env);
-static void assignTokenRegion(GroupDag &g, Node *n, TokenEnv &env) {
+static void assignTokenChain(GroupDag &g, Node *head, TokenEnv &env,
+                             Node *&unsupplied);
+static void assignTokenRegion(GroupDag &g, Node *n, TokenEnv &env,
+                              Node *&unsupplied) {
   std::optional<TokenEnv::Record> incoming;
   if (n->flow) {
     const TokenEnv::Record *last = env.last();
@@ -1433,6 +1224,8 @@ static void assignTokenRegion(GroupDag &g, Node *n, TokenEnv &env) {
       incoming = TokenEnv::Record{n->flow->owner, last->producer, last->sema};
     else if (const TokenEnv::Record *r = env.findOwner(n->flow->owner))
       incoming = *r;
+    if (!incoming && !unsupplied)
+      unsupplied = n; // a threading region with no incoming token
   }
   if (n->kind == Node::For) {
     TokenEnv body = env;
@@ -1447,7 +1240,7 @@ static void assignTokenRegion(GroupDag &g, Node *n, TokenEnv &env) {
     } else {
       seedEntryTokens(body, n->children[0]);
     }
-    assignTokenChain(g, n->children[0], body);
+    assignTokenChain(g, n->children[0], body, unsupplied);
     if (n->flow) {
       if (!n->flow->threadsToken())
         env.clear();
@@ -1461,16 +1254,17 @@ static void assignTokenRegion(GroupDag &g, Node *n, TokenEnv &env) {
   seedEntryTokens(thenEnv, n->children[0]);
   if (n->children.size() > 1 && n->children[1])
     seedEntryTokens(elseEnv, n->children[1]);
-  assignTokenChain(g, n->children[0], thenEnv);
+  assignTokenChain(g, n->children[0], thenEnv, unsupplied);
   if (n->children.size() > 1 && n->children[1])
-    assignTokenChain(g, n->children[1], elseEnv);
+    assignTokenChain(g, n->children[1], elseEnv, unsupplied);
   if (n->flow) {
     n->flow->resultSema = resolveResultSema(incoming, *n->flow);
     env.keepOnly(TokenEnv::Record{n->flow->owner, n,
                                   n->flow->resultSema.value_or(0)});
   }
 }
-static void assignTokenChain(GroupDag &g, Node *head, TokenEnv &env) {
+static void assignTokenChain(GroupDag &g, Node *head, TokenEnv &env,
+                             Node *&unsupplied) {
   for (Node *n = head; n; n = n->next) {
     switch (n->kind) {
     case Node::Acquire: {
@@ -1481,14 +1275,19 @@ static void assignTokenChain(GroupDag &g, Node *head, TokenEnv &env) {
     }
     case Node::Release:
       n->tokenSource = selectTokenSource(env, n);
+      if (!n->tokenSource && !unsupplied)
+        unsupplied = n;
       break;
     case Node::Access:
-      if (nodeTouchesGroup(g, n))
+      if (nodeTouchesGroup(g, n)) {
         n->tokenSource = selectTokenSource(env, n);
+        if (!n->tokenSource && !unsupplied)
+          unsupplied = n;
+      }
       break;
     case Node::For:
     case Node::If:
-      assignTokenRegion(g, n, env);
+      assignTokenRegion(g, n, env, unsupplied);
       break;
     case Node::Enter:
     case Node::Exit:
@@ -1497,11 +1296,15 @@ static void assignTokenChain(GroupDag &g, Node *head, TokenEnv &env) {
     }
   }
 }
-static void assignTokenSources(GroupDag &g) {
+// Returns the first event (chain order) that consumes a token but has none:
+// the demand that an entry acquire must satisfy. Null when fully supplied.
+static Node *assignTokenSources(GroupDag &g) {
   if (g.semas.empty() || g.root->children.empty())
-    return;
+    return nullptr;
   TokenEnv env;
-  assignTokenChain(g, g.root->children[0], env);
+  Node *unsupplied = nullptr;
+  assignTokenChain(g, g.root->children[0], env, unsupplied);
+  return unsupplied;
 }
 
 static void addPart(SmallVectorImpl<int> &parts, int part) {
@@ -1635,86 +1438,6 @@ static LogicalResult computeSemaphoreCopies(GroupDag &g, int lowerSemaphoreNumSt
   return success();
 }
 
-// Docs: sync-dag.md#edges-to-semaphores
-//       sync-dag.md#region-flows
-static LogicalResult verifyPointOfUseFlow(GroupDag &g, Node *F, const RegionFlow &c) {
-  auto errorAt = [&](Node *node) {
-    return semaError(node && node->op ? node->op : F->op);
-  };
-  Node *pointAcquire = exitsThroughRegion(c) ? c.entryAcquire : c.exit();
-  Node *recurrenceAcquire = pointAcquire;
-  if (pointAcquire->next != c.firstToucher)
-    return errorAt(F) << "point-of-use acquire is not adjacent to its first buffer use";
-  for (Node *m = F->children[0]; m && m != pointAcquire; m = m->next) {
-    if (isTokenEvent(g, m))
-      return errorAt(m) << "token event before point-of-use acquire";
-  }
-  if (exitsThroughRegion(c) && !isTransparentFlow(c.exit(), c.owner))
-    return errorAt(c.exit()) << "non-transparent region supplies a point-of-use flow";
-  if (exitsThroughRegion(c)) {
-    Node *closing = c.exit()->next;
-    if (!closing || closing->kind != Node::Release ||
-        closing->sema != c.entryAcquire->sema || closing != c.closingRelease)
-      return errorAt(F) << "nestedExit point-of-use lacks closing release after region result";
-  } else if (!c.closingRelease || std::max(1u, c.closingRelease->count) != 1) {
-    Operation *op = c.closingRelease && c.closingRelease->op ? c.closingRelease->op : F->op;
-    return semaError(op) << "point-of-use flow requires exactly one closing release";
-  }
-  if (c.postLoopAcquire) {
-    Node *postLoopAcquire = c.postLoopAcquire;
-    if (postLoopAcquire->kind != Node::Acquire ||
-        !postLoopAcquire->postLoopAcquire || postLoopAcquire->parent != F->parent ||
-        postLoopAcquire->sema != recurrenceAcquire->sema ||
-        postLoopAcquire->count != recurrenceAcquire->count ||
-        !sameOwner(postLoopAcquire->owner, c.owner))
-      return errorAt(F) << "malformed post-loop acquire";
-    bool reachedPostLoopAcquire = false;
-    for (Node *m = F->next; m; m = m->next) {
-      if (m == postLoopAcquire) {
-        reachedPostLoopAcquire = true;
-        break;
-      }
-      if (isTokenEvent(g, m))
-        return errorAt(m) << "group use precedes its post-loop acquire";
-    }
-    if (!reachedPostLoopAcquire)
-      return errorAt(F) << "post-loop acquire is not after its loop";
-  }
-  if (c.bridgeAcquire) {
-    Node *bridgeAcquire = c.bridgeAcquire;
-    Node *bridgeRelease = c.bridgeRelease;
-    bool prefixCut = bridgeAcquire == c.entryAcquire &&
-                     c.entryAcquire->sema == recurrenceAcquire->sema;
-    const Sema &entrySema = getSema(g, bridgeAcquire);
-    Owner entryOwner = bridgeAcquire->owner ? bridgeAcquire->owner : entrySema.entryTokenOwner;
-    bool common = getSema(g, recurrenceAcquire).isEntry && bridgeRelease &&
-                  bridgeAcquire->kind == Node::Acquire && sameOwner(entryOwner, c.owner) &&
-                  bridgeRelease->kind == Node::Release &&
-                  bridgeRelease->sema == recurrenceAcquire->sema &&
-                  bridgeRelease->count == recurrenceAcquire->count &&
-                  sameOwner(bridgeRelease->owner, c.owner) &&
-                  bridgeRelease->payloads == Payloads{AsyncOp::NONE} &&
-                  !bridgeRelease->sat;
-    if (!common)
-      return errorAt(F) << "malformed capability bridge";
-    if (prefixCut) {
-      if (!feedDominatesThroughCarriers(g, F, bridgeAcquire, c.owner, recurrenceAcquire->sema) ||
-          bridgeRelease->parent != F->parent || bridgeRelease->next != F ||
-          (c.owner && !nodeReusesToken(bridgeRelease, c.owner)))
-        return errorAt(F) << "malformed prefix capability cut";
-    } else {
-      if (bridgeAcquire->sema != c.entryAcquire->sema || bridgeAcquire->parent != F->parent ||
-          !sameOwner(bridgeAcquire->owner, c.owner) ||
-          bridgeRelease->parent != bridgeAcquire->parent || !precedesInChain(F, bridgeAcquire) ||
-          !precedesInChain(bridgeAcquire, bridgeRelease))
-        return errorAt(F) << "capability bridge is not after its loop";
-    }
-  } else if (c.bridgeRelease) {
-    return errorAt(F) << "unexpected outer-to-local semaphore bridge";
-  }
-  return success();
-}
-
 static LogicalResult verifySyncDag(GroupDag &g) {
   SmallVector<unsigned> releaseArrivals(g.semas.size(), 0);
   SmallVector<std::optional<int64_t>> acqClass(g.semas.size(), std::nullopt);
@@ -1731,21 +1454,6 @@ static LogicalResult verifySyncDag(GroupDag &g) {
         return semaError(n->op) << "carried region path exports no SSA capability";
     if (c.threadsToken() && !c.semaTransfer.valid)
       return semaError(n->op) << "region paths export incompatible semaphore capabilities";
-    if (c.threadsToken())
-      return success();
-    if (c.isPointOfUse()) {
-      if (!c.exit() || !c.firstToucher || !c.entryAcquire)
-        return semaError(n->op) << "malformed point-of-use flow crossing";
-      if (!exitsThroughRegion(c) && c.exit()->kind != Node::Acquire)
-        return semaError(n->op) << "point-of-use flow without acquire regain";
-      return verifyPointOfUseFlow(g, n, c);
-    }
-    if (c.exits.empty() || !c.exits[0] ||
-        c.exits[0]->kind != Node::For || c.firstToucher || c.entryAcquire)
-      return semaError(n->op) << "malformed child-owned region flow";
-    const RegionFlow *child = c.exits[0]->flow ? &*c.exits[0]->flow : nullptr;
-    if (!child || child->threadsToken())
-      return semaError(n->op) << "child-owned flow without native child";
     return success();
   };
   auto verifyNode = [&](Node *n) -> LogicalResult {
@@ -2025,6 +1733,8 @@ static int64_t positiveMod(int64_t value, int64_t modulus) {
 static std::optional<int64_t>
 computeLoopCarriedDistance(const SlotSchedule &slots, int64_t numSemaphoreCopies,
                            Node *producer, Node *consumer) {
+  if (numSemaphoreCopies == 1)
+    return 1; // one slot: a loop-carried pair spans exactly one iteration
   auto producerIt = slots.ordinalByAccess.find(producer);
   auto consumerIt = slots.ordinalByAccess.find(consumer);
   if (!slots.complete || producerIt == slots.ordinalByAccess.end() ||
@@ -2458,15 +2168,23 @@ LogicalResult buildSyncDag(GroupDag &g, bool useMetaPartitioner,
     return failure();
   if (failed(buildEdgesAndSemas(g, edges)))
     return failure();
+  if (!g.root->children.empty()) {
+    Node *head = g.root->children[0];
+    buildRegionFlows(g, head);
+    // Pruning an inner flow can invalidate an outer summary; iterate to the
+    // fixed point (flows only ever disappear, so this terminates).
+    bool changed = true;
+    while (changed) {
+      changed = refreshRegionFlows(g, head);
+      changed |= pruneDeadIfFlows(g, head, /*region=*/nullptr);
+      changed |= planLoopCarriers(g, head);
+    }
+    computeRequiredParts(head);
+  }
   if (failed(insertEntryAcquires(g)))
     return failure();
-  if (!g.root->children.empty()) {
-    buildRegionFlows(g, g.root->children[0]);
-    pruneDeadIfFlows(g, g.root->children[0], /*region=*/nullptr);
-    planRegionFlows(g, g.root->children[0]);
-    computeRequiredParts(g.root->children[0]);
-    assignTokenSources(g);
-  }
+  if (!g.root->children.empty())
+    assignTokenSources(g); // final token facts with the entry acquire placed
   if (failed(computeSemaphoreCopies(g, lowerSemaphoreNumStages)))
     return failure();
   if (!g.semas.empty())
@@ -2485,31 +2203,6 @@ static void printThreadInfo(llvm::raw_ostream &os, const Node *n) {
   }
   if (n->flow)
     os << " thread{" << ownerStr(n->op, n->flow->owner) << "}";
-  if (n->kind == Node::For && n->flow) {
-    os << " holdrule{";
-    const RegionFlow &c = *n->flow;
-    if (c.mode == RegionFlow::Mode::CARRIED) {
-      os << "gated";
-      if (c.blocker == RegionFlow::Blocker::TRAILING_USE)
-        os << "(trailing-use)";
-      else if (c.blocker == RegionFlow::Blocker::RESULT_CONSUMED)
-        os << "(result-consumed)";
-    } else if (c.mode == RegionFlow::Mode::POINT_OF_USE) {
-      os << "pointofuse->";
-      if (c.firstToucher && c.firstToucher->op)
-        os << c.firstToucher->op->getName().getStringRef();
-      else
-        os << "?";
-    } else
-      os << "passthrough-drop";
-    if (exitsThroughRegion(c))
-      os << ":nestedExit";
-    if (c.postLoopAcquire)
-      os << ":postLoopAcquire";
-    if (c.bridgeRelease)
-      os << ":entryBridge";
-    os << "}";
-  }
 }
 static void printYieldInfo(llvm::raw_ostream &os, GroupDag &g,
                            const Node *region, unsigned chainIdx) {
