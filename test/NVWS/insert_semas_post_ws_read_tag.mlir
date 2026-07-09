@@ -14,15 +14,13 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // LOWER: ttng.wait_barrier {{.*}} :
   // LOWER: [[READ:%.*]] = ttg.memdesc_index {{.*}} : !ttg.memdesc<1x128x128xf32
   // LOWER: [[OUT:%.*]], {{%.*}} = ttng.tmem_load [[READ]][]
-  // LOWER-NEXT: [[BAR:%.*]] = ttg.memdesc_index {{.*}} : !ttg.memdesc<1x1xi64
-  // LOWER-NEXT: ttng.arrive_barrier [[BAR]], 1
+  // LOWER-NEXT: "use"([[OUT]])
   // PARTITION-LABEL: @post_ws_tmem_read_carrier_tag
   // PARTITION: nvws.warp_group
   // PARTITION: ttng.tc_gen5_commit {{.*}} {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32}
   // PARTITION: [[POST_READ:%.*]] = ttg.memdesc_index {{.*}} : !ttg.memdesc<1x128x128xf32
   // PARTITION: [[POST_OUT:%.*]], {{%.*}} = ttng.tmem_load [[POST_READ]][]
-  // PARTITION: ttng.arrive_barrier {{.*}}, 1
-  // PARTITION: "use"([[POST_OUT]])
+  // PARTITION-NEXT: "use"([[POST_OUT]])
   // CHECK-LABEL: @post_ws_tmem_read_carrier_tag
   tt.func @post_ws_tmem_read_carrier_tag(
       %ub: i32,
@@ -53,7 +51,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK: [[V9:%.*]] = nvws.semaphore.buffer [[V3]], [[V8]] : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
     // CHECK: %{{[-A-Za-z0-9_.$#]+}}, %{{[-A-Za-z0-9_.$#]+}} = ttng.tmem_load [[V9]][] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128> -> tensor<128x128xf32, #blocked>
     %out, %load_tok = ttng.tmem_load %acc[%loop] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
-    // CHECK: nvws.semaphore.release [[V2]], [[V8]] [#nvws.async_op<none>] {arrive_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
+    // The post-loop read is the last access; no release of [[V2]] follows it.
+    // CHECK-NOT: nvws.semaphore.release
     "use"(%out) : (tensor<128x128xf32, #blocked>) -> ()
     tt.return
   }
