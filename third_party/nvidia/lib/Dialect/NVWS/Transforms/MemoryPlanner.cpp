@@ -251,6 +251,25 @@ static Channel *findChannelForOp(Operation *op,
   return TheCh;
 }
 
+/// Return the operation whose program position best represents when a channel
+/// starts being used. SMEM post channels often expose a local_store/local_alloc
+/// as their source; tie-breaking should follow the value stored into SMEM.
+static Operation *getLogicalProducerOp(Channel *ch) {
+  if (!ch)
+    return nullptr;
+  Operation *srcOp = ch->getSrcOp();
+  if (!srcOp)
+    return nullptr;
+  if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(srcOp))
+    if (Operation *defOp = storeOp.getSrc().getDefiningOp())
+      return defOp;
+  if (auto allocOp = dyn_cast<ttg::LocalAllocOp>(srcOp))
+    if (Value src = allocOp.getSrc())
+      if (Operation *defOp = src.getDefiningOp())
+        return defOp;
+  return srcOp;
+}
+
 /// Find the channel associated with a value's defining allocation operation.
 /// Convenience wrapper around findChannelForOp.
 /// @param value The value whose defining operation to find a channel for
@@ -813,9 +832,24 @@ struct WSBuffer {
   bool isCrossStage;
   unsigned bufferId;
   unsigned numCopies;
+  unsigned minCopies = 1; // Correctness floor; numCopies may not go below it.
   WSBufferPriority priority;
   bool isPinned = false; // Set by user annotation; skips heuristic phases.
 };
+
+static unsigned
+getWSBufferUsageOrder(const WSBuffer &buf, SmallVector<Channel *> &channels,
+                      const DenseMap<Operation *, unsigned> &opOrder) {
+  if (Channel *ch = findChannelForOp(buf.allocOp, channels)) {
+    if (Operation *producer = getLogicalProducerOp(ch)) {
+      if (auto it = opOrder.find(producer); it != opOrder.end())
+        return it->second;
+    }
+  }
+  if (auto it = opOrder.find(buf.allocOp); it != opOrder.end())
+    return it->second;
+  return std::numeric_limits<unsigned>::max();
+}
 
 /// Parsed channel annotation from tt.autows JSON on an MMA op.
 /// Format: "opndA,smem,2,0" → operand=opndA, memType=smem, numCopies=2,
@@ -1103,26 +1137,17 @@ static int getLoopStage(Operation *op) {
   return attr ? attr.getValue().getSExtValue() : -1;
 }
 
-/// Check if a channel's actual consumers are in different loop.stage values.
-/// The producer stage is not considered because it may be in a different
-/// partition. We follow through memdesc_trans operations to find the actual
-/// consumers. Only returns true if the buffer is updated inside the innermost
-/// loop (srcOp has loop.stage).
-static bool isSmemCrossStage(Operation *alloc,
-                             SmallVector<Channel *> &channels) {
+/// Compute the number of pipeline stages spanned by a buffer's consumers.
+/// Only buffers produced in the staged loop need a multi-copy floor.
+static unsigned getSmemCrossStageDepth(Operation *alloc,
+                                       SmallVector<Channel *> &channels) {
   Channel *ch = findChannelForOp(alloc, channels);
   if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
-    return false;
+    return 1;
 
-  // Check that the source (producer) is inside the innermost loop.
-  // If srcOp doesn't have loop.stage, the buffer is written outside the loop
-  // and doesn't need double-buffering.
   Operation *srcOp = ch->getSrcOp();
-  if (!srcOp)
-    return false;
-  int srcStage = getLoopStage(srcOp);
-  if (srcStage < 0)
-    return false;
+  if (!srcOp || getLoopStage(srcOp) < 0)
+    return 1;
 
   SmallVector<Operation *> dstOps;
   ch->getDstOps(dstOps);
@@ -1131,27 +1156,25 @@ static bool isSmemCrossStage(Operation *alloc,
       dstOps.push_back(dst);
   }
 
-  // Collect all actual consumers by following through memdesc_trans operations.
-  SmallVector<Operation *> actualConsumers;
+  int minStage = INT_MAX;
+  int maxStage = -1;
   for (Operation *dstOp : dstOps) {
-    auto consumers = getActualConsumers(dstOp);
-    for (auto *consumer : consumers)
-      actualConsumers.push_back(consumer);
-  }
-
-  // Check if actual consumers are in different stages.
-  int firstConsumerStage = -1;
-  for (Operation *consumer : actualConsumers) {
-    int stage = getLoopStage(consumer);
-    if (stage >= 0) {
-      if (firstConsumerStage < 0) {
-        firstConsumerStage = stage;
-      } else if (stage != firstConsumerStage) {
-        return true;
+    for (Operation *consumer : getActualConsumers(dstOp)) {
+      int stage = getLoopStage(consumer);
+      if (stage >= 0) {
+        minStage = std::min(minStage, stage);
+        maxStage = std::max(maxStage, stage);
       }
     }
   }
-  return false;
+  if (maxStage < 0 || minStage == INT_MAX || maxStage == minStage)
+    return 1;
+  return static_cast<unsigned>(maxStage - minStage + 1);
+}
+
+static bool isSmemCrossStage(Operation *alloc,
+                             SmallVector<Channel *> &channels) {
+  return getSmemCrossStageDepth(alloc, channels) > 1;
 }
 
 /// Compute the byte size for a local_alloc op.
@@ -1251,12 +1274,10 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
     // Determine current copies (should be uniform within a fused group).
     unsigned currentCopies = wsBuffers[indices[0]].numCopies;
 
-    // Respect cross-stage minimum from Phase 2.
+    // Respect the exact cross-stage floors established in Phase 2.
     unsigned minCopies = currentCopies;
-    for (unsigned idx : indices) {
-      if (wsBuffers[idx].isCrossStage)
-        minCopies = std::max(minCopies, 2u);
-    }
+    for (unsigned idx : indices)
+      minCopies = std::max(minCopies, wsBuffers[idx].minCopies);
     if (minCopies > currentCopies)
       currentCopies = minCopies;
 
@@ -1302,10 +1323,12 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
 static unsigned allocateSmemBuffers(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
-    const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation) {
+    const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
+    unsigned annotationMaxId = 0) {
   // ── Phase 1: Create WSBuffers ───────────────────────────────────────
   SmallVector<WSBuffer> wsBuffers;
-  unsigned nextBufferId = 0;
+  // SMEM and TMEM IDs share the namespace consumed by InsertSemas.
+  unsigned nextBufferId = annotationMaxId;
 
   funcOp->walk<WalkOrder::PreOrder>([&](ttg::LocalAllocOp alloc) {
     if (!alloc.isSharedMemoryAlloc())
@@ -1326,6 +1349,7 @@ static unsigned allocateSmemBuffers(
     if (it != allocToAnnotation.end() && it->second.memType == "smem") {
       buf.bufferId = it->second.bufferId;
       buf.numCopies = it->second.numCopies;
+      buf.minCopies = it->second.numCopies;
       buf.isPinned = true;
       LDBG("Phase 1: WSBuffer pinned by annotation: bufferId="
            << buf.bufferId << " numCopies=" << buf.numCopies);
@@ -1342,38 +1366,44 @@ static unsigned allocateSmemBuffers(
   if (wsBuffers.empty())
     return nextBufferId;
 
+  DenseMap<Operation *, unsigned> opOrder;
+  unsigned nextOpOrder = 0;
+  funcOp->walk<WalkOrder::PreOrder>(
+      [&](Operation *op) { opOrder[op] = nextOpOrder++; });
+
   // Ensure heuristic-assigned IDs don't collide with annotated IDs.
   for (auto &buf : wsBuffers)
     if (buf.isPinned)
       nextBufferId = std::max(nextBufferId, buf.bufferId + 1);
 
-  // ── Phase 2: Enforce cross-stage minimum ────────────────────────────
-  // Budget-aware: only set copy=2 if the total SMEM stays within budget.
+  // ── Phase 2: Enforce cross-stage correctness floors ─────────────────
+  // This is a correctness requirement, not a discretionary budget choice:
+  // dropping below the consumer stage span can let a producer overwrite a
+  // slot before the later-stage consumer has read it.
   for (auto &buf : wsBuffers) {
+    unsigned depth = getSmemCrossStageDepth(buf.allocOp, channels);
     if (buf.isPinned) {
-      if (buf.isCrossStage && buf.numCopies < 2) {
+      if (buf.numCopies < depth) {
+        buf.allocOp->emitWarning()
+            << "annotated cross-stage SMEM buffer has buffer.copy="
+            << buf.numCopies << ", below required cross-stage depth=" << depth
+            << "; preserving the annotation";
         LDBG("WARNING: pinned WSBuffer["
-             << buf.bufferId << "] is cross-stage but has numCopies="
-             << buf.numCopies << " — this may cause correctness issues"
-             << " (producer may overwrite before consumer reads)");
+             << buf.bufferId << "] has numCopies=" << buf.numCopies
+             << " below required cross-stage depth=" << depth);
       }
       continue;
     }
-    if (buf.isCrossStage && numBuffers >= 2) {
-      unsigned saved = buf.numCopies;
-      buf.numCopies = 2;
-      unsigned totalSmem = computeTotalSmem(wsBuffers);
-      if (totalSmem <= smemBudget) {
-        LDBG("Phase 2: WSBuffer[" << buf.bufferId
-                                  << "] cross-stage → numCopies=2"
-                                  << " (totalSmem=" << totalSmem << ")");
-      } else {
-        buf.numCopies = saved;
-        LDBG("Phase 2: WSBuffer["
-             << buf.bufferId << "] cross-stage copy=2 skipped"
-             << " (would exceed budget: " << totalSmem << " > " << smemBudget
-             << ")");
-      }
+    if (depth > 1) {
+      if (depth > numBuffers)
+        buf.allocOp->emitWarning()
+            << "cross-stage SMEM buffer requires buffer.copy=" << depth
+            << ", exceeding configured num-buffers=" << numBuffers
+            << "; enforcing the correctness floor";
+      buf.minCopies = std::max(buf.minCopies, depth);
+      buf.numCopies = std::max(buf.numCopies, buf.minCopies);
+      LDBG("Phase 2: WSBuffer[" << buf.bufferId
+                                << "] cross-stage floor=" << buf.minCopies);
     }
   }
 
@@ -1398,6 +1428,15 @@ static unsigned allocateSmemBuffers(
   // the same buffer.id to reduce SMEM usage before the copy increase pass.
   fuseEpilogueWSBuffers(wsBuffers, channels);
 
+  unsigned postFloorTotal = computeTotalSmem(wsBuffers);
+  if (postFloorTotal > smemBudget) {
+    funcOp.emitWarning()
+        << "SMEM allocation requires " << postFloorTotal
+        << " bytes after enforcing cross-stage correctness floors, exceeding "
+           "configured smem-budget="
+        << smemBudget << "; preserving the correctness floors";
+  }
+
   // ── Phase 4: Iterative copy increase ────────────────────────────────
   // Process P0 then P1. P2 is never increased.
   for (auto priority : {WSBufferPriority::P0_InnermostTMA,
@@ -1413,6 +1452,17 @@ static unsigned allocateSmemBuffers(
     if (candidateIndices.empty())
       continue;
 
+    // Allocation order must follow logical producer use, not the position of
+    // hoisted local_alloc operations. This keeps copy growth deterministic and
+    // gives earlier-used operands the first available slot.
+    llvm::stable_sort(candidateIndices, [&](unsigned a, unsigned b) {
+      unsigned orderA = getWSBufferUsageOrder(wsBuffers[a], channels, opOrder);
+      unsigned orderB = getWSBufferUsageOrder(wsBuffers[b], channels, opOrder);
+      if (orderA != orderB)
+        return orderA < orderB;
+      return a < b;
+    });
+
     LDBG("Phase 4: processing priority=" << static_cast<int>(priority)
                                          << " with " << candidateIndices.size()
                                          << " candidates");
@@ -1427,27 +1477,23 @@ static unsigned allocateSmemBuffers(
       // B shares A's buffer.id.
       bufB.bufferId = bufA.bufferId;
 
-      // Compute starting copies for the group based on cross-stage.
-      unsigned maxCrossStageMin = 1;
-      if (bufA.isCrossStage)
-        maxCrossStageMin = std::max(maxCrossStageMin, 2u);
-      if (bufB.isCrossStage)
-        maxCrossStageMin = std::max(maxCrossStageMin, 2u);
-
-      unsigned groupStart = 1;
-      if (maxCrossStageMin >= 2)
-        groupStart = maxCrossStageMin * 2 - 1; // e.g., 3
-
-      // Clamp to num_buffers.
+      // Interleaving a reuse pair whose member needs N private slots requires
+      // 2*N-1 group slots. Never clamp this correctness floor to the
+      // discretionary numBuffers limit.
+      unsigned maxMinCopies = std::max(bufA.minCopies, bufB.minCopies);
+      unsigned groupStart = maxMinCopies >= 2 ? 2 * maxMinCopies - 1 : 1;
       if (groupStart > numBuffers)
-        groupStart = numBuffers;
+        bufA.allocOp->emitWarning()
+            << "cross-stage SMEM reuse group requires buffer.copy="
+            << groupStart << ", exceeding configured num-buffers="
+            << numBuffers << "; enforcing the correctness floor";
 
       bufA.numCopies = groupStart;
       bufB.numCopies = groupStart;
 
       LDBG("Phase 4: formed reuse group ["
            << bufA.bufferId << "] with startCopies=" << groupStart
-           << " (crossStageMin=" << maxCrossStageMin << ")");
+           << " (maxMinCopies=" << maxMinCopies << ")");
     }
 
     // Step 1: Incremental loop.
@@ -1482,8 +1528,8 @@ static unsigned allocateSmemBuffers(
                                               << " ≤ " << smemBudget);
           currentGroupCopies++;
         } else {
-          bufA.numCopies = savedA;
-          bufB.numCopies = savedB;
+          bufA.numCopies = std::max(savedA, bufA.minCopies);
+          bufB.numCopies = std::max(savedB, bufB.minCopies);
           LDBG("Phase 4: reuse group copies="
                << currentGroupCopies << " totalSmem=" << totalSmem << " > "
                << smemBudget << " — budget exhausted");
@@ -1516,7 +1562,7 @@ static unsigned allocateSmemBuffers(
                  << buf.bufferId << "] copies=" << currentGroupCopies
                  << " totalSmem=" << totalSmem << " ≤ " << smemBudget);
           } else {
-            buf.numCopies = saved;
+            buf.numCopies = std::max(saved, buf.minCopies);
             LDBG("Phase 4: WSBuffer["
                  << buf.bufferId << "] copies=" << currentGroupCopies
                  << " totalSmem=" << totalSmem << " > " << smemBudget
@@ -1532,12 +1578,14 @@ static unsigned allocateSmemBuffers(
     }
 
     // Step 2: Finalize reuse decision.
-    // If final copies is even, split the group back.
+    // If final copies is even, split the group back only when each half still
+    // meets both members' correctness floors.
     if (isReuseGroup) {
       auto &bufA = wsBuffers[candidateIndices[0]];
       auto &bufB = wsBuffers[candidateIndices[1]];
-      if (bufA.numCopies % 2 == 0) {
-        unsigned half = bufA.numCopies / 2;
+      unsigned half = bufA.numCopies / 2;
+      if (bufA.numCopies % 2 == 0 && half >= bufA.minCopies &&
+          half >= bufB.minCopies) {
         bufA.numCopies = half;
         bufB.numCopies = half;
         bufB.bufferId = nextBufferId++;
@@ -2075,8 +2123,35 @@ public:
                                     operationId, ctrlOp, bufferId);
       } else {
         LDBG("using tmem allocation algorithm 2 (backtracking)");
-        result = allocateTMemAllocs2(allocsForThisLoop, buffers, allocToChannel,
-                                     operationId, ctrlOp, bufferId);
+        // Build initial state from pre-assigned allocs whose liveness
+        // intersects this loop, so un-annotated allocs can reuse them.
+        AllocationState initialState;
+        size_t seedColStart = 0;
+        for (auto alloc : allocs) {
+          if (!handledAllocs.count(alloc.getOperation()))
+            continue;
+          auto *buf = getBuffer(alloc.getOperation());
+          auto allocInt = bufferRange.lookup(buf);
+          if (!ctrlInt.intersects(allocInt))
+            continue;
+          if (buf->isOwnerOfSpace) {
+            int rowGroup =
+                (buf->rowSize == 2 * kRowGroupSize) ? -1 : 0; // default rg0
+            OwnerPlacement placement{seedColStart, rowGroup};
+            addOwnerToState(initialState, buf, placement);
+            seedColStart += buf->colSize;
+            LDBG("seeding owner [" << allocInt.start() << "-"
+                                   << allocInt.end() << ") at col "
+                                   << placement.colStart << " rowGroup "
+                                   << rowGroup << " size " << buf->rowSize
+                                   << "x" << buf->colSize);
+          } else {
+            initialState.assignment[buf] = {buf->reuseOwner, buf->colOffset};
+          }
+        }
+        result = allocateTMemAllocs2(allocsForThisLoop, buffers,
+                                     allocToChannel, operationId, ctrlOp,
+                                     bufferId, initialState);
       }
       if (failed(result))
         return failure();
@@ -2109,6 +2184,9 @@ public:
 
     unsigned totalCols = 0;
     for (auto alloc : allocs) {
+      // Reusers occupy their owner's columns and must not be counted twice.
+      if (alloc->hasAttr("buffer.offset"))
+        continue;
       ttng::TMemAllocation allocSize = ttng::getTmemAllocSizes(alloc.getType());
       unsigned baseCols = allocSize.numCols;
       unsigned copy = 1;
@@ -2170,16 +2248,108 @@ public:
   // ---------------------------------------------------------------
   // allocateTMemAllocs2 — backtracking search allocation algorithm.
   // ---------------------------------------------------------------
+  // TMEM has 128 physical rows (2 row groups of 64 each) x 512 columns.
+  // A 128-row alloc occupies both row groups. A 64-row alloc occupies one.
+  // Two 64-row allocs in different row groups can share the same columns.
 
-  /// State for backtracking search.
-  struct AllocationState {
-    /// For each buffer, stores (reuseOwner, colOffset). nullptr means owner.
-    DenseMap<BufferT *, std::pair<BufferT *, size_t>> assignment;
-    /// Set of buffers that own their space.
-    DenseSet<BufferT *> owners;
-    /// Total rows used.
-    size_t usedRows = 0;
+  static constexpr size_t kMaxTMemCols = 512;
+  static constexpr size_t kColAlignment = 4;
+  static constexpr int kNumRowGroups = 2;
+  static constexpr size_t kRowGroupSize = 64;
+
+  /// 2D placement for an owner buffer in the TMEM grid.
+  struct OwnerPlacement {
+    size_t colStart;
+    int rowGroup; // 0, 1, or -1 meaning both groups (128-row owner).
   };
+
+  /// State for backtracking search with a 2D TMEM model.
+  struct AllocationState {
+    /// For each reuser buffer, stores (reuseOwner, colOffset).
+    DenseMap<BufferT *, std::pair<BufferT *, size_t>> assignment;
+    DenseMap<BufferT *, OwnerPlacement> owners;
+    /// Column intervals occupied by each 64-row group, sorted by start.
+    SmallVector<std::pair<size_t, size_t>, 8> rowGroupCols[kNumRowGroups];
+
+    bool containsOwner(BufferT *buf) const { return owners.count(buf); }
+  };
+
+  void addOwnerToState(AllocationState &state, BufferT *buf,
+                       OwnerPlacement placement) const {
+    state.owners[buf] = placement;
+    auto interval =
+        std::make_pair(placement.colStart, placement.colStart + buf->colSize);
+    auto insertSorted = [](SmallVectorImpl<std::pair<size_t, size_t>> &vec,
+                           std::pair<size_t, size_t> iv) {
+      auto it = llvm::lower_bound(
+          vec, iv,
+          [](const std::pair<size_t, size_t> &a,
+             const std::pair<size_t, size_t> &b) { return a.first < b.first; });
+      vec.insert(it, iv);
+    };
+    if (placement.rowGroup == -1) {
+      insertSorted(state.rowGroupCols[0], interval);
+      insertSorted(state.rowGroupCols[1], interval);
+    } else {
+      insertSorted(state.rowGroupCols[placement.rowGroup], interval);
+    }
+  }
+
+  /// Find the first aligned gap of at least `size` columns.
+  std::optional<size_t>
+  findFirstGap(const SmallVectorImpl<std::pair<size_t, size_t>> &intervals,
+               size_t size, size_t maxCol) const {
+    size_t candidate = 0;
+    for (auto &[start, end] : intervals) {
+      if (candidate % kColAlignment != 0)
+        candidate = (candidate / kColAlignment + 1) * kColAlignment;
+      if (candidate + size <= start)
+        return candidate + size <= maxCol ? std::optional(candidate)
+                                          : std::nullopt;
+      candidate = std::max(candidate, end);
+    }
+    if (candidate % kColAlignment != 0)
+      candidate = (candidate / kColAlignment + 1) * kColAlignment;
+    if (candidate + size <= maxCol)
+      return candidate;
+    return std::nullopt;
+  }
+
+  /// Find valid placements for a new owner, preferring tighter column packing.
+  SmallVector<OwnerPlacement, 4>
+  findPlacements(BufferT *buf, const AllocationState &state,
+                 size_t maxCols) const {
+    SmallVector<OwnerPlacement, 4> result;
+
+    if (buf->rowSize == 2 * kRowGroupSize) {
+      // A 128-row owner needs the same column range free in both row groups.
+      SmallVector<std::pair<size_t, size_t>, 16> merged;
+      merged.append(state.rowGroupCols[0].begin(), state.rowGroupCols[0].end());
+      merged.append(state.rowGroupCols[1].begin(), state.rowGroupCols[1].end());
+      llvm::sort(merged,
+                 [](const auto &a, const auto &b) { return a.first < b.first; });
+      SmallVector<std::pair<size_t, size_t>, 16> mergedUnion;
+      for (auto &iv : merged) {
+        if (!mergedUnion.empty() && iv.first <= mergedUnion.back().second)
+          mergedUnion.back().second =
+              std::max(mergedUnion.back().second, iv.second);
+        else
+          mergedUnion.push_back(iv);
+      }
+      if (auto col = findFirstGap(mergedUnion, buf->colSize, maxCols))
+        result.push_back({*col, -1});
+    } else {
+      for (int rowGroup = 0; rowGroup < kNumRowGroups; ++rowGroup) {
+        if (auto col = findFirstGap(state.rowGroupCols[rowGroup], buf->colSize,
+                                    maxCols))
+          result.push_back({*col, rowGroup});
+      }
+      llvm::sort(result, [](const auto &a, const auto &b) {
+        return a.colStart < b.colStart;
+      });
+    }
+    return result;
+  }
 
   /// Check if candidate can potentially reuse owner's space.
   /// Returns priority: 0 = cannot reuse, 1 = can reuse, 2 = exact size match.
@@ -2251,7 +2421,7 @@ public:
 
   /// Recursive backtracking search for buffer allocation.
   bool tryAllocate(SmallVectorImpl<ttng::TMEMAllocOp> &allocs, size_t idx,
-                   AllocationState &state, size_t maxRows, Operation *ctrlOp) {
+                   AllocationState &state, size_t maxCols, Operation *ctrlOp) {
     // Base case: all buffers allocated
     if (idx == allocs.size())
       return true;
@@ -2260,7 +2430,7 @@ public:
 
     // Collect reuse candidates sorted by priority (descending)
     SmallVector<std::pair<BufferT *, int>> candidates;
-    for (BufferT *owner : state.owners) {
+    for (auto &[owner, placement] : state.owners) {
       int priority = hasPotentialReuse(owner, buf, ctrlOp);
       if (priority > 0)
         candidates.push_back({owner, priority});
@@ -2288,7 +2458,7 @@ public:
       });
 
       // Recurse
-      if (tryAllocate(allocs, idx + 1, newState, maxRows, ctrlOp)) {
+      if (tryAllocate(allocs, idx + 1, newState, maxCols, ctrlOp)) {
         state = newState;
         return true;
       }
@@ -2301,26 +2471,26 @@ public:
       });
     }
 
-    // Try allocating new space
-    if (state.usedRows + buf->rowSize <= maxRows) {
+    // Try allocating new owner space in the 2D TMEM grid.
+    for (auto placement : findPlacements(buf, state, maxCols)) {
       AllocationState newState = state;
-      newState.owners.insert(buf);
-      newState.usedRows += buf->rowSize;
+      addOwnerToState(newState, buf, placement);
 
       LLVM_DEBUG({
         LDBG("tryAllocate: trying new space for ["
              << bufferRange[buf].start() << "-" << bufferRange[buf].end()
-             << ") at row " << state.usedRows);
+             << ") at col " << placement.colStart << " rowGroup "
+             << placement.rowGroup);
       });
 
-      if (tryAllocate(allocs, idx + 1, newState, maxRows, ctrlOp)) {
+      if (tryAllocate(allocs, idx + 1, newState, maxCols, ctrlOp)) {
         state = newState;
         return true;
       }
       LLVM_DEBUG({
         LDBG("tryAllocate: backtracking from new space for ["
              << bufferRange[buf].start() << "-" << bufferRange[buf].end()
-             << ")");
+             << ") at col " << placement.colStart);
       });
     }
 
@@ -2329,14 +2499,23 @@ public:
 
   /// Apply the allocation state to the actual buffers.
   void applyAllocationState(SmallVectorImpl<ttng::TMEMAllocOp> &allocs,
-                            const AllocationState &state, unsigned &bufferId) {
-    // First pass: assign owners
-    size_t rowOffset = 0;
+                            const AllocationState &state, unsigned &bufferId,
+                            const AllocationState *initialState = nullptr) {
+    // First pass: assign owners. Carry IDs of pre-assigned owners into the
+    // map so newly discovered reusers can point at them.
     DenseMap<BufferT *, unsigned> ownerToBufferId;
+    if (initialState) {
+      for (auto &[buf, placement] : initialState->owners) {
+        if (auto idAttr =
+                buf->owner->getAttrOfType<IntegerAttr>("buffer.id"))
+          ownerToBufferId[buf] = idAttr.getInt();
+      }
+    }
     for (auto alloc : allocs) {
       BufferT *buf = getBuffer(alloc.getOperation());
-      if (state.owners.contains(buf)) {
-        buf->rowOffset = rowOffset;
+      if (state.containsOwner(buf)) {
+        auto placement = state.owners.lookup(buf);
+        buf->rowOffset = placement.rowGroup == 1 ? kRowGroupSize : 0;
         buf->colOffset = 0;
         buf->isOwnerOfSpace = true;
         buf->reuseOwner = buf;
@@ -2346,16 +2525,17 @@ public:
             IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
                              bufferId));
         ++bufferId;
-        rowOffset += buf->rowSize;
       }
     }
 
-    // Second pass: assign reusers
+    // Second pass: assign reusers. Entries already handled by annotation
+    // pre-assignment retain their attributes.
     for (auto alloc : allocs) {
       BufferT *buf = getBuffer(alloc.getOperation());
-      if (!state.owners.contains(buf)) {
+      if (!state.containsOwner(buf)) {
         auto it = state.assignment.find(buf);
-        assert(it != state.assignment.end());
+        if (it == state.assignment.end())
+          continue;
         auto [owner, colOffset] = it->second;
         buf->rowOffset = owner->rowOffset;
         buf->colOffset = colOffset;
@@ -2370,10 +2550,10 @@ public:
             IntegerAttr::get(IntegerType::get(alloc->getContext(), 32),
                              colOffset));
       }
-      // Set buffer.copy attribute
-      alloc.getOperation()->setAttr(
-          "buffer.copy",
-          IntegerAttr::get(IntegerType::get(alloc->getContext(), 32), 1));
+      if (!alloc.getOperation()->hasAttr("buffer.copy"))
+        alloc.getOperation()->setAttr(
+            "buffer.copy",
+            IntegerAttr::get(IntegerType::get(alloc->getContext(), 32), 1));
     }
   }
 
@@ -2381,9 +2561,12 @@ public:
       SmallVector<ttng::TMEMAllocOp> &allocs, SmallVector<BufferT *> &buffers,
       DenseMap<Operation *, TmemDataChannelPost *> &allocToChannel,
       DenseMap<Operation *, size_t> &operationId, Operation *ctrlOp,
-      unsigned bufferId) {
+      unsigned bufferId,
+      const AllocationState &initialState = AllocationState()) {
 
-    LDBG("allocateTMemAllocs2: starting with " << allocs.size() << " allocs");
+    LDBG("allocateTMemAllocs2: starting with "
+         << allocs.size() << " allocs, initial owners: "
+         << initialState.owners.size());
 
     // Debug: dump allocation order and liveness
     LLVM_DEBUG({
@@ -2415,20 +2598,31 @@ public:
           }
         }
       }
+      for (auto &[seedOwner, placement] : initialState.owners) {
+        for (auto alloc : allocs) {
+          auto *buf = getBuffer(alloc.getOperation());
+          int p1 = hasPotentialReuse(seedOwner, buf, ctrlOp);
+          int p2 = hasPotentialReuse(buf, seedOwner, ctrlOp);
+          if (p1 > 0 || p2 > 0)
+            llvm::dbgs() << "  hasPotentialReuse(seeded ["
+                         << bufferRange[seedOwner].start() << "-"
+                         << bufferRange[seedOwner].end() << "), ["
+                         << bufferRange[buf].start() << "-"
+                         << bufferRange[buf].end() << ")) = " << p1 << "/"
+                         << p2 << "\n";
+        }
+      }
       llvm::dbgs() << "=== End hasPotentialReuse ===\n\n";
     });
 
-    // Initialize state and run backtracking search
-    AllocationState state;
-    constexpr size_t maxRows = 512; // TMEM has 512 rows
+    AllocationState state = initialState;
 
-    if (!tryAllocate(allocs, 0, state, maxRows, ctrlOp)) {
+    if (!tryAllocate(allocs, 0, state, kMaxTMemCols, ctrlOp)) {
       return allocs[0].emitError(
           "allocateTMemAllocs2: failed to allocate TMEM buffers");
     }
 
-    // Apply the final allocation state
-    applyAllocationState(allocs, state, bufferId);
+    applyAllocationState(allocs, state, bufferId, &initialState);
 
     LLVM_DEBUG({
       llvm::dbgs() << "\n=== allocateTMemAllocs2: Final Allocation ===\n";
@@ -3144,13 +3338,20 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
           "NVWS memory planner requires smem-budget for smem-alloc-algo=1");
     // Parse channel annotations from MMA ops for SMEM pre-assignment.
     auto mmaAnnotations = parseChannelAnnotations(funcOp);
-    if (!mmaAnnotations.empty())
+    // Planner IDs are shared across SMEM and TMEM. Start heuristic SMEM IDs
+    // after every annotated ID, including TMEM-only annotations.
+    unsigned annotationMaxId = 0;
+    if (!mmaAnnotations.empty()) {
       smemAllocAnnotations =
           buildAllocToAnnotationMap(channels, mmaAnnotations);
+      for (auto &[key, annotation] : mmaAnnotations)
+        annotationMaxId =
+            std::max(annotationMaxId, annotation.bufferId + 1);
+    }
 
-    bufferId =
-        allocateSmemBuffers(funcOp, channels, numBuffers, effectiveSmemBudget,
-                            effectiveSmemCircularReuse, smemAllocAnnotations);
+    bufferId = allocateSmemBuffers(
+        funcOp, channels, numBuffers, effectiveSmemBudget,
+        effectiveSmemCircularReuse, smemAllocAnnotations, annotationMaxId);
   } else {
     // Original SMEM allocation.
     LDBG("using SMEM allocation algorithm 0 (original)");

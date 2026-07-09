@@ -2596,15 +2596,18 @@ static void insertYieldedProducerPartitions(SetVector<int> &result,
 }
 
 static SetVector<int> inferResultPartition(Operation *op, unsigned resultIdx) {
-  SetVector<int> tokenResult = inferAsyncTokenResultPartition(op, resultIdx);
-  if (!tokenResult.empty())
-    return tokenResult;
-
   SetVector<int> result;
   SmallVector<Value> yieldedValues;
   collectYieldedValues(op, resultIdx, yieldedValues);
   for (Value value : yieldedValues)
     insertYieldedProducerPartitions(result, value);
+
+  // An scf.for async-token result represents both sides of a loop-carried
+  // handoff: the yielded token's producer and the partition(s) that consume
+  // the corresponding region iter argument on the next iteration. Keep both
+  // in partition.outputs. Returning only the iter-argument consumers can make
+  // the metadata contradict the yielded SSA definition.
+  insertAll(result, inferAsyncTokenResultPartition(op, resultIdx));
 
   if (result.empty() && resultIdx < op->getNumResults())
     insertAll(result, getConsumerPartitionUnion(op->getResult(resultIdx)));
@@ -2953,10 +2956,28 @@ struct NVWSPartitionSchedulingMeta
 
 LogicalResult NVWSPartitionSchedulingMeta::runOnFuncOp(FuncOp funcOp) {
   SmallVector<scf::ForOp> loops;
+  SmallVector<scf::ForOp> nestedWSLoops;
   funcOp.walk([&](scf::ForOp loop) {
-    if (loop->hasAttr(kWarpSpecializeAttrName))
-      loops.push_back(loop);
+    if (!loop->hasAttr(kWarpSpecializeAttrName))
+      return;
+    // Nested warp-specialize loops belong to the same physical WS region as
+    // their outer loop. Scheduling them independently leaves outer partition
+    // ids on inner operations, which are invalid in the smaller inner schedule.
+    for (Operation *parent = loop->getParentOp(); parent;
+         parent = parent->getParentOp()) {
+      if (isa<scf::ForOp>(parent) &&
+          parent->hasAttr(kWarpSpecializeAttrName)) {
+        nestedWSLoops.push_back(loop);
+        return;
+      }
+    }
+    loops.push_back(loop);
   });
+  // getInitialSchedule on the outer loop already schedules the nested loop's
+  // operations. Prevent downstream WS passes from treating it as an independent
+  // region a second time.
+  for (scf::ForOp loop : nestedWSLoops)
+    loop->removeAttr(kWarpSpecializeAttrName);
   SmallVector<scf::ForOp> scheduledLoops;
   for (auto [idx, loop] : llvm::enumerate(loops)) {
     // Build SchedulingOptions from pass options and per-loop attributes.
