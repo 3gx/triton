@@ -838,6 +838,63 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     "use_result"(%lr) {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32} : (!ty) -> ()
     tt.return
   }
+
+  // CHECK-LABEL: @same_owner_nested
+  tt.func @same_owner_nested(%lb: i32, %ub: i32, %step: i32) {
+    // CHECK: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 999 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
+    // CHECK: [[READY:%.*]] = nvws.semaphore.create [[ALLOC]] true {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[S1:%.*]] = nvws.semaphore.create [[ALLOC]] false {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[S2:%.*]] = nvws.semaphore.create [[ALLOC]] false {pending_count = 2 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[S3:%.*]] = nvws.semaphore.create [[ALLOC]] false {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    %alloc = ttg.local_alloc {buffer.id = 999 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+    // CHECK-NOT: nvws.semaphore.create
+    // CHECK: scf.for %{{[-A-Za-z0-9_.$#]+}} = %{{[-A-Za-z0-9_.$#]+}} to %{{[-A-Za-z0-9_.$#]+}} step %{{[-A-Za-z0-9_.$#]+}} : i32 {
+    scf.for %i = %lb to %ub step %step : i32 {
+      %v3 = "producer3"() {ttg.partition = array<i32: 3>} : () -> !ty
+      // CHECK: [[OTOK:%.*]] = nvws.semaphore.acquire [[READY]] {ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+      // CHECK: [[OBUF:%.*]] = nvws.semaphore.buffer [[READY]], [[OTOK]] {ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+      // CHECK: ttg.local_store %{{[-A-Za-z0-9_.$#]+}}, [[OBUF]] {ttg.partition = array<i32: 3>} : tensor<1xi32, #blocked> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+      ttg.local_store %v3, %alloc {ttg.partition = array<i32: 3>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+      // CHECK: [[INNER_RESULT:%.*]] = scf.for %{{[-A-Za-z0-9_.$#]+}} = %{{[-A-Za-z0-9_.$#]+}} to %{{[-A-Za-z0-9_.$#]+}} step %{{[-A-Za-z0-9_.$#]+}} iter_args([[ITOK:%.*]] = [[OTOK]]) -> (!ttg.async.token) : i32 {
+      scf.for %j = %lb to %ub step %step : i32 {
+        // CHECK: nvws.semaphore.release [[S1]], [[ITOK]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
+        // CHECK: [[R3BUF:%.*]] = nvws.semaphore.buffer [[READY]], [[ITOK]] {ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+        // CHECK: [[R3:%.*]] = ttg.local_load [[R3BUF]] {ttg.partition = array<i32: 3>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> tensor<1xi32, #blocked>
+        %l3 = ttg.local_load %alloc {ttg.partition = array<i32: 3>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !ty
+        // CHECK: nvws.semaphore.release [[S2]], [[ITOK]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
+        "use3"(%l3) {ttg.partition = array<i32: 3>} : (!ty) -> ()
+
+        // CHECK: [[R2TOK:%.*]] = nvws.semaphore.acquire [[S1]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+        // CHECK: [[R2BUF:%.*]] = nvws.semaphore.buffer [[S1]], [[R2TOK]] {ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+        // CHECK: [[R2:%.*]] = ttg.local_load [[R2BUF]] {ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> tensor<1xi32, #blocked>
+        %l2 = ttg.local_load %alloc {ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !ty
+        // CHECK: nvws.semaphore.release [[S2]], [[R2TOK]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
+        "use2"(%l2) {ttg.partition = array<i32: 2>} : (!ty) -> ()
+
+        %v1 = "producer1"() {ttg.partition = array<i32: 1>} : () -> !ty
+        // CHECK: [[WTOK:%.*]] = nvws.semaphore.acquire [[S2]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+        // CHECK: [[WBUF:%.*]] = nvws.semaphore.buffer [[S2]], [[WTOK]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+        // CHECK: ttg.local_store %{{[-A-Za-z0-9_.$#]+}}, [[WBUF]] {ttg.partition = array<i32: 1>} : tensor<1xi32, #blocked> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+        ttg.local_store %v1, %alloc {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+
+        // CHECK: nvws.semaphore.release [[S3]], [[WTOK]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
+        // CHECK-NOT: nvws.semaphore.release [[READY]], [[WTOK]]
+        // CHECK: [[R0TOK:%.*]] = nvws.semaphore.acquire [[S3]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+        // CHECK: [[R0BUF:%.*]] = nvws.semaphore.buffer [[S3]], [[R0TOK]] {ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+        // CHECK: [[R0:%.*]] = ttg.local_load [[R0BUF]] {ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> tensor<1xi32, #blocked>
+        %l0 = ttg.local_load %alloc {ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !ty
+        // CHECK: nvws.semaphore.release [[READY]], [[R0TOK]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
+        "use0"(%l0) {ttg.partition = array<i32: 0>} : (!ty) -> ()
+
+        // CHECK: [[NEXT:%.*]] = nvws.semaphore.acquire [[READY]] {ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
+        // CHECK: scf.yield {ttg.partition = array<i32: 0, 1, 2, 3>} [[NEXT]] : !ttg.async.token
+        // CHECK: } {ttg.partition = array<i32: 0, 1, 2, 3>, ttg.partition.outputs = [array<i32: 3>]}
+      } {ttg.partition = array<i32: 0, 1, 2, 3>}
+      // CHECK: nvws.semaphore.release [[READY]], [[INNER_RESULT]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token
+      // CHECK: } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2, 3>, ttg.warp_specialize.tag = 0 : i32}
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2, 3>, ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
 }
 
 // -----
