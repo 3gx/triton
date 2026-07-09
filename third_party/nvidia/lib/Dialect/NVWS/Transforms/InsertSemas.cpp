@@ -26,9 +26,6 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner, int 
   for (GroupDag &g : groups)
     if (failed(buildAccessDag(g, funcOp)))
       return failure();
-  for (GroupDag &g : groups)
-    if (failed(buildOwnerDag(g)))
-      return failure();
   int numTmemBlocks = 0;
   for (GroupDag &g : groups)
     if (failed(buildSyncDag(g, useMetaPartitioner, lowerSemaphoreNumStages, numTmemBlocks)))
@@ -36,14 +33,11 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner, int 
   if (failed(finalizeSyncSchedule(groups)))
     return failure();
   if (shouldDumpDag()) {
-    llvm::errs() << "==== NVWS InsertSemas (commit 4: ACCESS-DAG + " "OWNER-DAG + SYNC-DAG + EMIT) ====\n";
+    llvm::errs() << "==== NVWS InsertSemas SYNC-DAG ====\n";
     llvm::errs() << "function: @" << funcOp.getName() << "\n";
     llvm::errs() << "groups: " << groups.size() << "\n";
-    for (GroupDag &g : groups) {
-      dumpGroupAccessDag(g, funcOp);
-      dumpGroupOwnerDag(g, funcOp);
+    for (GroupDag &g : groups)
       dumpGroupSyncDag(g, funcOp);
-    }
   }
   return emitIR(funcOp, groups);
 }

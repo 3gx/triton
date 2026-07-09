@@ -1,167 +1,123 @@
-// ACCESS analysis; see sema-docs/insert-semas/access-dag.md.
+// ACCESS and boundary-owner analysis; see sema-docs/insert-semas/access-dag.md.
 #include "InsertSemas.h"
 
 namespace mlir::triton::nvws_semas {
 
 FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp) {
-  llvm::MapVector<int64_t, SmallVector<Operation *, 2>> tmemBuckets, localBuckets;
+  using Buckets = llvm::MapVector<int64_t, SmallVector<Operation *, 2>>;
+  Buckets tmemBuckets, localBuckets;
   SmallVector<Operation *, 4> circularLocals;
-  llvm::DenseSet<int64_t> syntheticIds; // negative keys = synthetic
   int64_t nextSynthetic = -1;
+  auto add = [&](Buckets &buckets, Operation *op, std::optional<int64_t> id) {
+    int64_t key = id ? *id : nextSynthetic--;
+    buckets[key].push_back(op);
+  };
   LogicalResult result = success();
   funcOp.walk([&](Operation *op) {
-    if (auto alloc = dyn_cast<nvidia_gpu::TMEMAllocOp>(op)) {
-      std::optional<int64_t> id = getI64Attr(op, kBufferIdAttrName);
-      int64_t key = id ? *id : nextSynthetic--;
-      if (!id)
-        syntheticIds.insert(key);
-      tmemBuckets[key].push_back(op);
+    std::optional<int64_t> id = getI64Attr(op, kBufferIdAttrName);
+    if (isa<nvidia_gpu::TMEMAllocOp>(op)) {
+      add(tmemBuckets, op, id);
       return;
     }
-    if (auto alloc = dyn_cast<gpu::LocalAllocOp>(op)) {
-      auto type = cast<gpu::MemDescType>(alloc.getType());
-      if (!type.getMutableMemory())
-        return;
-      std::optional<int64_t> id = getI64Attr(op, kBufferIdAttrName);
-      if (op->hasAttr(kBufferCircularAttrName)) {
-        if (!id) {
-          result = semaError(op) << "circular local alloc requires buffer.id";
-          return;
-        }
-        for (StringRef name : {kBufferCopyAttrName, kBufferStartAttrName})
-          if (!op->hasAttr(name)) {
-            result = semaError(op) << "circular local alloc requires " << name;
-            return;
-          }
-        if (op->hasAttr(kBufferOffsetAttrName)) {
-          result = semaError(op) << "circular local alloc must not carry buffer.offset";
-          return;
-        }
-        circularLocals.push_back(op);
+    auto alloc = dyn_cast<gpu::LocalAllocOp>(op);
+    if (!alloc || !cast<gpu::MemDescType>(alloc.getType()).getMutableMemory())
+      return;
+    if (!op->hasAttr(kBufferCircularAttrName)) {
+      add(localBuckets, op, id);
+      return;
+    }
+    if (!id) {
+      result = semaError(op) << "circular local alloc requires buffer.id";
+      return;
+    }
+    for (StringRef name : {kBufferCopyAttrName, kBufferStartAttrName})
+      if (!op->hasAttr(name)) {
+        result = semaError(op) << "circular local alloc requires " << name;
         return;
       }
-      int64_t key = id ? *id : nextSynthetic--;
-      if (!id)
-        syntheticIds.insert(key);
-      localBuckets[key].push_back(op);
+    if (op->hasAttr(kBufferOffsetAttrName)) {
+      result = semaError(op) << "circular local alloc must not carry buffer.offset";
       return;
     }
+    circularLocals.push_back(op);
   });
   if (failed(result))
     return failure();
+
   SmallVector<GroupDag, 0> groups;
-  auto makeGroup = [&](MemKind memory, int64_t id, ArrayRef<Operation *> allocs, bool circular = false,
-                       bool mixedDepthPhysicalAlias = false) {
-    groups.emplace_back();
-    GroupDag &g = groups.back();
+  auto makeGroup = [&](MemKind memory, int64_t id, ArrayRef<Operation *> allocs,
+                       bool circular = false, bool mixedDepth = false) {
+    GroupDag &g = groups.emplace_back();
     g.bufferId = id;
-    g.synthetic = syntheticIds.contains(id);
-    g.mixedDepthPhysicalAlias = mixedDepthPhysicalAlias;
+    g.mixedDepthPhysicalAlias = mixedDepth;
     g.memory = memory;
     g.circular = circular;
-    for (Operation *allocOp : allocs) {
-      Member m;
-      m.allocOp = allocOp;
-      m.type = cast<gpu::MemDescType>(allocOp->getResult(0).getType());
-      m.circularStart = getI64Attr(allocOp, kBufferStartAttrName).value_or(0);
-      m.offset = circular ? 0 : getI64Attr(allocOp, kBufferOffsetAttrName).value_or(0);
-      m.extent = memory == MemKind::Tmem ? static_cast<int64_t>(mlir::triton::getMemDescSize(m.type))
-                     : (m.type.getShape().empty() ? 1 : m.type.getShape().front());
-      MemberId idx = static_cast<MemberId>(g.pieceTable.members.size());
-      g.pieceTable.members.push_back(m);
-      g.aliases.try_emplace(allocOp->getResult(0), std::make_pair(idx, SmallVector<AliasStep, 2>()));
+    for (Operation *op : allocs) {
+      auto type = cast<gpu::MemDescType>(op->getResult(0).getType());
+      int64_t extent = memory == MemKind::Tmem
+                           ? static_cast<int64_t>(mlir::triton::getMemDescSize(type))
+                           : (type.getShape().empty() ? 1 : type.getShape().front());
+      Member member{op, type,
+                    circular ? 0 : getI64Attr(op, kBufferOffsetAttrName).value_or(0),
+                    extent, getI64Attr(op, kBufferStartAttrName).value_or(0)};
+      MemberId index = g.pieceTable.members.size();
+      g.pieceTable.members.push_back(member);
+      g.aliases.try_emplace(op->getResult(0),
+                            std::make_pair(index, SmallVector<AliasStep, 2>()));
     }
   };
   for (auto &[id, allocs] : tmemBuckets) {
-    std::optional<int64_t> firstCopy;
-    bool allAuthored = true;
-    bool mixedCopies = false;
-    for (Operation *alloc : allocs) {
-      std::optional<int64_t> copy = getI64Attr(alloc, kBufferCopyAttrName);
-      if (!copy) {
-        allAuthored = false;
-        break;
-      }
-      if (!firstCopy)
-        firstCopy = *copy;
-      else if (*firstCopy != *copy)
-        mixedCopies = true;
-    }
-    if (!allAuthored || !mixedCopies) {
+    auto firstCopy = getI64Attr(allocs.front(), kBufferCopyAttrName);
+    bool split = firstCopy &&
+                 llvm::all_of(allocs, [&](Operation *op) {
+                   return getI64Attr(op, kBufferCopyAttrName).has_value();
+                 }) &&
+                 llvm::any_of(allocs, [&](Operation *op) {
+                   return getI64Attr(op, kBufferCopyAttrName) != firstCopy;
+                 });
+    if (!split) {
       makeGroup(MemKind::Tmem, id, allocs);
       continue;
     }
-    for (Operation *alloc : allocs) {
-      SmallVector<Operation *, 1> logicalMember{alloc};
-      makeGroup(MemKind::Tmem, id, logicalMember, /*circular=*/false, /*mixedDepthPhysicalAlias=*/true);
-    }
+    for (Operation *op : allocs)
+      makeGroup(MemKind::Tmem, id, ArrayRef<Operation *>(op), false, true);
   }
   for (auto &[id, allocs] : localBuckets)
     makeGroup(MemKind::Local, id, allocs);
-  for (Operation *allocOp : circularLocals)
-    makeGroup(MemKind::Local, *getI64Attr(allocOp, kBufferIdAttrName),
-              ArrayRef<Operation *>(allocOp), /*circular=*/true);
+  for (Operation *op : circularLocals)
+    makeGroup(MemKind::Local, *getI64Attr(op, kBufferIdAttrName),
+              ArrayRef<Operation *>(op), true);
   return groups;
 }
 
-static void buildPieces(PieceTable &pt) {
+static bool buildPieces(PieceTable &pt) {
   SmallVector<int64_t, 8> cuts;
-  for (const Member &m : pt.members) {
-    cuts.push_back(m.offset);
-    cuts.push_back(m.offset + m.extent);
+  for (const Member &member : pt.members) {
+    cuts.push_back(member.offset);
+    cuts.push_back(member.offset + member.extent);
   }
   llvm::sort(cuts);
   cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
-  SmallVector<Piece, 4> raw;
-  for (size_t i = 0; i + 1 < cuts.size(); ++i) {
-    Piece p;
-    p.lo = cuts[i];
-    p.hi = cuts[i + 1];
-    for (auto [mIdx, m] : llvm::enumerate(pt.members))
-      if (m.offset <= p.lo && p.hi <= m.offset + m.extent)
-        p.cover.push_back(static_cast<MemberId>(mIdx));
-    if (!p.cover.empty())
-      raw.push_back(std::move(p));
-  }
-  for (Piece &p : raw) {
-    if (!pt.pieces.empty() && pt.pieces.back().hi == p.lo && pt.pieces.back().cover == p.cover) {
-      pt.pieces.back().hi = p.hi;
-      continue;
-    }
-    pt.pieces.push_back(std::move(p));
-  }
   pt.footprint.assign(pt.members.size(), {});
-  for (auto [pIdx, piece] : llvm::enumerate(pt.pieces))
-    for (MemberId m : piece.cover)
-      pt.footprint[m].push_back(static_cast<PieceId>(pIdx));
-}
-// True when every piece connects (through shared members) into a single
-// component. InsertSemas relies on this (one group, one synchronization
-// unit). The memory planner keeps a buffer.id group single-component by
-// stacking reusers within their owner's columns, so no reuser is
-// disjoint from the rest.
-static bool piecesSingleComponent(const PieceTable &pt) {
-  if (pt.pieces.size() <= 1)
-    return true;
-  SmallVector<unsigned, 4> parent(pt.pieces.size());
-  for (auto [i, _] : llvm::enumerate(parent))
-    parent[i] = i;
-  std::function<unsigned(unsigned)> find = [&](unsigned x) -> unsigned {
-    while (parent[x] != x)
-      x = parent[x] = parent[parent[x]];
-    return x;
-  };
-  for (const auto &fp : pt.footprint)
-    for (size_t i = 1; i < fp.size(); ++i)
-      parent[find(fp[i])] = find(fp[0]);
-  unsigned rep0 = find(0);
-  for (size_t i = 1; i < pt.pieces.size(); ++i)
-    if (find(static_cast<unsigned>(i)) != rep0)
+  SmallVector<MemberId, 2> previous;
+  PieceId piece = 0;
+  for (size_t i = 0; i + 1 < cuts.size(); ++i) {
+    SmallVector<MemberId, 2> cover;
+    for (auto [index, member] : llvm::enumerate(pt.members))
+      if (member.offset <= cuts[i] && cuts[i + 1] <= member.offset + member.extent)
+        cover.push_back(static_cast<MemberId>(index));
+    if (cover.empty()) return false;
+    if (previous == cover) continue;
+    if (!previous.empty() && llvm::none_of(previous, [&](MemberId member) {
+          return llvm::is_contained(cover, member);
+        }))
       return false;
+    for (MemberId member : cover)
+      pt.footprint[member].push_back(piece);
+    previous = std::move(cover);
+    ++piece;
+  }
   return true;
-}
-static bool isStructuralOp(Operation *op) {
-  return isa<scf::ForOp, scf::IfOp, scf::YieldOp, triton::FuncOp, triton::ReturnOp>(op);
 }
 static LogicalResult rejectAliasOperands(GroupDag &g, Operation *op) {
   for (Value operand : op->getOperands())
@@ -169,51 +125,37 @@ static LogicalResult rejectAliasOperands(GroupDag &g, Operation *op) {
       return semaError(op) << "unsupported memdesc flow through control-flow op " << op->getName();
   return success();
 }
-static FailureOr<bool> tryExtendAlias(GroupDag &g, Operation *op) {
-  if (op->getNumResults() != 1 || !isa<gpu::MemDescType>(op->getResult(0).getType()))
-    return false;
-  for (auto [idx, operand] : llvm::enumerate(op->getOperands())) {
-    auto it = g.aliases.find(operand);
-    if (it == g.aliases.end())
-      continue;
-    if (!isSupportedAliasOp(op))
-      return semaError(op) << "unsupported memdesc alias use " << op->getName();
-    auto chain = it->second; // copy {member, steps}
-    chain.second.push_back({op, static_cast<unsigned>(idx), op->getResult(0).getType()});
-    g.aliases.try_emplace(op->getResult(0), std::move(chain));
-    return true;
-  }
-  return false;
-}
-static void addTouch(GroupDag &g, SmallVectorImpl<Touch> &touches, Value v, Effect effect) {
-  auto it = g.aliases.find(v);
-  if (it == g.aliases.end())
-    return;
-  Touch t;
-  t.member = it->second.first;
-  t.effect = effect;
-  t.accessValue = v;
-  t.accessType = v.getType();
-  t.alias = it->second.second;
-  touches.push_back(std::move(t));
-}
 static LogicalResult collectTouches(GroupDag &g, Operation *op, SmallVectorImpl<Touch> &touches) {
+  if (op->getNumResults() == 1 && isa<gpu::MemDescType>(op->getResult(0).getType()))
+    for (auto [index, operand] : llvm::enumerate(op->getOperands())) {
+      auto it = g.aliases.find(operand);
+      if (it == g.aliases.end())
+        continue;
+      if (!isSupportedAliasOp(op))
+        return semaError(op) << "unsupported memdesc alias use " << op->getName();
+      auto alias = it->second;
+      alias.second.push_back({op, static_cast<unsigned>(index)});
+      g.aliases.try_emplace(op->getResult(0), std::move(alias));
+      return success();
+    }
   auto touch = [&](Value value, Effect effect) {
-    addTouch(g, touches, value, effect);
-    return success();
+    auto it = g.aliases.find(value);
+    if (it != g.aliases.end())
+      touches.push_back(
+          Touch{it->second.first, effect, value, it->second.second});
   };
   if (auto tmemAlloc = dyn_cast<nvidia_gpu::TMEMAllocOp>(op)) {
     if (tmemAlloc.getSrc())
-      addTouch(g, touches, tmemAlloc.getResult(), Effect::W);
+      touch(tmemAlloc.getResult(), Effect::W);
     return success();
   }
   if (auto localAlloc = dyn_cast<gpu::LocalAllocOp>(op)) {
-    if (Value src = localAlloc.getSrc()) {
-      if (Operation *def = src.getDefiningOp())
-        if (isa<triton::DescriptorLoadOp, triton::DescriptorGatherOp>(def) &&
-            g.aliases.count(localAlloc.getResult())) // member of THIS group
-          g.ttDescriptorFedMembers.push_back(localAlloc);
-      addTouch(g, touches, localAlloc.getResult(), Effect::W);
+    if (Value src = localAlloc.getSrc();
+        src && g.aliases.contains(localAlloc.getResult())) {
+      if (isa_and_nonnull<triton::DescriptorLoadOp,
+                          triton::DescriptorGatherOp>(src.getDefiningOp()))
+        g.ttDescriptorFedMembers.push_back(localAlloc);
+      touch(localAlloc.getResult(), Effect::W);
     }
     return success();
   }
@@ -230,147 +172,177 @@ static LogicalResult collectTouches(GroupDag &g, Operation *op, SmallVectorImpl<
     write = x.getResult();
   else if (auto x = dyn_cast<nvws::DescriptorGatherOp>(op))
     write = x.getResult();
-  if (read || write)
-    return touch(read ? read : write, read ? Effect::R : Effect::W);
-  if (auto mma = dyn_cast<nvidia_gpu::MMAv5OpInterface>(op)) {
-    Value acc = mma.getAccumulator();
-    bool accTouched = false;
-    for (Value operand : op->getOperands()) {
-      if (operand == acc) {
-        if (!accTouched)
-          addTouch(g, touches, operand, Effect::W);
-        accTouched = true;
-        continue;
-      }
-      addTouch(g, touches, operand, Effect::R);
-    }
+  if (read || write) {
+    touch(read ? read : write, read ? Effect::R : Effect::W);
     return success();
   }
-  if (isStructuralOp(op)) {
-    return rejectAliasOperands(g, op);
+  if (auto mma = dyn_cast<nvidia_gpu::MMAv5OpInterface>(op)) {
+    Value acc = mma.getAccumulator();
+    touch(acc, Effect::W);
+    for (Value operand : op->getOperands())
+      if (operand != acc) touch(operand, Effect::R);
+    return success();
   }
+  if (isa<scf::YieldOp, triton::FuncOp, triton::ReturnOp>(op))
+    return rejectAliasOperands(g, op);
   for (Value operand : op->getOperands())
     if (g.aliases.contains(operand))
-      addTouch(g, touches, operand, Effect::W);
+      touch(operand, Effect::W);
   return success();
 }
 
-static FailureOr<Node *> buildChainForBlock(GroupDag &g, Block &block, Node *parent);
-static void appendNode(Node *parent, Node *&head, Node *&tail, Node *n) {
-  n->parent = parent;
-  n->prev = tail;
-  if (tail)
-    tail->next = n;
+// Transient construction summary.  The persistent graph remains Node-only;
+// these facts let ACCESS assign region owners and boundary records while it
+// builds that graph instead of recovering them in a second analysis pass.
+struct Chain {
+  Node *head = nullptr, *tail = nullptr;
+  DenseMap<PieceId, Effect> effects;
+  DenseMap<PieceId, Owner> firstOwners, lastOwners;
+};
+static void appendNode(GroupDag &g, Chain &chain, Node *node) {
+  node->prev = chain.tail;
+  if (chain.tail)
+    chain.tail->next = node;
   else
-    head = n;
-  tail = n;
+    chain.head = node;
+  chain.tail = node;
+  auto record = [&](PieceId piece, Effect effect, const Owner &owner) {
+    mergeEffect(chain.effects, piece, effect);
+    chain.firstOwners.try_emplace(piece, owner);
+    chain.lastOwners[piece] = owner;
+  };
+  if (node->kind == Node::Access) {
+    forEachTouchedPiece(g, node, [&](PieceId piece, Effect effect) {
+      record(piece, effect, node->owner);
+    });
+  } else {
+    assert(node->isRegion() && "appendNode expects an access or region");
+    bool sealed = node->kind == Node::For && gpu::hasWarpSpecializeTag(node->op);
+    for (auto [piece, info] : node->pieceInfo)
+      record(piece, info.effect, sealed ? Owner() : info.owner);
+  }
 }
-static SmallVector<Operation *> directUsers(Value value) {
-  SmallVector<Operation *> users;
-  users.append(value.getUsers().begin(), value.getUsers().end());
-  return users;
-}
-
 static LogicalResult deriveCompletionAnchor(Node *access) {
   auto load = dyn_cast<gpu::LocalLoadOp>(access->op);
   if (!load)
     return success();
-  struct Candidate {
-    Operation *forward = nullptr;
-    Operation *store = nullptr;
-  };
-  SmallVector<Candidate, 2> candidates;
+  Operation *forward = nullptr, *store = nullptr;
+  unsigned paths = 0;
   for (Operation *user : load.getResult().getUsers()) {
     if (isa<triton::DescriptorStoreOp>(user)) {
-      candidates.push_back({nullptr, user});
+      forward = nullptr;
+      store = user;
+      ++paths;
       continue;
     }
-    auto convert = dyn_cast<gpu::ConvertLayoutOp>(user);
-    if (!convert)
-      continue;
-    for (Operation *convertUser : convert.getResult().getUsers())
-      if (isa<triton::DescriptorStoreOp>(convertUser))
-        candidates.push_back({user, convertUser});
+    if (auto convert = dyn_cast<gpu::ConvertLayoutOp>(user))
+      for (Operation *convertUser : convert.getResult().getUsers())
+        if (isa<triton::DescriptorStoreOp>(convertUser)) {
+          forward = user;
+          store = convertUser;
+          ++paths;
+        }
   }
-  if (candidates.empty())
+  if (!paths)
     return success();
-  if (candidates.size() != 1)
+  if (paths != 1)
     return semaError(load) << "managed local_load reaches multiple descriptor "
                               "stores; ownership completion is ambiguous";
-  Candidate candidate = candidates.front();
-  SmallVector<Operation *> loadUsers = directUsers(load.getResult());
-  Operation *expectedLoadUser = candidate.forward ? candidate.forward : candidate.store;
-  if (loadUsers.size() != 1 || loadUsers.front() != expectedLoadUser)
+  auto onlyUser = [](Value value, Operation *expected) {
+    return llvm::hasSingleElement(value.getUsers()) && *value.getUsers().begin() == expected;
+  };
+  if (!onlyUser(load.getResult(), forward ? forward : store))
     return semaError(load) << "descriptor-store local_load path has fan-out";
-  if (candidate.forward) {
-    auto convert = cast<gpu::ConvertLayoutOp>(candidate.forward);
-    SmallVector<Operation *> convertUsers = directUsers(convert.getResult());
-    if (convertUsers.size() != 1 || convertUsers.front() != candidate.store)
-      return semaError(load) << "descriptor-store convert_layout path has fan-out";
-  }
+  if (forward && !onlyUser(forward->getResult(0), store))
+    return semaError(load) << "descriptor-store convert_layout path has fan-out";
   Block *block = load->getBlock();
-  if (candidate.store->getBlock() != block || (candidate.forward && candidate.forward->getBlock() != block)) {
+  if (store->getBlock() != block || (forward && forward->getBlock() != block)) {
     InFlightDiagnostic diag = semaError(load) << "descriptor-store completion crosses control flow";
-    diag.attachNote(candidate.store->getLoc()) << "descriptor store is here";
+    diag.attachNote(store->getLoc()) << "descriptor store is here";
     return failure();
   }
-  if (!load->isBeforeInBlock(candidate.store))
+  if (!load->isBeforeInBlock(store))
     return semaError(load) << "descriptor store must follow managed local_load";
-  if (!sameOwner(access->owner, resolveOwner(candidate.store))) {
+  if (!sameOwner(access->owner, resolveOwner(store))) {
     InFlightDiagnostic diag = semaError(load) << "descriptor-store completion owner differs "
                                  "from managed local_load owner";
-    diag.attachNote(candidate.store->getLoc()) << "descriptor store is here";
+    diag.attachNote(store->getLoc()) << "descriptor store is here";
     return failure();
   }
-  access->completionAnchor = candidate.store;
+  access->completionAnchor = store;
   return success();
 }
 
-static FailureOr<Node *> buildChainForBlock(GroupDag &g, Block &block, Node *parent) {
-  Node *head = nullptr, *tail = nullptr;
+static FailureOr<Chain> buildChainForBlock(GroupDag &g, Block &block, Node *parent) {
+  Chain chain;
   for (Operation &op : block) {
-    if (auto forOp = dyn_cast<scf::ForOp>(&op)) {
+    Node::Kind kind = isa<scf::ForOp>(op) ? Node::For
+                      : isa<scf::IfOp>(op) ? Node::If
+                                           : Node::Access;
+    if (kind != Node::Access) {
       if (failed(rejectAliasOperands(g, &op)))
         return failure();
-      Node *forNode = g.newNode(Node::For, &op, parent);
-      auto body = buildChainForBlock(g, *forOp.getBody(), forNode);
-      if (failed(body))
-        return failure();
-      if (!*body) {
-        g.nodes.pop_back(); // empty subtree: no structural node
-        continue;
-      }
-      forNode->children.push_back(*body);
-      appendNode(parent, head, tail, forNode);
-      continue;
-    }
-    if (auto ifOp = dyn_cast<scf::IfOp>(&op)) {
-      if (failed(rejectAliasOperands(g, &op)))
-        return failure();
-      Node *ifNode = g.newNode(Node::If, &op, parent);
-      auto thenChain = buildChainForBlock(g, *ifOp.thenBlock(), ifNode);
-      if (failed(thenChain))
-        return failure();
-      FailureOr<Node *> elseChain((Node *)nullptr);
-      if (ifOp.elseBlock()) {
-        elseChain = buildChainForBlock(g, *ifOp.elseBlock(), ifNode);
-        if (failed(elseChain))
+      Node *region = g.newNode(kind, &op, parent);
+      SmallVector<Chain, 2> branches;
+      for (Region &nested : op.getRegions()) {
+        if (nested.empty()) {
+          branches.emplace_back();
+          continue;
+        }
+        auto branch = buildChainForBlock(g, nested.front(), region);
+        if (failed(branch))
           return failure();
+        branches.push_back(std::move(*branch));
       }
-      if (!*thenChain && !*elseChain) {
+      assert((kind != Node::If || branches.size() == 2) &&
+             "If node carries then+else slots");
+      if (llvm::all_of(branches, [](const Chain &branch) { return !branch.head; })) {
         g.nodes.pop_back();
         continue;
       }
-      ifNode->children.push_back(*thenChain); // may be null
-      ifNode->children.push_back(*elseChain); // may be null
-      appendNode(parent, head, tail, ifNode);
+      for (const Chain &branch : branches)
+        for (auto [piece, effect] : branch.effects) {
+          auto [it, inserted] = region->pieceInfo.try_emplace(
+              piece, PieceInfo{std::nullopt, effect});
+          if (!inserted)
+            it->second.effect = joinEffect(it->second.effect, effect);
+        }
+      auto lookup = [](const DenseMap<PieceId, Owner> &owners,
+                       PieceId piece) -> const Owner * {
+        auto it = owners.find(piece);
+        return it == owners.end() ? nullptr : &it->second;
+      };
+      for (auto [piece, info] : sortedPieceInfo(region)) {
+        const Owner *owner = nullptr;
+        if (region->kind == Node::If)
+          owner = lookup(chain.lastOwners, piece);
+        for (const Chain &branch : branches)
+          if (!owner)
+            owner = lookup(branch.firstOwners, piece);
+        if (!owner) {
+          semaError(region->op) << "no toucher resolves the owner for a piece in this region's "
+                                   "summary (stage-1/stage-2 inconsistency)";
+          return failure();
+        }
+        region->pieceInfo[piece].owner = *owner;
+      }
+      for (const Chain &branch : branches) {
+        Node *enter = g.newNode(Node::Enter, nullptr, region);
+        Node *exit = g.newNode(Node::Exit, nullptr, region);
+        for (auto [piece, effect] : branch.effects)
+          enter->pieceInfo[piece] = exit->pieceInfo[piece] =
+              PieceInfo{region->pieceInfo[piece].owner, effect};
+        Node *head = branch.head ? branch.head : exit;
+        Node *tail = branch.tail ? branch.tail : enter;
+        enter->next = head;
+        head->prev = enter;
+        tail->next = exit;
+        exit->prev = tail;
+        region->children.push_back(enter);
+      }
+      appendNode(g, chain, region);
       continue;
     }
-    auto aliased = tryExtendAlias(g, &op);
-    if (failed(aliased))
-      return failure();
-    if (*aliased)
-      continue;
     SmallVector<Touch, 2> touches;
     if (failed(collectTouches(g, &op, touches)))
       return failure();
@@ -381,78 +353,31 @@ static FailureOr<Node *> buildChainForBlock(GroupDag &g, Block &block, Node *par
     access->touches = std::move(touches);
     if (failed(deriveCompletionAnchor(access)))
       return failure();
-    appendNode(parent, head, tail, access);
+    g.accessNodeOps.insert(&op);
+    appendNode(g, chain, access);
   }
-  return head;
-}
-static void computeEffectSummary(GroupDag &g, Node *n, DenseMap<PieceId, Effect> &out) {
-  if (n->kind == Node::Access) {
-    forEachTouchedPiece(g, n, [&](PieceId p, Effect e) { mergeEffect(out, p, e); });
-    return;
-  }
-  DenseMap<PieceId, Effect> sub;
-  for (Node *childHead : n->children)
-    for (Node *c = childHead; c; c = c->next)
-      computeEffectSummary(g, c, sub);
-  if (n->isRegion())
-    for (const auto &[p, e] : sub)
-      n->pieceInfo[p] = PieceInfo{std::nullopt, e};
-  for (const auto &[p, e] : sub)
-    mergeEffect(out, p, e);
+  return chain;
 }
 
 LogicalResult buildAccessDag(GroupDag &g, triton::FuncOp funcOp) {
-  buildPieces(g.pieceTable);
   // Single-component invariant: every buffer.id group's pieces connect
   // (through shared members) into one component -- the memory planner keeps
   // reusers stacked within their owner's columns. The rest of InsertSemas
   // relies on this (one group == one synchronization unit); reject anything
   // that violates it rather than mis-synchronizing.
-  if (!piecesSingleComponent(g.pieceTable)) {
-    Operation *at = g.pieceTable.members.empty()
-                        ? funcOp.getOperation()
-                        : g.pieceTable.members.front().allocOp;
-    return semaError(at) << "buffer.id group has disjoint pieces (more than "
+  if (!buildPieces(g.pieceTable))
+    return semaError(g.pieceTable.members.front().allocOp)
+           << "buffer.id group has disjoint pieces (more than "
                             "one connected component); InsertSemas requires "
                             "one component per group";
-  }
   Node *func = g.newNode(Node::Func, funcOp, nullptr);
   auto chain = buildChainForBlock(g, funcOp.getBody().front(), func);
   if (failed(chain))
     return failure();
-  if (*chain)
-    func->children.push_back(*chain);
+  if (chain->head)
+    func->children.push_back(chain->head);
   g.root = func;
-  DenseMap<PieceId, Effect> ignored;
-  computeEffectSummary(g, func, ignored);
   return success();
 }
 
-void dumpGroupAccessDag(GroupDag &g, triton::FuncOp funcOp) {
-  auto &os = llvm::errs();
-  os << "GROUP ";
-  if (g.synthetic)
-    os << "buffer.id=none#" << -g.bufferId;
-  else
-    os << "buffer.id=" << g.bufferId;
-  os << " memory=" << (g.isTmem() ? "tmem" : "local") << " members=" << g.pieceTable.members.size() << "\n";
-  os << "  members:";
-  for (auto [idx, m] : llvm::enumerate(g.pieceTable.members))
-    os << " m" << idx << "[" << m.offset << "," << (m.offset + m.extent) << ")";
-  os << "\n  pieces:";
-  for (auto [idx, p] : llvm::enumerate(g.pieceTable.pieces)) {
-    os << " P" << idx << "=[" << p.lo << "," << p.hi << "){";
-    llvm::interleaveComma(p.cover, os, [&](MemberId m) { os << "m" << m; });
-    os << "}";
-  }
-  os << "\n  footprints:";
-  for (auto [idx, fp] : llvm::enumerate(g.pieceTable.footprint)) {
-    os << " m" << idx << "={";
-    llvm::interleaveComma(fp, os, [&](PieceId p) { os << "P" << p; });
-    os << "}";
-  }
-  os << "\nACCESS-DAG\n";
-  os << "|- func @" << funcOp.getName() << "\n";
-  dumpDagTree(g, DumpStage::Access);
-}
 } // namespace mlir::triton::nvws_semas

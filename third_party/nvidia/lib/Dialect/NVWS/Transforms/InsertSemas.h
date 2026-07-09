@@ -26,7 +26,6 @@
 #include <utility>
 
 namespace mlir::triton::nvws_semas {
-using namespace mlir;
 using triton::nvws::AsyncOp;
 namespace gpu = triton::gpu;
 namespace nvidia_gpu = triton::nvidia_gpu;
@@ -55,14 +54,12 @@ struct PieceInfo {
 struct AliasStep {
   Operation *op = nullptr;
   unsigned operandIdx = 0;
-  Type resultType;
 };
 
 struct Touch {
   MemberId member = 0;
   Effect effect = Effect::R;
   Value accessValue;
-  Type accessType;
   SmallVector<AliasStep, 2> alias;
 };
 
@@ -130,18 +127,12 @@ sortedPieceInfo(const Node *n) {
 // Outer optional: the node has one uniform owner. Inner Owner may still be
 // root; an empty outer optional means no pieces or mixed owners.
 inline std::optional<Owner> uniformPieceOwner(const Node *n) {
-  bool fresh = true;
-  Owner owner;
-  for (auto &[p, pi] : sortedPieceInfo(n)) {
-    if (fresh) {
-      owner = pi.owner;
-      fresh = false;
-    } else if (!sameOwner(owner, pi.owner)) {
-      return std::nullopt;
-    }
-  }
-  if (fresh)
+  if (n->pieceInfo.empty())
     return std::nullopt;
+  Owner owner = n->pieceInfo.begin()->second.owner;
+  for (const auto &entry : n->pieceInfo)
+    if (!sameOwner(owner, entry.second.owner))
+      return std::nullopt;
   return std::optional<Owner>(std::in_place, owner);
 }
 
@@ -153,31 +144,22 @@ struct Member {
   int64_t circularStart = 0;
 };
 
-struct Piece {
-  int64_t lo = 0, hi = 0;
-  SmallVector<MemberId, 2> cover;
-};
-
 struct PieceTable {
   SmallVector<Member> members;
-  SmallVector<Piece> pieces;
   SmallVector<SmallVector<PieceId, 2>> footprint;
 };
 
 struct Sema {
   std::string name;
   unsigned count = 0;
-  bool isEntry = false;
-  Owner entryTokenOwner;
+  std::optional<Owner> entryOwner;
   Value create;
 };
 
 enum class MemKind { Tmem, Local };
-enum class DumpStage { Access, Owner, Sync };
 
 struct GroupDag {
   int64_t bufferId = 0;
-  bool synthetic = false;
   bool mixedDepthPhysicalAlias = false;
   MemKind memory = MemKind::Tmem;
   bool circular = false;
@@ -191,24 +173,15 @@ struct GroupDag {
   int numCopies = 1, numSemaphoreCopies = 1;
   SmallVector<Value> backing;
   bool isTmem() const { return memory == MemKind::Tmem; }
-  bool isLocal() const { return memory == MemKind::Local; }
   bool isCircular() const { return circular; }
   Node *newNode(Node::Kind k, Operation *op, Node *parent) {
-    nodes.push_back(std::make_unique<Node>());
-    Node *n = nodes.back().get();
+    Node *n = nodes.emplace_back(std::make_unique<Node>()).get();
     n->kind = k;
     n->op = op;
-    n->completionAnchor = op;
     n->parent = parent;
     return n;
   }
 };
-inline Sema &getSema(GroupDag &group, const Node *node) {
-  return group.semas[node->sema];
-}
-inline const Sema &getSema(const GroupDag &group, const Node *node) {
-  return group.semas[node->sema];
-}
 inline bool canOwnMixedDepthTmem(const GroupDag &owner, const GroupDag &reuser) {
   if (!owner.isTmem() || !reuser.isTmem() || owner.pieceTable.members.size() != 1 ||
       reuser.pieceTable.members.size() != 1)
@@ -302,27 +275,13 @@ template <typename Fn>
 inline void forEachNode(Node *head, Fn &&fn) {
   for (Node *n = head; n; n = n->next) {
     fn(n);
-    if (n->isRegion())
-      for (Node *child : n->children)
-        forEachNode(child, fn);
+    for (Node *child : n->children)
+      forEachNode(child, fn);
   }
 }
 template <typename Fn>
 inline void forEachNode(GroupDag &g, Fn &&fn) {
-  if (!g.root->children.empty())
-    forEachNode(g.root->children[0], std::forward<Fn>(fn));
-}
-template <typename Fn>
-inline LogicalResult forEachNodeChecked(Node *head, Fn &&fn) {
-  for (Node *n = head; n; n = n->next) {
-    if (failed(fn(n)))
-      return failure();
-    if (n->isRegion())
-      for (Node *child : n->children)
-        if (failed(forEachNodeChecked(child, fn)))
-          return failure();
-  }
-  return success();
+  for (Node *child : g.root->children) forEachNode(child, fn);
 }
 template <typename Fn>
 inline void forEachRegionPostOrder(Node *head, Fn &&fn) {
@@ -345,29 +304,17 @@ inline bool touchesPiece(const GroupDag &g, const Node *node, PieceId piece) {
   forEachTouchedPiece(g, node, [&](PieceId p, Effect) { found |= p == piece; });
   return found;
 }
-inline bool nodeTouchesGroup(const GroupDag &g, const Node *node) {
-  bool found = false;
-  forEachTouchedPiece(g, node, [&](PieceId, Effect) { found = true; });
-  return found;
-}
 template <typename Map>
 inline void mergeEffect(Map &effects, PieceId piece, Effect effect) {
-  auto [it, inserted] = effects.try_emplace(piece, effect);
-  if (!inserted)
-    it->second = joinEffect(it->second, effect);
+  effects[piece] = joinEffect(effects[piece], effect);
 }
 
 FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp);
 LogicalResult buildAccessDag(GroupDag &g, triton::FuncOp funcOp);
-LogicalResult buildOwnerDag(GroupDag &g);
 LogicalResult buildSyncDag(GroupDag &g, bool useMetaPartitioner,
                            int lowerSemaphoreNumStages, int &numTmemBlocks);
 LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups);
 LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups);
-void printPieceRecord(llvm::raw_ostream &os, const Node *node, Operation *anchor);
-void dumpGroupAccessDag(GroupDag &g, triton::FuncOp funcOp);
-void dumpGroupOwnerDag(GroupDag &g, triton::FuncOp funcOp);
 void dumpGroupSyncDag(GroupDag &g, triton::FuncOp funcOp);
-void dumpDagTree(GroupDag &g, DumpStage stage);
 } // namespace mlir::triton::nvws_semas
 #endif // NVWS_TRANSFORMS_INSERT_SEMAS_H_
