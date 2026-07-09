@@ -13,7 +13,7 @@ struct EmitCtx {
     unsigned index; // absolute result / iter_arg index in the NEW op
   };
   llvm::MapVector<Operation *, SmallVector<Slot, 2>> slots;
-  DenseSet<Operation *> reusedTokenBufferOps;
+  DenseSet<Operation *> exactReuseBufferOps;
 };
 
 struct RenderState {
@@ -22,20 +22,13 @@ struct RenderState {
     Value sema;
     TokenRef ref;
   };
-  // One exact capability per token known in this chain. The last record is
-  // used by default; owner-marked nodes may instead use their owner's record.
+  // One exact record per token known in this chain. Consumers always name
+  // the producer selected by the SYNC-DAG; rendering never guesses by owner or
+  // list position.
   SmallVector<Token, 2> tokens;
+  DenseSet<Node *> releasedSources;
   DenseMap<MemberId, std::pair<Value, int64_t>> view;  // member view + owner
   void clearViews() { view.clear(); }
-  const Token *lastToken() const {
-    return tokens.empty() ? nullptr : &tokens.back();
-  }
-  Token *tokenForOwner(const Owner &owner) {
-    for (Token &token : tokens)
-      if (sameOwner(token.ref.owner, owner) && token.value && token.sema)
-        return &token;
-    return nullptr;
-  }
   const Token *tokenFor(const TokenRef &ref) const {
     for (const Token &token : tokens)
       if (token.ref.producer == ref.producer && token.ref.sema == ref.sema &&
@@ -51,9 +44,6 @@ struct RenderState {
         return &token;
     return nullptr;
   }
-  Token *tokenFor(const TokenRef &ref) {
-    return const_cast<Token *>(std::as_const(*this).tokenFor(ref));
-  }
   Token *tokenForProducer(Node *producer, const Owner &owner) {
     // Producer selects phase/slot lineage. The region result separately names
     // its static render channel, so the source acquire's semaphore may differ.
@@ -64,22 +54,14 @@ struct RenderState {
     return nullptr;
   }
   void recordToken(Value value, Value sema, const TokenRef &ref) {
-    for (auto it = tokens.begin(); it != tokens.end();) {
-      if (!it->ref.owner || sameOwner(it->ref.owner, ref.owner))
-        it = tokens.erase(it);
-      else
-        ++it;
-    }
+    llvm::erase_if(tokens, [&](const Token &token) {
+      return token.ref.producer == ref.producer;
+    });
+    releasedSources.erase(ref.producer);
     tokens.push_back(Token{value, sema, ref});
   }
-  void keepOnly(const Token &token) {
-    Token copy = token;
-    tokens.clear();
-    tokens.push_back(copy);
-  }
-  void clearTokens() {
-    tokens.clear();
-    clearViews();
+  void aliasToken(Value value, Value sema, const TokenRef &ref) {
+    recordToken(value, sema, ref);
   }
   RenderState nested() const {
     RenderState copy = *this;
@@ -113,6 +95,20 @@ static Operation *nextRealOp(const Node *n) {
   for (const Node *m = n; m; m = m->next)
     if ((m->kind == Node::Access || m->kind == Node::For || m->kind == Node::If) && m->op)
       return m->op;
+  return nullptr;
+}
+static Block *chainBlock(Node *node) {
+  if (!node || !node->parent || !node->parent->op)
+    return nullptr;
+  Node *head = node;
+  while (head->prev)
+    head = head->prev;
+  Node *parent = node->parent;
+  if (parent->kind == Node::Func)
+    return &parent->op->getRegion(0).front();
+  for (auto [index, child] : llvm::enumerate(parent->children))
+    if (child == head && index < parent->op->getNumRegions())
+      return &parent->op->getRegion(index).front();
   return nullptr;
 }
 static SetVector<int> partitionIdsOfFwd(Operation *op) {
@@ -263,25 +259,6 @@ static void emitBackingsAndCreates(EmitCtx &ctx, GroupDag &g) {
     s.create = create.getResult();
   }
 }
-static void emitEntryAcquires(EmitCtx &ctx, GroupDag &g, DenseMap<Node *, Value> &emitted) {
-  forEachNode(g, [&](Node *n) {
-    if (n->kind != Node::Acquire || n->owner || !getSema(g, n).isEntry || emitted.count(n))
-      return;
-    Operation *before = nextRealOp(n->next);
-    OpBuilder b(ctx.func);
-    if (before)
-      b.setInsertionPoint(before);
-    else
-      b.setInsertionPoint(n->parent && n->parent->op ? n->parent->op->getRegion(0).front().getTerminator()
-                              : &ctx.func.getBody().front().back());
-    const Sema &s = getSema(g, n);
-    auto acq = emitInto<nvws::SemaphoreAcquireOp>(
-        b, before ? before->getLoc() : ctx.func.getLoc(), Owner(), {}, s.create, ctx.tokenType);
-    if (n->stageOffset)
-      acq.setStage(materializeI32Before(acq, *n->stageOffset));
-    emitted[n] = acq.getToken();
-  });
-}
 static void fixupAnchors(MutableArrayRef<GroupDag> groups, Operation *oldOp, Operation *newOp) {
   for (GroupDag &g : groups) {
     forEachNode(g, [&](Node *n) {
@@ -322,6 +299,35 @@ static void eraseDroppedYields(Operation *op, ArrayRef<bool> keep) {
 }
 
 static bool eraseDeadTokenSlots(EmitCtx &ctx, MutableArrayRef<GroupDag> groups) {
+  std::function<bool(Value, DenseSet<Value> &)> hasRealUse =
+      [&](Value value, DenseSet<Value> &seen) -> bool {
+    if (!seen.insert(value).second)
+      return false;
+    for (OpOperand &use : value.getUses()) {
+      Operation *owner = use.getOwner();
+      if (auto yield = dyn_cast<scf::YieldOp>(owner)) {
+        Operation *parent = yield->getParentOp();
+        unsigned index = use.getOperandNumber();
+        if (index < parent->getNumResults() &&
+            hasRealUse(parent->getResult(index), seen))
+          return true;
+        continue;
+      }
+      if (auto nested = dyn_cast<scf::ForOp>(owner)) {
+        unsigned operand = use.getOperandNumber();
+        if (operand >= 3) {
+          unsigned index = operand - 3;
+          if (index < nested.getNumRegionIterArgs() &&
+              (hasRealUse(nested.getRegionIterArg(index), seen) ||
+               hasRealUse(nested.getResult(index), seen)))
+            return true;
+          continue;
+        }
+      }
+      return true;
+    }
+    return false;
+  };
   bool changed = false;
   SmallVector<scf::ForOp> fors;
   SmallVector<scf::IfOp> ifs;
@@ -360,11 +366,16 @@ static bool eraseDeadTokenSlots(EmitCtx &ctx, MutableArrayRef<GroupDag> groups) 
   for (scf::ForOp forOp : fors) {
     SmallVector<bool> keep(forOp.getNumResults(), true);
     bool any = false;
-    for (auto [i, res] : llvm::enumerate(forOp.getResults()))
-      if (res.getType() == ctx.tokenType && res.use_empty() && forOp.getRegionIterArg(i).use_empty()) {
+    for (auto [i, res] : llvm::enumerate(forOp.getResults())) {
+      DenseSet<Value> seen;
+      BlockArgument arg = forOp.getRegionIterArg(i);
+      if (res.getType() == ctx.tokenType && res.use_empty() &&
+          !hasRealUse(arg, seen)) {
+        arg.replaceAllUsesWith(ctx.poison);
         keep[i] = false;
         any = true;
       }
+    }
     if (!any)
       continue;
     SmallVector<Value> keptInits;
@@ -504,9 +515,9 @@ static void refreshAliasResultTypes(Operation *op, Value source) {
           resultType,
           cast<gpu::MemDescType>(source.getType()).getMutableMemory()));
 }
-static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs, Node *node,
-                     const Touch &t, Operation *accessOp,
-                     const Owner &owner) {
+static FailureOr<Value> getView(EmitCtx &ctx, GroupDag &g, RenderState &rs,
+                                Node *node, const Touch &t,
+                                Operation *accessOp, const Owner &owner) {
   auto it = rs.view.find(t.member);
   Value base;
   int64_t viewOwner = ownerKey(owner);
@@ -522,18 +533,24 @@ static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs, Node *node,
       else
         types.push_back(localViewType(g, static_cast<MemberId>(mi), {&t}, bt));
     }
-    bool reusesToken = nodeReusesToken(node, owner);
-    const RenderState::Token *token =
-        node->tokenSource ? rs.tokenForSource(node->tokenSource) : rs.lastToken();
-    assert(token && "no capability for the recorded token source");
+    if (!node->tokenSource)
+      return semaError(accessOp)
+             << "buffer access has no exact token producer";
+    const RenderState::Token *token = rs.tokenForSource(node->tokenSource);
+    if (!token)
+      return semaError(accessOp)
+             << "buffer access cannot resolve its exact token producer";
+    if (token->ref.owner && !sameOwner(owner, token->ref.owner))
+      return semaError(accessOp)
+             << "buffer access token belongs to another partition";
     Value tok = token->value;
     Value semaVal = token->sema;
-    assert(tok && "no token for view");
-    assert(semaVal && "no semaphore for token");
+    if (!tok || !semaVal)
+      return semaError(accessOp) << "buffer access has an incomplete token";
     auto buf = emitInto<nvws::SemaphoreBufferOp>(
         b, accessOp->getLoc(), owner, gpu::getStageCluster(accessOp), semaVal, TypeRange(types), tok);
-    if (reusesToken)
-      ctx.reusedTokenBufferOps.insert(buf.getOperation());
+    if (rs.releasedSources.contains(node->tokenSource))
+      ctx.exactReuseBufferOps.insert(buf.getOperation());
     if (node->bufferStageOffset)
       buf.setStage(materializeI32Before(buf, *node->bufferStageOffset));
     for (auto [mi, v] : llvm::enumerate(buf.getBuffers()))
@@ -559,42 +576,24 @@ static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs, Node *node,
 }
 
 static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
-                                 RenderState &rs,
-                                 DenseMap<Node *, Value> &emitted);
-static void seedRegionEntry(RenderState &state, Node *head) {
-  if (!head || head->pieceInfo.empty())
-    return;
-  std::optional<Owner> owner = uniformPieceOwner(head);
-  if (!owner) {
-    state.clearTokens();
-    return;
-  }
-  if (owner->has_value() && state.lastToken() &&
-      !state.lastToken()->ref.owner) {
-    RenderState::Token adopted = *state.lastToken();
-    adopted.ref.owner = *owner;
-    state.keepOnly(adopted);
-  } else if (RenderState::Token *token = state.tokenForOwner(*owner)) {
-    state.keepOnly(*token);
-  } else {
-    state.clearTokens();
-  }
-}
-static Operation *renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
-                               RenderState &rs) {
+                                 RenderState &rs);
+static FailureOr<Operation *> renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
+                                           RenderState &rs) {
   Operation *op = n->op;
   Operation *anchor = op;
   for (const Touch &t : n->touches) {
-    Value view = getView(ctx, g, rs, n, t, op, n->owner);
+    FailureOr<Value> view = getView(ctx, g, rs, n, t, op, n->owner);
+    if (failed(view))
+      return failure();
     if (auto ta = dyn_cast<nvidia_gpu::TMEMAllocOp>(op)) {
       OpBuilder b(op);
       auto pidsc = std::make_pair(n->owner, gpu::getStageCluster(op));
       auto vTrue = emitInto<arith::ConstantOp>(b, op->getLoc(), n->owner, pidsc.second, b.getBoolAttr(true));
-      anchor = emitInto<nvidia_gpu::TMEMStoreOp>(b, op->getLoc(), n->owner, pidsc.second, Type(), view,
+      anchor = emitInto<nvidia_gpu::TMEMStoreOp>(b, op->getLoc(), n->owner, pidsc.second, Type(), *view,
                                                  Value(), ta.getSrc(), vTrue);
-      ta.getResult().replaceUsesWithIf(view, [&](OpOperand &use) {
+      ta.getResult().replaceUsesWithIf(*view, [&](OpOperand &use) {
         return !isa<nvws::SemaphoreCreateOp>(use.getOwner()) &&
-               use.getOwner() != view.getDefiningOp() &&
+               use.getOwner() != view->getDefiningOp() &&
                !g.accessNodeOps.contains(use.getOwner());
       });
       return anchor;
@@ -604,11 +603,11 @@ static Operation *renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
       Value src = la.getSrc();
       if (src && !isa<RankedTensorType>(src.getType())) {
         auto splat = emitInto<triton::SplatOp>(b, op->getLoc(), n->owner, gpu::getStageCluster(op),
-            RankedTensorType::get(cast<gpu::MemDescType>(view.getType()).getShape(), src.getType()), src);
+            RankedTensorType::get(cast<gpu::MemDescType>(view->getType()).getShape(), src.getType()), src);
         src = splat.getResult();
       }
-      anchor = emitInto<gpu::LocalStoreOp>(b, op->getLoc(), n->owner, gpu::getStageCluster(op), src, view);
-      la.getResult().replaceUsesWithIf(view, [&](OpOperand &use) {
+      anchor = emitInto<gpu::LocalStoreOp>(b, op->getLoc(), n->owner, gpu::getStageCluster(op), src, *view);
+      la.getResult().replaceUsesWithIf(*view, [&](OpOperand &use) {
         return !isa<nvws::SemaphoreCreateOp>(use.getOwner()) &&
                !g.accessNodeOps.contains(use.getOwner());
       });
@@ -616,15 +615,15 @@ static Operation *renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
     }
     if (auto mma = dyn_cast<nvidia_gpu::MMAv5OpInterface>(op)) {
       if (mma.getAccumulator() == t.accessValue)
-        mma.setAccumulator(view);
+        mma.setAccumulator(*view);
       for (OpOperand &o : op->getOpOperands())
         if (o.get() == t.accessValue && o.get() != mma.getAccumulator())
-          o.set(view);
+          o.set(*view);
       continue;
     }
     for (OpOperand &o : op->getOpOperands())
       if (o.get() == t.accessValue)
-        o.set(view);
+        o.set(*view);
   }
   if (n->completionAnchor)
     anchor = n->completionAnchor;
@@ -632,24 +631,35 @@ static Operation *renderAccess(EmitCtx &ctx, GroupDag &g, Node *n,
 }
 
 static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
-                                  RenderState &rs,
-                                  DenseMap<Node *, Value> &emitted) {
+                                  RenderState &rs) {
   std::optional<RenderState::Token> incoming;
   if (n->flow) {
-    if (n->flow->owner && rs.lastToken() &&
-        !rs.lastToken()->ref.owner) {
-      incoming = *rs.lastToken();
-      incoming->ref.owner = n->flow->owner;
-    } else if (auto *token = rs.tokenForOwner(n->flow->owner)) {
-      incoming = *token;
+    bool needsIncoming = n->kind == Node::For ||
+                         (n->kind == Node::If && n->children.size() < 2) ||
+                         llvm::is_contained(n->flow->exits, nullptr);
+    if (n->tokenSource) {
+      if (const auto *token = rs.tokenForSource(n->tokenSource))
+        incoming = *token;
+      else
+        return semaError(n->op)
+               << "threaded region cannot resolve its incoming token producer";
+      if (incoming->ref.owner &&
+          !sameOwner(incoming->ref.owner, n->flow->owner))
+        return semaError(n->op)
+               << "threaded region input belongs to another partition";
+    } else if (needsIncoming) {
+      return semaError(n->op)
+             << "pass-through region has no exact incoming token producer";
     }
   }
   std::optional<TokenRef> resultRef;
   if (n->flow) {
-    if (!n->flow->resultSema)
+    std::optional<SemaId> channel =
+        incoming ? std::optional<SemaId>(incoming->ref.sema) : n->flow->sema;
+    if (!channel)
       return semaError(n->op)
              << "region has no statically selected semaphore channel";
-    resultRef = TokenRef{n, *n->flow->resultSema, n->flow->owner};
+    resultRef = TokenRef{n, *channel, n->flow->owner};
   }
   if (!n->requiredParts.empty() && gpu::hasPartition(n->op)) {
     SetVector<int> set = gpu::getPartitionIds(n->op);
@@ -661,6 +671,14 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
   }
   if (auto forOp = dyn_cast<scf::ForOp>(n->op)) {
     RenderState body = rs.nested();
+    if (!n->flow && n->tokenSource) {
+      const RenderState::Token *capture = rs.tokenForSource(n->tokenSource);
+      if (!capture)
+        return semaError(n->op)
+               << "capturing loop cannot resolve its incoming token producer";
+      body.aliasToken(capture->value, capture->sema,
+                      TokenRef{n, capture->ref.sema, capture->ref.owner});
+    }
     if (n->flow) {
       if (!resultRef || !incoming)
         return semaError(n->op)
@@ -670,11 +688,18 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
       RenderState::Token carrier{
           forOp.getRegionIterArg(idx), g.semas[resultRef->sema].create,
           *resultRef};
-      body.keepOnly(carrier);
-    } else {
-      seedRegionEntry(body, n->children[0]);
+      body.recordToken(carrier.value, carrier.sema, carrier.ref);
+      // The loop carrier is the exact dynamic substitution for its incoming
+      // producer.  Child nodes were constructed against that producer before
+      // the enclosing flow result was known, so retain the producer identity
+      // as an alias of the same SSA carrier until a new same-owner token is
+      // acquired in the body.
+      if (n->tokenSource && n->tokenSource != n)
+        body.aliasToken(carrier.value, carrier.sema,
+                        TokenRef{n->tokenSource, resultRef->sema,
+                                 resultRef->owner});
     }
-    if (failed(renderChain(ctx, g, n->children[0], body, emitted)))
+    if (failed(renderChain(ctx, g, n->children[0], body)))
       return failure();
     auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
     if (n->flow) {
@@ -693,27 +718,53 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
       RenderState::Token result{
           forOp.getResult(idx), g.semas[resultRef->sema].create,
           *resultRef};
-      rs.keepOnly(result);
+      rs.recordToken(result.value, result.sema, result.ref);
+      if (n->tokenSource && n->tokenSource != n)
+        rs.aliasToken(result.value, result.sema,
+                      TokenRef{n->tokenSource, resultRef->sema,
+                               resultRef->owner});
+      if (final && final != n)
+        rs.aliasToken(result.value, result.sema,
+                      TokenRef{final, resultRef->sema, resultRef->owner});
+    }
+    if (!n->flow && n->tokenSource) {
+      const RenderState::Token *capture = rs.tokenForSource(n->tokenSource);
+      if (!capture)
+        return semaError(n->op)
+               << "capturing loop lost its exact incoming token producer";
+      rs.aliasToken(capture->value, capture->sema,
+                    TokenRef{n, capture->ref.sema, capture->ref.owner});
     }
     rs.clearViews();
     return success();
   }
   auto ifOp = cast<scf::IfOp>(n->op);
+  if (!ifOp.elseBlock() && n->children.size() > 1 && n->children[1]) {
+    Block &block = ifOp.getElseRegion().emplaceBlock();
+    OpBuilder b = OpBuilder::atBlockEnd(&block);
+    scf::YieldOp::create(b, ifOp.getLoc());
+  }
   RenderState thenSt = rs.nested(), elseSt = rs.nested();
-  seedRegionEntry(thenSt, n->children[0]);
-  if (n->children.size() > 1 && n->children[1])
-    seedRegionEntry(elseSt, n->children[1]);
-  if (failed(renderChain(ctx, g, n->children[0], thenSt, emitted)))
+  if (n->tokenSource) {
+    const RenderState::Token *capture = rs.tokenForSource(n->tokenSource);
+    if (!capture)
+      return semaError(n->op)
+             << "conditional cannot resolve its incoming token producer";
+    TokenRef boundary{n, capture->ref.sema, capture->ref.owner};
+    thenSt.aliasToken(capture->value, capture->sema, boundary);
+    elseSt.aliasToken(capture->value, capture->sema, boundary);
+  }
+  if (failed(renderChain(ctx, g, n->children[0], thenSt)))
     return failure();
   if (n->children.size() > 1 && n->children[1])
-    if (failed(renderChain(ctx, g, n->children[1], elseSt, emitted)))
+    if (failed(renderChain(ctx, g, n->children[1], elseSt)))
       return failure();
   if (n->flow) {
     const RegionFlow &c = *n->flow;
     if (!resultRef)
-      return semaError(n->op) << "threaded if lacks an exact result capability";
+      return semaError(n->op) << "threaded if lacks an exact result token";
     unsigned idx = slotIndexFor(ctx, n->op, &g);
-    auto exitCapability = [&](unsigned branch, RenderState &state)
+    auto exitToken = [&](unsigned branch, RenderState &state)
         -> const RenderState::Token * {
       Node *final = branch < c.exits.size() ? c.exits[branch] : nullptr;
       if (!final)
@@ -723,11 +774,10 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
         return nullptr;
       return state.tokenForProducer(final, resultRef->owner);
     };
-    const RenderState::Token *thenToken = exitCapability(0, thenSt);
-    const RenderState::Token *elseToken = exitCapability(1, elseSt);
+    const RenderState::Token *thenToken = exitToken(0, thenSt);
+    const RenderState::Token *elseToken = exitToken(1, elseSt);
     if (!thenToken || !elseToken)
-      return semaError(n->op)
-             << "if path exports no exact compatible capability";
+      return semaError(n->op) << "if path exports no exact compatible token";
     auto thenYield = cast<scf::YieldOp>(ifOp.thenBlock()->getTerminator());
     thenYield->setOperand(idx, thenToken->value);
     auto elseYield = cast<scf::YieldOp>(ifOp.elseBlock()->getTerminator());
@@ -735,33 +785,47 @@ static LogicalResult renderRegion(EmitCtx &ctx, GroupDag &g, Node *n,
     RenderState::Token result{ifOp.getResult(idx),
                                    g.semas[resultRef->sema].create,
                                    *resultRef};
-    rs.keepOnly(result);
+    rs.recordToken(result.value, result.sema, result.ref);
+    for (Node *final : c.exits)
+      if (final && final != n)
+        rs.aliasToken(result.value, result.sema,
+                      TokenRef{final, resultRef->sema, resultRef->owner});
   }
   rs.clearViews();
   return success();
 }
 
 static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
-                                 RenderState &rs,
-                                 DenseMap<Node *, Value> &emitted) {
+                                 RenderState &rs) {
   Operation *lastReal = nullptr;
   for (Node *n = head; n; n = n->next) {
-    if (n->kind == Node::Access || n->kind == Node::Release) {
-      RenderState::Token *owned = n->owner
-          ? rs.tokenForOwner(n->owner) : nullptr;
-      const RenderState::Token *active = rs.lastToken();
-      bool consumes = n->kind == Node::Release || nodeTouchesGroup(g, n);
-      if (n->reuseTokenOwner && !owned)
+    if (n->kind == Node::Release ||
+        (n->kind == Node::Access && nodeTouchesGroup(g, n))) {
+      const RenderState::Token *source =
+          n->tokenSource ? rs.tokenForSource(n->tokenSource) : nullptr;
+      if (!source) {
+        InFlightDiagnostic diag = semaError(n->op ? n->op : g.root->op)
+            << "buffer consumer cannot resolve its exact token producer; "
+            << "consumer kind=" << static_cast<unsigned>(n->kind)
+            << " owner="
+            << ownerStr(n->op ? n->op : g.root->op, n->owner);
+        if (n->tokenSource)
+          diag << " source kind="
+               << static_cast<unsigned>(n->tokenSource->kind)
+               << " source owner="
+               << ownerStr(n->op ? n->op : g.root->op,
+                           n->tokenSource->owner);
+        diag << " live=";
+        for (const RenderState::Token &token : rs.tokens)
+          diag << static_cast<unsigned>(token.ref.producer->kind) << ":"
+               << ownerStr(n->op ? n->op : g.root->op, token.ref.owner)
+               << ",";
+        return failure();
+      }
+      if (source->ref.owner &&
+          !sameOwner(n->owner, source->ref.owner))
         return semaError(n->op ? n->op : g.root->op)
-               << "token-reuse node names no live capability for its owner";
-      if (consumes && !active && !owned)
-        return semaError(n->op ? n->op : g.root->op)
-               << "buffer use has no live semaphore capability";
-      if (consumes && n->owner && active && active->ref.owner &&
-          !sameOwner(active->ref.owner, n->owner) &&
-          !(nodeReusesToken(n, n->owner) && owned))
-        return semaError(n->op ? n->op : g.root->op)
-               << "buffer use consumes another partition's capability";
+               << "buffer consumer token belongs to another partition";
     }
     switch (n->kind) {
     case Node::Enter:
@@ -771,12 +835,6 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
       const Sema &sema = getSema(g, n);
       Owner tokenOwner =
           sema.isEntry && !n->owner ? sema.entryTokenOwner : n->owner;
-      if (Value v = emitted.lookup(n)) { // pre-rendered entry instance
-        rs.recordToken(v, sema.create,
-                       TokenRef{n, n->sema, tokenOwner});
-        rs.clearViews();
-        break;
-      }
       Operation *before = nextRealOp(n->next);
       OpBuilder b(ctx.func);
       if (before) {
@@ -785,16 +843,17 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
         b.setInsertionPoint(lastReal->getBlock()->getTerminator());
       } else if (lastReal) {
         b.setInsertionPointAfter(lastReal);
-      } else if (n->parent && n->parent->op) {
-        Region &region = n->parent->op->getRegion(0);
-        b.setInsertionPoint(region.front().getTerminator());
+      } else if (Block *block = chainBlock(n)) {
+        b.setInsertionPoint(block->getTerminator());
+      } else {
+        return semaError(ctx.func)
+               << "acquire has no exact containing block";
       }
       auto acq = emitInto<nvws::SemaphoreAcquireOp>(
           b, before ? before->getLoc() : ctx.func.getLoc(), n->owner,
           n->stageCluster, sema.create, ctx.tokenType);
       if (n->stageOffset)
         acq.setStage(materializeI32Before(acq, *n->stageOffset));
-      emitted[n] = acq.getToken();
       rs.recordToken(acq.getToken(), sema.create,
                      TokenRef{n, n->sema, tokenOwner});
       rs.clearViews();
@@ -802,36 +861,46 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
       break;
     }
     case Node::Release: {
-      const RenderState::Token *source =
-          n->tokenSource ? rs.tokenForSource(n->tokenSource) : rs.lastToken();
-      assert(source && "release without a live token for its recorded source");
+      if (!n->tokenSource)
+        return semaError(n->op ? n->op : g.root->op)
+               << "release has no exact token producer";
+      const RenderState::Token *source = rs.tokenForSource(n->tokenSource);
+      if (!source)
+        return semaError(n->op ? n->op : g.root->op)
+               << "release cannot resolve its exact token producer";
       Value tok = source->value;
-      assert(tok && "release without token");
+      if (!tok)
+        return semaError(n->op ? n->op : g.root->op)
+               << "release token producer has no rendered token";
+      rs.releasedSources.insert(n->tokenSource);
       OpBuilder b(ctx.func);
       if (lastReal)
         b.setInsertionPointAfter(lastReal);
-      else if (n->parent && n->parent->op)
-        b.setInsertionPointToStart(&n->parent->op->getRegion(0).front());
+      else if (Block *block = chainBlock(n))
+        b.setInsertionPointToStart(block);
       else
-        b.setInsertionPointToStart(&ctx.func.getBody().front());
+        return semaError(ctx.func)
+               << "release has no exact containing block";
       auto rel = emitInto<nvws::SemaphoreReleaseOp>(
           b, lastReal ? lastReal->getLoc() : ctx.func.getLoc(), n->owner,
           n->stageCluster, getSema(g, n).create, tok, asyncOpsAttr(b.getContext(), n));
       if (n->stageOffset)
         rel.setStage(materializeI32Before(rel, *n->stageOffset));
       rel.setArriveCountAttr(b.getI32IntegerAttr(n->count));
-      emitted[n] = Value();
       lastReal = rel;
       break;
     }
     case Node::Access: {
-      if (Operation *anchor = renderAccess(ctx, g, n, rs))
-        lastReal = anchor;
+      FailureOr<Operation *> anchor = renderAccess(ctx, g, n, rs);
+      if (failed(anchor))
+        return failure();
+      if (*anchor)
+        lastReal = *anchor;
       break;
     }
     case Node::For:
     case Node::If:
-      if (failed(renderRegion(ctx, g, n, rs, emitted)))
+      if (failed(renderRegion(ctx, g, n, rs)))
         return failure();
       lastReal = n->op;
       break;
@@ -1036,187 +1105,6 @@ static LogicalResult foldCircularGroups(MutableArrayRef<GroupDag> groups) {
   return success();
 }
 
-struct IfSplitCandidate {
-  scf::IfOp ifOp;
-  bool branchIsThen = true;
-  nvws::SemaphoreReleaseOp releaseOp;
-  nvws::SemaphoreAcquireOp acquireOp;
-  unsigned tokenResultIdx = 0;
-  bool releaseOnly = false;
-};
-static nvws::SemaphoreReleaseOp findBranchReleaseForSplit(Block *block) {
-  for (Operation &op : *block) {
-    if (isa<scf::YieldOp>(op))
-      return nullptr;
-    if (auto rel = dyn_cast<nvws::SemaphoreReleaseOp>(&op))
-      return rel;
-    if (isa<nvws::SemaphoreAcquireOp>(op))
-      return nullptr;
-    if (op.hasTrait<OpTrait::ConstantLike>() || isSupportedAliasOp(&op))
-      continue;
-    return nullptr;
-  }
-  return nullptr;
-}
-static nvws::SemaphoreAcquireOp findBranchTrailingAcquire(Block *block) {
-  return dyn_cast_or_null<nvws::SemaphoreAcquireOp>(block->getTerminator()->getPrevNode());
-}
-static bool branchHasAcquireAfter(nvws::SemaphoreReleaseOp rel) {
-  for (Operation *op = rel->getNextNode(); op; op = op->getNextNode()) {
-    if (isa<scf::YieldOp>(op))
-      return false;
-    if (isa<nvws::SemaphoreAcquireOp>(op))
-      return true;
-  }
-  return false;
-}
-static gpu::StageCluster inferPrecedingMmaStage(scf::IfOp ifOp) {
-  for (Operation *op = ifOp->getPrevNode(); op; op = op->getPrevNode())
-    if (isa<nvidia_gpu::MMAv5OpInterface>(op))
-      return gpu::getStageCluster(op);
-  return {};
-}
-static bool semaUsesTmem(Value sem) {
-  auto ty = dyn_cast<nvws::SemaphoreType>(sem.getType());
-  if (!ty || ty.getBaseType().empty())
-    return false;
-  auto md = dyn_cast<gpu::MemDescType>(ty.getBaseType()[0]);
-  return md && isa<nvidia_gpu::TensorMemorySpaceAttr>(md.getMemorySpace());
-}
-static unsigned semaBaseTypeCount(Value sem) {
-  auto ty = dyn_cast<nvws::SemaphoreType>(sem.getType());
-  return ty ? ty.getBaseType().size() : 0;
-}
-static void assignStageIfKnown(OpBuilder &b, Operation *op, gpu::StageCluster sc) {
-  if (sc)
-    gpu::setStageCluster(b, op, sc);
-}
-static std::optional<unsigned> yieldedTokenIndex(scf::YieldOp yield, Value token) {
-  for (auto [index, value] : llvm::enumerate(yield.getOperands()))
-    if (value == token)
-      return index;
-  return std::nullopt;
-}
-
-static void workaroundLoopScheduler(EmitCtx &ctx) {
-  SmallVector<IfSplitCandidate> candidates;
-  ctx.func.walk([&](scf::IfOp ifOp) {
-    if (ifOp.thenBlock()->empty())
-      return;
-    auto makeCandidate = [&](bool branchIsThen, bool releaseOnly) -> std::optional<IfSplitCandidate> {
-      if (!branchIsThen && ifOp.getElseRegion().empty())
-        return std::nullopt;
-      Block *block = branchIsThen ? ifOp.thenBlock() : ifOp.elseBlock();
-      auto rel = findBranchReleaseForSplit(block);
-      if (!rel)
-        return std::nullopt;
-      if (releaseOnly) {
-        if (!(semaUsesTmem(rel.getSemaphore()) && branchHasAcquireAfter(rel)))
-          return std::nullopt;
-        return IfSplitCandidate{ifOp, branchIsThen, rel, {}, 0, true};
-      }
-      auto acq = findBranchTrailingAcquire(block);
-      if (!acq)
-        return std::nullopt;
-      if (semaUsesTmem(rel.getSemaphore()) && semaBaseTypeCount(rel.getSemaphore()) > 1)
-        return std::nullopt;
-      auto yieldOp = branchIsThen ? ifOp.thenYield() : ifOp.elseYield();
-      std::optional<unsigned> pos = yieldedTokenIndex(yieldOp, acq.getToken());
-      if (!pos)
-        return std::nullopt;
-      return IfSplitCandidate{ifOp, branchIsThen, rel, acq, *pos, false};
-    };
-    for (bool releaseOnly : {false, true})
-      for (bool branchIsThen : {true, false})
-        if (auto c = makeCandidate(branchIsThen, releaseOnly)) {
-          candidates.push_back(*c);
-          return;
-        }
-    if (auto acq = dyn_cast_or_null<nvws::SemaphoreAcquireOp>(&ifOp.thenBlock()->front())) {
-      Operation *prev = ifOp->getPrevNode();
-      if (prev && ifOp.getCondition().getDefiningOp() == prev)
-        prev = prev->getPrevNode();
-      if (auto rel = dyn_cast_or_null<nvws::SemaphoreReleaseOp>(prev)) {
-        std::optional<unsigned> pos = yieldedTokenIndex(ifOp.thenYield(), acq.getToken());
-        if (pos)
-          candidates.push_back(IfSplitCandidate{ifOp, true, rel, acq, *pos, false});
-      }
-    }
-  });
-  for (IfSplitCandidate &c : candidates) {
-    scf::IfOp ifOp = c.ifOp;
-    OpBuilder b(ifOp);
-    Location loc = ifOp.getLoc();
-    auto exitIf = scf::IfOp::create(b, loc, TypeRange{}, ifOp.getCondition(),
-                                    /*withElseRegion=*/!c.branchIsThen);
-    Block *exitBlock = c.branchIsThen ? exitIf.thenBlock() : exitIf.elseBlock();
-    c.releaseOp->moveBefore(exitBlock, exitBlock->begin());
-    exitIf->setAttrs(ifOp->getAttrs());
-    gpu::StageCluster releaseStage = gpu::getStageCluster(c.releaseOp);
-    if (!releaseStage)
-      releaseStage = inferPrecedingMmaStage(ifOp);
-    assignStageIfKnown(b, c.releaseOp, releaseStage);
-    assignStageIfKnown(b, exitIf, releaseStage);
-    SetVector<int> exitIds = partitionIdsOfFwd(c.releaseOp);
-    if (exitIds.empty())
-      exitIds = partitionIdsOfFwd(ifOp);
-    if (!exitIds.empty())
-      gpu::setPartition(exitIf, exitIds.getArrayRef());
-    gpu::setPartitionOutputs(exitIf, {});
-    if (c.releaseOnly)
-      continue;
-    b.setInsertionPointAfter(ifOp);
-    auto enterIf = scf::IfOp::create(b, loc, TypeRange{ctx.tokenType}, ifOp.getCondition(),
-                                     /*withElseRegion=*/true);
-    Block *acqBlock = c.branchIsThen ? enterIf.thenBlock() : enterIf.elseBlock();
-    c.acquireOp->moveBefore(acqBlock, acqBlock->begin());
-    ifOp.getResult(c.tokenResultIdx).replaceAllUsesWith(enterIf.getResult(0));
-    b.setInsertionPointToEnd(enterIf.thenBlock());
-    scf::YieldOp::create(b, loc, ValueRange{c.branchIsThen ? Value(c.acquireOp.getToken())
-                       : ifOp.thenYield().getOperand(c.tokenResultIdx)});
-    b.setInsertionPointToEnd(enterIf.elseBlock());
-    scf::YieldOp::create(b, loc, ValueRange{c.branchIsThen ? ifOp.elseYield().getOperand(c.tokenResultIdx)
-                       : Value(c.acquireOp.getToken())});
-    b.setInsertionPoint(ifOp);
-    Value poison = ub::PoisonOp::create(b, loc, ctx.tokenType).getResult();
-    ifOp.thenYield().setOperand(c.tokenResultIdx, poison);
-    ifOp.elseYield().setOperand(c.tokenResultIdx, poison);
-    enterIf->setAttrs(ifOp->getAttrs());
-    gpu::StageCluster acquireStage = gpu::getStageCluster(c.acquireOp);
-    assignStageIfKnown(b, enterIf, acquireStage);
-    SetVector<int> enterExitIds = partitionIdsOfFwd(c.releaseOp);
-    for (int p : partitionIdsOfFwd(c.acquireOp))
-      enterExitIds.insert(p);
-    if (!enterExitIds.empty()) {
-      gpu::setPartition(exitIf, enterExitIds.getArrayRef());
-      gpu::setPartition(enterIf, enterExitIds.getArrayRef());
-      gpu::setPartitionOutputs(exitIf, {});
-      SmallVector<SetVector<int>, 1> enterOutputs{enterExitIds};
-      gpu::setPartitionOutputs(enterIf, enterOutputs);
-    }
-    SetVector<int> middleIds;
-    for (Region *region : {&ifOp.getThenRegion(), &ifOp.getElseRegion()}) {
-      if (region->empty())
-        continue;
-      for (Operation &op : region->front()) {
-        if (isa<scf::YieldOp>(op))
-          continue;
-        for (int p : partitionIdsOfFwd(&op))
-          middleIds.insert(p);
-      }
-    }
-    auto authored = gpu::getPartitionOutputs(ifOp);
-    for (auto [i, o] : llvm::enumerate(authored)) {
-      if (i == c.tokenResultIdx)
-        continue; // dead after the reroute; dropped by the sweep
-      for (int p : o)
-        middleIds.insert(p);
-    }
-    if (!middleIds.empty())
-      gpu::setPartition(ifOp, middleIds.getArrayRef());
-  }
-}
-
 static LogicalResult verifyPartitionOutputs(triton::FuncOp func) {
   constexpr llvm::StringLiteral kOutputs = "ttg.partition.outputs";
   auto producerIds = [&](Value v) -> SetVector<int> {
@@ -1352,7 +1240,7 @@ static LogicalResult verifyTokenLocality(triton::FuncOp func) {
 }
 static LogicalResult
 verifyNoUseAfterRelease(triton::FuncOp funcOp,
-                        const DenseSet<Operation *> &reusedTokenBufferOps) {
+                        const DenseSet<Operation *> &exactReuseBufferOps) {
   auto checkToken = [&](Value tok) -> LogicalResult {
     llvm::SmallDenseMap<Block *, SmallVector<Operation *, 4>> byBlock;
     for (Operation *u : tok.getUsers())
@@ -1366,7 +1254,7 @@ verifyNoUseAfterRelease(triton::FuncOp funcOp,
         if (isa<nvws::SemaphoreReleaseOp>(u))
           sawRelease = true;
         else if (sawRelease && isa<nvws::SemaphoreBufferOp>(u) &&
-                 !reusedTokenBufferOps.contains(u))
+                 !exactReuseBufferOps.contains(u))
           return semaError(u) << "token has a buffer view after its release "
                     "(use-after-release; spec fable/semas-report3.md Addendum B.3(b))";
       }
@@ -1452,26 +1340,14 @@ LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups) {
     }
   while (eraseDeadTokenSlots(ctx, groups)) {
   }
-  DenseMap<Node *, Value> emitted;
   for (GroupDag &g : groups)
     emitBackingsAndCreates(ctx, g);
-  for (GroupDag &g : groups)
-    if (!g.semas.empty())
-      emitEntryAcquires(ctx, g, emitted);
   rewriteSignatures(ctx, groups);
   for (GroupDag &g : groups) {
     if (g.semas.empty())
       continue;
     RenderState rs;
-    for (Node *n = g.root->children[0]; n; n = n->next)
-      if (n->kind == Node::Acquire && emitted.count(n)) {
-        const Sema &sema = getSema(g, n);
-        Owner owner =
-            sema.isEntry && !n->owner ? sema.entryTokenOwner : n->owner;
-        rs.recordToken(emitted.lookup(n), sema.create,
-                       TokenRef{n, n->sema, owner});
-      }
-    if (failed(renderChain(ctx, g, g.root->children[0], rs, emitted)))
+    if (failed(renderChain(ctx, g, g.root->children[0], rs)))
       return failure();
   }
   if (failed(foldCircularGroups(groups)))
@@ -1480,11 +1356,6 @@ LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups) {
     coalesceBackings(g);
   if (failed(coalesceMixedDepthTmemBackings(groups)))
     return failure();
-  {
-    workaroundLoopScheduler(ctx);
-    while (eraseDeadTokenSlots(ctx, groups)) {
-    }
-  }
   {
     bool changed = true;
     while (changed) {
@@ -1508,13 +1379,17 @@ LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups) {
       if (m.allocOp && m.allocOp->getBlock() && m.allocOp->use_empty())
         m.allocOp->erase();
   }
+  // Managed buffer dependencies have all been rebuilt from exact semaphore
+  // tokens.  A poison can remain only on detached legacy token plumbing whose
+  // result is consumed by an unrelated opaque operation; keep the valid IR as
+  // the pre-refactor emitter did.  Structural dead slots are removed above.
   if (ctx.poison.use_empty())
     ctx.poison.getDefiningOp()->erase();
   if (failed(verifyPartitionOutputs(funcOp)))
     return failure();
   if (failed(verifyTokenLocality(funcOp)))
     return failure();
-  if (failed(verifyNoUseAfterRelease(funcOp, ctx.reusedTokenBufferOps)))
+  if (failed(verifyNoUseAfterRelease(funcOp, ctx.exactReuseBufferOps)))
     return failure();
   if (failed(verifySingleTokenSlotPerGroup(funcOp)))
     return failure();

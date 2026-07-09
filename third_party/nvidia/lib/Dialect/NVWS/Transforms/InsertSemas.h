@@ -85,10 +85,10 @@ struct TokenRef {
 struct RegionFlow {
   Owner owner;
   SmallVector<Node *, 2> exits; // nullptr means pass the ENTER token
-  // Render channel of the region's token result, resolved directly by the
-  // token sweep: the incoming record's semaphore when one exists, otherwise
-  // the first branch final's concrete semaphore.
-  std::optional<SemaId> resultSema;
+  // Render channel of the region's token result.  Placement records only the
+  // exact path producers; channel formation fills this after every acquire
+  // and release has its final location.
+  std::optional<SemaId> sema;
 };
 
 struct Node {
@@ -107,10 +107,10 @@ struct Node {
   gpu::StageCluster stageCluster;
   std::optional<int64_t> stageOffset;
   std::optional<int64_t> bufferStageOffset;
-  // The SYNC-DAG proved that this node can reuse its owner's earlier token in
-  // the same chain without a fresh handoff. EmitIR renders this fact; it does
-  // not infer token-reuse eligibility on its own.
-  std::optional<int64_t> reuseTokenOwner;
+  // Exact distance for a recurrence demand.  In particular, a tail acquire
+  // can be lexically after its releases while supplying the next iteration;
+  // schedule analysis must not rediscover that fact from list order.
+  std::optional<int64_t> recurrenceDistance;
   // Exact token producer for this access or release: the acquire, region, or
   // inherited record whose token this node consumes. Assigned by the SYNC-DAG
   // token sweep; EmitIR routes by this fact and never guesses by owner.
@@ -120,16 +120,7 @@ struct Node {
   std::optional<RegionFlow> flow;
   SmallVector<int, 2> requiredParts;
   bool isRegion() const { return kind == For || kind == If; }
-  bool isProtocol() const { return kind == Acquire || kind == Release; }
 };
-inline void markTokenReuse(Node *n, const Owner &owner) {
-  assert(owner && n->owner && sameOwner(n->owner, owner));
-  n->reuseTokenOwner = ownerKey(owner);
-}
-inline bool nodeReusesToken(const Node *n, const Owner &owner) {
-  return owner && n->reuseTokenOwner &&
-         *n->reuseTokenOwner == ownerKey(owner);
-}
 inline SmallVector<std::pair<PieceId, PieceInfo>, 4>
 sortedPieceInfo(const Node *n) {
   SmallVector<std::pair<PieceId, PieceInfo>, 4> v(n->pieceInfo.begin(), n->pieceInfo.end());
@@ -175,7 +166,7 @@ struct PieceTable {
 
 struct Sema {
   std::string name;
-  unsigned count = 0, expectedArrivals = 0;
+  unsigned count = 0;
   bool isEntry = false;
   Owner entryTokenOwner;
   Value create;
