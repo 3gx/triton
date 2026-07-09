@@ -392,8 +392,8 @@ semaphore DAG for the same synchronization edges
                walk |                      |                 walk |
                     v                      |                      v
   release EMPTY, r1tok {1}                 |     release EMPTY, r2tok {2}
-              EMPTY |                      |                     | EMPTY
-                    +----------------------+---------------------+
+              EMPTY |                      |                      | EMPTY
+                    +----------------------+----------------------+
                                            v
                       acquire EMPTY(i+1) pending_count=2 {0}
                                       next |
@@ -498,18 +498,18 @@ semaphore DAG
                        +--------------------+--------------------+
                   walk |                                         | walk
                        v                                         v
-       release LEFT_READY, both {1}             release RIGHT_READY, both {1}
-            LEFT_READY |                              RIGHT_READY |
-                       v                                          v
+       release LEFT_READY, both {1}            release RIGHT_READY, both {1}
+            LEFT_READY |                             RIGHT_READY |
+                       v                                         v
           left = acquire LEFT_READY {2}             right = acquire RIGHT_READY {4}
                   walk |                                         | walk
                        v                                         v
              W m0(i) [left] {2}                         W m1(i) [right] {4}
                   walk |                                         | walk
                        v                                         v
-        release LEFT_FULL, left {2}              release RIGHT_FULL, right {4}
-             LEFT_FULL |                               RIGHT_FULL |
-                       v                                          v
+        release LEFT_FULL, left {2}             release RIGHT_FULL, right {4}
+             LEFT_FULL |                              RIGHT_FULL |
+                       v                                         v
          lread = acquire LEFT_FULL {3}             rread = acquire RIGHT_FULL {0}
                   walk |                                         | walk
                        v                                         v
@@ -536,50 +536,51 @@ before the acquire.
 
 ### Nested regions
 
-A region has one summary node in its parent node sequence and a separate node
-sequence for each child path:
+A nested `for` or `if` contains many reads and writes, but occupies one
+position among the surrounding nodes. The node at that position is called
+the region summary because it records, for every buffer piece, whether the
+child region reads or writes it and which owner appears at the child
+boundary. ACCESS-DAG therefore gives SYNC-DAG two views of the region:
 
 ```text
-parent nodes                     child nodes
-
-... -> [for or if summary] ...   ENTER -> child nodes -> EXIT
+parent view   ... -> [one region summary] -> ...
+child view           ENTER -> reads and writes -> EXIT
 ```
 
-The parent applies the normal read/write rules to the summary. Each child
-path starts with separate state for every piece. A read by a new owner
-receives an edge from `ENTER`, not directly from a parent access. `ENTER`
-itself creates no acquire or release.
-
-The child remembers which owner established the buffer contents before the
-region. If that owner is also the `ENTER` owner, `ENTER` keeps the
-asynchronous completion kinds; otherwise it uses `[none]`.
-
-When the piece may be used in the next iteration or after the region, `EXIT`
-receives an edge from the latest read or write by each other owner unless it
-is already ordered before the `EXIT` owner. The parent resumes from the state
-produced by its region summary; child uses never replace the parent's uses.
-
-After a region, tokens recorded before the region are no longer considered
-available. If the summary has one partition owner, the region node records a
-token for that owner. Otherwise it records no partition token, so a later
-access may need an edge solely to acquire one.
-
-An ordering established inside an `if` is valid afterward only when every
-path establishes it. A missing `else` leaves the incoming ordering unchanged.
-For a loop that may execute zero times, ordering established only in its body
-is not assumed after the loop.
+For example, `P0:W:{2}` means that the region writes P0 and has boundary owner
+`{2}` for that piece. The parent applies the ordinary read/write rules to
+this one node. Each child path is analyzed separately between its `ENTER` and
+`EXIT` nodes. ACCESS-DAG explains how the pass decides whether a region reads
+or writes each piece and how it chooses boundary owners in
+[Regions and boundaries](access-dag.md#regions-and-boundaries).
 
 ### Example: the same rules at two region levels
 
 `test/NVWS/insert_semas_release_count.mlir`
-`@release_multiplicity_unified_fanin_regain` contains an outer write by `{3}`
-and an inner loop summarized as a write by `{2}`.
-
-Parent synchronization edges:
+`@release_multiplicity_unified_fanin_regain` uses `m0`, which contains the
+single buffer piece P0. The function has this high-level shape:
 
 ```text
-p1: W m0 {3} -> [inner-for summary P0:W:{2}]
-p2: [inner-for summary P0:W:{2}] -> EXIT outer(i) {3}
+outer for
+  W m0 {3}
+
+  inner for
+    R m0 {2}
+    R m0 {1}
+    W m0 {1}
+    R m0 {0}
+```
+
+The inner loop's first P0 access has owner `{2}`, so `{2}` is its boundary
+owner. The inner loop also writes P0, so its parent summary is `P0:W:{2}`.
+The parent therefore sees only these four nodes:
+
+```text
+DAG node                              synchronization edge ending here
+ENTER outer(i) {3}                    none
+W m0 {3}                              none
+[inner for P0:W:{2}]                  p1: W m0 {3} -> inner for
+EXIT outer(i) {3}                     p2: inner for -> EXIT outer(i) {3}
 ```
 
 ```text
@@ -595,22 +596,18 @@ p2: [inner-for summary P0:W:{2}] -> EXIT outer(i) {3}
                          EXIT outer(i) {3}
 ```
 
-The child starts P0 at `ENTER inner(i) {2}` and applies exactly the same
-rules:
+The inner loop uses its actual reads and write rather than the summary node:
 
 ```text
-child synchronization edges
-  c1: ENTER inner(i) {2} -> R m0 {1}
-  c2: R m0 {2}          -> W m0 {1}
-  c3: W m0 {1}          -> R m0 {0}
-  c4: W m0 {1}          -> EXIT inner(i) {2}
-  c5: R m0 {0}          -> EXIT inner(i) {2}
+DAG node                 synchronization edge ending here
+ENTER inner(i) {2}       none
+R m0 {2}                 none
+R m0 {1}                 c1: ENTER inner(i) {2} -> R m0 {1}
+W m0 {1}                 c2: R m0 {2} -> W m0 {1}
+R m0 {0}                 c3: W m0 {1} -> R m0 {0}
+EXIT inner(i) {2}        c4: W m0 {1} -> EXIT inner(i) {2}
+                         c5: R m0 {0} -> EXIT inner(i) {2}
 ```
-
-`R m0 {2}` rereads the buffer contents present at `ENTER` and updates only
-`{2}`'s recorded use. The later write by `{1}` therefore waits for that read
-through `c2`. `R m0 {1}` is not the source of `c2` because it has the same
-owner as the write.
 
 ```text
                          ENTER inner(i) {2}
@@ -633,11 +630,244 @@ owner as the write.
                           EXIT inner(i) {2}
 ```
 
-Only `c1` through `c5` are synchronization edges. The two `walk` lines are
-program order.
-The parent and child piece states remain separate. Semaphore sharing between
-`p1` and the child edges to `EXIT` is explained in
+`R m0 {2}` reads with the `ENTER` owner, so it needs no synchronization edge.
+The other read of the incoming contents has owner `{1}`, so `c1` starts at
+`ENTER`. The later write by `{1}` waits for `{2}`'s read through `c2`; it does
+not wait for `{1}`'s read because that read has the same owner. Finally,
+`c4` and `c5` make the next inner iteration wait for the write by `{1}` and
+the read by `{0}`.
+
+The path through `c3` and `c5` already makes `EXIT` wait for `W m0 {1}`, so
+`c4` is removed. The remaining edges use four semaphores: `c1` uses `S1`,
+`c2` uses `S2`, `c3` uses `S3`, and `c5` uses `READY`. Parent edge `p1`
+releases `READY` for the first inner iteration; after that, `c5` releases it
+for the next inner iteration. Every acquire has `pending_count=1`.
+
+The diagram begins after at least one inner iteration has completed so it can
+show how `READY` crosses `EXIT` and `ENTER`. For the first inner iteration,
+`p1` supplies `ptok` before the inner loop, so there is no preceding inner
+`EXIT`.
+
+```text
+semaphore DAG for the inner loop
+
+                         ptok = acquire READY(i) {2}
+                                      ptok |
+                                           v
+                              EXIT inner(i-1) {2}
+                                           | next iteration
+                                           v
+                               ENTER inner(i) {2}
+                         +-----------------+-----------------+
+                    walk |                                   | walk
+                         v                                   v
+             release S1, ptok {2}                  R m0(i) [ptok] {2}
+                      S1 |                                   | walk
+                         v                                   v
+          r1tok = acquire S1 {1}                  release S2, ptok {2}
+                   r1tok |                                S2 |
+                         v                                   v
+            R m0(i) [r1tok] {1}              wtok = acquire S2 {1}
+                    walk |                              wtok |
+                         +-----------------+-----------------+
+                                           v
+                                W m0(i) [wtok] {1}
+                                           | walk
+                                           v
+                                release S3, wtok {1}
+                                        S3 |
+                                           v
+                            r0tok = acquire S3 {0}
+                                     r0tok |
+                                           v
+                              R m0(i) [r0tok] {0}
+                                           | walk
+                                           v
+                            release READY, r0tok {0}
+                                     READY |
+                                           v
+                        next = acquire READY(i+1) {2}
+                                      next |
+                                           v
+                                EXIT inner(i) {2}
+                                           | next iteration
+                                           v
+                              ENTER inner(i+1) {2}
+```
+
+The parent updates its state only from the summary node; the child reads and
+writes do not replace the parent's recorded state. `ENTER` and `EXIT` are DAG
+nodes, not acquire or release operations. The requirement that `p1` and `c5`
+use the same `READY` semaphore is explained in
 [Entry and the next iteration use one semaphore](#entry-and-the-next-iteration-use-one-semaphore).
+
+Three boundary details matter in later sections:
+
+- If buffer contents came from an asynchronous operation with the same owner
+  as `ENTER`, its completion kinds remain attached to `ENTER`; otherwise
+  `ENTER` uses `[none]`. [Exact-source async edges](#exact-source-async-edges)
+  explains how those completion kinds affect a release.
+- After a region, one partition token remains available only when the summary
+  has one partition owner.
+  [Tokens through `for` and `if`](#tokens-through-for-and-if) explains how
+  regions return tokens.
+- An ordering from an `if` is usable afterward only when every branch
+  establishes it. A loop that may execute zero times cannot establish an
+  ordering solely in its body. The later
+  [Region results](#region-results) and
+  [Branch completion must agree](#branch-completion-must-agree) examples show
+  the corresponding token and schedule rules.
+
+#### Both loops together
+
+The complete example below uses `i` for the outer iteration and `j` for the
+inner iteration. The box combines the two views without joining their DAGs:
+`p1` ends at the summary node and `p2` starts there in the outer DAG, while
+`c1`, `c2`, `c3`, and `c5` belong to the child DAG. The diagram shows the
+edges that remain after `c4` is removed.
+
+```text
+synchronization-edge DAG with both region levels
+
+                         ENTER outer(i) {3}
+                                  | walk
+                                  v
+                              W m0(i) {3}
+                                  | p1
+                                  v
+ +-------------- [inner-for summary P0:W:{2}] ---------------+
+ |                                                           |
+ |                    ENTER inner(i,j) {2}                   |
+ |                         +---------+---------+             |
+ |                    walk |                   | c1          |
+ |                         v                   v             |
+ |                     R m0 {2}            R m0 {1}          |
+ |                      c2 |                   | walk        |
+ |                         +---------+---------+             |
+ |                                   v                       |
+ |                              W m0 {1}                     |
+ |                                   | c3                    |
+ |                                   v                       |
+ |                              R m0 {0}                     |
+ |                                   | c5                    |
+ |                                   v                       |
+ |                          EXIT inner(i,j) {2}              |
+ |                                   | next inner iteration  |
+ |                                   v                       |
+ |                         ENTER inner(i,j+1) {2}            |
+ |                                                           |
+ +-----------------------------------------------------------+
+                                  | p2
+                                  v
+                         EXIT outer(i) {3}
+```
+
+The arrow to `ENTER inner(i,j+1)` shows the case in which the inner loop runs
+again. After its final iteration there is no following inner `ENTER`; the
+child ends at `EXIT`, the summary completes, and `p2` applies.
+
+The parent edges do not connect directly to the child `ENTER` or `EXIT`.
+Their semaphore operations cross those boundaries when tokens are placed.
+`READY` implements `p1` and `c5`; `S1`, `S2`, and `S3` implement `c1`,
+`c2`, and `c3`; and initially released `EMPTY` implements `p2`. Every
+semaphore has `pending_count=1`.
+
+```text
+semaphore DAG with both region levels
+
+                         ENTER outer(i) {3}
+                                  | walk
+                                  v
+               otok = acquire EMPTY(i) {3}
+                              otok |
+                                   v
+                         W m0(i) [otok] {3}
+                                  | walk
+                                  v
+                     release READY, otok {3}      p1
+                             READY |
+                                   v
+                 ptok = acquire READY {2}
+                              ptok |
+                                   v
+                      ENTER inner(i,0) {2}
+                 +--------------+--------------+
+            walk |                             | walk
+                 v                             v
+        release S1, ptok {2} c1       R m0(i,0) [ptok] {2}
+              S1 |                             | walk
+                 v                             v
+  r1tok = acquire S1 {1}           release S2, ptok {2} c2
+           r1tok |                          S2 |
+                 v                             v
+  R m0(i,0) [r1tok] {1}          wtok = acquire S2 {1}
+            walk |                        wtok |
+                 +--------------+--------------+
+                                v
+                     W m0(i,0) [wtok] {1}
+                                | walk
+                                v
+                     release S3, wtok {1}       c3
+                             S3 |
+                                v
+                 r0tok = acquire S3 {0}
+                          r0tok |
+                                v
+                   R m0(i,0) [r0tok] {0}
+                                | walk
+                                v
+                 release READY, r0tok {0}        c5
+                          READY |
+                                v
+              next = acquire READY {2}
+                           next |
+                                v
+                     EXIT inner(i,0) {2}
+                       +--------+--------+
+      another inner j  |                 | inner loop finishes
+                  next |                 | next
+                       v                 v
+        ENTER inner(i,1) {2}       result = next
+                       |                 |
+             repeat the body             |
+             through its final EXIT      |
+                       |                 |
+                       v                 |
+             result = final next         |
+                       +--------+--------+
+                                v
+                 release EMPTY, result {2}        p2
+                    +-----------+-----------+
+               walk |                       | EMPTY
+                    v                       |
+             EXIT outer(i) {3}              |
+                    | next outer iteration  |
+                    v                       |
+            ENTER outer(i+1) {3}            |
+               walk |                       |
+                    +-----------+-----------+
+                                v
+           otok2 = acquire EMPTY(i+1) {3}
+                           otok2 |
+                                 v
+                     W m0(i+1) [otok2] {3}
+```
+
+`result = next` and `result = final next` only name the token returned by the
+inner loop; they are not operations.
+
+For inner `j=0`, `p1` supplies `ptok` directly: there is no
+`EXIT inner(i,-1)`. The acquire of `ptok` is outside the inner loop but still
+inside outer iteration `i`. For `j>0`, `c5` supplies `next`; that acquire is
+before the current inner `EXIT`, and the token passes through `EXIT` into the
+next `ENTER`. On the final inner iteration, the final `next` becomes
+`result`, which supplies the `p2` release.
+
+`EMPTY` starts released, so outer iteration zero needs no preceding outer
+`EXIT`. On later outer iterations, the `p2` release signals `EMPTY`, and its
+acquire is placed immediately before the next outer write rather than being
+carried by the outer loop. If the inner loop executes zero times, its input
+`ptok` is its `result`.
 
 ## Reducing synchronization edges
 
@@ -1258,7 +1488,9 @@ entry and on the next iteration.
 
 Using the two-level example above, the acquire created from parent edge `p1`
 returns the first-iteration token. The acquire created from child edge `c5`
-returns later-iteration tokens after `c4` is removed:
+returns later-iteration tokens after `c4` is removed. The table first shows
+the acquire sites immediately after semaphores are assigned, before an
+acquire is moved to the next buffer operation that needs its token:
 
 ```text
 acquire site                         reduced edges       semaphore   count
@@ -1269,6 +1501,10 @@ before W m0 {1}                      c2                  S2          1
 before R m0 {0}                      c3                  S3          1
 before EXIT outer(i) {3}             p2                  S4          1
 ```
+
+The last row is an intermediate position. Token placement makes `S4` the
+initially released `EMPTY` semaphore and moves its acquire to the next outer
+write, as shown in [Both loops together](#both-loops-together).
 
 ```text
 %first = acquire READY {2}       // parent p1
