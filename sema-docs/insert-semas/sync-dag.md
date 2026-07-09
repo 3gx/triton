@@ -16,13 +16,11 @@
   - [Example: the outer owner starts the inner loop](#example-the-outer-owner-starts-the-inner-loop)
 - [Reducing synchronization edges](#reducing-synchronization-edges)
   - [Example: an edge within one region is redundant](#example-an-edge-within-one-region-is-redundant)
-  - [Example: edge reduction lowers the pending count](#example-edge-reduction-lowers-the-pending-count)
   - [Example: an edge to `EXIT` is redundant](#example-an-edge-to-exit-is-redundant)
-  - [Exact-source async edges](#exact-source-async-edges)
-  - [Earliest release position (`releaseFloors`)](#earliest-release-position-releasefloors)
-  - [Reduction does not choose placement](#reduction-does-not-choose-placement)
+  - [Edges from an asynchronous write](#edges-from-an-asynchronous-write)
+  - [A surviving release does not move earlier](#a-surviving-release-does-not-move-earlier)
 - [From reduced edges to semaphores](#from-reduced-edges-to-semaphores)
-  - [Repeated edges from one sender](#repeated-edges-from-one-sender)
+  - [Repeated edges from one owner](#repeated-edges-from-one-owner)
   - [Removing a release when another path imposes the same wait](#removing-a-release-when-another-path-imposes-the-same-wait)
   - [One destination, one semaphore](#one-destination-one-semaphore)
   - [Reading one semaphore](#reading-one-semaphore)
@@ -35,13 +33,15 @@
   - [When the loop keeps a token](#when-the-loop-keeps-a-token)
   - [A use after the loop](#a-use-after-the-loop)
   - [Nested loops](#nested-loops)
-  - [Branch completion must agree](#branch-completion-must-agree)
 - [Backing copies](#backing-copies)
+  - [Example: a TMEM accumulator gets two copies](#example-a-tmem-accumulator-gets-two-copies)
+  - [Example: a TMA load increases only the semaphore copies](#example-a-tma-load-increases-only-the-semaphore-copies)
 - [Pipeline schedule](#pipeline-schedule)
   - [Minimal pipeline model](#minimal-pipeline-model)
   - [Example: one-copy synchronization between iterations](#example-one-copy-synchronization-between-iterations)
   - [Finalizing one release/acquire pair](#finalizing-one-releaseacquire-pair)
   - [Moving an acquire updates its schedule relation](#moving-an-acquire-updates-its-schedule-relation)
+  - [Branch completion must agree](#branch-completion-must-agree)
   - [Post-loop acquires use their owner's boundary](#post-loop-acquires-use-their-owners-boundary)
   - [Schedule and stage offset are separate](#schedule-and-stage-offset-are-separate)
 - [Explicit buffer-stage offsets](#explicit-buffer-stage-offsets)
@@ -64,7 +64,7 @@ The construction order is important:
 all required synchronization edges
     -> choose physical backing copies
     -> remove safely redundant edges
-    -> merge repeated edges from one sender
+    -> merge repeated edges from one source owner
     -> group remaining edges by destination
     -> assign a semaphore and pending count
     -> create entry tokens and plan region tokens
@@ -101,6 +101,11 @@ them. An edge used by the next iteration is stored as `source -> EXIT(i)`. A
 diagram that follows the edge across the loop boundary labels the two
 iterations `i` and `i+1`.
 
+When an acquire moves to the first access of the next iteration, the
+semaphore arrow runs directly from the release to that acquire. `EXIT` and
+the next `ENTER` remain on a separate control-flow spine; the semaphore arrow
+does not pass through them.
+
 Names used throughout:
 
 ```text
@@ -109,10 +114,10 @@ backing        the physical SMEM or TMEM allocation used by the group
 m0, m1         members: allocation names or views in the group
 P0, P1         disjoint pieces of the backing
 {0}, {1}       owners: partitions 0 and 1 of the enclosing WS loop
+WS             warp-specialized
 root           code with no partition owner
 source         node that supplies the current value to a new reader
 use            latest access to the current value by one owner
-sender         source owner whose edges into one destination become one release
 token          value returned by an acquire and used by releases and semaphore.buffer
 ```
 
@@ -125,6 +130,10 @@ R m0 [%b] {1}
 release S1, %t {1}
 for iter_args(%t = %entry) { ... yield %next }
 ```
+
+In the explanatory DAGs, `R m0 [t]` or `W m0 [t]` abbreviates creating a
+`semaphore.buffer` with token `t` and using that buffer at the read or write.
+Examples that show exact IR spell out the `semaphore.buffer` operation.
 
 An edge may record one or more completion kinds. `[none]` completes when the
 release executes. `[tma_load]` and `[tc5mma]` complete with the named async
@@ -291,6 +300,12 @@ implemented with semaphore `FULL` and `e2` with initially released semaphore
 `EMPTY`:
 
 ```text
+edge    semaphore    pending_count    initial state
+e1      FULL         1                false
+e2      EMPTY        1                initially released
+```
+
+```text
 %empty = acquire EMPTY {0}
 W store [%empty] {0}
 release FULL, %empty {0}
@@ -308,29 +323,33 @@ complete.
 ```text
 semaphore DAG showing the boundary from iteration i to iteration i+1
 
-                       acquire EMPTY(i) {0}
+                etok = acquire EMPTY(i) {0}
+                               etok |
+                                    v
+                         W store(i) [etok] {0}
                                   | walk
                                   v
-                           W store(i) {0}
-                                  | walk
-                                  v
-                         release FULL(i) {0}
+                       release FULL, etok {0}       e1
                                   | FULL
                                   v
-                         acquire FULL(i) {1}
+                ftok = acquire FULL(i) {1}
+                               ftok |
+                                    v
+                         R load(i) [ftok] {1}
                                   | walk
                                   v
-                           R load(i) {1}
-                                  | walk
-                                  v
-                        release EMPTY(i) {1}
+                      release EMPTY, ftok {1}       e2
                                   | EMPTY
                                   v
-                       acquire EMPTY(i+1) {0}
-                                  | walk
-                                  v
-                         W store(i+1) {0}
+                next = acquire EMPTY(i+1) {0}
+                               next |
+                                    v
+                       W store(i+1) [next] {0}
 ```
+
+There is no buffer use after the loop. After the final iteration, no later
+acquire consumes its `EMPTY` release. A zero-trip loop executes none of the
+shown operations and leaves `EMPTY` initially released.
 
 ### Example: several readers and token reuse
 
@@ -367,17 +386,30 @@ program order.
                          +-------------+-------------+
                                        v
                                   EXIT(i) {0}
+```
 
+```text
+edge    semaphore    pending_count    initial state
+f1      F1           1                false
+f2      F2           1                false
+f3, f4  EMPTY        2                initially released
+```
+
+For the first iteration, a root acquire consumes the initially released
+`EMPTY` state and supplies owner `{0}`'s loop token:
+
+```text
+ptok = acquire EMPTY pending_count=2 root       supplies owner {0}
+                      ptok |
+                           v
+                      ENTER(0) {0}
+```
+
+```text
 semaphore DAG for the same synchronization edges
 
-                     acquire EMPTY(i) pending_count=2 {0}
-                                      ptok |
-                                           v
-                                     EXIT(i-1) {0}
-                                           | next iteration
-                                           v
                                       ENTER(i) {0}
-                                           | walk
+                                      ptok |
                                            v
                                   W alloc(i) [ptok] {0}
                     +----------------------+----------------------+
@@ -387,7 +419,7 @@ semaphore DAG for the same synchronization edges
                  F1 |                 walk |                      | F2
                     v                      v                      v
    r1tok = acquire F1 {1}                  |          r2tok = acquire F2 {2}
-               walk |                      |                 walk |
+              r1tok |                      |                r2tok |
                     v                      |                      v
       R load(i) [r1tok] {1}                |         R load(i) [r2tok] {2}
                walk |                      |                 walk |
@@ -396,11 +428,11 @@ semaphore DAG for the same synchronization edges
               EMPTY |                      |                      | EMPTY
                     +----------------------+----------------------+
                                            v
-                      acquire EMPTY(i+1) pending_count=2 {0}
+               next = acquire EMPTY(i+1) pending_count=2 {0}
                                       next |
                                            v
                                       EXIT(i) {0}
-                                           | next iteration
+                                      next | next iteration
                                            v
                                     ENTER(i+1) {0}
 ```
@@ -417,6 +449,9 @@ release EMPTY, %reader2 {2}
 `reuseTokenOwner` tells EMIT-IR to use the earlier `{0}` token for the final
 `{0}` read.
 
+After the final iteration, the loop returns its final `next` token. For a
+zero-trip loop, it returns the root-acquired `ptok` unchanged.
+
 ### Example: disjoint pieces stay independent
 
 This conceptual example uses `m0` for the first half of a buffer, `m1` for
@@ -427,7 +462,10 @@ members:    m0[0,128)   m1[128,256)   m2[0,256)
 pieces:     P0=[0,128){m0,m2}   P1=[128,256){m1,m2}
 ```
 
-The DAG nodes and the edges that remain for semaphore construction are:
+This example starts from the edges that remain after removal and merging
+because its purpose is to show that P0 and P1 stay independent. The next
+section derives edge removal from the complete initial set. The remaining
+nodes and edges here are:
 
 ```text
 DAG node         buffer pieces            synchronization edge ending here
@@ -441,14 +479,11 @@ R m1 {0}         P1                       e5: W m1 {4} -> R m1 {0}
 EXIT(i) {0}      P0, P1                   e6: R m0 {3} -> EXIT(i) {0}
 ```
 
-Before reduction, the pass records two edges from `W m2 {0}` to `R m2 {1}`:
-one for P0 and one for P1. Because they have the same endpoints, one remaining
-edge, `e1: W m2 {0} -> R m2 {1}`, is sufficient for that wait. The pass also
-records additional direct edges whose waits are already imposed by the paths
-shown below. Those additional edges are removed before semaphore construction,
-as explained in
-[Reducing synchronization edges](#reducing-synchronization-edges). The
-remaining synchronization-edge DAG is:
+Before merging, P0 and P1 each produce an edge from `W m2 {0}` to
+`R m2 {1}`. Their endpoints and owners match, so `e1` represents both.
+Ordering-redundant direct edges are also absent from this view; their removal
+is explained in [Reducing synchronization edges](#reducing-synchronization-edges).
+The remaining synchronization-edge DAG is:
 
 ```text
                                   ENTER(i) {0}
@@ -475,16 +510,35 @@ remaining synchronization-edge DAG is:
 semaphores; and `e6` becomes initially released semaphore `EMPTY`:
 
 ```text
+edge    semaphore       pending_count    initial state
+e1      FULL_BOTH       1                false
+e2      LEFT_READY      1                false
+e3      LEFT_FULL       1                false
+e4      RIGHT_READY     1                false
+e5      RIGHT_FULL      1                false
+e6      EMPTY           1                initially released
+```
+
+The diagram assumes a surrounding loop that must keep its boundary token, so
+the `EMPTY` acquire remains before `EXIT`. In an eligible loop with no such
+use, token planning may instead move that acquire to the first access of the
+next iteration; the synchronization edges and semaphore mapping do not
+change.
+
+The carried-token form obtains its first token outside the loop:
+
+```text
+btok = acquire EMPTY pending_count=1 root       supplies owner {0}
+                      btok |
+                           v
+                      ENTER(0) {0}
+```
+
+```text
 semaphore DAG
 
-                     acquire EMPTY(i) pending_count=1 {0}
-                                      btok |
-                                           v
-                                     EXIT(i-1) {0}
-                                           | next iteration
-                                           v
                                       ENTER(i) {0}
-                                           | walk
+                                      btok |
                                            v
                                 W m2(i) [btok] {0}
                                            | walk
@@ -493,7 +547,7 @@ semaphore DAG
                                   FULL_BOTH |
                                             v
                                both = acquire FULL_BOTH {1}
-                                            | walk
+                                       both |
                                             v
                                  R m2(i) [both] {1}
                        +--------------------+--------------------+
@@ -503,7 +557,7 @@ semaphore DAG
             LEFT_READY |                             RIGHT_READY |
                        v                                         v
           left = acquire LEFT_READY {2}             right = acquire RIGHT_READY {4}
-                  walk |                                         | walk
+                  left |                                         | right
                        v                                         v
              W m0(i) [left] {2}                         W m1(i) [right] {4}
                   walk |                                         | walk
@@ -512,7 +566,7 @@ semaphore DAG
              LEFT_FULL |                              RIGHT_FULL |
                        v                                         v
          lread = acquire LEFT_FULL {3}             rread = acquire RIGHT_FULL {0}
-                  walk |                                         | walk
+                 lread |                                         | rread
                        v                                         v
             R m0(i) [lread] {3}                       R m1(i) [rread] {0}
                   walk |                                         | walk
@@ -521,11 +575,11 @@ semaphore DAG
                  EMPTY |                                         |
                        +--------------------+--------------------+
                                             v
-                       acquire EMPTY(i+1) pending_count=1 {0}
+                next = acquire EMPTY(i+1) pending_count=1 {0}
                                       next |
                                            v
                                       EXIT(i) {0}
-                                           | next iteration
+                                      next | next iteration
                                            v
                                     ENTER(i+1) {0}
 ```
@@ -534,6 +588,9 @@ After `R m2`, the P0 and P1 paths have no synchronization edge between them.
 P0 releases `EMPTY` because its last reader is owner `{3}`. `R m1` and the
 acquire of `EMPTY` both have owner `{0}`, and program order places the read
 before the acquire.
+
+After the final iteration, the loop returns `next`. A zero-trip loop returns
+the root-acquired `btok` unchanged.
 
 ### Nested regions
 
@@ -644,6 +701,14 @@ The path through `c3` and `c5` already makes `EXIT` wait for `W m0 {1}`, so
 releases `READY` for the first inner iteration; after that, `c5` releases it
 for the next inner iteration. Every acquire has `pending_count=1`.
 
+```text
+edges      semaphore    pending_count
+c1         S1           1
+c2         S2           1
+c3         S3           1
+p1, c5     READY        1
+```
+
 The diagram begins after at least one inner iteration has completed so it can
 show how `READY` crosses `EXIT` and `ENTER`. For the first inner iteration,
 `p1` supplies `ptok` before the inner loop, so there is no preceding inner
@@ -706,7 +771,8 @@ Three boundary details matter in later sections:
 
 - If buffer contents came from an asynchronous operation with the same owner
   as `ENTER`, its completion kinds remain attached to `ENTER`; otherwise
-  `ENTER` uses `[none]`. [Exact-source async edges](#exact-source-async-edges)
+  `ENTER` uses `[none]`.
+  [Edges from an asynchronous write](#edges-from-an-asynchronous-write)
   explains how those completion kinds affect a release.
 - After a region, one partition token remains available only when the summary
   has one partition owner.
@@ -1179,35 +1245,44 @@ place.
 
 ## Reducing synchronization edges
 
-The walk produces a complete edge set. `reduceEdges` then applies two
-functions:
+The walk records every synchronization edge required by the read and write
+rules. Some of those edges impose a wait that the other edges already impose.
+Removing such an edge is safe only when the remaining edges and program order
+still make the same owner wait and still leave an acquire for that owner.
 
-- `reduceStraightEdges` handles edges between access nodes in one region.
-- `reduceLoopCloses` handles edges from an access to `EXIT` when the other
-  ordering crosses the loop boundary.
-
-Both functions consider only program order and edges that have not been
-removed. Only a kept edge updates the ordering and available-token
-information used for later decisions.
+Reduction considers edges in their fixed walk order. An edge that remains can
+justify removing a later edge; an edge that has been removed cannot. Edges to
+`EXIT` need an additional check because the replacement path may continue in
+the next iteration.
 
 ### Example: an edge within one region is redundant
 
 `test/NVWS/insert_semas_transitive_reduction.mlir`
-`@serialized_ring_reduces` has overlapping members:
+`@serialized_ring_reduces` contains this sequence:
+
+```text
+W m0 {0}
+R m0 {1}
+W m1 {2}
+```
+
+The two members overlap:
 
 ```text
 members:    m0[0,256)   m1[64,192)
 pieces:     P0=[0,64){m0}   P1=[64,192){m0,m1}   P2=[192,256){m0}
 ```
 
-On P1, owner `{0}` writes, owner `{1}` reads, and owner `{2}` writes. The
-second write finds recorded uses by both `{0}` and `{1}`.
+Only P1 is relevant to this reduction. Owner `{0}` writes it, owner `{1}`
+reads it, and owner `{2}` writes it. The write by `{2}` must initially wait
+for the recorded uses by both earlier owners:
 
 ```text
-initial edge set
-  e1: W m0 {0} -> R m0 {1}
-  e2: W m0 {0} -> W m1 {2}       considered for removal
-  e3: R m0 {1} -> W m1 {2}
+DAG node       synchronization edge ending here
+W m0 {0}       none
+R m0 {1}       e1: W m0 {0} -> R m0 {1}
+W m1 {2}       e2: W m0 {0} -> W m1 {2}
+                e3: R m0 {1} -> W m1 {2}
 ```
 
 ```text
@@ -1225,8 +1300,8 @@ initial DAG
 ```
 
 Following `e1` and then `e3` makes `W m1 {2}` wait for `W m0 {0}`, so `e2`
-is unnecessary. `e3` also provides the token used by owner `{2}`.
-`reduceStraightEdges` drops `e2`.
+is unnecessary. The acquire created from `e3` will return the token used by
+owner `{2}`.
 
 ```text
 reduced DAG
@@ -1240,93 +1315,116 @@ reduced DAG
                             W m1 {2}
 ```
 
-`reduceStraightEdges` does not consider root, region, `ENTER`, or `EXIT`
-endpoints. It keeps an edge unless the other remaining edges together with
-program order impose the same wait and provide a token for the destination
-owner.
-
-### Example: edge reduction lowers the pending count
-
-The same example shows why reduction precedes semaphore creation. If all
-three synchronization edges were kept, the write by `{2}` would wait for
-releases from both `{0}` and `{1}`. After `e2` is removed, only `e3` ends at
-that write:
+The remaining edges map to two count-1 semaphores:
 
 ```text
-synchronization edges
-  e1, e2, e3
-
-after reduceStraightEdges
-  e1, e3
-
-after grouping
-  e1 -> S0 pending_count=1 at R m0 {1}
-  e3 -> S1 pending_count=1 at W m1 {2}
+edge    semaphore    acquire before    pending_count
+e1      S0           R m0 {1}          1
+e3      S1           W m1 {2}          1
 ```
+
+Let `t0` be the token already held by owner `{0}`. The semaphore DAG is:
 
 ```text
 semaphore DAG
 
-                            W m0 {0}
+                       W m0 [t0] {0}
                                 | walk
                                 v
-                          release S0 {0}
+                       release S0, t0 {0}       e1
                                 | S0
                                 v
-                          acquire S0 {1}
+                         t1 = acquire S0 {1}
+                                t1 |
+                                v
+                       R m0 [t1] {1}
                                 | walk
                                 v
-                            R m0 {1}
-                                | walk
-                                v
-                          release S1 {1}
+                       release S1, t1 {1}       e3
                                 | S1
                                 v
-                          acquire S1 {2}
-                                | walk
+                         t2 = acquire S1 {2}
+                                t2 |
                                 v
-                            W m1 {2}
+                       W m1 [t2] {2}
 ```
 
-`S1` has `pending_count=1` because only `e3` ends at `W m1 {2}`.
+If `e2` had remained, `W m1 {2}` would have waited for separate releases
+from `{0}` and `{1}`. Removing it therefore changes that acquire from count 2
+to count 1.
+
+Implementation note: `reduceStraightEdges` performs this reduction for
+access nodes in one region. It does not consider root, region, `ENTER`, or
+`EXIT` endpoints.
 
 ### Example: an edge to `EXIT` is redundant
 
 `test/NVWS/insert_semas_local_buffer_reuse.mlir`
-`@local_n_owner_aliased_buffers` uses two partly overlapping members:
+`@local_n_owner_aliased_buffers` repeats this sequence in a loop:
+
+```text
+for
+  W m0 {0}
+  R m0 {1}
+  W m1 {2}
+  R m1 {0}
+```
+
+The two members partly overlap:
 
 ```text
 members:    m0[0,128)   m1[64,192)
 pieces:     P0=[0,64){m0}   P1=[64,128){m0,m1}   P2=[128,192){m1}
 ```
 
-The complete in-body synchronization edge set is:
+The complete edge set for one iteration is:
 
 ```text
-l1a: W m0 {0} -> R m0 {1}       P0
-l1b: W m0 {0} -> R m0 {1}       P1
-l2a: W m0 {0} -> W m1 {2}       P1, possible removal through {1}
-l2b: R m0 {1} -> W m1 {2}       P1
-l3a: W m1 {2} -> R m1 {0}       P1
-l3b: W m1 {2} -> R m1 {0}       P2
-```
-
-The walk then records three synchronization edges to `EXIT`:
-
-```text
-c0: R m0(i) {1} -> EXIT(i) {0}   P0 returns to first owner {0}
-c1: W m1(i) {2} -> EXIT(i) {0}   P1, possible removal through {0}
-c2: R m1(i) {0} -> EXIT(i) {2}   P2 returns to first owner {2}
+DAG node     synchronization edge ending here
+ENTER(i)     none
+W m0 {0}     none
+R m0 {1}     l1a: W m0 {0} -> R m0 {1}       P0
+              l1b: W m0 {0} -> R m0 {1}       P1
+W m1 {2}     l2a: W m0 {0} -> W m1 {2}       P1
+              l2b: R m0 {1} -> W m1 {2}       P1
+R m1 {0}     l3a: W m1 {2} -> R m1 {0}       P1
+              l3b: W m1 {2} -> R m1 {0}       P2
+EXIT(i)      c0: R m0 {1} -> EXIT(i)           destination owner {0}, P0
+              c1: W m1 {2} -> EXIT(i)           destination owner {0}, P1
+              c2: R m1 {0} -> EXIT(i)           destination owner {2}, P2
 ```
 
 `c1` starts at `W m1`, not `R m0`, because that write replaces P1's contents.
 The write is already ordered before `{0}`'s P1 read.
 
-`reduceStraightEdges` keeps `l1a` and `l3a`, drops their same-endpoint
-duplicates `l1b` and `l3b`, and drops `l2a` through `l1a -> l2b`.
+The initial synchronization-edge DAG is:
 
-For `reduceLoopCloses`, the stored `c2` edge ends at `EXIT(i)`. The diagram
-follows owner `{2}` from `EXIT(i)` to its first P2 access, `W m1(i+1)`.
+```text
+                              W m0(i) {0}
+                         +--------+------------------+
+                l1a,l1b |                           | l2a
+                         v                           |
+                    R m0(i) {1}                      |
+                    +----+----+                      |
+                 c0 |         | l2b                  |
+                    |         v                      |
+                    |     W m1(i) {2} <--------------+
+                    |      +-----+-----+
+                    |   c1 |           | l3a,l3b
+                    |      |           v
+                    |      |      R m1(i) {0}
+                    |      |           | c2
+                    +------+-----+-----+
+                                 v
+                              EXIT(i)
+```
+
+The first reduction removes `l1b` and `l3b` because each duplicates an edge
+with the same endpoints. It also removes `l2a` because `l1a -> l2b` imposes
+the same wait.
+
+To test `c2`, follow the loop boundary to owner `{2}`'s first P2 access in the
+next iteration:
 
 ```text
 path considered when testing c2, shown across two iterations
@@ -1350,166 +1448,363 @@ path considered when testing c2, shown across two iterations
                     W m1(i+1) {2} <----------------------+
 ```
 
-The kept path `l1a -> l2b` orders the next P2 write and makes `{2}`'s token
-available there. `{2}` is not the owner of the region's first
-partition-owned access, so `reduceLoopCloses` drops `c2`.
+The path through `l1a` and `l2b` already ends at the next P2 write, where an
+acquire will return `{2}`'s token. Therefore `c2` is removed. Edges `c0` and
+`c1` end at the first access owner `{0}`, so this loop-boundary reduction
+keeps them.
+
+A later check removes `c1`: `l3a` makes `{0}` wait for `{2}`'s P1 write, and
+`{0}`'s program order reaches `EXIT`. The final edge set is:
 
 ```text
-after reduceLoopCloses, shown across two iterations
-
-                         R m1(i) {0}
-                              | walk
-                              v
-                           EXIT(i)
-                              | walk
-                              v
-                          ENTER(i+1)
-                              | walk
-                              v
-                         W m0(i+1) {0}
-                              | l1a
-                              v
-                         R m0(i+1) {1}
-                              | l2b
-                              v
-                         W m1(i+1) {2}
+edge    endpoints                         destination owner
+l1a     W m0 {0} -> R m0 {1}             {1}
+l2b     R m0 {1} -> W m1 {2}             {2}
+l3a     W m1 {2} -> R m1 {0}             {0}
+c0      R m0(i) {1} -> EXIT(i)            {0}
 ```
 
-Both `c0` and `c1` target `{0}`, the first access owner, so
-`reduceLoopCloses` retains them. `buildEdgesAndSemas` later removes `c1`:
-`l3a` orders `{2}`'s P1 write before `{0}`'s P1 read, and `{0}`'s operation
-order then reaches `EXIT`. `c0` is the only edge left for the next iteration.
+```text
+reduced DAG
 
-The two functions use different information. `reduceLoopCloses` uses the
-first access owner, the first read or write of each piece in the next
-iteration, and token availability. The later removal requires remaining
-edges from the source owner through another owner to the destination.
+                         W m0(i) {0}
+                              | l1a
+                              v
+                         R m0(i) {1}
+                         +----+----------------+
+                    l2b |                     | c0
+                         v                     |
+                    W m1(i) {2}                |
+                         | l3a
+                         v
+                    R m1(i) {0}
+                         | walk
+                         +----------+----------+
+                                    v
+                                  EXIT(i)
+                                    | walk
+                                    v
+                                ENTER(i+1)
+```
 
-### Exact-source async edges
-
-An edge starting at an asynchronous write also records that operation's
-completion kind. `EdgeRec::preserve` prevents either edge reducer from
-deleting it, but `buildEdgesAndSemas` may still remove its release when
-another path provides the same wait.
+The four remaining edges become four count-1 semaphores:
 
 ```text
-initial edge set
-  a1: W async {0} -> R {1}       completion [tma_load]
-  a2: W async {0} -> W {2}       exact source, completion [tma_load],
-                                  possible removal through {1}
-  a3: R {1}       -> W {2}
+edge    semaphore    acquire before                  pending_count
+l1a     F01          R m0 {1}                        1
+l2b     F12          W m1 {2}                        1
+l3a     F20          R m1 {0}                        1
+c0      EMPTY        W m0 in the next iteration      1
+```
+
+The edge `c0` is stored as an edge to `EXIT`, but its acquire is placed at the
+next write that needs owner `{0}`'s token:
+
+```text
+semaphore DAG across two iterations
+
+                    t0 = acquire EMPTY(i) {0}
+                               t0 |
+                                  v
+                       W m0(i) [t0] {0}
+                                  | walk
+                                  v
+                       release F01, t0 {0}       l1a
+                                F01 |
+                                    v
+                         t1 = acquire F01 {1}
+                                    t1 |
+                                       v
+                            R m0(i) [t1] {1}
+                         +-------------+-------------+
+                    walk |                           | walk
+                         v                           v
+              release F12, t1 {1} l2b    release EMPTY, t1 {1} c0
+                         | F12                      EMPTY |
+                         v                                |
+              t2 = acquire F12 {2}                       |
+                         t2 |                             |
+                            v                             |
+                 W m1(i) [t2] {2}                        |
+                            | walk                        |
+                            v                             |
+                 release F20, t2 {2} l3a                  |
+                         F20 |                             |
+                             v                            |
+                  t0b = acquire F20 {0}                   |
+                         t0b |                             |
+                              v                           |
+                   R m1(i) [t0b] {0}                      |
+                              | walk                      |
+                              v                           |
+                            EXIT(i)                       |
+                              | walk                      |
+                              v                           |
+                          ENTER(i+1)                      |
+                              | walk                      |
+                              v                           |
+              t0next = acquire EMPTY(i+1) {0} <-----------+
+                         t0next |
+                                v
+                     W m0(i+1) [t0next] {0}
+```
+
+`EMPTY` starts released for iteration zero. On later iterations, the `c0`
+release supplies its next phase.
+
+Implementation note: `reduceLoopCloses` performs the loop-boundary check. It
+uses the first read or write of each piece in the next iteration. The later
+removal of `c1` happens while the remaining edges are converted to
+semaphores.
+
+### Edges from an asynchronous write
+
+An edge from an asynchronous write records the operation that must finish.
+Consider this sequence:
+
+```text
+W async m0 {0}    completion [tma_load]
+R m0 {1}
+W m0 {2}
+```
+
+The walk records:
+
+```text
+DAG node          synchronization edge ending here
+W async m0 {0}    none
+R m0 {1}          a1: W async m0 {0} -> R m0 {1}  [tma_load]
+W m0 {2}          a2: W async m0 {0} -> W m0 {2}  [tma_load]
+                   a3: R m0 {1} -> W m0 {2}        [none]
 ```
 
 ```text
 initial DAG
 
-                          W async {0}
-                    +-----------+-----------+
-     a1 [tma_load]  |                       | a2 [tma_load], through {1}
-                    v                       |
-                  R {1}                     |
-               a3   |                       |
-                    +-----------+-----------+
+                       W async m0 {0}
+                    +---------+---------+
+     a1 [tma_load]  |                   | a2 [tma_load]
+                    v                   |
+                 R m0 {1}               |
+                  a3 |                   |
+                    +---------+---------+
+                              v
+                           W m0 {2}
+```
+
+The early reduction keeps `a2` because it directly records the asynchronous
+write whose completion it needs. When semaphores are built, `a2` may still be
+removed if both `a1` and `a3` remain: `a1` waits for the TMA load before the
+read, and `a3` orders that read before the final write.
+
+```text
+reduced DAG after removing a2
+
+                       W async m0 {0}
+                              | a1 [tma_load]
+                              v
+                           R m0 {1}
+                              | a3
+                              v
+                           W m0 {2}
+```
+
+```text
+edge    semaphore    completion    pending_count
+a1      ASYNC_READY  [tma_load]    1
+a3      WRITE_READY  [none]        1
+```
+
+```text
+semaphore DAG
+
+                   W async m0 [t0] {0}
+                              | walk
+                              v
+       release ASYNC_READY, t0 [tma_load] {0}       a1
+                    ASYNC_READY |
                                 v
-                              W {2}
+              t1 = acquire ASYNC_READY {1}
+                                t1 |
+                                   v
+                        R m0 [t1] {1}
+                                   | walk
+                                   v
+           release WRITE_READY, t1 [none] {1}       a3
+                    WRITE_READY |
+                                v
+              t2 = acquire WRITE_READY {2}
+                                t2 |
+                                   v
+                        W m0 [t2] {2}
 ```
 
-The path `a1 -> a3` already orders the endpoints of `a2`. Because `a2` also
-identifies the asynchronous write as its completion source, `preserve` keeps
-it through both reducers.
+If either `a1` or `a3` disappears, the direct `a2` release remains. A later
+synchronous read is not the asynchronous operation that produced the buffer
+contents, so an edge starting at that read does not carry `[tma_load]`.
 
-`buildEdgesAndSemas` may still delete `a2`: `a1` waits for the TMA load before
-`{1}` reads, and `a3` orders that read before `{2}` writes. If either edge
-were removed, `a2` would remain. A later synchronous read is not the write
-that produced the value and therefore does not receive `preserve`.
+Implementation note: `EdgeRec::preserve` keeps `a2` through the two early
+edge reducers. The later whole-release check may remove it only after
+validating the complete remaining path.
 
-### Earliest release position (`releaseFloors`)
+### A surviving release does not move earlier
 
-Before reduction, `releaseFloors` records the latest source node for every
-`(destination, destination owner, source owner)` tuple. A remaining release
-from that source owner cannot be placed before this node.
-
-Consider two synchronization edges from `{1}` into the same destination:
+Reduction decides which waits remain. It does not move a surviving release
+before a source node that originally contributed to that release. Consider
+four accesses to three pieces:
 
 ```text
-edge  endpoints
-r1    A {1} -> D {2}
-r2    B {1} -> D {2}      B follows A in the same node sequence
+A: W async a {1}      P0            completion [tma_load]
+B: W b {1}            P1, P2        follows A
+C: R b {0}            P1, P2
+D: W all {2}          P0, P1, P2
 ```
 
-The earliest release position is `B`, even if reduction later removes `r2`.
-When the remaining `{1}` edges are merged, their release is placed no earlier
-than B:
+The relevant edges are:
 
 ```text
-release and acquire placement after semaphore assignment
-
-A {1} --walk--> B {1} --walk--> release S {1} --S--> acquire S {2}
-                                                       |
-                                                     walk
-                                                       v
-                                                     D {2}
+DAG node    synchronization edge ending here
+A {1}       none
+B {1}       none
+C {0}       q1: B {1} -> C {0}                    P1, P2
+D {2}       q2: A {1} -> D {2} [tma_load]         P0
+             q3: B {1} -> D {2}                    P1, P2
+             q4: C {0} -> D {2}                    P1, P2
 ```
 
-This gives edge removal a placement rule:
+When P1 and P2 produce edges with the same endpoints, the table shows that
+repeated pair once.
 
-- removing all edges from one source owner may remove that owner's release;
-- reduction may remove a whole semaphore;
-- a remaining release cannot move earlier.
+```text
+initial DAG
 
-The rule matters for asynchronous and warp-group work: a release after the
-source owner's last write must not move before an earlier read merely because
-one synchronization edge became redundant.
+                    A async {1}
+                    +------+----------------------+
+               walk |                             | q2 [tma_load]
+                    v                             |
+                  B {1}                           |
+             +------+-------+                     |
+          q1 |              | q3                  |
+             v              |                     |
+           C {0}            |                     |
+          q4 |              |                     |
+             +-------+------+---------------------+
+                     v
+                   D {2}
+```
 
-### Reduction does not choose placement
+The path `q1 -> q4` makes `q3` unnecessary. Edge `q2` remains because it
+directly records A's asynchronous completion; the early reducers preserve
+such an edge rather than replacing it with a path through a later synchronous
+access:
 
-Reduction asks whether remaining edges provide the same wait and destination
-token. Release placement asks how early a remaining release may execute. The
-reducers remove edges but do not recompute `releaseFloors`.
+```text
+reduced DAG
 
-Removing one per-piece edge may leave another edge from the same source owner
-and retain its release. Removing every edge from one source owner removes that
-owner's release. Removing every source owner removes the acquire and
-semaphore. If a release remains, it stays at or after its recorded position.
+             A async {1} ----q2 [tma_load]---+
+                  | walk                      |
+                  v                           |
+                B {1}                         |
+                  | q1                        |
+                  v                           |
+                C {0}                         |
+                  | q4                        |
+                  +-------------+-------------+
+                                v
+                              D {2}
+```
 
-Merging combines remaining edges from one source owner into one release and
-combines their completion kinds. It does not prove an ordering path, move a
-release earlier, or combine releases from different owners. Grouping places
-releases with the same destination under one acquire and computes its pending
-count.
+Edges `q2` and `q4` end at the same node and owner, so they share semaphore
+`SD`. They have different source owners and therefore contribute two
+releases. Edge `q1` uses `SC`:
+
+```text
+edge    semaphore    release owner    pending_count
+q1      SC           {1}              1
+q2,q4   SD           {1}, {0}         2
+```
+
+Although `q2` starts at A, owner `{1}`'s `SD` release stays after B because
+the removed `q3` also contributed to the same destination before reduction:
+
+```text
+semaphore DAG
+
+                        A [t1] {1}
+                            | walk
+                            v
+                        B [t1] {1}
+                     +------+------+
+                walk |             | walk
+                     v             v
+          release SC, t1 {1}   release SD, t1 [tma_load] {1}
+                  SC |             SD |                  q2, placed after B
+                     v                |
+         t0 = acquire SC {0}           |
+                  t0 |                 |
+                     v                 |
+                 C [t0] {0}            |
+                     | walk             |
+                     v                  |
+          release SD, t0 {0}       q4  |
+                  SD |                  |
+                     +---------+--------+
+                               v
+            t2 = acquire SD pending_count=2 {2}
+                            t2 |
+                               v
+                           D [t2] {2}
+```
+
+This rule permits three outcomes: removing all edges from one source owner
+may remove that owner's release; removing every source owner removes the
+semaphore and acquire; but any release that survives stays at or after its
+original latest source node. This is important when asynchronous or
+warp-group work makes release placement performance-sensitive.
+
+Implementation note: `releaseFloors` records that latest source before any
+edge is removed. The reducers do not recompute it.
 
 ## From reduced edges to semaphores
 
-`buildEdgesAndSemas` processes the reduced edge set in this order:
+The remaining synchronization edges are converted to semaphore, acquire, and
+release nodes in this order:
 
 ```text
-1. merge edges with the same destination, destination owner, and source owner
-2. group merged edges by destination node and destination owner
-3. remove a source-owner release when another remaining path provides the same wait
-4. reconcile loop-entry and next-iteration pending counts
-5. create one semaphore for each remaining destination group
-6. insert one acquire at the destination and one release for each source owner
+1. merge edges with the same destination and source owner
+2. group the merged edges that end at the same node and owner
+3. remove a source owner's release when another remaining path imposes the same wait
+4. make loop entry and re-entry use one fixed pending count
+5. assign one semaphore and acquire to each remaining destination
+6. add one release for each remaining source owner
 ```
 
-### Repeated edges from one sender
+These are still plan nodes. EMIT-IR later creates the actual
+`nvws.semaphore.acquire` and `nvws.semaphore.release` operations.
+
+### Repeated edges from one owner
 
 Two pieces can create edges from different nodes of the same owner into the
 same `EXIT`. Use this conceptual loop:
 
 ```text
-W m0 {0}        writes P0 and P1
-R m0 {1}        latest {1} use for P0
-R m1 {1}        later {1} use for P1
-EXIT(i) {0}     returns both pieces to {0}
+for
+  W m0 {0}        writes P0 and P1
+  R m0 {1}        reads P0 and P1
+  R m1 {1}        later read of P1
 ```
 
-Initial edge set:
+At `EXIT`, both pieces return to owner `{0}`. Their initial edges are:
 
 ```text
-m1a: W m0 {0} -> R m0 {1}       P0
-m1b: W m0 {0} -> R m0 {1}       P1
-m2: R m0 {1} -> EXIT(i) {0}      P0
-m3: R m1 {1} -> EXIT(i) {0}      P1
+DAG node          synchronization edge ending here
+ENTER(i) {0}      none
+W m0 {0}          none
+R m0 {1}          m1a: W m0 {0} -> R m0 {1}       P0
+                   m1b: W m0 {0} -> R m0 {1}       P1
+R m1 {1}          none
+EXIT(i) {0}       m2: R m0 {1} -> EXIT(i) {0}      P0
+                   m3: R m1 {1} -> EXIT(i) {0}      P1
 ```
 
 ```text
@@ -1529,68 +1824,100 @@ initial DAG
                            EXIT(i) {0}
 ```
 
-`reduceStraightEdges` keeps `m1a` and removes duplicate `m1b`.
-`reduceLoopCloses` removes neither `m2` nor `m3`, so the reduced edge set is
-`m1a`, `m2`, and `m3`.
-
-`m2` and `m3` have the same sender and destination. The later source is
-`R m1 {1}`, so one release after that node is sufficient for both edges.
-Their completion kinds are combined.
+Edges `m1a` and `m1b` have the same endpoints, so only `m1a` remains. Edges
+`m2` and `m3` have the same source owner and destination. One release after
+the later read is sufficient for both pieces. Call the merged edge `M1`:
 
 ```text
-same-sender merge
+after reduction and merging
 
-destination       EXIT(i) {0}
-sender owner      {1}
-earliest release node  R m1 {1}
-represented edges      m2, m3
-merged edge             M1: R m1 {1} -> EXIT(i) {0}
+                            W m0 {0}
+                                | m1a
+                                v
+                            R m0 {1}
+                                | walk
+                                v
+                            R m1 {1}
+                                | M1 represents m2 and m3
+                                v
+                           EXIT(i) {0}
 ```
 
-With `[none]`, the release signals the semaphore once. With
-`[none, tma_load]`, it signals twice, so the acquire has `pending_count=2`
-even though there is one sender owner.
+The two remaining edges map to count-1 semaphores:
+
+```text
+edge    semaphore    acquire before    pending_count    initial state
+m1a     FULL         R m0 {1}          1                false
+M1      READY        EXIT(i) {0}       1                initially released
+```
+
+Let `t0` be the token held by owner `{0}` at the start of the iteration:
+
+This conceptual loop is shown in the carried-token form so the example can
+focus on merging `m2` and `m3`. If token planning moves the `READY` acquire to
+the next iteration's first access, the merged release and pending count stay
+the same.
+
+On the first iteration, a root acquire of initially released `READY` supplies
+`t0`. In the carried-token form, the final `next` is the loop result; a
+zero-trip loop returns the root-acquired `t0` unchanged.
+
+```text
+semaphore DAG
+
+                         W m0(i) [t0] {0}
+                                  | walk
+                                  v
+                       release FULL, t0 {0}       m1a
+                              FULL |
+                                   v
+                    t1 = acquire FULL {1}
+                              t1 |
+                                 v
+                      R m0(i) [t1] {1}
+                                 | walk
+                                 v
+                      R m1(i) [t1] {1}
+                                 | walk
+                                 v
+                      release READY, t1 {1}       M1
+                             READY |
+                                   v
+                  next = acquire READY {0}
+                            next |
+                                 v
+                         EXIT(i) {0}
+                            next | next iteration
+                                 v
+                       ENTER(i+1) {0}
+```
+
+When all represented edges have completion `[none]`, the merged release
+signals once. If their distinct completion kinds are `[none, tma_load]`, the
+one release signals twice and the acquire has `pending_count=2`. Edges from
+different source owners are never merged into one release.
 
 ### Removing a release when another path imposes the same wait
 
-While constructing synchronization edges, the pass may record that an edge
-could later be removed through another owner. It does so only when the edge
-starts at the current source node and an existing edge already orders that
-node before the other owner's latest access.
-
-After edges with the same destination node, destination owner, and source
-owner are merged, the source owner's release can be removed only when every
-edge represented by that release names such an intermediate owner. For each
-edge, the remaining synchronization must provide both parts of the path:
-
-1. from the original source owner to the intermediate owner; and
-2. from the intermediate owner to the destination.
-
-For the first part, a remaining release from the original source owner must
-occur at or after the original source node. Its acquire must occur no later
-than the node from which the intermediate owner releases to the final
-destination. When the intermediate owner is also the destination owner, the
-acquire must instead occur no later than the destination node, and that
-owner's operation order provides the second part. A check may cross enclosing
-`for` boundaries, but never from one `if` branch into another.
-
-The pass records the edge before reduction and uses its source when computing
-`releaseFloors`. If the edge is later removed, that earlier record still
-prevents a remaining release from moving before its original position. If the
-edge remains after reduction, it is merged with other edges from the same
-source owner.
-
 The inner loop in
 `test/NVWS/insert_semas_release_count.mlir`
-`@release_multiplicity_unified_fanin_regain` has this shape. Owner `{1}`
-writes the buffer, owner `{0}` reads the written value, and the inner `EXIT`
-has owner `{2}`.
+`@release_multiplicity_unified_fanin_regain` contains this part:
 
 ```text
-initial edge set
-  k1: W correct {1} -> R corrected {0}
-  k2: W correct {1} -> EXIT inner(i) {2}   possible removal through {0}
-  k3: R corrected {0} -> EXIT inner(i) {2}
+inner for with boundary owner {2}
+  W correct {1}
+  R corrected {0}
+```
+
+Owner `{1}` writes the buffer, owner `{0}` reads the written value, and the
+next inner iteration starts with owner `{2}`. The walk records:
+
+```text
+DAG node             synchronization edge ending here
+W correct {1}        none
+R corrected {0}      k1: W correct {1} -> R corrected {0}
+EXIT inner(i) {2}    k2: W correct {1} -> EXIT inner(i) {2}
+                      k3: R corrected {0} -> EXIT inner(i) {2}
 ```
 
 ```text
@@ -1607,17 +1934,16 @@ initial DAG
                         EXIT inner(i) {2}
 ```
 
-Both edges to `EXIT` remain after `reduceLoopCloses` because `{2}` is the
-first access owner. After merging edges with the same destination node,
-destination owner, and source owner, `buildEdgesAndSemas` checks whether the
-path through `{0}` still exists:
+The early loop-boundary reduction keeps both edges to `EXIT` because `{2}` is
+the inner loop's first access owner. Before creating releases, the pass checks
+the remaining path:
 
 - `k1` orders `{1}`'s write before `{0}`'s read;
 - `k3` orders `{0}`'s read before the destination.
 
-Therefore `k2` and `{1}`'s release into the `EXIT` semaphore can be removed.
-The separate `{1}` release created for `k1` remains, as do `k3` and `{0}`'s
-release into `EXIT`:
+Therefore `k2` imposes no additional wait. Removing it removes owner `{1}`'s
+release into the `EXIT` semaphore. Owner `{1}` still releases the different
+semaphore created from `k1`:
 
 ```text
 reduced DAG after removing k2
@@ -1631,123 +1957,123 @@ reduced DAG after removing k2
                         EXIT inner(i) {2}
 ```
 
-After semaphore assignment, `k1` and `k3` become different semaphores:
+The remaining edges become two count-1 semaphores:
 
 ```text
-%writer = token already owned by {1}
-W correct [%writer] {1}
-release CORRECTED, %writer {1}
-%corrected = acquire CORRECTED {0}
-R corrected [%corrected] {0}
-release READY, %corrected {0}
-%regain = acquire READY pending_count=1 {2}
+edge    semaphore    acquire before          pending_count
+k1      CORRECTED    R corrected {0}         1
+k3      READY        EXIT inner(i) {2}       1
 ```
 
-If any edge represented by a source owner's release has no recorded
-intermediate owner, that release remains at the position recorded in
-`releaseFloors`. This step never deletes only an earlier edge while retaining
-another edge from the same source owner.
-
-Each proposed removal is checked against the edges that remain. For example:
+Let `wtok` be the token already held by owner `{1}`:
 
 ```text
-initial edge set into D
-  f1: A {0} -> B {1}
-  f2: B {1} -> C {2}
-  f3: A {0} -> D {3}     possible removal through {1}
-  f4: B {1} -> D {3}     possible removal through {2}
-  f5: C {2} -> D {3}     no alternate path
+semaphore DAG
+
+                    W correct [wtok] {1}
+                              | walk
+                              v
+             release CORRECTED, wtok {1}       k1
+                    CORRECTED |
+                              v
+            ctok = acquire CORRECTED {0}
+                         ctok |
+                              v
+                 R corrected [ctok] {0}
+                              | walk
+                              v
+                 release READY, ctok {0}       k3
+                         READY |
+                               v
+                next = acquire READY {2}
+                          next |
+                               v
+                    EXIT inner(i) {2}
+                          next | next iteration
+                               v
+                   ENTER inner(i+1) {2}
 ```
 
-```text
-initial DAG
+The general check is deliberately stricter than finding any path in the DAG.
+Every synchronization edge represented by one source owner's release must
+have both of these remaining parts:
 
-                              A {0}
-                       +---------+-----------------+
-                    f1 |                           | f3 through {1}
-                       v                           |
-                     B {1}                         |
-                       +---------+-----------------+
-                    f2 |                           | f4 through {2}
-                       v                           |
-                     C {2}                         |
-                  f5   |                           |
-                       +------------+--------------+
-                                    v
-                                  D {3}
-```
+1. a semaphore transfers the buffer from the original source owner to
+   another owner after the original source node; and
+2. that owner still releases to the final destination, or that owner is the
+   destination owner and its program order reaches the destination.
 
-`f4` may be removed because `f2` orders `B` before `C` and `f5` orders `C`
-before `D`. After `f4` is removed, that path still orders `B` before `D`, but
-owner `{1}` no longer has its own release into `D`. The check for `f3`
-requires that release, so `f3` must remain. The pass repeats the check until
-every proposed removal still has both required path segments. It never uses
-one `if` branch to prove ordering in another.
+The first acquire must occur no later than the node from which the other
+owner releases to the destination. A check may cross enclosing `for`
+boundaries, but it never uses one `if` branch to prove ordering in another.
 
-Finally, loop entry and the next iteration may share one semaphore. These removals
-are optional, so the pass keeps the releases when removing them would make
-the two sites unable to use one fixed pending count. The first two columns
-below show the signal counts after the proposed removals but before any
-`arrive_count` adjustment:
+All edges represented by one release stay or disappear together. Proposed
+removals are repeatedly checked against the releases that still remain. If
+removing one release destroys the path needed to remove another, the second
+release stays. The original source nodes still constrain placement as
+described in [A surviving release does not move earlier](#a-surviving-release-does-not-move-earlier).
 
-```text
-entry signals    next-iteration signals   result
-1 [none]         2                     entry release uses arrive_count=2
-2                2                     both sites use pending_count=2
-2                1 after removal       cancel all proposed removals at both sites;
-                                       recheck counts
-```
+If every incoming release to a destination disappears, no semaphore or
+acquire is created for that destination. Removals shared by loop entry and
+re-entry are also optional: the pass restores them when removal would prevent
+the two sites from using one fixed pending count.
 
-If all incoming edges to a destination are removed, no acquire or semaphore
-is created for them.
+Implementation note: `buildEdgesAndSemas` performs this whole-release check
+after merging edges from each source owner. Candidate releases are removed
+only after the candidate set stops changing.
 
 ### One destination, one semaphore
 
-After reduction and merging, each `(destination node, destination owner)`
-pair receives one semaphore and one acquire. Each remaining source owner
-receives one release. The pending count is:
+After reduction and merging, all remaining edges ending at the same node for
+the same owner share one semaphore and one acquire. Each remaining source
+owner contributes one release. The pending count is:
 
 ```text
-sum over remaining senders of max(1, number of completion kinds)
+sum over remaining source owners of max(1, number of completion kinds)
 ```
 
-This means:
+```text
+remaining releases                           pending_count
+two source owners, each with [none]          2
+one source owner with [none, tma_load]        2
+two per-piece edges from one owner, [none]    1
+```
 
-- two `[none]` senders give pending count 2;
-- one sender with `[none, tma_load]` gives pending count 2;
-- two per-piece edges merged into one `[none]` source owner give pending count 1.
-
-The release is placed immediately after its earliest allowed node, after any
-earlier releases there. An asynchronous source uses its physical completion
-point. The acquire is placed before the destination, except when it can be
-safely placed at that owner's first read or write in the next iteration.
+A release is placed after the latest source node recorded for that source
+owner and destination. When that access has a `completionAnchor`, placement
+uses the anchor described in
+[When an access finishes](access-dag.md#when-an-access-finishes). If the
+source starts asynchronous work, its completion kind stays on the release so
+the signal waits for that work. The acquire is placed before the destination,
+except when it can safely move to that owner's first read or write in the next
+iteration.
 
 ### Reading one semaphore
 
-Start at an acquire and work backward. Its destination node and destination
-owner identify the synchronization. Every remaining source owner has one
-release of that semaphore. The pending count is the total number of times
-those releases signal it. Releases from different owners remain separate.
+To read a semaphore DAG, start at an acquire. The following access or boundary
+is its destination. Working backward, each source owner has one release of
+that semaphore. The pending count is the total number of times those releases
+signal it; releases from different owners remain separate.
 
-Then work forward from the acquire. `semaphore.buffer` uses the semaphore and
-the acquire token to produce the buffer operand used by the destination
-access. The same token can feed later releases by the destination owner until
-another acquire replaces it or the token is returned through `for` or `if`.
+Working forward, the acquire returns a token. EMIT-IR uses the semaphore and
+that token to create the `semaphore.buffer` operand for the destination
+access. The destination owner can reuse the token for later accesses and
+releases until another acquire replaces it or the token passes through a
+`for` or `if` boundary.
 
 The semaphore is chosen from the reduced edges, not from the allocation
-member that happened to create an edge. Overlapping members in one group can
-therefore use the same semaphore when their reduced edges have the same
-destination and owners. Disjoint paths keep separate semaphores because
-their destination nodes or owners differ.
+member that happened to create one. Overlapping members can therefore share
+a semaphore when their remaining edges have the same destination and owners.
+Paths with different destinations or destination owners use different
+semaphores.
 
-An async completion belongs on the release that represents its source. It
-increases the pending count of the same acquire; it does not create another
-acquire. A release with `[none, tma_load]` signals twice, while a plain
-release signals once.
+An asynchronous completion stays on the release for its source. It increases
+the pending count of the existing acquire rather than creating another
+acquire. A release with `[none, tma_load]` signals twice; one with `[none]`
+signals once.
 
 Entry and next-iteration acquires for the same buffer group may use one
-semaphore. A loop-carried token requires both sites to use that semaphore and
-the same pending count.
+semaphore. Both sites must use the same pending count.
 
 After this point, edges are not reduced or merged again. Token planning may
 move or add acquires and add releases needed to pass a token across a region
@@ -1757,75 +2083,84 @@ recomputing the reduced edges.
 
 ### Creating the first token
 
-`insertEntryAcquires` inserts an acquire before the first access or region
-that needs a token. The acquire is outside the first `for` when that loop is
-the first node. Its IR owner is `root`, while `entryTokenOwner` records the
-first access owner for token checks and emission.
+The first owner needs a token even when no earlier access can release one. If
+a loop already returns a token through a semaphore, that semaphore starts
+released and supplies the first token too.
 
-If a loop already uses a semaphore between iterations, the entry acquire uses
-that semaphore and marks it initially released:
+In [Repeated edges from one owner](#repeated-edges-from-one-owner), `READY`
+returns owner `{0}`'s token at the end of each iteration. The same semaphore
+supplies the first token too: `READY` starts released, and a root-owned
+acquire before the loop returns the `t0` used at `W m0(0)`. On later
+iterations, the `next` acquire shown in that example returns the token before
+`EXIT`, and `EXIT` passes it into the next `ENTER`.
 
-```text
-%first = acquire READY root
-for iter_args(%token = %first) {
-  ...
-  %next = acquire READY {1}
-  yield %next
-}
-```
-
-Otherwise, the pass creates a count-1 entry semaphore. Its acquire supplies
-the first token, and its release follows the last access or region:
-
-```text
-%entry = acquire ENTRY root
-... first access or region ...
-... last access or region ...
-release ENTRY, %last_token
-```
+The acquire has IR owner `root` because it is outside the partitioned loop,
+but it supplies the token used by owner `{0}`. If no existing semaphore can
+return the first owner's token, the pass creates an initially released,
+count-1 `ENTRY` semaphore. Its acquire supplies the first token, and its
+release follows the last access or region that uses that token.
 
 If the only top-level access or region that needs a token is an `if`, and
 exactly one branch contains an access or region that reads or writes the
 group, the acquire can be placed in that branch. A synchronized group with no
 access or region that reads or writes the group is an error.
 
+Implementation note: `insertEntryAcquires` creates this acquire.
+`entryTokenOwner` records which partition uses the root-owned result.
+
 ### Entry and the next iteration use one semaphore
 
-A token passed through `for iter_args` must come from the same semaphore on
-entry and on the next iteration.
-
-Using the two-level example above, the acquire created from parent edge `p1`
-returns the first-iteration token. The acquire created from child edge `c5`
-returns later-iteration tokens after `c4` is removed. The table first shows
-the acquire sites immediately after semaphores are assigned, before an
-acquire is moved to the next buffer operation that needs its token:
+A token passed through a `for` must come from the same semaphore on first
+entry and on every later entry. In
+[Example: the same rules at two region levels](#example-the-same-rules-at-two-region-levels),
+parent edge `p1` supplies the first inner iteration and child edge `c5`
+supplies later inner iterations after `c4` is removed:
 
 ```text
-acquire site                         reduced edges       semaphore   count
-before the inner for                 p1                  READY       1
-before EXIT inner(i) {2}             c5                  READY       1
-before R m0 {1}                      c1                  S1          1
-before W m0 {1}                      c2                  S2          1
-before R m0 {0}                      c3                  S3          1
-before EXIT outer(i) {3}             p2                  S4          1
+edge    semaphore    token used at                         pending_count
+p1      READY        ENTER inner(i,0) {2}                 1
+c5      READY        EXIT inner(i,j), then ENTER(i,j+1)   1
+c1      S1           R m0 {1}                             1
+c2      S2           W m0 {1}                             1
+c3      S3           R m0 {0}                             1
+p2      EMPTY        W m0 in the next outer iteration     1
 ```
 
-The last row is an intermediate position. Token placement makes `S4` the
-initially released `EMPTY` semaphore and moves its acquire to the next outer
-write, as shown in [Both loops together](#both-loops-together).
+The two `READY` paths in the complete semaphore DAG are:
 
 ```text
-%first = acquire READY {2}       // parent p1
-for iter_args(%token = %first) {
-  %view = semaphore.buffer READY, %token
-  ... use %view ...
-  %next = acquire READY {2}      // child c5
-  yield %next
-}
+first inner entry
+
+             release READY, otok {3}       p1
+                       READY |
+                             v
+              ptok = acquire READY {2}
+                       ptok |
+                            v
+                  ENTER inner(i,0) {2}
+
+later inner entry
+
+             release READY, r0tok {0}      c5
+                       READY |
+                             v
+              next = acquire READY {2}
+                       next |
+                            v
+                   EXIT inner(i,j) {2}
+                       next |
+                            v
+                 ENTER inner(i,j+1) {2}
 ```
 
-When the next-iteration acquire has count 2 and entry has one `[none]` edge, the
-single entry release uses `arrive_count=2`:
+The full parent and child flow appears in
+[Both loops together](#both-loops-together). The first path has no preceding
+inner `EXIT`; the second passes `next` through the current `EXIT` into the
+next `ENTER`.
+
+Both acquire sites must use one fixed pending count. If re-entry waits for
+two signals but entry has one `[none]` release, that entry release can signal
+twice through the literal IR attribute `arrive_count=2`:
 
 ```text
 release READY, %outer [none] arrive_count=2
@@ -1838,163 +2173,322 @@ release READY, %reader2 [none] arrive_count=1
 %next = acquire READY pending_count=2
 ```
 
-Increasing `arrive_count` is allowed only when the entry has exactly one
-`[none]` release. Other differences are errors unless restoring removed
-releases makes the two pending counts equal.
+The complete reconciliation rules are:
+
+```text
+entry signals    re-entry signals    result
+1 [none]         2                   entry release uses arrive_count=2
+2                2                   both acquires use pending_count=2
+2                1 after removal     restore optional removals and recheck
+```
+
+Increasing `arrive_count` is allowed only when entry has exactly one `[none]`
+release. Any remaining count mismatch is an error.
 
 ## Tokens through `for` and `if`
 
-After semaphore placement, a region may receive a token at its entry and
-produce a token on each exit path. `RegionFlow` records only what emission
-needs:
+After semaphores are assigned, a region may receive a token before it starts
+and return a token when it finishes. Each `if` path chooses separately:
 
 ```text
-owner          owner of the token at the region boundary
-exits          selected acquire or child region returning a token on each path;
-               null means that path returns the input token unchanged
-concreteSema   semaphore used when the result cannot use the input semaphore
+path performs an acquire     return the token from that acquire
+path performs no acquire     return the token that entered the path
 ```
 
-Region results are planned from inner regions to outer regions. The parent
-treats a finished child as one node that may return a token; it does not
-inspect the child operations again.
+Every path must return a token with the same owner. A path cannot return its
+input token when no input token exists.
 
-For a loop, the pass chooses between two IR forms:
+A loop has another choice. It can carry a token from one iteration to the
+next, or it can acquire the token immediately before the first buffer use
+that needs it:
 
 ```text
 carry the token
   %result = for iter_args(%token = %entry) { ... yield %next }
 
 acquire at the first buffer use
-  for { %token = acquire S; ... }
+  for { %token = acquire S; ... use buffer with %token ... }
 ```
 
-A final nested loop can also provide the needed token, so an outer loop may
-need no token result of its own.
+The following examples derive these choices from the input accesses and
+synchronization edges. Inner regions are handled first. Their parent then
+uses the returned token without inspecting the child operations again.
 
 ### Region results
 
-`summarizeRegionFlow` selects the acquire or child whose token each path
-returns. Every path that returns a token must return the same owner. A path
-with no such node returns the input token when the region boundary has one
-owner.
-
-EMIT-IR selects one semaphore for the region result. A loop keeps its input
-semaphore. An `if` normally does the same; when the input is an unpartitioned
-entry acquire, the result can use a semaphore from a path that returns a
-token. Without a usable input semaphore, the result uses `concreteSema`. This
-allows:
+The token returned by a region must come from one semaphore. A loop normally
+returns a token from the semaphore that supplied its input. An `if` normally
+does the same, but an `if` entered with a root-owned token may instead use the
+semaphore acquired on one of its paths. This permits:
 
 - both branches to return tokens from acquires;
 - one branch to return a token from an acquire while the other returns the
   input token; and
 - an `if` without `else` to return the input token on its implicit path.
 
-A path cannot return the input token when no input token exists.
-`pruneDeadIfFlows` removes an `if` token result when no buffer access,
-release, or child region with a token result appears before the next acquire,
-provided the enclosing region does not retain that result.
+An `if` does not need to return a token when nothing uses that token before
+the next acquire and its enclosing region does not need the result. A parent
+uses a child's token only when the child enters and returns the same owner and
+no later acquire, release, buffer use, or child region replaces it on any
+path.
 
-A parent can use a child's returned token only when the child enters and
-returns the same owner and no later acquire, release, group access, or child
-region appears on any path.
+In the implementation, `RegionFlow` records the boundary owner, the acquire
+or child selected on each path, and the semaphore used when the input
+semaphore cannot be used. `summarizeRegionFlow` builds that record, and
+`pruneDeadIfFlows` removes unused `if` results.
 
 ### Example: an `if` returns one owner's token
 
 `test/NVWS/insert_semas_conditional_multi_result.mlir`
-`@conditional_multi_result_if_token` has a buffer owned by `{1}` around an
-`if`. The then path transfers the token to `{0}` for the read and then returns
-a token owned by `{1}`; the else path does nothing.
-
-Input shape:
+`@conditional_multi_result_if_token` has this relevant access pattern in one
+loop iteration. `m0` contains one piece P0:
 
 ```text
-%in = token owned by {1}
-W m0 [%in] {1}
-%out = if %cond {
-  R m0 {0}
-  yield token returned to {1}
-} else {
-  yield %in
-}
-release ..., %out {1}
+W m0 {1}
+if cond
+  then: R m0 {0}
+  else: no m0 access
 ```
 
-The semaphore operations selected by SYNC-DAG are shown below. EMIT-IR can
-subsequently split this shape into scheduler-safe release, body, and acquire
-conditionals, as shown in
+The owner immediately before the `if` is `{1}`, so its summary is
+`P0:R:{1}`. The parent needs no synchronization edge around that summary:
+
+```text
+DAG node                    synchronization edge ending here
+W m0 {1}                    none
+[if P0:R:{1}]               none
+```
+
+The then path changes owners twice. The empty else path changes nothing:
+
+```text
+then-path DAG node          synchronization edge ending here
+ENTER if {1}                none
+R m0 {0}                    e1: ENTER if {1} -> R m0 {0}
+EXIT if {1}                 e2: R m0 {0} -> EXIT if {1}
+
+else-path DAG node          synchronization edge ending here
+ENTER if {1}                none
+EXIT if {1}                 none
+```
+
+```text
+synchronization-edge DAGs
+
+parent                         then path                else path
+
+W m0 {1}                      ENTER if {1}             ENTER if {1}
+    | walk                         | e1                     | walk
+    v                              v                        v
+[if P0:R:{1}]                 R m0 {0}                  EXIT if {1}
+                                   | e2
+                                   v
+                              EXIT if {1}
+```
+
+The parent summary and the two child paths are separate DAGs. Token planning
+joins the two child results afterward; no synchronization edge connects the
+summary directly to a child `ENTER` or `EXIT`.
+
+The two edges use two semaphores. The semaphore used by `e2` also carries the
+owner-`{1}` token into the loop and on to its next iteration:
+
+```text
+edge    semaphore    pending_count    initial state
+e1      FULL         1                false
+e2      EMPTY        1                initially released
+```
+
+`EMPTY` starts released. The then path returns a newly acquired owner-`{1}`
+token. The else path returns the owner-`{1}` token that entered the `if`:
+
+```text
+semaphore DAG for one loop iteration
+
+                         ENTER loop(i) {1}
+                                   | walk
+                                   v
+                  itok = acquire EMPTY {1}
+                              itok |
+                                   v
+                         W m0(i) [itok] {1}
+                                   |
+                         +---------+---------+
+                  then   |                   | else
+                         v                   v
+                 ENTER if {1}             ENTER if {1}
+                           |                 | walk
+                           v                 v
+       release FULL, itok [tc5mma] {1}     EXIT if {1}
+                      FULL |                 |
+                           v                 |
+              rtok = acquire FULL {0}        |
+                      rtok |                 |
+                           v                 |
+                  R m0(i) [rtok] {0}         |
+                           |                 |
+                release EMPTY, rtok {0}      |
+                     EMPTY |                 |
+                           v                 |
+          returned = acquire EMPTY {1}       |
+                  returned |                 |
+                           v                 |
+                   EXIT if {1}               |
+                           |                 |
+              out = returned        out = itok
+                         +---------+---------+
+                                   v
+ release EMPTY, out {1} ---------------- EMPTY ----------------+
+                 | walk                                      |
+                 v                                           |
+                         EXIT loop(i) {1}
+                                   | next iteration
+                                   v
+                       ENTER loop(i+1) {1}
+                                   | walk
+                                   v
+                    next = acquire EMPTY {1} <----------------+
+                               next |
+                                    v
+                         W m0(i+1) [next] {1}
+```
+
+On iteration zero, the initially released `EMPTY` supplies `itok`. On later
+iterations, the release after the preceding `if` supplies it. If the loop
+executes zero times, none of these operations executes.
+
+The `release EMPTY, out` after the `if` is not `e2`. Edge `e2` returns the
+then path to owner `{1}`; the later release makes whichever owner-`{1}` token
+the `if` returned available to the next loop iteration.
+
+EMIT-IR can subsequently split the then-path release, body, and acquire into
+scheduler-safe conditionals, as shown in
 [Scheduler-safe conditional boundaries](emit-ir.md#scheduler-safe-conditional-boundaries).
-
-```text
-%out = if %cond -> token {
-  release TO_READER, %in {1}
-  %read = acquire TO_READER {0}
-  %view = semaphore.buffer TO_READER, %read
-  R m0 [%view] {0}
-  release BACK, %read {0}
-  %returned = acquire BACK {1}
-  yield %returned
-} else {
-  yield %in
-}
-release NEXT, %out {1}
-```
-
-The region boundary owner is `{1}` on both paths. The then path returns the
-token from the final acquire; the else path returns the input token.
 
 ### Moving an acquire to its first use
 
-`planLoop` can remove a token from the loop operands and results when the
-final token of iteration `i` is needed first at one buffer access in
-iteration `i+1`. The acquire moves to that first access.
-
-`test/NVWS/insert_semas.mlir` `@local_reg_and_smem_use` begins with this
-loop-carried token form:
+`test/NVWS/insert_semas.mlir` `@local_reg_and_smem_use` has this input. The
+last operation directly consumes the memdesc through an unknown operation,
+so ACCESS-DAG conservatively records it as an exclusive `W` access. It is not
+a literal store:
 
 ```text
-%entry = acquire EMPTY root
-for iter_args(%token = %entry) {
-  W m0 [%token] {0}
-  release FULL0, %token {0}
-
-  %r = acquire FULL0 {1}
-  R m0 [%r] {1}
-  release FULL1, %r {1}
-
-  %w = acquire FULL1 {2}
-  W m0 [%w] {2}
-  release EMPTY, %w {2}
-
-  %next = acquire EMPTY {0}
-  yield %next
-}
+for
+  W m0 {0}
+  R m0 {1}
+  exclusive use of m0 {2}    recorded as W
 ```
 
-Nothing uses `%next` after its acquire. The next operation that needs it is
-the following iteration's `{0}` write, so the loop becomes:
+The boundary owner is `{0}`. The complete edge set is:
 
 ```text
-for {
-  %token = acquire EMPTY {0}
-  %view0 = semaphore.buffer EMPTY, %token
-  W m0 [%view0] {0}
-  release FULL0, %token {0}
-
-  %r = acquire FULL0 {1}
-  %view1 = semaphore.buffer FULL0, %r
-  R m0 [%view1] {1}
-  release FULL1, %r {1}
-
-  %w = acquire FULL1 {2}
-  %view2 = semaphore.buffer FULL1, %w
-  W m0 [%view2] {2}
-  release EMPTY, %w {2}
-}
+DAG node                  synchronization edge ending here
+ENTER(i) {0}              none
+W m0 {0}                  none
+R m0 {1}                  e1: W m0 {0} -> R m0 {1}
+W m0 {2}                  e2: R m0 {1} -> W m0 {2}
+EXIT(i) {0}               e3: W m0 {2} -> EXIT(i) {0}
 ```
 
-`EMPTY` is initially released, so the in-body acquire succeeds on iteration
-zero. Every iteration releases it for the next one.
+```text
+synchronization-edge DAG
+
+                          ENTER(i) {0}
+                               | walk
+                               v
+                           W m0 {0}
+                               | e1
+                               v
+                           R m0 {1}
+                               | e2
+                               v
+                           W m0 {2}
+                               | e3
+                               v
+                           EXIT(i) {0}
+```
+
+The three edges use three semaphores:
+
+```text
+edge    semaphore    pending_count
+e1      FULL0        1
+e2      FULL1        1
+e3      EMPTY        1
+```
+
+Immediately after semaphore placement, the acquire for `e3` is before
+`EXIT(i)` and its token is returned to the next iteration:
+
+```text
+initial token path
+
+release EMPTY, tok2 {2}
+          EMPTY |
+                v
+next = acquire EMPTY {0}
+           next |
+                v
+          EXIT(i) {0}
+           next | next iteration
+                v
+        ENTER(i+1) {0}
+           next |
+                v
+       W m0(i+1) [next] {0}
+```
+
+Nothing between that acquire and the next write uses `next`. The acquire can
+therefore move directly before the write, removing the token from the loop
+operands and results. The final semaphore DAG is:
+
+```text
+semaphore DAG after moving the acquire
+
+                         ENTER(i) {0}
+                              | walk
+                              v
+                tok0 = acquire EMPTY {0}
+                         tok0 |
+                              v
+                    W m0(i) [tok0] {0}
+                              | walk
+                              v
+                  release FULL0, tok0 {0}
+                        FULL0 |
+                              v
+                 tok1 = acquire FULL0 {1}
+                         tok1 |
+                              v
+                    R m0(i) [tok1] {1}
+                              | walk
+                              v
+                  release FULL1, tok1 {1}
+                        FULL1 |
+                              v
+                 tok2 = acquire FULL1 {2}
+                         tok2 |
+                              v
+                    W m0(i) [tok2] {2}
+                              | walk
+                              v
+        release EMPTY, tok2 {2} e3 -------------- EMPTY ---------------+
+                                                                       |
+                         EXIT(i) {0}                                   |
+                              | next iteration                         |
+                              v                                        |
+                       ENTER(i+1) {0}                                  |
+                              | walk                                   |
+                              v                                        |
+                next = acquire EMPTY {0} <-----------------------------+
+                         next |
+                              v
+                  W m0(i+1) [next] {0}
+```
+
+`EMPTY` starts released, so the acquire succeeds on iteration zero. Every
+iteration releases it for the next one. A zero-trip loop executes neither the
+acquire nor the release.
 
 The move requires an input token, a returned token, and one first direct
 buffer access before the next acquire. In particular:
@@ -2017,191 +2511,558 @@ When these conditions do not hold, the loop keeps its token.
 ### When the loop keeps a token
 
 `test/NVWS/insert_semas_per_edge_tmem.mlir`
-`@tmem_single_producer_multi_consumer_fanout` writes in `{0}`, reads in `{1}`
-and `{2}`, then writes again in `{0}`.
+`@tmem_single_producer_multi_consumer_fanout` has one piece P0 and this input:
 
 ```text
-%entry = acquire EMPTY pending_count=2 root
-for iter_args(%token = %entry) {
-  W buf [%token] {0}
-  release TO_R1, %token {0}
-  release TO_R2, %token {0}
-
-  %r1 = acquire TO_R1 {1}
-  R buf [%r1] {1}
-  release EMPTY, %r1 {1}
-
-  %r2 = acquire TO_R2 {2}
-  R buf [%r2] {2}
-  release EMPTY, %r2 {2}
-
-  %next = acquire EMPTY pending_count=2 {0}
-  W buf [%next] {0}
-  yield %next
-}
+for
+  W first {0}
+  R reader1 {1}
+  R reader2 {2}
+  W final {0}
 ```
 
-`%next` protects both the final write in iteration `i` and the first write in
-iteration `i+1`. Moving its acquire to the next first write would split one
-owner's buffer use across the boundary and require an extra release/acquire
-pair. The loop carries `%next` instead.
+The boundary owner is `{0}`. The first write sends the value to both readers,
+and the final write waits for both readers:
 
 ```text
-emitted token path from iteration i to iteration i+1
-
-                   %next = acquire EMPTY(i) {0}
-                                | walk
-                                v
-                         W final(i) [%next] {0}
-                                | walk
-                                v
-                         scf.yield %next
-                                | loop backedge
-                                v
-                    %token = iter_arg(i+1)
-                                | walk
-                                v
-                       W first(i+1) [%token] {0}
+DAG node                  synchronization edge ending here
+ENTER(i) {0}              none
+W first {0}               none
+R reader1 {1}             e1: W first {0} -> R reader1 {1}
+R reader2 {2}             e2: W first {0} -> R reader2 {2}
+W final {0}               e3: R reader1 {1} -> W final {0}
+                           e4: R reader2 {2} -> W final {0}
+EXIT(i) {0}               none
 ```
 
-`EMPTY` has `pending_count=2` because owners `{1}` and `{2}` each release it.
-The region boundary adds no semaphore.
+```text
+synchronization-edge DAG
+
+                          ENTER(i) {0}
+                               | walk
+                               v
+                          W first {0}
+                         +-----+-----+
+                      e1 |           | e2
+                         v           v
+                  R reader1 {1}  R reader2 {2}
+                      e3 |           | e4
+                         +-----+-----+
+                               v
+                          W final {0}
+                               | walk
+                               v
+                          EXIT(i) {0}
+```
+
+The two edges ending at the final write share one count-2 semaphore:
+
+```text
+edge        semaphore    pending_count
+e1          TO_R1        1
+e2          TO_R2        1
+e3, e4      EMPTY        2
+```
+
+The token acquired from `EMPTY` serves both the final write in iteration `i`
+and the first write in iteration `i+1`:
+
+```text
+semaphore DAG
+
+       entry = acquire EMPTY pending_count=2 root       supplies owner {0}
+                              entry |
+                                    v
+                             ENTER(i) {0}
+                                    | walk
+                                    v
+                       W first(i) [entry] {0}
+                         +----------+----------+
+                         |                     |
+          release TO_R1, entry {0}   release TO_R2, entry {0}
+                   TO_R1 |                TO_R2 |
+                         v                     v
+          r1tok = acquire TO_R1 {1}  r2tok = acquire TO_R2 {2}
+                  r1tok |                     | r2tok
+                         v                     v
+             R reader1(i) [r1tok]    R reader2(i) [r2tok]
+                         |                     |
+      release EMPTY, r1tok {1}       release EMPTY, r2tok {2}
+                   EMPTY |                     | EMPTY
+                         +----------+----------+
+                                    v
+          next = acquire EMPTY pending_count=2 {0}
+                               next |
+                                    v
+                       W final(i) [next] {0}
+                                    | walk
+                                    v
+                              EXIT(i) {0}
+                                    | loop backedge
+                                    v
+                            ENTER(i+1) {0}
+                                    | walk
+                                    v
+                       W first(i+1) [next] {0}
+```
+
+Moving the count-2 acquire to the next first write would leave the final write
+without a token and require another release/acquire pair. The loop therefore
+carries `next`. The boundary, first write, and final write all have owner
+`{0}`, so the boundary itself adds no synchronization edge. If the loop
+executes zero times, `entry` is its result.
 
 ### A use after the loop
 
-A token needed after the loop does not always force a loop-carried token. The
-pass can acquire the final released semaphore once after the loop:
+This deliberately simplified example shows why a use after a loop does not
+always require a loop-carried token. It has one piece P0:
 
 ```text
-%entry = acquire READY {1}
-W buf [%entry] {1}
-release TO_READER, %entry {1}
+W before {1}
 
-for {
-  %read = acquire TO_READER {2}
-  R buf [%read] {2}
-  release TO_WRITER, %read {2}
+for
+  R body-read {2}
+  W body-write {1}
 
-  %write = acquire TO_WRITER {1}
-  W buf [%write] {1}
-  release TO_READER, %write {1}
-}
-
-%final = acquire TO_READER {2}
-release AFTER_LOOP, %final {2}
-%consumer = acquire AFTER_LOOP {3}
-R buf [%consumer] {3}
+R after {3}
 ```
 
-For a non-empty loop, `%final` waits for the final iteration. For a zero-trip
-loop, it waits for the release before the loop. `postLoopAcquire` marks this
-acquire inserted after the loop so schedule finalization uses the correct
-owner boundary.
+The loop writes P0 and its first access has owner `{2}`, so its summary is
+`P0:W:{2}`. The parent edges are:
+
+```text
+DAG node                     synchronization edge ending here
+W before {1}                 none
+[for P0:W:{2}]               p1: W before {1} -> for
+R after {3}                  p2: for -> R after {3}
+```
+
+The child edges are:
+
+```text
+DAG node                     synchronization edge ending here
+ENTER(i) {2}                 none
+R body-read {2}              none
+W body-write {1}             c1: R body-read {2} -> W body-write {1}
+EXIT(i) {2}                  c2: W body-write {1} -> EXIT(i) {2}
+```
+
+```text
+synchronization-edge DAGs
+
+parent                              child
+
+W before {1}                       ENTER(i) {2}
+     | p1                               | walk
+     v                                  v
+[for P0:W:{2}]                    R body-read {2}
+     | p2                               | c1
+     v                                  v
+R after {3}                       W body-write {1}
+                                         | c2
+                                         v
+                                    EXIT(i) {2}
+```
+
+Parent edge `p1` and child edge `c2` use the same semaphore: `p1` supplies
+the first iteration and `c2` supplies the next iteration. The other two edges
+use their own semaphores:
+
+```text
+edges      semaphore    pending_count    initial state
+p1, c2     TO_READER    1                initially released
+c1         TO_WRITER    1                false
+p2         AFTER_LOOP   1                false
+```
+
+The acquire after the loop consumes the same `TO_READER` release that would
+have supplied another iteration. The initially released state of `TO_READER`
+also supplies the root-owned token used by `W before`:
+
+```text
+semaphore DAG through one body iteration
+
+        before = acquire TO_READER root       supplies owner {1}
+                              before |
+                                     v
+                        W before [before] {1}
+                                     | walk
+                                     v
+      release TO_READER, before {1} p1 -------- TO_READER --------+
+                                                                 |
+                             ENTER(0) {2}                        |
+                                    | walk                       |
+                                    v                            |
+                read = acquire TO_READER {2} <-------------------+
+                               read |
+                                    v
+                    R body-read(0) [read] {2}
+                                    | walk
+                                    v
+                    release TO_WRITER, read {2}         c1
+                          TO_WRITER |
+                                    v
+               write = acquire TO_WRITER {1}
+                              write |
+                                    v
+                  W body-write(0) [write] {1}
+                                    | walk
+                                    v
+                   release TO_READER, write {1}         c2
+
+                              EXIT(0) {2}
+```
+
+If the loop continues, the next iteration acquires the release from `c2` at
+its first read:
+
+```text
+release TO_READER, write(i) {1} c2 -------- TO_READER --------+
+                                                              |
+                    EXIT(i) {2}                              |
+                         | next iteration                    |
+                         v                                   |
+                   ENTER(i+1) {2}                            |
+                         | walk                              |
+                         v                                   |
+       next = acquire TO_READER {2} <------------------------+
+                      next |
+                           v
+          R body-read(i+1) [next] {2}
+```
+
+If the loop finishes, the acquire after the loop consumes the release from
+the final `c2`, then implements parent edge `p2`:
+
+```text
+release TO_READER, write(last) {1} c2 -------- TO_READER --------+
+                                                                 |
+                    EXIT(last) {2}                              |
+                         | loop finishes                        |
+                         v                                      |
+       final = acquire TO_READER {2} <--------------------------+
+                     final |
+                           v
+     release AFTER_LOOP, final {2}       p2
+                AFTER_LOOP |
+                           v
+        out = acquire AFTER_LOOP {3}
+                       out |
+                           v
+              R after [out] {3}
+```
+
+For a zero-trip loop, there is no child `ENTER` or `EXIT`; the post-loop
+`final` acquire consumes the `p1` release after `W before`. The
+implementation marks `final` with `postLoopAcquire` so schedule finalization
+uses owner `{2}`'s boundary after the loop.
 
 If the last child returns the loop token and that token is also used after the
 loop, the token remains in the child result and the loop returns it.
 
 ### Nested loops
 
-Inner loops are analyzed before outer loops. In
-`test/NVWS/insert_semas_nested_ws_inner_loop.mlir`
-`@nested_ws_inner_loop`, the inner loop acquires at its first MMA. The outer
-loop does not use that token, so it needs no token argument or result:
+Inner loops are handled before their outer loops. The first example in
+`test/NVWS/insert_semas_nested_ws_inner_loop.mlir`,
+`@nested_ws_inner_loop`, has this input for one piece P0:
 
 ```text
-outer for {
-  inner for {
-    %mma = acquire MMA_READY {1}
-    %acc = semaphore.buffer MMA_READY, %mma
-    W acc [%acc] {1}
-    release ACC_FULL, %mma [tc5mma] {1}
-
-    %read = acquire ACC_FULL {0}
-    %view = semaphore.buffer ACC_FULL, %read
-    R acc [%view] {0}
-    release MMA_READY, %read {0}
-  }
-}
+outer for
+  inner for
+    W acc {1}    MMA
+    R acc {0}
 ```
 
-`@nested_ws_inner_loop_parent_continuation` adds an outer read after the inner
-loop. The inner loop still acquires at its first MMA. An acquire and release
-after the inner loop provide a token for the outer read. A final acquire and
-release in the outer body provide the token needed by the next inner
-iteration. Neither loop needs a token argument or result:
+The inner summary is `P0:W:{1}`. It is the only P0 node in the outer body, so
+the outer child has no synchronization edge:
 
 ```text
-%outer_entry = acquire OUTER_EMPTY root
-
-outer for {
-  inner for {
-    %mma = acquire LOCAL_EMPTY {1}
-    ... MMA {1}, read {0} ...
-    release LOCAL_EMPTY, %read {0}
-  }
-
-  %bridge = acquire LOCAL_EMPTY {1}
-  release OUTER_FULL, %bridge [tc5mma] {1}
-  %outer_read = acquire OUTER_FULL {0}
-  %outer_view = semaphore.buffer OUTER_FULL, %outer_read
-  R acc [%outer_view] {0}
-  release OUTER_EMPTY, %outer_read {0}
-
-  %tail = acquire OUTER_EMPTY {1}
-  release LOCAL_EMPTY, %tail {1}
-}
+DAG node                         synchronization edge ending here
+ENTER outer(i) {1}              none
+[inner for P0:W:{1}]            none
+EXIT outer(i) {1}               none
 ```
 
-The root acquire provides the token for the first outer iteration without
-becoming a loop argument. The outer analysis uses the token and completion
-recorded for the inner region after its body is analyzed.
-
-### Branch completion must agree
-
-Both paths can return a token with the same owner while the latest operation
-by that owner has a different schedule on each path. `completionAfterChain`
-records whether a path keeps the schedule from before the region or uses the
-schedule of a later operation. For a later operation it records `loop.stage`
-and `loop.cluster`.
-
-`test/NVWS/insert_semas_nested_carrier.mlir`
-`@branch_completion_requires_carrier` has this inner loop:
+The inner child changes from `{1}` to `{0}` and back to boundary owner `{1}`:
 
 ```text
-%result = for iter_args(%ready = %pre_loop) {
-  %first = MMA acc[%ready] {1}              stage 0, cluster 1
-
-  %branch = if %cond -> token {
-    %second = MMA acc[%first] {1}           stage 1, cluster 2
-    release BRANCH_FULL, %ready [tc5mma]
-    %read = acquire BRANCH_FULL {0}         stage 1, cluster 3
-    R acc [%read] {0}
-    release BRANCH_BACK, %read {0}
-    %returned = acquire BRANCH_BACK {1}     stage 1, cluster 2
-    yield %returned
-  } else {
-    yield %ready                            incoming stage-0 completion
-  }
-
-  release FINAL_FULL, %branch [tc5mma] {1}
-  %final = acquire FINAL_FULL {0}
-  R acc [%final] {0}
-  release READY, %final {0}
-  %next = acquire READY {1}
-  yield %next
-}
+DAG node                         synchronization edge ending here
+ENTER inner(i,j) {1}            none
+W acc {1}                        none
+R acc {0}                        e1: W acc {1} -> R acc {0}
+EXIT inner(i,j) {1}             e2: R acc {0} -> EXIT inner(i,j) {1}
 ```
 
-The then path ends after an owner-`{1}` operation at stage 1. The else path
-keeps the incoming stage-0 schedule. Because those schedules differ, the loop
-keeps `%ready` as an iter-arg and yields `%next`. An absent `else` also keeps
-the incoming schedule. A loop that executes zero times must account for both
-the incoming schedule and the body result.
+```text
+synchronization-edge DAG with both region levels
+
+                       ENTER outer(i) {1}
+                                | walk
+                                v
+               +-- [inner-for summary P0:W:{1}] --+
+               |                                   |
+               |       ENTER inner(i,j) {1}        |
+               |                | walk             |
+               |                v                  |
+               |            W acc {1}              |
+               |                | e1               |
+               |                v                  |
+               |            R acc {0}              |
+               |                | e2               |
+               |                v                  |
+               |       EXIT inner(i,j) {1}         |
+               +-----------------------------------+
+                                | walk
+                                v
+                        EXIT outer(i) {1}
+```
+
+`e1` uses `FULL`, and `e2` uses initially released `EMPTY`. Both have
+`pending_count=1`:
+
+```text
+edge    semaphore    pending_count
+e1      FULL         1
+e2      EMPTY        1
+```
+
+The `EMPTY` acquire moves to the first MMA in each inner iteration:
+
+```text
+semaphore DAG for one executed inner iteration
+
+                      ENTER inner(i,j) {1}
+                                | walk
+                                v
+                   wtok = acquire EMPTY {1}
+                            wtok |
+                                 v
+                    W acc(i,j) [wtok] {1}
+                                 | walk
+                                 v
+          release FULL, wtok [tc5mma] {1}       e1
+                           FULL |
+                                v
+                    rtok = acquire FULL {0}
+                            rtok |
+                                 v
+                    R acc(i,j) [rtok] {0}
+                                 | walk
+                                 v
+                    release EMPTY, rtok {0}       e2
+```
+
+The `EMPTY` semaphore connects that release to the first MMA in whichever
+inner iteration executes next. The control-flow paths do not carry its token:
+
+```text
+release EMPTY, rtok {0} e2 ------------------- EMPTY -------------------+
+                                                                         |
+EXIT inner(i,j) {1}                                                      |
+       +----------------------+----------------------+                    |
+       | inner continues      | inner finishes       |                    |
+       v                      v                                           |
+ENTER inner(i,j+1) {1}   EXIT outer(i) {1}                               |
+                              | next outer iteration                     |
+                              v                                          |
+                       ENTER outer(i+1) {1}                               |
+                              | walk                                     |
+                              v                                          |
+                       ENTER inner(i+1,0) {1}                             |
+       +----------------------+----------------------+                    |
+                              v                                          |
+            next = acquire EMPTY {1} <-----------------------------------+
+                         next |
+                              v
+                 W acc [next] {1}
+```
+
+The initially released `EMPTY` supplies the first executed inner iteration.
+Each read releases it for the next executed inner iteration, even when that
+iteration belongs to the next outer iteration. If an inner loop executes zero
+times, it performs no semaphore operation and leaves `EMPTY` available. The
+pass adds no semaphore-token operand or result to either loop; the unrelated
+async token already present in the test remains separate.
+
+`@nested_ws_inner_loop_parent_continuation` adds one read after the inner
+loop:
+
+```text
+outer for
+  inner for
+    W acc {1}    MMA
+    R acc {0}
+
+  R acc {0}      outer read
+```
+
+The inner edge set is unchanged. In the outer child, the inner summary has
+owner `{1}` and the outer read has owner `{0}`:
+
+```text
+outer DAG node                   synchronization edge ending here
+ENTER outer(i) {1}              none
+[inner for P0:W:{1}]            none
+R outer {0}                     p1: inner for -> R outer {0}
+EXIT outer(i) {1}               p2: R outer {0} -> EXIT outer(i) {1}
+
+inner DAG node                   synchronization edge ending here
+ENTER inner(i,j) {1}            none
+W acc {1}                        none
+R inner {0}                     c1: W acc {1} -> R inner {0}
+EXIT inner(i,j) {1}             c2: R inner {0} -> EXIT inner(i,j) {1}
+```
+
+```text
+synchronization-edge DAG with outer continuation
+
+                       ENTER outer(i) {1}
+                                | walk
+                                v
+               +-- [inner-for summary P0:W:{1}] --+
+               |                                   |
+               |       ENTER inner(i,j) {1}        |
+               |                | walk             |
+               |                v                  |
+               |            W acc {1}              |
+               |                | c1               |
+               |                v                  |
+               |          R inner {0}              |
+               |                | c2               |
+               |                v                  |
+               |       EXIT inner(i,j) {1}         |
+               +-----------------------------------+
+                                | p1
+                                v
+                         R outer {0}
+                                | p2
+                                v
+                        EXIT outer(i) {1}
+```
+
+The four edges use four count-1 semaphores:
+
+```text
+edge    semaphore       pending_count    initial state
+c1      LOCAL_FULL      1                false
+c2      LOCAL_EMPTY     1                initially released
+p1      OUTER_FULL      1                false
+p2      OUTER_EMPTY     1                initially released
+```
+
+`LOCAL_EMPTY` and `OUTER_EMPTY` start released. The acquire of
+`OUTER_EMPTY` before the outer loop consumes its initial value; it is not a
+loop argument. This makes the later tail acquire wait for the outer read
+rather than succeeding early.
+
+```text
+outer_entry = acquire OUTER_EMPTY root
+```
+
+```text
+semaphore DAG for an inner iteration
+
+                 wtok = acquire LOCAL_EMPTY {1}
+                            wtok |
+                                 v
+                    W acc(i,j) [wtok] {1}
+                                 | walk
+                                 v
+      release LOCAL_FULL, wtok [tc5mma] {1}       c1
+                     LOCAL_FULL |
+                                v
+               rtok = acquire LOCAL_FULL {0}
+                            rtok |
+                                 v
+                   R inner(i,j) [rtok] {0}
+                                 | walk
+                                 v
+               release LOCAL_EMPTY, rtok {0}       c2
+```
+
+If the inner loop continues, that `LOCAL_EMPTY` release supplies the acquire
+at the next MMA. If it finishes, `bridge` consumes the same release after the
+last `EXIT`:
+
+```text
+inner loop continues
+
+release LOCAL_EMPTY, rtok {0} c2 -------------- LOCAL_EMPTY --------------+
+                                                                          |
+EXIT inner(i,j) {1}                                                       |
+       | next inner iteration                                             |
+       v                                                                  |
+ENTER inner(i,j+1) {1}                                                    |
+       | walk                                                             |
+       v                                                                  |
+next = acquire LOCAL_EMPTY {1} <------------------------------------------+
+       next |
+            v
+       next MMA
+
+inner loop finishes
+
+release LOCAL_EMPTY, rtok {0} c2 -------------- LOCAL_EMPTY --------------+
+                                                                          |
+EXIT inner(i,last) {1}                                                    |
+       | loop finishes                                                    |
+       v                                                                  |
+bridge = acquire LOCAL_EMPTY {1} <----------------------------------------+
+       bridge |
+              v
+release OUTER_FULL, bridge [tc5mma] {1} p1
+       OUTER_FULL |
+                  v
+out = acquire OUTER_FULL {0}
+       out |
+           v
+R outer(i) [out] {0}
+       | walk
+       v
+release OUTER_EMPTY, out {0}       p2
+       OUTER_EMPTY |
+                   v
+tail = acquire OUTER_EMPTY {1}
+       tail |
+            v
+release LOCAL_EMPTY, tail {1}
+```
+
+The final release makes the token available in the next outer iteration. It
+connects directly to either that iteration's first MMA acquire or its
+post-inner `bridge` when the inner loop has zero iterations:
+
+```text
+release LOCAL_EMPTY, tail {1} ---------------- LOCAL_EMPTY ---------------+
+                                                                          |
+EXIT outer(i) {1}                                                         |
+       | next outer iteration                                             |
+       v                                                                  |
+ENTER outer(i+1) {1}                                                      |
+       +----------------------+----------------------+                     |
+       | inner executes       | inner has zero trips |                     |
+       v                      v                                            |
+ENTER inner(i+1,0) {1}   bridge = acquire LOCAL_EMPTY {1} <----------------+
+       | walk                                                             |
+       v                                                                  |
+first = acquire LOCAL_EMPTY {1} <------------------------------------------+
+       first |
+             v
+        first MMA
+```
+
+The release from `tail` to `LOCAL_EMPTY` is not another synchronization
+edge. It makes owner `{1}`'s token available to the first inner MMA of the
+next outer iteration. If the inner loop executes zero times, `bridge` consumes
+the initially released `LOCAL_EMPTY` on the first outer iteration or the
+preceding `tail` release on later outer iterations. The outer read and tail
+then proceed in the same way. Neither loop carries a semaphore token.
 
 ## Backing copies
 
-`computeBackingCopies` chooses physical buffer copies. A synchronized group
-with explicit `buffer.copy` uses that value. Otherwise it starts with one
+After synchronization edges are known, the pass chooses how many physical
+copies back each synchronized buffer group. A group with an explicit
+`buffer.copy` uses that value. A group without the attribute starts with one
 copy.
 
 A synchronized TMEM accumulator can use two copies when every MMA directly
@@ -2213,38 +3074,259 @@ inside the loop satisfies these checks:
 - two copies fit in the available TMEM blocks; and
 - no scaled MMA uses block N of 256.
 
-When `use-meta-partitioner` is set, the pass does not add this automatic TMEM
-copy. An inconsistent or non-positive explicit `buffer.copy` in one group is
-an error.
+When `use-meta-partitioner` is set, the pass does not add this automatic
+second TMEM copy. An inconsistent or non-positive explicit `buffer.copy` in
+one group is an error.
 
-Semaphore copies are computed separately by `computeSemaphoreCopies`.
-Usually they equal buffer copies. For a local buffer with no explicit
-`buffer.copy`, a release after a TMA load uses at least the number of
-semaphore stages requested by `LowerSemaphore`:
+Semaphore copies are chosen separately and usually equal the buffer copies.
+For a local buffer with no explicit `buffer.copy`, a release after a TMA load
+uses at least the number of stages requested by later semaphore lowering:
 
 ```text
-numSemaphoreCopies = max(1, lowerSemaphoreNumStages)
+semaphore copies = max(1, requested lowering stages)
 ```
 
 This does not change the buffer copy count. Schedule and stage analysis use
-the semaphore copy count that lowering will create.
+the semaphore copy count that lowering will create. The implementation calls
+the lowering-stage source `LowerSemaphore`.
 
-For example, `@root_entry_accumulator_adopts_without_semaphore_handoff` in
-`test/NVWS/insert_semas_root_entry_tmem.mlir` has one MMA satisfying the
-checks above and enough TMEM for two accumulator copies.
+### Example: a TMEM accumulator gets two copies
 
-By contrast, the `buffer.id = 102` group in
-`test/NVWS/insert_semas.mlir` `@local_release_after_mma` keeps one buffer copy,
-while its semaphore uses the lowering stage count because its release follows
-a descriptor load:
+`test/NVWS/insert_semas_root_entry_tmem.mlir`
+`@root_entry_accumulator_adopts_without_semaphore_handoff` has one TMEM piece
+P0. Its relevant input is:
 
 ```text
-W m0  nvws.descriptor_load {0}
-release FULL [tma_load] {0}
+W acc root                 initial store
 
-numCopies = 1
-numSemaphoreCopies = max(1, lowerSemaphoreNumStages)
+for
+  R acc {1}
+  W acc {1}
+  W acc {2}                MMA accumulator
+
+R acc root                 final load
 ```
+
+The loop boundary owner is `{1}`. The root token used by the initial store is
+passed into the loop, so no root-to-`{1}` synchronization edge is needed. The
+loop writes P0 and first accesses it in owner `{1}`, so its parent summary is
+`P0:W:{1}`:
+
+```text
+parent DAG node                 synchronization edge ending here
+W acc root                     none
+[for P0:W:{1}]                 none
+R acc root                     p1: for -> R acc root
+```
+
+```text
+parent synchronization-edge DAG
+
+                       W acc root
+                           | walk, same token
+                           v
+                     [for P0:W:{1}]
+                           | p1
+                           v
+                       R acc root
+```
+
+The child edge set is:
+
+```text
+DAG node                   synchronization edge ending here
+ENTER(i) {1}               none
+R acc {1}                  none
+W acc {1}                  none
+W acc {2}                  e1: W acc {1} -> W acc {2}
+EXIT(i) {1}                e2: W acc {2} -> EXIT(i) {1}
+```
+
+```text
+synchronization-edge DAG
+
+                           ENTER(i) {1}
+                                | walk
+                                v
+                            R acc {1}
+                                | walk
+                                v
+                            W acc {1}
+                                | e1
+                                v
+                       W acc {2}  MMA
+                                | e2
+                                v
+                           EXIT(i) {1}
+```
+
+`e1` uses `TO_MMA`, `e2` uses initially released `EMPTY`, and parent edge
+`p1` uses `AFTER`. All have `pending_count=1`:
+
+```text
+edge    semaphore    pending_count    initial state
+e1      TO_MMA       1                false
+e2      EMPTY        1                initially released
+p1      AFTER        1                false
+```
+
+The same `EMPTY` token serves the root store and the first owner-`{1}`
+access, so no release/acquire pair is inserted between them.
+
+```text
+semaphore DAG
+
+                     root = acquire EMPTY
+                              root |
+                                   v
+                      W acc [root] root
+                              same token
+                                   |
+                                   v
+                          ENTER(0) {1}
+                                   | walk
+                                   v
+                         R acc(0) [root] {1}
+                                   | walk
+                                   v
+                         W acc(0) [root] {1}
+                                   |
+                    release TO_MMA, root {1}      e1
+                          TO_MMA |
+                                 v
+                    mma = acquire TO_MMA {2}
+                             mma |
+                                 v
+                    W acc(0) [mma] {2}  MMA
+                                 |
+               release EMPTY, mma [tc5mma] {2}    e2
+                           EMPTY |
+                                 v
+                   next = acquire EMPTY {1}
+                            next |
+                                 v
+                           EXIT(0) {1}
+                       +---------+---------+
+       another iteration         |         | loop finishes
+                       next       |         | next
+                         v        |         v
+                 ENTER(1) {1}     |  result = next
+                         |        |         |
+                    repeat body   |         v
+                         |        |  release AFTER, result {1}       p1
+                         |        |       AFTER |
+                         +--------+             v
+                                     out = acquire AFTER root
+                                                   out |
+                                                       v
+                                          R acc [out] root
+```
+
+The release to `AFTER` implements parent edge `p1`; it is not another child
+synchronization edge. For a zero-trip loop, the initial root token is the loop
+result and supplies that release.
+
+This group is synchronized, has no explicit `buffer.copy`, is in TMEM, and
+has one qualifying MMA. Two copies fit, so the generated allocation and the
+semaphores refer to a two-copy buffer:
+
+```text
+input TMEM buffer       memdesc<128x128xf32>
+generated backing      memdesc<2x128x128xf32>
+buffer copies           2
+semaphore copies        2
+```
+
+### Example: a TMA load increases only the semaphore copies
+
+The `buffer.id = 102` group in `test/NVWS/insert_semas.mlir`
+`@local_release_after_mma` is an SMEM group with one piece P0 and no explicit
+`buffer.copy`. Its input is:
+
+```text
+for
+  W m0 {0}    descriptor_load
+  R m0 {1}    MMA operand
+```
+
+The loop boundary owner is `{0}`. The descriptor load sends P0 to the MMA,
+and the MMA must finish reading P0 before the next descriptor load:
+
+```text
+DAG node                  synchronization edge ending here
+ENTER(i) {0}              none
+W m0 {0}                  none
+R m0 {1}                  e1: W m0 {0} -> R m0 {1}
+EXIT(i) {0}               e2: R m0 {1} -> EXIT(i) {0}
+```
+
+```text
+synchronization-edge DAG
+
+                         ENTER(i) {0}
+                              | walk
+                              v
+                          W m0(i) {0}
+                              | e1
+                              v
+                          R m0(i) {1}
+                              | e2
+                              v
+                          EXIT(i) {0}
+```
+
+`e1` uses `FULL`, and `e2` uses initially released `EMPTY`. Both have
+`pending_count=1`:
+
+```text
+edge    semaphore    pending_count    initial state
+e1      FULL         1                false
+e2      EMPTY        1                initially released
+```
+
+The semaphore DAG shows the descriptor load's asynchronous completion on the
+`FULL` release and the MMA completion on the `EMPTY` release:
+
+```text
+                    empty = acquire EMPTY(i) {0}
+                                 empty |
+                                       v
+                    W m0(i) [empty] {0}       descriptor_load
+                                       | walk
+                                       v
+        release FULL, empty [tma_load] {0}          e1
+                                 FULL |
+                                      v
+                       full = acquire FULL {1}
+                                  full |
+                                       v
+                    R m0(i) [full] {1}       MMA operand
+                                       | walk
+                                       v
+         release EMPTY, full [tc5mma] {1}           e2
+                                EMPTY |
+                                      v
+                  next = acquire EMPTY(i+1) {0}
+                                 next |
+                                      v
+                       W m0(i+1) [next] {0}
+```
+
+SMEM does not receive the automatic second TMEM copy, so the buffer stays
+single-copy. Because the `FULL` release carries `tma_load`, the semaphore
+copy count for the whole group uses the lowering stage count:
+
+```text
+buffer copies       1
+semaphore copies    max(1, requested lowering stages)
+```
+
+The initially released `EMPTY` supplies iteration zero. Each MMA release
+supplies the next descriptor load. There is no buffer use after the loop, and
+a zero-trip loop executes none of the shown operations.
+
+In the implementation, `computeBackingCopies` chooses the buffer copies and
+`computeSemaphoreCopies` applies the TMA-load rule.
 
 ## Pipeline schedule
 
@@ -2276,29 +3358,102 @@ inside one cluster. A release/acquire pair between iterations may therefore
 connect operations from different source iterations that execute in the same
 expanded loop body.
 
-For release/acquire relationships created from synchronization edges, and for
-additional relationships created while moving tokens through regions, the
-pass records a `ProtocolArc`. A dedicated entry acquire and its final release
-need no `ProtocolArc`.
-
-Each recorded relation contains:
-
-```text
-release    generated release node
-acquire    generated acquire node
-producer   source access or region
-consumer   destination access or region
-wait       acquire used when checking release-before-acquire schedule order
-```
-
-`producer` and `consumer` identify the source and destination access or
-region. The record remains available when token placement moves an acquire.
+For each release/acquire relationship created from a synchronization edge,
+the pass records a schedule relation. Token movement through a region can
+create another such relation. It remembers the source, destination, release,
+and acquire so schedule finalization can check whether the release must
+execute before that acquire in one expanded loop body. The relation remains
+available when token placement moves an acquire. A dedicated entry acquire
+and the release that replenishes it need no schedule relation.
 
 ### Example: one-copy synchronization between iterations
 
 `test/NVWS/insert_semas_recurrence_schedule.mlir`
-`@one_slot_recurrence` uses `EMPTY` to protect the next write and `FULL` to
-protect the following read. `(s,c)` below is `(loop.stage, loop.cluster)`.
+`@one_slot_recurrence` has one physical copy of P0. Its input has one write
+to member `m0`, which covers P0, followed by two reads from `m0`. The write
+has owner `{3}` and both reads have owner `{1}`. `(s,c)` is
+`(loop.stage, loop.cluster)`:
+
+```text
+buffer.copy = 1
+
+for i
+  W m0(i) {3}             (0,1)
+  R first m0(i) {1}       (0,1)
+  R final m0(i) {1}       (1,2)
+```
+
+The two reads have the same owner. The final read therefore replaces that
+owner's latest read without adding another synchronization edge:
+
+```text
+DAG node                  synchronization edge ending here
+ENTER(i) {3}              none
+W m0(i) {3}               none
+R first m0(i) {1}         e1: W m0(i) {3} -> R first m0(i) {1}
+R final m0(i) {1}         none
+EXIT(i) {3}               e2: R final m0(i) {1} -> EXIT(i) {3}
+```
+
+```text
+                          ENTER(i) {3}
+                               | walk
+                               v
+                           W m0(i) {3}
+                               | e1
+                               v
+                       R first m0(i) {1}
+                               | walk
+                               v
+                       R final m0(i) {1}
+                               | e2
+                               v
+                           EXIT(i) {3}
+```
+
+`e1` becomes `FULL`. `e2` becomes `EMPTY`, which is also initially released
+to provide the first write token. Both semaphores have `pending_count=1`.
+The semaphore DAG follows the same accesses across the iteration boundary:
+
+```text
+                    wtok = acquire EMPTY(i) {3}
+                                wtok |
+                                     v
+                         W m0(i) [wtok] {3}
+                                     | walk
+                                     v
+                     release FULL, wtok {3}       e1
+                               FULL |
+                                     v
+                    rtok = acquire FULL(i) {1}
+                                rtok |
+                                     v
+                   R first m0(i) [rtok] {1}
+                                     | walk
+                                     v
+                   R final m0(i) [rtok] {1}
+                                     | walk
+                                     v
+ release EMPTY, rtok {1} e2 --------------- EMPTY ---------------+
+                                                                    |
+                               EXIT(i) {3}
+                                     | next iteration
+                                     v
+                             ENTER(i+1) {3}
+                                     | walk
+                                     v
+                 next = acquire EMPTY(i+1) {3} <-------------------+
+                                next |
+                                     v
+                       W m0(i+1) [next] {3}
+```
+
+The `EMPTY` release in iteration `i` satisfies the acquire in iteration
+`i+1`. The acquire is at the next write rather than carried through the loop.
+The initially released state supplies `wtok` when `i=0`. There is no
+post-loop buffer use in this test; after the final iteration, no later acquire
+consumes its `EMPTY` release. A zero-trip loop executes none of these
+operations and leaves the initially released state untouched.
 
 Copying schedules only from adjacent accesses gives:
 
@@ -2354,9 +3509,8 @@ owner {1}
 `release EMPTY(i)` can now run and unblock `{3}`. Owner `{3}` writes and
 releases `FULL`, which unblocks `{1}`.
 
-The required loop distance depends on physical copy reuse.
-`computeLoopCarriedDistance` follows the ordered reads and writes to determine
-when a physical copy is reused:
+The required loop distance depends on physical copy reuse. The pass follows
+the ordered reads and writes to determine when a physical copy is reused:
 
 ```text
 one copy:  W(i+1) first reuses the copy released in i      distance 1
@@ -2377,7 +3531,7 @@ acquire EMPTY(i+1) owner {3}  (?,?)
 W(i+1)             owner {3}  (0,1)
 ```
 
-The write/read analysis finds distance 1. After `legalizeLoopSchedule` moves
+The write/read analysis finds distance 1. After schedule finalization moves
 the destination operations to cluster 3, the release uses the source
 completion schedule and the acquire uses the destination schedule:
 
@@ -2388,9 +3542,10 @@ acquire EMPTY(i+1) owner {3}  (0,3)
 W(i+1)             owner {3}  (0,3)
 ```
 
-For an async producer, the release copies the schedule of its physical
-completion, not necessarily the access operation itself. A semaphore buffer
-copies the schedule of the access it serves.
+When a source access has a `completionAnchor`, its release copies that
+anchor's schedule rather than the access schedule. Asynchronous work instead
+stays on the release as a completion kind. A semaphore buffer copies the
+schedule of the access it serves.
 
 Owners execute independently. Let `offset[P]` be the whole-iteration delay
 of owner P. A release by P at stage `before`, followed at loop distance
@@ -2400,8 +3555,8 @@ of owner P. A release by P at stage `before`, followed at loop distance
 offset[Q] >= offset[P] + before - after - distance
 ```
 
-`solveOwnerScheduleConstraints` solves all release/acquire relationships in
-one scheduled loop together. The cycle total is the sum of
+The pass solves all release/acquire schedule relations in one loop together.
+The cycle total is the sum of
 `before - after - distance` for the relationships around one owner cycle:
 
 ```text
@@ -2415,13 +3570,13 @@ A negative cycle is feasible because the combined stage and loop-distance
 terms separate the operations. An individual zero-delay release/acquire pair
 on that cycle can still need cluster ordering.
 
-A positive delay on one edge is legal when the reverse path has enough
-negative delay. For example, a `+1` edge and `-3` return edge form a legal
-`-2` cycle. `test/NVWS/insert_semas_recurrence_owner_cycle.mlir` exercises
-that shape.
+A positive delay in one schedule relation is legal when the reverse path has
+enough negative delay. For example, a `+1` relation and a `-3` return
+relation form a legal `-2` cycle.
+`test/NVWS/insert_semas_recurrence_owner_cycle.mlir` exercises that shape.
 
-`legalizeLoopSchedule` collects release/acquire orderings that must hold in
-one expanded loop body, together with same-stage SSA orderings, and increases
+Schedule finalization collects release/acquire orderings that must hold in one
+expanded loop body, together with same-stage SSA orderings, and increases
 clusters to satisfy them. A cycle in those required orderings is an error.
 Stage values remain unchanged.
 
@@ -2442,31 +3597,185 @@ Within cluster 4, block order keeps `W other` first.
 
 ### Moving an acquire updates its schedule relation
 
-`planLoop` may move an acquire for the next iteration from the end of a loop
-to the first buffer use. A release/acquire scheduling relation that still
-names the moved acquire may no longer be valid at its new position.
-
-`fixupProtocolArcs` handles every scheduling relation that waited on the moved
-acquire:
+`test/NVWS/insert_semas_nested_carrier.mlir`
+`@scheduled_relocated_acquire_boundaries` has one outer loop and one inner
+loop over a TMEM accumulator. At a high level its accesses are:
 
 ```text
-moved acquire remains in the same node sequence as the release, and either
-the release precedes it or the semaphore is an entry semaphore
-  keep wait = moved acquire
+outer for i
+  W acc {0}
 
-same-semaphore post-loop acquire follows the release in the same node sequence
-  set wait = post-loop acquire
+  inner for j
+    W acc by MMA {1}      stage 0, cluster 1
+    R acc {0}             stage 1, cluster 2
 
-neither relation holds
-  clear wait; this relation no longer adds a release-before-acquire schedule rule
+  R acc {0}               stage 0, cluster 4
 ```
 
-`test/NVWS/insert_semas_nested_carrier.mlir`
-`@scheduled_relocated_acquire_boundaries` has:
+The inner loop writes P0 and its first access has owner `{1}`, so its parent
+summary is `P0:W:{1}`. The parent edges are:
 
 ```text
-inside the inner loop
+DAG node                         synchronization edge ending here
+ENTER outer(i) {0}               none
+W acc {0}                        none
+[inner for P0:W:{1}]             p1: W acc {0} -> inner for
+R acc after inner {0}            p2: inner for -> R acc after inner {0}
+EXIT outer(i) {0}                none
+```
 
+```text
+                      ENTER outer(i) {0}
+                               | walk
+                               v
+                           W acc {0}
+                               | p1
+                               v
+                    [inner-for P0:W:{1}]
+                               | p2
+                               v
+                    R acc after inner {0}
+                               | walk
+                               v
+                      EXIT outer(i) {0}
+```
+
+The child uses its actual write and read:
+
+```text
+DAG node                         synchronization edge ending here
+ENTER inner(i,j) {1}             none
+W acc by MMA {1}                 none
+R acc {0}                        c1: W acc by MMA {1} -> R acc {0}
+EXIT inner(i,j) {1}              c2: R acc {0} -> EXIT inner(i,j) {1}
+```
+
+```text
+                       ENTER inner(i,j) {1}
+                                | walk
+                                v
+                      W acc by MMA {1}
+                                | c1
+                                v
+                           R acc {0}
+                                | c2
+                                v
+                       EXIT inner(i,j) {1}
+```
+
+`p1` and `c2` use `MMA_READY`: `p1` supplies the first inner iteration and
+`c2` supplies the next one. `c1` uses `ACC_FULL`, and `p2` uses
+`OUTER_EMPTY`. Every semaphore has `pending_count=1`. Token placement gives:
+
+```text
+outer entry and one inner iteration
+
+                   entry = acquire OUTER_EMPTY root
+                               entry |
+                                     v
+                         ENTER outer(0) {0}
+                               entry |
+                                     v
+                         W acc(0) [entry] {0}
+                                     | walk
+                                     v
+ release MMA_READY, entry {0} p1 -------------- MMA_READY --------------+
+                                                                         |
+                         ENTER inner(0,0) {1}                            |
+                                     | walk                              |
+                                     v                                   |
+                 ready = acquire MMA_READY {1} <-------------------------+
+                               ready |
+                                     v
+            W acc by MMA(0,0) [ready] {1}       (0,1)
+                                     | walk
+                                     v
+        release ACC_FULL, ready [tc5mma] {1}       c1
+                           ACC_FULL |
+                                     v
+                    full = acquire ACC_FULL {0}
+                                full |
+                                     v
+                       R acc(0,0) [full] {0}       (1,2)
+                                     | walk
+                                     v
+                    release MMA_READY, full {0}       c2
+```
+
+After an executed inner iteration, the `c2` release supplies either the next
+inner MMA or the post-loop `bridge` acquire:
+
+```text
+inner loop continues
+
+release MMA_READY, full {0} c2 --------------- MMA_READY ---------------+
+                                                                         |
+EXIT inner(i,j) {1}                                                      |
+       | next inner iteration                                            |
+       v                                                                 |
+ENTER inner(i,j+1) {1}                                                   |
+       | walk                                                            |
+       v                                                                 |
+ready = acquire MMA_READY {1} <------------------------------------------+
+       ready |
+             v
+       next MMA
+
+inner loop finishes
+
+release MMA_READY, full {0} c2 --------------- MMA_READY ---------------+
+                                                                         |
+EXIT inner(i,last) {1}                                                   |
+       | loop finishes                                                   |
+       v                                                                 |
+bridge = acquire MMA_READY {1} <-----------------------------------------+
+       bridge |
+              v
+release OUTER_EMPTY, bridge [tc5mma] {1} p2
+       OUTER_EMPTY |
+                   v
+post = acquire OUTER_EMPTY {0}
+       post |
+            v
+R acc after inner [post] {0}       (0,4)
+       post |
+            v
+EXIT outer(i) {0}
+       post | next outer iteration
+            v
+ENTER outer(i+1) {0}
+       post |
+            v
+W acc(i+1) [post] {0}
+```
+
+For another inner iteration, the `MMA_READY` release supplies the acquire at
+that iteration's first MMA. After the final inner iteration, `%bridge`
+acquires the same released semaphore and supplies parent edge `p2`.
+`entry` is the root acquire before outer iteration zero. The post-loop `{0}`
+read keeps its token for each later outer iteration. If the inner loop
+executes zero times, `%bridge` consumes the `MMA_READY` release from `p1`, so
+parent edge `p2` is still implemented.
+
+Moving the next-iteration acquire from the inner `EXIT` to the first MMA
+changes where it appears, so every schedule relation that referred to the
+old position is checked again:
+
+```text
+the release and moved acquire are in the same region path, and the release
+precedes it or the semaphore is an entry semaphore
+  use the moved acquire for the schedule comparison
+
+a later acquire of the same semaphore follows the release in that region path
+  use the later acquire for the schedule comparison
+
+neither condition holds
+  do not add a release-before-acquire cluster constraint
+```
+
+Inside the inner loop the resulting semaphore operations are:
+
+```text
 %ready = acquire MMA_READY {1}      stage 0, cluster 1
 MMA acc[%ready] {1}                 stage 0, cluster 1
 release ACC_FULL, %ready [tc5mma]   stage 0, cluster 1
@@ -2488,16 +3797,260 @@ would move the MMA operations to a later cluster even though the acquire is
 already before the first MMA. The checked output keeps the MMA acquire,
 buffer, MMA, and release at `(0,1)`.
 
-`ProtocolArc::wait` affects only schedule construction. Clearing a stale wait
-does not remove the semaphore release or acquire from IR.
+Discarding an obsolete schedule comparison does not remove the semaphore
+release or acquire from IR.
+
+### Branch completion must agree
+
+A loop can carry one owner token through an `if` even when the two paths
+finish that owner's work at different schedules. That difference matters
+when deciding whether the loop's acquire can move to its first buffer use.
+
+`test/NVWS/insert_semas_nested_carrier.mlir`
+`@branch_completion_requires_carrier` has this relevant access pattern for
+one TMEM piece P0:
+
+```text
+outer for
+  W acc {0}
+
+  inner for
+    W first acc {1}                 stage 0, cluster 1
+
+    if cond
+      then:
+        W branch acc {1}            stage 1, cluster 2
+        R branch acc {0}            stage 1, cluster 3
+      else:
+        no acc access
+
+    R final acc {0}                 stage 1, cluster 4
+
+  R post acc {0}
+```
+
+The inner loop writes P0 and first accesses it in owner `{1}`, so its parent
+summary is `P0:W:{1}`. The outer-level edges are:
+
+```text
+parent DAG node                    synchronization edge ending here
+ENTER outer(i) {0}                 none
+W acc {0}                          none
+[inner for P0:W:{1}]               p0: W acc {0} -> inner for
+R post acc {0}                     p3: inner for -> R post acc {0}
+EXIT outer(i) {0}                  none
+```
+
+```text
+parent synchronization-edge DAG
+
+                       ENTER outer(i) {0}
+                                | walk
+                                v
+                            W acc {0}
+                                | p0
+                                v
+                     [inner for P0:W:{1}]
+                                | p3
+                                v
+                         R post acc {0}
+                                | walk
+                                v
+                       EXIT outer(i) {0}
+```
+
+The `if` writes P0 on its then path, and its first P0 access has owner `{1}`.
+Its parent summary is therefore `P0:W:{1}`. At the inner-loop level, the
+first write and the summary have the same owner. The final read changes to
+owner `{0}`, and `EXIT` returns to boundary owner `{1}`:
+
+```text
+inner DAG node                    synchronization edge ending here
+ENTER inner(j) {1}                none
+W first acc {1}                   none
+[if summary P0:W:{1}]             none
+R final acc {0}                   e3: if summary -> R final acc {0}
+EXIT inner(j) {1}                 e4: R final acc {0} -> EXIT inner(j) {1}
+```
+
+The then path changes from `{1}` to `{0}` and back to the `if` boundary.
+The empty else path preserves the incoming owner and ordering:
+
+```text
+then-path DAG node                synchronization edge ending here
+ENTER if {1}                      none
+W branch acc {1}                  none
+R branch acc {0}                  b1: W branch acc {1} -> R branch acc {0}
+EXIT if {1}                       b2: R branch acc {0} -> EXIT if {1}
+
+else-path DAG node                synchronization edge ending here
+ENTER if {1}                      none
+EXIT if {1}                       none
+```
+
+```text
+synchronization-edge DAGs
+
+inner-loop level                         if paths
+
+ENTER inner(j) {1}                       ENTER if {1}
+         | walk                           +-----+-----+
+         v                           then |           | else
+ W first acc {1}                         v           v
+         | walk                W branch acc {1}   EXIT if {1}
+         v                               | b1
+[if summary P0:W:{1}]                    v
+         | e3                  R branch acc {0}
+         v                               | b2
+ R final acc {0}                         v
+         | e4                       EXIT if {1}
+         v
+ EXIT inner(j) {1}
+```
+
+Parent edge `p0` and child edge `e4` share `BRANCH_READY`: `p0` supplies the
+first inner iteration and `e4` supplies later ones. The remaining edges use
+four more count-1 semaphores:
+
+```text
+edges      semaphore       acquire before         pending_count    initial state
+p0, e4     BRANCH_READY    ENTER/EXIT inner {1}   1                false
+b1         BRANCH_FULL     R branch acc {0}       1                false
+b2         BRANCH_BACK     EXIT if {1}            1                false
+e3         FINAL_FULL      R final acc {0}        1                false
+p3         BRANCH_EMPTY    R post acc {0}         1                initially released
+```
+
+Let `ready` be the owner-`{1}` token acquired from `BRANCH_READY` before the
+inner loop. The then path acquires a replacement owner-`{1}` token; the else
+path returns `ready` unchanged. The selected token then serves the final
+read:
+
+```text
+outer and first inner entry
+
+             outer = acquire BRANCH_EMPTY root
+                            outer |
+                                  v
+                       ENTER outer(0) {0}
+                            outer |
+                                  v
+                         W acc [outer] {0}
+                                  | walk
+                                  v
+          release BRANCH_READY, outer {0}       p0
+                     BRANCH_READY |
+                                  v
+               ready = acquire BRANCH_READY {1}
+                            ready |
+                                  v
+                        ENTER inner(0) {1}
+```
+
+```text
+semaphore DAG for one inner iteration
+
+                  ENTER inner(j) {1}
+                           ready |
+                                 v
+                W first acc [ready] {1}       (0,1)
+                                 |
+                       +---------+---------+
+                then   |                   | else
+                       v                   v
+       W branch acc [ready] {1}       out = ready
+                       |                   |
+ release BRANCH_FULL, ready [tc5mma] {1} b1 |
+            BRANCH_FULL |                  |
+                        v                  |
+       btok = acquire BRANCH_FULL {0}      |
+                   btok |                  |
+                        v                  |
+          R branch acc [btok] {0}          |
+                        |                  |
+       release BRANCH_BACK, btok {0} b2    |
+            BRANCH_BACK |                  |
+                        v                  |
+       returned = acquire BRANCH_BACK {1}  |
+               returned |                  |
+                        v                  |
+           out = returned                  |
+                       +---------+---------+
+                                 v
+        release FINAL_FULL, out [tc5mma] {1}        e3
+                      FINAL_FULL |
+                                 v
+             final = acquire FINAL_FULL {0}
+                            final |
+                                  v
+               R final acc [final] {0}       (1,4)
+                                  |
+               release BRANCH_READY, final {0}       e4
+                     BRANCH_READY |
+                                  v
+              next = acquire BRANCH_READY {1}
+                             next |
+                                  v
+                    EXIT inner(j) {1}
+                             next | next inner iteration
+                                  v
+                  ENTER inner(j+1) {1}
+```
+
+The then path's owner-`{1}` result is `returned`, whose acquire is placed at
+stage 1, cluster 2. The else path's result is `ready`, whose physical work in
+this iteration is the first MMA at stage 0, cluster 1:
+
+```text
+path    returned token    owner-{1} completion schedule
+then    returned          stage 1, cluster 2
+else    ready             stage 0, cluster 1
+```
+
+Because the schedules differ, the inner loop keeps `ready` as an input token
+and returns `next`. Moving the `BRANCH_READY` acquire to `W first acc` would
+discard the distinct path result needed for scheduling. On the first inner
+iteration, the outer write's release supplies `ready`; on later iterations,
+`e4` supplies `next`. If the inner loop executes zero times, its input
+`ready` is its result. A missing `else` likewise preserves the incoming
+schedule on the path that does not enter the body.
+
+After the inner loop, that result implements parent edge `p3`. The acquired
+owner-`{0}` token then remains available through the next outer iteration:
+
+```text
+result = final next, or ready when the inner loop has zero trips
+       result |
+              v
+release BRANCH_EMPTY, result [tc5mma] {1}       p3
+       BRANCH_EMPTY |
+                    v
+post = acquire BRANCH_EMPTY {0}
+       post |
+            v
+R post acc [post] {0}
+       post |
+            v
+EXIT outer(i) {0}
+       post | next outer iteration
+            v
+ENTER outer(i+1) {0}
+       post |
+            v
+W acc(i+1) [post] {0}
+```
+
+Implementation note: `completionAfterChain` records, for each path, whether
+the returned token keeps the incoming completion or uses a later owner's
+schedule. The acquire moves only when all possible paths agree.
 
 ### Post-loop acquires use their owner's boundary
 
-An acquire inserted after a nested loop has no later read or write by the
-same owner. `postLoopAcquire` prevents it from copying the schedule of an
-unrelated later access.
-
-The same test produces:
+The `@scheduled_relocated_acquire_boundaries` example in
+[Moving an acquire updates its schedule relation](#moving-an-acquire-updates-its-schedule-relation)
+also shows why an acquire after a nested loop uses the schedule at its own
+owner's boundary. `%bridge` has no later owner-`{1}` read or write from which
+to copy a schedule. The relevant part of the semaphore DAG is:
 
 ```text
 last inner owner-{1} schedule
@@ -2512,9 +4065,9 @@ after inner loop
 ```
 
 `%bridge` uses owner `{1}`'s boundary schedule `(0,1)`, not owner `{0}`'s
-`(0,4)` schedule. If no later operation provides a schedule,
-`scheduleAtOwnerBoundary` uses the greatest `loop.cluster` assigned to any
-operation with the same owner and stage.
+`(0,4)` schedule. If no later operation provides a schedule, the acquire uses
+the greatest `loop.cluster` assigned to any operation with the same owner and
+stage.
 
 Root entry acquires remain unscheduled.
 
@@ -2525,11 +4078,11 @@ Root entry acquires remain unscheduled.
 buffer copy it uses. EMIT-IR places `bufferStageOffset` on the
 `semaphore.buffer` created for an access.
 
-Schedule finalization uses applicable `ProtocolArc` records whose release and
-acquire still define a loop scheduling relationship. It uses loop distance
-and owner order to decide whether a cluster must move. The result keeps the
-release at the source completion and the acquire at the destination, but may
-delay the destination cluster so the release can execute first.
+Schedule finalization uses the schedule relations whose release and acquire
+still define a loop ordering. It uses loop distance and owner order to decide
+whether a cluster must move. The result keeps the release at the source
+completion and the acquire at the destination, but may delay the destination
+cluster so the release can execute first.
 
 Stage-offset assignment follows the ordered reads and writes to determine
 which buffer copy or semaphore stage is required. For circular buffers it
@@ -2581,13 +4134,101 @@ their representation and attachment points differ.
 
 ### Circular groups
 
-Circular members with one physical `buffer.id` are separate groups.
-They must agree on type and `buffer.copy`, have unique valid `buffer.start`
-values, and be written in the order required by those `buffer.start` values.
+Circular members with one physical `buffer.id` are tracked separately for
+access ordering. They must agree on type and `buffer.copy`, have unique valid
+`buffer.start` values, and be written in the order required by those
+`buffer.start` values.
 
 `test/NVWS/insert_semas_circular_smem.mlir`
 `@circular_tutorial_1_1_to_2_2` uses K and V in a two-copy circular buffer
 with starts 0 and 1:
+
+```text
+K = local_alloc {buffer.id = 301, buffer.copy = 2,
+                 buffer.circular, buffer.start = 0}
+V = local_alloc {buffer.id = 301, buffer.copy = 2,
+                 buffer.circular, buffer.start = 1}
+
+for i
+  W K(i) {1}
+  W V(i) {1}
+  R K(i) {2}
+  R V(i) {2}
+```
+
+K and V each have one write-to-read edge and one edge that protects the next
+write:
+
+```text
+member  DAG node          synchronization edge ending here
+K       ENTER(i) {1}      none
+K       W K(i) {1}        none
+K       R K(i) {2}        k1: W K(i) {1} -> R K(i) {2}
+K       EXIT(i) {1}       k2: R K(i) {2} -> EXIT(i) {1}
+
+V       ENTER(i) {1}      none
+V       W V(i) {1}        none
+V       R V(i) {2}        v1: W V(i) {1} -> R V(i) {2}
+V       EXIT(i) {1}       v2: R V(i) {2} -> EXIT(i) {1}
+```
+
+```text
+K synchronization-edge DAG             V synchronization-edge DAG
+
+ENTER(i) {1}                            ENTER(i) {1}
+     | walk                                  | walk
+     v                                       v
+ W K(i) {1}                              W V(i) {1}
+     | k1                                    | v1
+     v                                       v
+ R K(i) {2}                              R V(i) {2}
+     | k2                                    | v2
+     v                                       v
+ EXIT(i) {1}                             EXIT(i) {1}
+```
+
+Emission creates one initially released `EMPTY` semaphore and one `FULL`
+semaphore for the circular buffer. K and V use separate operations on those
+two semaphores, each with `pending_count=1`. Before adding offsets, the
+semaphore DAGs are:
+
+```text
+edge    semaphore    pending_count    initial state
+k1      FULL         1                false
+k2      EMPTY        1                initially released
+v1      FULL         1                false
+v2      EMPTY        1                initially released
+```
+
+```text
+K semaphore DAG                          V semaphore DAG
+
+ktok = acquire EMPTY {1}                 vtok = acquire EMPTY {1}
+          ktok |                                    vtok |
+               v                                         v
+       W K [ktok] {1}                            W V [vtok] {1}
+               | walk                                    | walk
+               v                                         v
+release FULL, ktok {1}                    release FULL, vtok {1}
+          FULL |                                    FULL |
+               v                                         v
+kr = acquire FULL {2}                    vr = acquire FULL {2}
+            kr |                                      vr |
+               v                                         v
+         R K [kr] {2}                              R V [vr] {2}
+               | walk                                    | walk
+               v                                         v
+release EMPTY, kr {2}                    release EMPTY, vr {2}
+               | next K write                            | next V write
+               v                                         v
+knext = acquire EMPTY {1}                 vnext = acquire EMPTY {1}
+         knext |                                    vnext |
+               v                                         v
+ W K(i+1) [knext] {1}                       W V(i+1) [vnext] {1}
+```
+
+The accesses occur in the order shown by the input IR. Their write numbers
+and offsets are:
 
 ```text
 event       current write number   required write number   offset
@@ -2597,40 +4238,39 @@ load K       1                     K = 0                  -1
 load V       1                     V = 1                   0
 ```
 
-K and V share one entry semaphore, `EMPTY`, and one non-entry semaphore,
-`FULL`. `emitPhysicalIR` creates those two semaphores once for the circular
-buffer. Each group places its own offsets on the acquire, `semaphore.buffer`,
-and release operations that use those semaphores.
-
 K writes copy 0 and V then writes copy 1, so K's read selects the preceding
 copy. The acquire of `FULL` and the release of `EMPTY` receive offset `-1`:
 
 ```text
-K semaphore operations
+K semaphore path with offsets
 
-acquire EMPTY {1}               offset  0
-W K {1}
-release FULL {1}                offset  0
-acquire FULL {2}                offset -1
-R K {2}
-release EMPTY {2}               offset -1
+ktok = acquire EMPTY[0] {1}
+W K [ktok, buffer 0] {1}
+release FULL[0], ktok {1}
+
+kr = acquire FULL[-1] {2}
+R K [kr, buffer -1] {2}
+release EMPTY[-1], kr {2}
 ```
 
 V stays on the current copy:
 
 ```text
-V semaphore operations
+V semaphore path with offsets
 
-acquire EMPTY {1}               offset 0
-W V {1}
-release FULL {1}                offset 0
-acquire FULL {2}                offset 0
-R V {2}
-release EMPTY {2}               offset 0
+vtok = acquire EMPTY[0] {1}
+W V [vtok, buffer 0] {1}
+release FULL[0], vtok {1}
+
+vr = acquire FULL[0] {2}
+R V [vr, buffer 0] {2}
+release EMPTY[0], vr {2}
 ```
 
 The shared `EMPTY` semaphore is initially released so iteration zero's first
-acquire succeeds and returns a token.
+acquire succeeds and returns a token. There is no buffer use after the loop,
+so the final `EMPTY` releases have no later acquires. A zero-trip loop
+executes none of these operations and leaves its stages initially released.
 
 ### Non-circular aliases
 
@@ -2641,81 +4281,136 @@ to exact aliases whose semaphore copy count exceeds their buffer copy count.
 SMEM and TMEM use the same analysis.
 
 `test/NVWS/insert_semas_fused_alias_handoff.mlir`
-`@fused_alias_depth_two` has the same SMEM structure as a split dV epilogue
-in backward attention: two allocation names use one two-copy backing.
+`@fused_alias_depth_two` has two allocation names for one two-copy SMEM
+backing. The input test uses ordinary loads and consumers:
 
 ```mlir
-%dv0 = ttg.local_alloc {buffer.id = 5, buffer.copy = 2}
-%dv1 = ttg.local_alloc {buffer.id = 5, buffer.copy = 2}
+%m0 = ttg.local_alloc {buffer.id = 500, buffer.copy = 2}
+%m1 = ttg.local_alloc {buffer.id = 500, buffer.copy = 2}
 
 scf.for {
-  ttg.local_store %v0, %dv0 {partition = 4}
-  %r0 = ttg.local_load %dv0 {partition = 2}
-  tt.descriptor_store ..., %r0 {partition = 2}
+  ttg.local_store %v0, %m0 {partition = 4}
+  %r0 = ttg.local_load %m0 {partition = 2}
+  "consume0"(%r0) {partition = 2}
 
-  ttg.local_store %v1, %dv1 {partition = 4}
-  %r1 = ttg.local_load %dv1 {partition = 2}
-  tt.descriptor_store ..., %r1 {partition = 2}
+  ttg.local_store %v1, %m1 {partition = 4}
+  %r1 = ttg.local_load %m1 {partition = 2}
+  "consume1"(%r1) {partition = 2}
 }
 ```
 
 Both members read or write the same piece, so the access rules produce one
-node sequence. The diagram shows semaphore operations after edge reduction
-and merging, across the boundary from iteration `i` to iteration `i+1`.
+ordered set of synchronization edges:
+
+```text
+DAG node             synchronization edge ending here
+ENTER(i) {4}         none
+W m0(i) {4}          none
+R m0(i) {2}          e1: W m0(i) {4} -> R m0(i) {2}
+W m1(i) {4}          e2: R m0(i) {2} -> W m1(i) {4}
+R m1(i) {2}          e3: W m1(i) {4} -> R m1(i) {2}
+EXIT(i) {4}          e4: R m1(i) {2} -> EXIT(i) {4}
+```
+
+```text
+                         ENTER(i) {4}
+                              | walk
+                              v
+                          W m0(i) {4}
+                              | e1
+                              v
+                          R m0(i) {2}
+                              | e2
+                              v
+                          W m1(i) {4}
+                              | e3
+                              v
+                          R m1(i) {2}
+                              | e4
+                              v
+                          EXIT(i) {4}
+                              | next iteration
+                              v
+                        ENTER(i+1) {4}
+```
+
+`e1` uses `FULL0`, `e2` uses `M1_READY`, `e3` uses `FULL1`, and `e4`
+uses the initially released `ENTRY` semaphore. Every semaphore has
+`pending_count=1`:
+
+```text
+edge    semaphore    pending_count    initial state
+e1      FULL0        1                false
+e2      M1_READY     1                false
+e3      FULL1        1                false
+e4      ENTRY        1                initially released
+```
+
+The semaphore DAG across two iterations is:
 
 ```text
 semaphore DAG across two iterations
 
-                         acquire ENTRY(i) {4}
+                         ENTER(i) {4}
                                   | walk
                                   v
-                            W dv0(i) {4}
+                     t0 = acquire ENTRY(i) {4}
+                               t0 |
+                                  v
+                         W m0(i) [t0] {4}
                                   | walk
                                   v
-                         release FULL0(i) {4}
+                       release FULL0, t0 {4}       e1
                                   | FULL0
                                   v
-                         acquire FULL0(i) {2}
+                    t1 = acquire FULL0(i) {2}
+                               t1 |
+                                  v
+                         R m0(i) [t1] {2}
                                   | walk
                                   v
-                            R dv0(i) {2}
+                    release M1_READY, t1 {2}       e2
+                                  | M1_READY
+                                  v
+                    t2 = acquire M1_READY(i) {4}
+                               t2 |
+                                  v
+                         W m1(i) [t2] {4}
                                   | walk
                                   v
-                      release DV1_READY(i) {2}
-                                  | DV1_READY
-                                  v
-                      acquire DV1_READY(i) {4}
-                                  | walk
-                                  v
-                            W dv1(i) {4}
-                                  | walk
-                                  v
-                         release FULL1(i) {4}
+                       release FULL1, t2 {4}       e3
                                   | FULL1
                                   v
-                         acquire FULL1(i) {2}
+                    t3 = acquire FULL1(i) {2}
+                               t3 |
+                                  v
+                         R m1(i) [t3] {2}
                                   | walk
                                   v
-                            R dv1(i) {2}
+                       release ENTRY, t3 {2}       e4
+                              ENTRY |
+                                    +-----------------------------------+
+                                                                        |
+                              EXIT(i) {4}
+                                  | next iteration
+                                  v
+                            ENTER(i+1) {4}
                                   | walk
                                   v
-                         release ENTRY(i) {2}
-                                  | ENTRY
+                    next = acquire ENTRY(i+1) {4} <---------------------+
+                             next |
                                   v
-                       acquire ENTRY(i+1) {4}
-                                  | walk
-                                  v
-                          W dv0(i+1) {4}
+                       W m0(i+1) [next] {4}
 ```
 
-The emitted shape before ASP is:
+The emitted shape before `AssignStagePhase` is:
 
 ```mlir
-%base = ttg.local_alloc {buffer.id = 5, buffer.copy = 2}
+%base = ttg.local_alloc {buffer.id = 500, buffer.copy = 2}
 
 %entry   = nvws.semaphore.create %base true
 %full0   = nvws.semaphore.create %base false
-%dv1_ready = nvws.semaphore.create %base false
+%m1_ready = nvws.semaphore.create %base false
 %full1   = nvws.semaphore.create %base false
 
 scf.for {
@@ -2727,18 +4422,18 @@ scf.for {
   %t1 = nvws.semaphore.acquire %full0[0] {partition = 2}
   %b1 = nvws.semaphore.buffer %full0[0], %t1
   %r0 = ttg.local_load %b1 {partition = 2}
-  tt.descriptor_store ..., %r0 {partition = 2}
-  nvws.semaphore.release %dv1_ready[1], %t1 {partition = 2}
+  "consume0"(%r0) {partition = 2}
+  nvws.semaphore.release %m1_ready[1], %t1 {partition = 2}
 
-  %t2 = nvws.semaphore.acquire %dv1_ready[0] {partition = 4}
-  %b2 = nvws.semaphore.buffer %dv1_ready[0], %t2
+  %t2 = nvws.semaphore.acquire %m1_ready[0] {partition = 4}
+  %b2 = nvws.semaphore.buffer %m1_ready[0], %t2
   ttg.local_store %v1, %b2 {partition = 4}
   nvws.semaphore.release %full1[0], %t2 {partition = 4}
 
   %t3 = nvws.semaphore.acquire %full1[0] {partition = 2}
   %b3 = nvws.semaphore.buffer %full1[0], %t3
   %r1 = ttg.local_load %b3 {partition = 2}
-  tt.descriptor_store ..., %r1 {partition = 2}
+  "consume1"(%r1) {partition = 2}
   nvws.semaphore.release %entry[1], %t3 {partition = 2}
 }
 ```
@@ -2748,23 +4443,27 @@ write/read pair uses physical stage `s`, the second pair uses `(s+1) mod 2`.
 
 ```text
 release/acquire pairs that keep the same copy
-  W dv0 at s     -> R dv0 at s
-  W dv1 at s+1   -> R dv1 at s+1
+  W m0 at s     -> R m0 at s
+  W m1 at s+1   -> R m1 at s+1
 
 release/acquire pairs that advance to the next copy
-  R dv0 at s     -> W dv1 at s+1
-  R dv1 at s+1   -> W dv0(i+1) at s
+  R m0 at s     -> W m1 at s+1
+  R m1 at s+1   -> W m0(i+1) at s
 ```
 
 The two releases that advance to the next copy receive offset `+1`. Without
-it, `%dv1_ready` would
-release stage `s` while its acquire waits on stage `s+1`; the initially false
-semaphore would never satisfy that acquire. The release/acquire pair between
-iterations requires the same adjustment when the copy index wraps.
+it, `%m1_ready` would release stage `s` while its acquire waits on stage
+`s+1`; the initially false semaphore would never satisfy that acquire. The
+release/acquire pair between iterations requires the same adjustment when the
+copy index wraps.
 
 `test/NVWS/insert_semas_fused_alias_handoff.mlir`
 `@tmem_fused_alias_depth_two` uses the same ordered read/write analysis for two
 non-circular TMEM aliases with explicit `buffer.copy = 2`.
+
+There is no buffer use after the loop. The final `ENTRY` release therefore
+has no later acquire, and a zero-trip loop executes none of the shown
+operations while leaving `ENTRY` initially released.
 
 ## Build order and code map
 
