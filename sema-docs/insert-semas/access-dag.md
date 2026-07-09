@@ -9,9 +9,10 @@ semaphores or tokens; [SYNC-DAG](sync-dag.md) uses these facts to do that.
 
 The examples use a compact schematic form. `W m0 ttg.local_alloc {0}` means
 that the `ttg.local_alloc` writes member `m0` in partition 0. A region summary
-such as `pieces{P0:W:{0}}` says that the region writes piece P0 and presents
-owner `{0}` at its boundary. Tree lines show block nesting and program order,
-not synchronization edges. Model terms are defined in the
+such as `pieces{P0:W:{0}}` records that the region contains at least one write
+to P0. It would record `R` if the region only read P0. `{0}` is the boundary
+owner for P0. Tree lines show region nesting and program order, not
+synchronization edges. Model terms are defined in the
 [InsertSemas overview](overview.md#core-objects).
 
 ## What is analyzed
@@ -29,10 +30,8 @@ An immutable `local_alloc` can still communicate across partitions —
 ttng.tc_gen5_mma ... %mem ... {ttg.partition = [2]}  // read in another partition
 ```
 
-— and this pass skips `%mem`, so who synchronizes partition 2 with
-partition 1's write? Nobody has to, because this shape never reaches
-`InsertSemas`: [InsertAllocas](../insert-allocas.md) is expected to run
-first and rewrite it to
+This pass skips `%mem`. [InsertAllocas](../insert-allocas.md) is expected to
+run first and rewrite it to
 
 ```text
 %buf = ttg.local_alloc : !ttg.memdesc<..., mutable>   // communication buffer
@@ -85,17 +84,19 @@ later rejects the group with a diagnostic when it computes the backing plan
 ## Pieces
 
 Within a group, members may partially overlap. `buffer.offset` places a
-member's start on the group's address line; missing `buffer.offset` is zero.
+member's start on the group's logical coordinate; missing `buffer.offset` is
+zero.
 (The Meta planner emits the attribute only on TMEM allocations — see
 [meta-ports](../meta-ports.md#memory-planning) — but the analysis honors it
 on any member, and SMEM members with explicit offsets appear in hand-written
-and lit-test IR.) The address line is measured in TMEM columns for TMEM
-(extent = the full memdesc size) and in leading-dimension elements for local
-memory (extent = the leading shape dimension). The algorithm cuts that address line
-at every member start and end and merges adjacent intervals with identical
-coverage. The resulting disjoint intervals are the **pieces**; because the
-cuts happen at member boundaries, each member is *exactly* the union of a
-subset of pieces — its footprint.
+and lit-test IR.) The piece table uses a one-dimensional logical coordinate.
+TMEM offsets and extents are measured in TMEM columns. SMEM offsets and
+extents are measured along the first memdesc dimension; this classifies
+logical overlap and is not byte-address analysis. The algorithm cuts the
+logical coordinate at every member start and end and merges adjacent
+intervals with identical coverage. The resulting disjoint intervals are the
+**pieces**; because the cuts happen at member boundaries, each member is
+*exactly* the union of a subset of pieces — its footprint.
 
 That gives two levels:
 
@@ -299,18 +300,74 @@ view-operation rule rejects it.
 
 ## When an access finishes
 
-Normally an access completes at the memory operation itself. A `local_load`
-from one of these SMEM buffers that feeds exactly one same-block descriptor
-store, directly or through one `convert_layout`, remains physically live
-until that store: TMA-store lowering turns that load/store pair into one
-async copy issued directly out of the SMEM buffer, so the buffer must stay
-protected until the store. The DAG records the store as `completionAnchor`;
-later steps use it for release placement and scheduling without
-re-discovering the pattern.
+ACCESS-DAG records every read and write to the buffer as a separate access
+node. It continues scanning after each node. This section only determines
+where one `local_load` is considered complete.
 
-If no descriptor-store candidate exists, the ordinary completion point is
-kept. Once a candidate exists, every extra direct load/convert user,
-control-flow crossing, or owner mismatch fails the pass with a diagnostic.
+A `local_load` normally stops using its SMEM buffer at the load operation.
+One pattern is different: when the load feeds exactly one `descriptor_store`,
+directly or through one `convert_layout`, lowering makes the descriptor store
+read directly from the SMEM buffer. The buffer must therefore remain
+protected through the descriptor store. The access node records the store as
+its `completionAnchor`, causing release placement and scheduling to use the
+store instead of the load.
+
+### Why `descriptor_store` needs special handling
+
+At this point in the pipeline, `tt.descriptor_store` accepts a tensor rather
+than an SMEM buffer:
+
+```mlir
+%loaded = ttg.local_load %buf
+%value = ttg.convert_layout %loaded  // optional
+tt.descriptor_store %desc, ..., %value
+```
+
+The buffer operand appears only on `local_load`, so ordinary access discovery
+records the read there. The optional `convert_layout` can later be folded
+into a `local_load` that produces the required layout directly. TMA lowering
+can then reuse `%buf` and replace the load-to-store path with an asynchronous
+store from SMEM:
+
+```mlir
+ttng.async_tma_copy_local_to_global %desc, ..., %buf
+```
+
+The buffer dependency is therefore implicit in the tensor passed from
+`local_load`, optionally through one `convert_layout`, to
+`descriptor_store`. Recording the descriptor store as `completionAnchor`
+keeps `%buf` protected through the operation that consumes it.
+
+The `local_load`-to-`descriptor_store` path must have no other users, remain
+in one block, preserve ownership, and place the store after the load. If no
+descriptor store is reached, the load remains its own completion anchor. If
+a descriptor store is reached but the path violates these requirements, the
+pass reports an error.
+
+There is currently no `nvws.descriptor_store` counterpart to
+`nvws.descriptor_load`. A buffer-taking operation would make the buffer
+dependency explicit:
+
+```mlir
+%loaded = ttg.local_load %buf
+%value = ttg.convert_layout %loaded
+ttg.local_store %value, %buf
+nvws.descriptor_store %desc, ..., %buf
+```
+
+ACCESS-DAG could record the `local_store` as a write to `%buf` and
+`nvws.descriptor_store` directly as the following read from `%buf`. When the
+load-convert-store round trip is proven not to change the SMEM
+representation and its intermediate values have no other users, it could be
+folded to:
+
+```mlir
+nvws.descriptor_store %desc, ..., %buf
+```
+
+This direct form would not need to recover the buffer dependency through
+`local_load`. The operation would still need to represent when the
+asynchronous store finishes consuming the buffer.
 
 ## Regions and boundaries
 
