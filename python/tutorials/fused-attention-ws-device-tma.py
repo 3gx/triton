@@ -572,6 +572,7 @@ def _attn_fwd_persist(
             merge_epilogue=True,
             separate_epilogue_store=True,
             data_partition_factor=DP_FACTOR,
+            smem_alloc_algo=0,
     ):
         pid = tile_idx % n_tile_num
         off_hz = tile_idx // n_tile_num
