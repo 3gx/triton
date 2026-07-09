@@ -112,7 +112,9 @@ struct Node {
   // inherited record whose token this node consumes. Assigned by the SYNC-DAG
   // token sweep; EmitIR routes by this fact and never guesses by owner.
   Node *tokenSource = nullptr;
-  Node *sat = nullptr;
+  // Exact acquire sites satisfied by a release.  More than one is legal only
+  // for mutually exclusive continuation paths sharing the same channel.
+  SmallVector<Node *, 2> consumers;
   Node *scheduleAnchor = nullptr;
   std::optional<RegionFlow> flow;
   SmallVector<int, 2> requiredParts;
