@@ -347,31 +347,54 @@ respect to each other by a raw edge. The `{0}` reread also has no incoming
 raw edge; it appears only in program order.
 
 ```text
-                              W alloc(i) {0}
-                         +----------+----------+
-                      f1 |                     | f2
-                         v                     v
-                    R load(i) {1}         R load(i) {2}
-                      f3 |                     | f4
-                         +----------+----------+
-                                    v
-                               EXIT(i) {0}
+                                  ENTER(i) {0}
+                                       | walk
+                                       v
+                                  W alloc(i) {0}
+                         +-------------+-------------+
+                      f1 |        walk |             | f2
+                         v             v             v
+                  R load(i) {1} R load(i) {0} R load(i) {2}
+                      f3 |        walk |             | f4
+                         +-------------+-------------+
+                                       v
+                                  EXIT(i) {0}
 
-walk order for the same nodes; these arrows are not raw edges
+semaphore DAG for the same synchronization edges
 
-W alloc(i) {0}
-      | walk
-      v
-R load(i) {1}
-      | walk
-      v
-R load(i) {2}
-      | walk
-      v
-R load(i) {0}
-      | walk
-      v
-EXIT(i) {0}
+                     acquire EMPTY(i) pending_count=2 {0}
+                                      ptok |
+                                           v
+                                     EXIT(i-1) {0}
+                                           | loop
+                                           v
+                                      ENTER(i) {0}
+                                           | walk
+                                           v
+                                  W alloc(i) [ptok] {0}
+                    +----------------------+----------------------+
+               walk |                 walk |                 walk |
+                    v                      v                      v
+    release F1, ptok {0}       R load(i) [ptok] {0}    release F2, ptok {0}
+                 F1 |                 walk |                      | F2
+                    v                      v                      v
+   r1tok = acquire F1 {1}                  |          r2tok = acquire F2 {2}
+               walk |                      |                 walk |
+                    v                      |                      v
+      R load(i) [r1tok] {1}                |         R load(i) [r2tok] {2}
+               walk |                      |                 walk |
+                    v                      |                      v
+  release EMPTY, r1tok {1}                 |     release EMPTY, r2tok {2}
+              EMPTY |                      |                     | EMPTY
+                    +----------------------+---------------------+
+                                           v
+                      acquire EMPTY(i+1) pending_count=2 {0}
+                                      next |
+                                           v
+                                      EXIT(i) {0}
+                                           | loop
+                                           v
+                                    ENTER(i+1) {0}
 ```
 
 `f3` and `f4` remain separate senders into one destination. They become two
