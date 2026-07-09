@@ -392,6 +392,60 @@ static FailureOr<Chain> buildChainForBlock(GroupDag &g, Block &block,
   return chain;
 }
 
+// Return the block directly owned by the function body that contains `op`.
+// InsertSemas models structured control flow recursively, but a Triton
+// function may also contain top-level CFG blocks (for example an early-return
+// diamond).  A managed allocation and all of its memdesc users must live in a
+// single such block until the access DAG grows a CFG dataflow model.
+static Block *getFunctionBlock(Operation *op, triton::FuncOp funcOp) {
+  Block *block = op->getBlock();
+  while (block && block->getParent() != &funcOp.getBody()) {
+    Operation *parent = block->getParentOp();
+    block = parent ? parent->getBlock() : nullptr;
+  }
+  return block;
+}
+
+static FailureOr<Block *> getAnalysisBlock(GroupDag &g,
+                                           triton::FuncOp funcOp) {
+  Block *analysisBlock = nullptr;
+  SmallVector<Value, 4> worklist;
+  DenseSet<Value> seen;
+  for (const Member &member : g.pieceTable.members) {
+    Block *block = getFunctionBlock(member.allocOp, funcOp);
+    if (!block)
+      return semaError(member.allocOp)
+             << "managed allocation is not nested in the function body";
+    if (analysisBlock && analysisBlock != block)
+      return semaError(member.allocOp)
+             << "one buffer group spans function CFG blocks";
+    analysisBlock = block;
+    worklist.push_back(member.allocOp->getResult(0));
+  }
+
+  // Do not silently miss a use in another CFG block.  Alias operations are
+  // followed explicitly because their results carry the same managed
+  // storage.  Structured-region users remain in the same function block and
+  // are handled recursively by buildChainForBlock.
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!seen.insert(value).second)
+      continue;
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
+      if (getFunctionBlock(user, funcOp) != analysisBlock)
+        return semaError(user)
+               << "managed memdesc flow across function CFG blocks is "
+                  "unsupported";
+      if (user->getNumResults() == 1 &&
+          isa<gpu::MemDescType>(user->getResult(0).getType()) &&
+          isSupportedAliasOp(user))
+        worklist.push_back(user->getResult(0));
+    }
+  }
+  return analysisBlock;
+}
+
 LogicalResult buildAccessDag(GroupDag &g, triton::FuncOp funcOp) {
   // Single-component invariant: every buffer.id group's pieces connect
   // (through shared members) into one component -- the memory planner keeps
@@ -405,7 +459,10 @@ LogicalResult buildAccessDag(GroupDag &g, triton::FuncOp funcOp) {
                             "one component per group";
   }
   Node *func = g.newNode(Node::Func, funcOp, nullptr);
-  auto chain = buildChainForBlock(g, funcOp.getBody().front(), func);
+  FailureOr<Block *> analysisBlock = getAnalysisBlock(g, funcOp);
+  if (failed(analysisBlock))
+    return failure();
+  auto chain = buildChainForBlock(g, **analysisBlock, func);
   if (failed(chain))
     return failure();
   if (chain->head)
