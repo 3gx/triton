@@ -418,133 +418,121 @@ release EMPTY, %reader2 {2}
 
 ### Example: disjoint pieces stay independent
 
-The following conceptual `spanning_split_parallel` shape uses `m0` for the
-first half, `m1` for the second half, and `m2` for the full backing. It is a
-compact teaching example, not the name of an in-tree test:
+This conceptual example uses `m0` for the first half of a buffer, `m1` for
+the second half, and `m2` for the whole buffer:
 
 ```text
 members:    m0[0,128)   m1[128,256)   m2[0,256)
 pieces:     P0=[0,128){m0,m2}   P1=[128,256){m1,m2}
-footprints: m0={P0}   m1={P1}   m2={P0,P1}
 ```
 
-The full-width write followed by the full-width read occurs before the two
-half-width paths. `applyTouch` records one synchronization edge per piece, so
-the two edges with the same full-width endpoints are both present before edge
-reduction:
+The DAG nodes and the edges that remain for semaphore construction are:
 
 ```text
-initial edge set
-  d1a: W m2 {0} -> R m2 {1}       P0
-  d1b: W m2 {0} -> R m2 {1}       P1
-
-  d2a: W m2 {0} -> W m0 {2}       P0, possible removal through {1}
-  d2b: R m2 {1} -> W m0 {2}       P0
-  d3:  W m0 {2} -> R m0 {3}       P0
-
-  d4a: W m2 {0} -> W m1 {4}       P1, possible removal through {1}
-  d4b: R m2 {1} -> W m1 {4}       P1
-  d5:  W m1 {4} -> R m1 {0}       P1
-
-  d6: W m0 {2} -> EXIT(i) {0}     P0, possible removal through {3}
-  d7: R m0 {3} -> EXIT(i) {0}     P0
-  d8: W m1 {4} -> EXIT(i) {0}     P1, possible removal through {0}
+DAG node         buffer pieces            synchronization edge ending here
+ENTER(i) {0}     P0, P1                   none
+W m2 {0}         P0, P1                   none
+R m2 {1}         P0, P1                   e1: W m2 {0} -> R m2 {1}
+W m0 {2}         P0                       e2: R m2 {1} -> W m0 {2}
+R m0 {3}         P0                       e3: W m0 {2} -> R m0 {3}
+W m1 {4}         P1                       e4: R m2 {1} -> W m1 {4}
+R m1 {0}         P1                       e5: W m1 {4} -> R m1 {0}
+EXIT(i) {0}      P0, P1                   e6: R m0 {3} -> EXIT(i) {0}
 ```
 
-The two piece DAGs list their edges separately and add no edge between the
-half-width paths:
+Before reduction, the pass records two edges from `W m2 {0}` to `R m2 {1}`:
+one for P0 and one for P1. Because they have the same endpoints, one remaining
+edge, `e1: W m2 {0} -> R m2 {1}`, is sufficient for that wait. The pass also
+records additional direct edges whose waits are already imposed by the paths
+shown below. Those additional edges are removed before semaphore construction,
+as explained in
+[Reducing synchronization edges](#reducing-synchronization-edges). The
+remaining synchronization-edge DAG is:
 
 ```text
-initial DAG for P0
-
-                             W m2 {0}
-                        +--------+--------+
-                     d2a|                 |d1a
-                        |                 v
-                        |             R m2 {1}
-                        |                 |d2b
-                        +--------+--------+
-                                 v
-                             W m0 {2}
-                        +--------+--------+
-                      d6|                 |d3
-                        |                 v
-                        |             R m0 {3}
-                        |                 |d7
-                        +--------+--------+
-                                 v
-                            EXIT(i) {0}
-
-initial DAG for P1
-
-                             W m2 {0}
-                        +--------+--------+
-                     d4a|                 |d1b
-                        |                 v
-                        |             R m2 {1}
-                        |                 |d4b
-                        +--------+--------+
-                                 v
-                             W m1 {4}
-                        +--------+--------+
-                      d8|                 |d5
-                        |                 v
-                        |             R m1 {0}
-                        |                 |walk
-                        +--------+--------+
-                                 v
-                            EXIT(i) {0}
+                                  ENTER(i) {0}
+                                       | walk
+                                       v
+                                  W m2(i) {0}
+                                       | e1
+                                       v
+                                  R m2(i) {1}
+                         +-------------+-------------+
+                  e2: P0 |                           | e4: P1
+                         v                           v
+                    W m0(i) {2}                 W m1(i) {4}
+                      e3 |                           | e5
+                         v                           v
+                    R m0(i) {3}                 R m1(i) {0}
+                      e6 |                           | walk
+                         +-------------+-------------+
+                                       v
+                                  EXIT(i) {0}
 ```
 
-`reduceStraightEdges` keeps `d1a`, removes duplicate `d1b`, removes `d2a`
-because `d1a` followed by `d2b` imposes the same wait, and removes `d4a`
-because `d1a` followed by `d4b` does the same. `reduceLoopCloses` initially
-keeps `d6`, `d7`, and `d8` because they end at `EXIT` with owner `{0}`. The
-later removal step removes `d6` because `d3` followed by `d7` imposes the
-same wait. It removes `d8` because `d5` reaches owner `{0}`, whose later
-operations follow program order. Only `d7` therefore causes a release to
-`EMPTY` for the next iteration.
-
-`d1a` is the only remaining synchronization edge for the full-width write and
-read. The other P0 and P1 edges remain independent. The P1 path after `R m2`
-neither acquires nor releases `EMPTY`. `EMPTY` still applies to the whole
-group, although its only release comes from `d7` on P0:
+`e1` becomes `FULL_BOTH`; `e2` through `e5` become the left and right
+semaphores; and `e6` becomes initially released semaphore `EMPTY`:
 
 ```text
-remaining edge   semaphore
-d1a            FULL_BOTH
-d2b            LEFT_READY
-d3             LEFT_FULL
-d4b            RIGHT_READY
-d5             RIGHT_FULL
-d7             EMPTY, initially released
+semaphore DAG
+
+                     acquire EMPTY(i) pending_count=1 {0}
+                                      btok |
+                                           v
+                                     EXIT(i-1) {0}
+                                           | next iteration
+                                           v
+                                      ENTER(i) {0}
+                                           | walk
+                                           v
+                                W m2(i) [btok] {0}
+                                           | walk
+                                           v
+                             release FULL_BOTH, btok {0}
+                                  FULL_BOTH |
+                                            v
+                               both = acquire FULL_BOTH {1}
+                                            | walk
+                                            v
+                                 R m2(i) [both] {1}
+                       +--------------------+--------------------+
+                  walk |                                         | walk
+                       v                                         v
+       release LEFT_READY, both {1}             release RIGHT_READY, both {1}
+            LEFT_READY |                              RIGHT_READY |
+                       v                                          v
+          left = acquire LEFT_READY {2}             right = acquire RIGHT_READY {4}
+                  walk |                                         | walk
+                       v                                         v
+             W m0(i) [left] {2}                         W m1(i) [right] {4}
+                  walk |                                         | walk
+                       v                                         v
+        release LEFT_FULL, left {2}              release RIGHT_FULL, right {4}
+             LEFT_FULL |                               RIGHT_FULL |
+                       v                                          v
+         lread = acquire LEFT_FULL {3}             rread = acquire RIGHT_FULL {0}
+                  walk |                                         | walk
+                       v                                         v
+            R m0(i) [lread] {3}                       R m1(i) [rread] {0}
+                  walk |                                         | walk
+                       v                                         |
+          release EMPTY, lread {3}                                |
+                 EMPTY |                                         |
+                       +--------------------+--------------------+
+                                            v
+                       acquire EMPTY(i+1) pending_count=1 {0}
+                                      next |
+                                           v
+                                      EXIT(i) {0}
+                                           | next iteration
+                                           v
+                                    ENTER(i+1) {0}
 ```
 
-```text
-%both = acquire EMPTY pending_count=1 {0}
-W m2 [%both] {0}
-release FULL_BOTH, %both {0}
-
-%read_both = acquire FULL_BOTH {1}
-R m2 [%read_both] {1}
-release LEFT_READY,  %read_both {1}
-release RIGHT_READY, %read_both {1}
-
-%left = acquire LEFT_READY {2}
-W m0 [%left] {2}
-release LEFT_FULL, %left {2}
-
-%left_read = acquire LEFT_FULL {3}
-R m0 [%left_read] {3}
-release EMPTY, %left_read {3}
-
-%right = acquire RIGHT_READY {4}
-W m1 [%right] {4}
-release RIGHT_FULL, %right {4}
-
-%right_read = acquire RIGHT_FULL {0}
-R m1 [%right_read] {0}
-```
+After `R m2`, the P0 and P1 paths have no synchronization edge between them.
+P0 releases `EMPTY` because its last reader is owner `{3}`. `R m1` and the
+acquire of `EMPTY` both have owner `{0}`, and program order places the read
+before the acquire.
 
 ### Nested regions
 
