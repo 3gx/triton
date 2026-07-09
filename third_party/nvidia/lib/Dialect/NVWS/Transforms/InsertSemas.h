@@ -19,7 +19,6 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdlib>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -38,7 +37,8 @@ using PartitionId = std::pair<int /*ttg.partition*/, int /*ws tag*/>;
 using Owner = std::optional<PartitionId>;
 inline int64_t ownerKey(const Owner &o) {
   return o ? (static_cast<int64_t>(o->second) << 32) |
-                 static_cast<uint32_t>(o->first) : -1;
+                 static_cast<uint32_t>(o->first)
+           : -1;
 }
 inline bool sameOwner(const Owner &a, const Owner &b) { return a == b; }
 
@@ -68,44 +68,29 @@ struct Touch {
 
 struct Node;
 
-// Static identity of one semaphore capability.  The group is implicit in the
-// GroupDag being processed; producer identifies the token SSA (an acquire or a
-// region carrier), while that token preserves its dynamic physical-slot
-// lineage. `sema` is the selected render channel; region results preserve an
-// incoming channel when one exists, otherwise use a deterministic fallback.
-// The exact producer may have acquired another channel in the same GroupDag.
-struct CapabilityRef {
+// Static identity of one token.  The group is implicit in the GroupDag being
+// processed; producer identifies the token SSA (an acquire or a region
+// carrier), while that token preserves its dynamic physical-slot lineage.
+// `sema` is the selected render channel; region results preserve an incoming
+// channel when one exists, otherwise use a deterministic fallback. The exact
+// producer may have acquired another channel in the same GroupDag.
+struct TokenRef {
   Node *producer = nullptr;
   SemaId sema = 0;
   Owner owner;
 };
-struct SemaTransfer {
-  // passesInput describes SSA provenance; concrete is the fallback render
-  // channel when the region has no incoming capability.
-  bool valid = false, passesInput = false;
-  std::optional<SemaId> concrete;
+struct CompletionSummary {
+  bool valid = true, usesInput = true, hasFallback = false;
+  gpu::StageCluster schedule;
 };
-
+// A region that threads a token: each exit path names the boundary owner's
+// last token producer inside that path, or nullptr to pass the ENTER token
+// through unchanged.
 struct RegionFlow {
-  enum class Mode { CARRIED, POINT_OF_USE, CHILD_OWNS };
-  enum class Blocker { NONE, TRAILING_USE, RESULT_CONSUMED };
   Owner owner;
-  SmallVector<Node *, 2> exits;
-  SemaTransfer semaTransfer;
-  bool ownersCompatible = true;
-  bool transparent = false;
-  bool completionUniform = true, completionUsesInput = true;
-  bool completionHasFallback = false;
-  gpu::StageCluster completionSchedule;
-  Mode mode = Mode::CARRIED;
-  Blocker blocker = Blocker::NONE;
-  Node *entryAcquire = nullptr, *closingRelease = nullptr;
-  Node *firstToucher = nullptr;
-  Node *postLoopAcquire = nullptr, *bridgeAcquire = nullptr, *bridgeRelease = nullptr;
-  bool threadsToken() const { return mode == Mode::CARRIED; }
-  bool isPointOfUse() const { return mode == Mode::POINT_OF_USE; }
-  bool isChildOwned() const { return mode == Mode::CHILD_OWNS; }
-  Node *exit() const { return exits.empty() ? nullptr : exits.front(); }
+  SmallVector<Node *, 2> exits; // nullptr means pass the ENTER token
+  // Concrete exit channel used when no non-entry token reaches the region.
+  std::optional<SemaId> concreteSema;
 };
 
 struct Node {
@@ -120,36 +105,79 @@ struct Node {
   DenseMap<PieceId, PieceInfo> pieceInfo;
   SemaId sema = 0;
   unsigned count = 0;
-  bool postLoopAcquire = false;
   SmallVector<AsyncOp, 1> payloads;
   gpu::StageCluster stageCluster;
   std::optional<int64_t> stageOffset;
   std::optional<int64_t> bufferStageOffset;
-  // Explicit distance for a planned recurrence demand. Schedule analysis
-  // consumes this fact directly instead of recognizing a placement shape.
-  std::optional<int64_t> recurrenceDistance;
+  bool postLoopAcquire = false;
   // The SYNC-DAG proved that this node can reuse its owner's earlier token in
   // the same chain without a fresh handoff. EmitIR renders this fact; it does
   // not infer token-reuse eligibility on its own.
   std::optional<int64_t> reuseTokenOwner;
-  Node *sat = nullptr;
-  Node *scheduleAnchor = nullptr;
   std::optional<RegionFlow> flow;
+  std::optional<Owner> completionOwner;
+  CompletionSummary completion;
   SmallVector<int, 2> requiredParts;
   bool isRegion() const { return kind == For || kind == If; }
   bool isProtocol() const { return kind == Acquire || kind == Release; }
+  bool isSlotEvent() const {
+    return kind == Access || (isRegion() && !pieceInfo.empty());
+  }
+  bool isLinked() const {
+    return parent &&
+           (prev || next || llvm::is_contained(parent->children, this));
+  }
+  bool isDirectLoopNode() const { return isLinked() && parent->kind == For; }
+};
+struct ProtocolArc {
+  Node *release = nullptr, *acquire = nullptr;
+  Node *producer = nullptr, *consumer = nullptr;
+  Node *wait = nullptr;
 };
 inline void markTokenReuse(Node *n, const Owner &owner) {
   assert(owner && n->owner && sameOwner(n->owner, owner));
   n->reuseTokenOwner = ownerKey(owner);
 }
 inline bool nodeReusesToken(const Node *n, const Owner &owner) {
-  return owner && n->reuseTokenOwner &&
-         *n->reuseTokenOwner == ownerKey(owner);
+  return owner && n->reuseTokenOwner && *n->reuseTokenOwner == ownerKey(owner);
+}
+inline CompletionSummary joinCompletion(CompletionSummary a,
+                                        CompletionSummary b) {
+  if (!a.valid || !b.valid ||
+      (a.hasFallback && b.hasFallback && a.schedule != b.schedule))
+    return {false};
+  return {true, a.usesInput || b.usesInput, a.hasFallback || b.hasFallback,
+          a.hasFallback ? a.schedule : b.schedule};
+}
+inline CompletionSummary applyCompletion(CompletionSummary flow,
+                                         CompletionSummary input) {
+  if (!flow.valid || !input.valid ||
+      (flow.usesInput && flow.hasFallback && input.hasFallback &&
+       flow.schedule != input.schedule))
+    return {false};
+  if (!flow.usesInput)
+    return {true, false, true, flow.schedule};
+  return {true, input.usesInput, flow.hasFallback || input.hasFallback,
+          input.hasFallback ? input.schedule : flow.schedule};
+}
+inline CompletionSummary completionAfterChain(Node *head, const Owner &owner,
+                                              CompletionSummary state = {}) {
+  for (Node *n = head; n; n = n->next) {
+    if (n->kind == Node::Access && sameOwner(n->owner, owner)) {
+      Operation *completion = n->completionAnchor ? n->completionAnchor : n->op;
+      state = {true, false, true, gpu::getStageCluster(completion)};
+    } else if (n->isRegion() && n->completionOwner &&
+               !(n->kind == Node::For && gpu::hasWarpSpecializeTag(n->op)) &&
+               sameOwner(*n->completionOwner, owner)) {
+      state = applyCompletion(n->completion, state);
+    }
+  }
+  return state;
 }
 inline SmallVector<std::pair<PieceId, PieceInfo>, 4>
 sortedPieceInfo(const Node *n) {
-  SmallVector<std::pair<PieceId, PieceInfo>, 4> v(n->pieceInfo.begin(), n->pieceInfo.end());
+  SmallVector<std::pair<PieceId, PieceInfo>, 4> v(n->pieceInfo.begin(),
+                                                  n->pieceInfo.end());
   llvm::sort(v, [](const auto &a, const auto &b) { return a.first < b.first; });
   return v;
 }
@@ -192,14 +220,13 @@ struct PieceTable {
 
 struct Sema {
   std::string name;
-  unsigned count = 0, expectedArrivals = 0;
+  unsigned count = 0;
   bool isEntry = false;
   Owner entryTokenOwner;
   Value create;
 };
 
 enum class MemKind { Tmem, Local };
-enum class DumpStage { Access, Owner, Sync };
 
 struct GroupDag {
   int64_t bufferId = 0;
@@ -214,6 +241,7 @@ struct GroupDag {
   SmallVector<std::unique_ptr<Node>> nodes;
   Node *root = nullptr;
   SmallVector<Sema> semas;
+  SmallVector<ProtocolArc> protocolArcs;
   int numCopies = 1, numSemaphoreCopies = 1;
   SmallVector<Value> backing;
   bool isTmem() const { return memory == MemKind::Tmem; }
@@ -235,8 +263,10 @@ inline Sema &getSema(GroupDag &group, const Node *node) {
 inline const Sema &getSema(const GroupDag &group, const Node *node) {
   return group.semas[node->sema];
 }
-inline bool canOwnMixedDepthTmem(const GroupDag &owner, const GroupDag &reuser) {
-  if (!owner.isTmem() || !reuser.isTmem() || owner.pieceTable.members.size() != 1 ||
+inline bool canOwnMixedDepthTmem(const GroupDag &owner,
+                                 const GroupDag &reuser) {
+  if (!owner.isTmem() || !reuser.isTmem() ||
+      owner.pieceTable.members.size() != 1 ||
       reuser.pieceTable.members.size() != 1)
     return false;
   const Member &ownerMember = owner.pieceTable.members.front();
@@ -263,8 +293,7 @@ inline std::optional<int64_t> getI64Attr(Operation *op, StringRef name) {
 inline InFlightDiagnostic semaError(Operation *op) {
   return op->emitError() << "nvws-insert-semas: ";
 }
-template <typename OpTy>
-inline InFlightDiagnostic semaError(OpTy op) {
+template <typename OpTy> inline InFlightDiagnostic semaError(OpTy op) {
   return semaError(op.getOperation());
 }
 inline Owner resolveOwner(Operation *op) {
@@ -288,7 +317,8 @@ inline std::string ownerStr(Operation *anchor, const Owner &owner) {
   Operation *scope = anchor;
   while (scope && !(isa<scf::ForOp>(scope) && gpu::hasWarpSpecializeTag(scope)))
     scope = scope->getParentOfType<scf::ForOp>();
-  std::optional<int> tag = scope ? gpu::getWarpSpecializeTag(scope) : std::nullopt;
+  std::optional<int> tag =
+      scope ? gpu::getWarpSpecializeTag(scope) : std::nullopt;
   if (tag && *tag == owner->second)
     os << "{" << owner->first << "}";
   else
@@ -312,20 +342,14 @@ inline AsyncOp asyncPayloadOf(Operation *op) {
 inline bool isSupportedAliasOp(Operation *op) {
   StringRef name = op->getName().getStringRef();
   return name == "ttg.memdesc_index" || name == "ttg.memdesc_subview" ||
-         name == "ttg.memdesc_trans" || name == "ttg.memdesc_reinterpret" || name == "ttg.memdesc_reshape";
-}
-inline std::string treePrefix(unsigned depth) {
-  std::string s;
-  for (unsigned i = 0; i < depth; ++i)
-    s += "|  ";
-  return s;
+         name == "ttg.memdesc_trans" || name == "ttg.memdesc_reinterpret" ||
+         name == "ttg.memdesc_reshape";
 }
 inline bool shouldDumpDag() {
   const char *env = ::getenv("NVWS_INSERT_SEMA_DUMP_DAG");
   return env && StringRef(env) == "1";
 }
-template <typename Fn>
-inline void forEachNode(Node *head, Fn &&fn) {
+template <typename Fn> inline void forEachNode(Node *head, Fn &&fn) {
   for (Node *n = head; n; n = n->next) {
     fn(n);
     if (n->isRegion())
@@ -333,25 +357,11 @@ inline void forEachNode(Node *head, Fn &&fn) {
         forEachNode(child, fn);
   }
 }
-template <typename Fn>
-inline void forEachNode(GroupDag &g, Fn &&fn) {
+template <typename Fn> inline void forEachNode(GroupDag &g, Fn &&fn) {
   if (!g.root->children.empty())
     forEachNode(g.root->children[0], std::forward<Fn>(fn));
 }
-template <typename Fn>
-inline LogicalResult forEachNodeChecked(Node *head, Fn &&fn) {
-  for (Node *n = head; n; n = n->next) {
-    if (failed(fn(n)))
-      return failure();
-    if (n->isRegion())
-      for (Node *child : n->children)
-        if (failed(forEachNodeChecked(child, fn)))
-          return failure();
-  }
-  return success();
-}
-template <typename Fn>
-inline void forEachRegionPostOrder(Node *head, Fn &&fn) {
+template <typename Fn> inline void forEachRegionPostOrder(Node *head, Fn &&fn) {
   for (Node *n = head; n; n = n->next) {
     if (!n->isRegion())
       continue;
@@ -385,15 +395,9 @@ inline void mergeEffect(Map &effects, PieceId piece, Effect effect) {
 
 FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp);
 LogicalResult buildAccessDag(GroupDag &g, triton::FuncOp funcOp);
-LogicalResult buildOwnerDag(GroupDag &g);
 LogicalResult buildSyncDag(GroupDag &g, bool useMetaPartitioner,
                            int lowerSemaphoreNumStages, int &numTmemBlocks);
 LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups);
 LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups);
-void printPieceRecord(llvm::raw_ostream &os, const Node *node, Operation *anchor);
-void dumpGroupAccessDag(GroupDag &g, triton::FuncOp funcOp);
-void dumpGroupOwnerDag(GroupDag &g, triton::FuncOp funcOp);
-void dumpGroupSyncDag(GroupDag &g, triton::FuncOp funcOp);
-void dumpDagTree(GroupDag &g, DumpStage stage);
 } // namespace mlir::triton::nvws_semas
 #endif // NVWS_TRANSFORMS_INSERT_SEMAS_H_

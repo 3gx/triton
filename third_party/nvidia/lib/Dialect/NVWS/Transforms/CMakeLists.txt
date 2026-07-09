@@ -9,7 +9,6 @@ add_triton_library(NVWSTransforms
   InsertSemas.cpp
   InsertSemasAccessDag.cpp
   InsertSemasEmitIR.cpp
-  InsertSemasOwnerDag.cpp
   InsertSemasSyncDag.cpp
   HoistTmemStore.cpp
   WSUtility.cpp
