@@ -4,158 +4,136 @@
 
 `NVWSInsertSemas` consumes partitioned IR with explicit mutable SMEM/TMEM
 accesses. Optional `buffer.*` attributes describe physical reuse and the
-number of backing copies.
-It produces `nvws.semaphore.create/acquire/buffer/release`, threads semaphore
-tokens through structured control flow, and assigns pipeline-legal
+number of backing copies. It produces
+`nvws.semaphore.create/acquire/buffer/release`, threads semaphore tokens
+through structured control flow, and assigns pipeline-legal
 `loop.stage`/`loop.cluster` annotations. Pipeline-wide terms are defined in
 the [NVWS-AWS terminology](../nvws-aws-overview.md#terminology).
 
 The pass models exclusive ownership for writes and shared ownership for
-reads. SYNC-DAG keeps two facts for each piece. Its *source* records the
-logical producer of the current version and the concrete DAG node from which
-a new reader receives that version. Its *uses* record each owner's latest
-access to that version:
+reads. For each physical piece of a buffer, synchronization construction
+tracks two facts:
+
+- `source`: the DAG node for the most recent write to the piece.
+- `uses`: a table from partition to DAG node. After a write, it contains
+  `[writing partition -> write]`. Each later read adds or replaces
+  `[reading partition -> read]`.
+
+The state is updated as follows:
 
 ```text
-first touch: source = this node; uses = [this owner -> this node]
-write:       wait on uses owned by every other owner, unless already ordered;
-             reset source and uses
-reread:      move only this owner's use; keep the source
-new reader:  wait on the stable source; add this owner's use
+read in a partition already present in uses
+  replace that partition's entry with this read
+
+read in a partition not present in uses
+  add source -> read
+  add [this partition -> read] to uses
+
+write
+  for each other partition in uses not already ordered before this write:
+    add uses[partition] -> write
+  source = this write
+  uses   = [writing partition -> this write]
 ```
 
-The source node is the latest write in the same chain, the first toucher
-before any write, or a child `ENTER` node that represents a version established
-outside the child. A child preserves the inherited logical producer while
-using `ENTER` as its chain-local source. Keeping source and uses separate lets
-independent readers fan out from the same source while a later writer still
-waits for the node stored for every other owner in `uses`.
+After a write, `source` remains fixed at that write while reads update
+`uses`. The first read in another partition is ordered after `source`; later
+reads in the same partition only replace that partition's entry. Reads in
+different partitions are therefore not ordered with respect to one another.
+When another write is encountered, the required entries in `uses` are
+ordered before it, and the new write resets both `source` and `uses`.
 
-## One model, four steps
+## One model, three steps
 
 ```text
 ACCESS-DAG
-  discover physical IDs, groups, overlap pieces, accesses, effects, regions
-      |
-OWNER-DAG
-  add region boundary markers and assign an owner to each piece on each
-  for/if node
+  collect groups and overlap pieces; build accesses and owners;
+  wrap region bodies with ENTER/EXIT boundaries
       |
 SYNC-DAG
-  derive required memory edges, token-supply edges, semaphores, token reuse,
-  region flows, loop token decisions, buffer-stage schedule
+  build raw edges; choose backing copies; reduce and merge edges;
+  choose semaphores, tokens, and semaphore copies;
+  assign stage offsets, legalize clusters, and schedule acquires/releases
       |
 EMIT-IR
-  materialize the already-decided protocol
+  materialize the decided acquire/release/token/buffer protocol
 ```
 
-All four steps use the same `Node` graph. Later steps extend it instead of
-reconstructing ownership from mutated IR.
+All three steps use the same `Node` graph. Each step adds decisions to that
+graph, so later steps do not reconstruct memory ownership from changed IR.
 
 ## Core objects
 
-Model objects with their code names — the shared graph types are in
-`InsertSemas.h`, the chain builder `buildChainForBlock` is in
-`InsertSemasAccessDag.cpp`, and the walk's `VersionSource`, `PieceState`,
-`ActiveUse`, and `Tokens` are in `InsertSemasSyncDag.cpp`. The step documents
-use these terms with exactly these meanings.
+The shared graph types are in `InsertSemas.h`. The detailed construction is
+covered by [ACCESS-DAG](access-dag.md) and [SYNC-DAG](sync-dag.md).
 
-- **Group** (`GroupDag`): the allocations analyzed together for ownership.
-  Ordinarily, allocations of one memory kind with the same `buffer.id` form
-  one group; an allocation without `buffer.id` gets a private synthetic
-  group. Allocations sharing a physical `buffer.id` are analyzed as separate
-  groups when they need independent synchronization: circular SMEM
-  allocations, or TMEM allocations with different `buffer.copy` values.
-- **Member** (`Member`): one allocation within a group.
-- **Piece** (`Piece`): a maximal address interval with one fixed set of
-  covering members. A group's pieces must all connect through shared members
-  — one connected component; `buildAccessDag` rejects the group otherwise
-  (see [ACCESS-DAG](access-dag.md#pieces-must-connect)). The group is therefore the unit
-  of synchronization — one set of semaphores, tokens scoped to the group
-  (never to a piece), and one set of region flows — while
-  source/use state is tracked per piece.
-- **Node** (`Node`): one entry of a group's program-order graph. Kinds:
-  `Func` (the root of the graph), `Access` (a real operation touching group
-  memory), `For`/`If` (a nested region), `Acquire`/`Release` (semaphore
-  protocol added by SYNC-DAG), and the `ENTER`/`EXIT` boundary markers. An
-  access or release may carry `Node::reuseTokenOwner`, SYNC-DAG's proof that
-  the node can reuse that owner's earlier token.
-- **Chain**: the node sequence of one block, built in program order
-  (`buildChainForBlock`); each region node holds child chains.
-- **Owner** (`Owner`): the one partition that executes an access, acquire, or
-  release inside a tagged WS scope, identified as `(partition ID, WS tag)`.
-- **Root**: the owner of an access with no WS tag on itself or an enclosing
-  `scf.for` (`Owner == std::nullopt`). A root access has no WS partition
-  owner even if it carries `ttg.partition`: a partition index names an
-  executor only relative to a WS-tagged loop, so `ttg.partition` with no tag
-  in scope is stray metadata, not ownership — the pass does not diagnose it
-  and resolves the access to root (Meta-NVWS strips such metadata before
-  this pass; see [meta-ports](../meta-ports.md#partition-scheduling)). Root
-  is distinct from partition 0 inside a WS scope.
-- **Region partition set**: the partitions in which `PartitionLoops` will
-  clone a `for` or `if`. It may contain several partitions and is separate
-  from access ownership; the owner a region reports per piece is stored on
-  the region node (`Node::pieceInfo`).
-- **Touch** (`Touch`): one member access on an `Access` node, classified read
-  (`R`) or write (`W`).
+- **Group** (`GroupDag`): allocations analyzed together for ownership.
+  Allocations of one memory kind with the same `buffer.id` normally form one
+  group; an allocation without `buffer.id` gets a private synthetic group.
+  Circular SMEM allocations and TMEM allocations with different
+  `buffer.copy` values may use separate groups while sharing physical storage.
+- **Member** (`Member`): one allocation in a group.
+- **Piece** (`Piece`): a maximal address interval covered by one fixed set of
+  members. A group's pieces must be connected through shared members. The
+  group is one synchronization unit, while source and use state is tracked
+  separately for each piece.
+- **Node** (`Node`): one entry in the group's program-order graph. An
+  `Access` is a real memory operation; `For` and `If` hold child chains;
+  `ENTER` and `EXIT` mark region boundaries; `Acquire` and `Release` are added
+  by synchronization construction. `Func` is the graph root.
+- **Chain**: the node sequence for one region. A region node occupies one
+  position in its parent chain and owns one child chain per region.
+- **Owner** (`Owner`): the partition and WS tag that execute an access,
+  acquire, or release: `(partition ID, WS tag)`.
+- **Root**: an access with no owner. Root is distinct from partition 0 inside
+  a WS scope.
+- **Region boundary**: the per-piece owner and read/write effect recorded on a
+  `For`, `If`, `ENTER`, or `EXIT` node. It presents a child chain as one event
+  to its parent.
+- **Touch** (`Touch`): one member access on an `Access` node, classified as a
+  read (`R`) or write (`W`). A touch reaches every piece in that member's
+  footprint.
 - **Semaphore token**: the `!ttg.async.token` returned by
-  `nvws.semaphore.acquire`. `nvws.semaphore.buffer` uses it to expose the
-  guarded memory, and `nvws.semaphore.release` takes it as an operand. Tokens
-  are group-scoped, not piece-scoped. Within a chain, the pass keeps known
-  owner tokens in deterministic order and uses the last token by default. A
-  node marked with `reuseTokenOwner` instead uses that owner's earlier token.
-  A region flow selects which token, if any, survives its boundary and
-  resets this chain-local reuse state; EMIT-IR renders the mark and never
-  infers reuse.
-- **Capability reference** (`CapabilityRef`): token producer, semaphore, and
-  owner.
-- **Semaphore transfer** (`SemaTransfer`): whether a path returns the input
-  token or a token from a named semaphore.
-- **Region flow** (`RegionFlow`): the token returned by each `for`/`if` path
-  and, for loops, the `CARRIED`, `POINT_OF_USE`, or `CHILD_OWNS` choice.
+  `nvws.semaphore.acquire`. `nvws.semaphore.buffer` uses it to expose guarded
+  memory, and `nvws.semaphore.release` consumes it. Tokens belong to a group,
+  not to an individual piece.
 
-The loop decision rules and dump labels are explained in
-[SYNC-DAG's Region flows section](sync-dag.md#region-flows).
-
-For supported accesses, owner resolution is:
+For a supported memory access, owner resolution is:
 
 ```text
-partition [p] with WS tag t -> owner (p, t)
-no tag on the access or an enclosing scf.for -> root
+partition [p] with WS tag t  -> owner (p, t)
+no partition or no tag       -> root
+several partitions           -> unsupported for a memory access
 ```
 
-Inside a tagged WS scope, every access to an SMEM or TMEM allocation handled
-by `InsertSemas` must execute in one partition. Multi-partition accesses are
-not supported: the pass does not diagnose them and silently treats such an
-access as root-owned (`resolveOwner` in `InsertSemas.h`), which can drop the
-intended handoff. Multi-partition metadata is supported on region and control
-operations, where it describes execution rather than access ownership.
+Inside a tagged WS scope, a supported SMEM/TMEM access must execute in one
+partition. A memory access carrying several partition IDs is unsupported.
+Multi-partition metadata is supported on control operations, where it
+describes which partitions execute the region rather than who owns a memory
+access.
 
 When root-held state enters a tagged WS loop, the first partition to touch it
-may take ownership without an incoming partition-to-partition handoff.
+may adopt it without a partition-to-partition handoff.
 
 ## Mutation boundary
 
-ACCESS, OWNER, and per-group SYNC construction are analysis-only. Global SYNC
-schedule finalization may raise existing `loop.cluster` values when a
-producer and consumer execute in the same pipelined iteration (see
-[SYNC-DAG](sync-dag.md#pipeline-schedule)); it never changes `loop.stage`.
-EMIT-IR then renders the graph and performs
-representation-driven folding and cleanup; its one schedule exception is the
-loop-scheduler workaround, which splits qualifying `scf.if` operations and
-may copy a pipeline stage onto a release it moves (see
-[EMIT-IR](emit-ir.md)).
+ACCESS-DAG and per-group SYNC-DAG construction only build and annotate the
+model. Schedule finalization may raise an existing `loop.cluster` when a
+producer and consumer execute in the same pipelined iteration; it does not
+change `loop.stage`. EMIT-IR then creates semaphore operations, threads their
+tokens through `for` and `if`, materializes shared backing, and removes dead
+token slots and replaced allocations.
 
 ## Step documents
 
-- [ACCESS-DAG](access-dag.md)
-- [OWNER-DAG](owner-dag.md)
+- [ACCESS-DAG: accesses, owners, and boundaries](access-dag.md)
 - [SYNC-DAG](sync-dag.md)
 - [EMIT-IR](emit-ir.md)
 
 ## Code map
 
-- Dispatcher: [`InsertSemas.cpp`](../../third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemas.cpp)
+- Dispatcher:
+  [`InsertSemas.cpp`](../../third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemas.cpp)
 - Shared model and traversal utilities:
   [`InsertSemas.h`](../../third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemas.h)
 - Pass options: [`Passes.td`](../../third_party/nvidia/include/Dialect/NVWS/Transforms/Passes.td),

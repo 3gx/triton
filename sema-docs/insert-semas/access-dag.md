@@ -1,18 +1,17 @@
-# ACCESS-DAG
+# ACCESS-DAG: accesses, owners, and boundaries
 
 ## Purpose
 
-ACCESS-DAG is the memory fact layer: it answers *who touches what, where,
-and how* — physical overlap, program-order accesses, executing partitions,
-and region effects — without deciding any synchronization. Who *owns* memory
-and when ownership must move is decided by the later steps
-([OWNER-DAG](owner-dag.md), [SYNC-DAG](sync-dag.md)); nothing in this step
-depends on those answers.
+ACCESS-DAG is the memory fact layer. It answers *who touches what, where, and
+how*: physical overlap, program-order accesses, executing owners, region
+effects, and the owners visible at region boundaries. It does not create
+semaphores or tokens; [SYNC-DAG](sync-dag.md) uses these facts to do that.
 
-Figures use the pass's dump format (`NVWS_INSERT_SEMA_DUMP_DAG=1`, trimmed
-excerpts): `W m0 ttg.local_alloc {0}` is a write of member `m0` by the op
-`ttg.local_alloc` in partition 0, and region nodes carry
-`effects{piece:effect}`. Model terms are defined in the
+The examples use a compact schematic form. `W m0 ttg.local_alloc {0}` means
+that the `ttg.local_alloc` writes member `m0` in partition 0. A region summary
+such as `pieces{P0:W:{0}}` says that the region writes piece P0 and presents
+owner `{0}` at its boundary. Tree lines show block nesting and program order,
+not synchronization edges. Model terms are defined in the
 [InsertSemas overview](overview.md#core-objects).
 
 ## What is analyzed
@@ -50,19 +49,18 @@ form directly into `InsertSemas` gets no synchronization and no diagnostic.
 These allocations are grouped by `buffer.id`, with SMEM and TMEM in separate
 namespaces; an allocation without an ID receives a private synthetic group.
 
-The analysis runs **once per group**: ACCESS-DAG and OWNER-DAG are fully
-independent per group, and SYNC-DAG walks each group's ownership
-separately (the per-piece source/use state — see
-[SYNC-DAG](sync-dag.md)). The later steps do share some state — SYNC-DAG
-validates circular sibling groups together, threads a function-wide TMEM
+The analysis runs **once per group**. ACCESS-DAG builds each group's accesses
+and boundaries, and SYNC-DAG walks each group's ownership separately (the
+per-piece source/use state is described in [SYNC-DAG](sync-dag.md)). The later
+steps do share some state: SYNC-DAG validates circular sibling groups
+together, threads a function-wide TMEM
 budget, and runs final schedule legalization over the whole function;
 EMIT-IR sees all groups at once so it can reunify shared storage. Across
-groups, however, synchronization remains independent. The license for that
-is a contract from upstream: distinct `buffer.id`s occupy disjoint storage,
+groups, however, synchronization remains independent. This is valid because
+upstream guarantees that distinct `buffer.id`s occupy disjoint storage,
 while split groups with one `buffer.id` are planned to take turns using the
-shared storage. The dump prints one complete `GROUP` block per group; an op
-that touches two groups appears in both analyses, each seeing only its own
-facet.
+shared storage. An operation that touches two groups appears in both analyses,
+each seeing only its own group.
 
 The memory planner can make several logical buffers take turns occupying
 one physical allocation (announced through the `buffer.*` attributes): at
@@ -70,8 +68,8 @@ any moment each byte belongs to exactly one of the buffers, and over the
 loop's iterations the same byte serves first one, then another. Buffers that
 never hold a byte at the same time do not conflict, so in the two
 arrangements below each logical buffer is analyzed as its own group — own
-pieces, own chain, own semaphores — and EMIT-IR re-merges the shared storage
-at the very end:
+pieces, own chain, own semaphores — while EMIT-IR materializes one shared
+physical backing before it emits their protocol:
 
 - a circular local member requires `buffer.id`, `buffer.copy`, and
   `buffer.start`, forbids `buffer.offset`, uses logical offset zero, and forms
@@ -126,9 +124,10 @@ two accesses land on the same piece.
 ### Pieces must connect
 
 `buildAccessDag` requires all of a group's pieces to connect through shared
-members — one connected component (`piecesSingleComponent`, a union-find
-over the piece table). The rest of the pass relies on it: one group is one
-synchronization unit, with one group-scoped semaphore/token protocol
+members. Because pieces are ordered intervals, `buildPieces` checks that each
+adjacent pair touches and shares at least one member. The rest of the pass
+relies on this: one group is one synchronization unit, with one group-scoped
+semaphore/token protocol
 ([SYNC-DAG](sync-dag.md)). Draw members and pieces as a graph — an edge
 wherever a member covers a piece — and the requirement is that the graph is
 one island:
@@ -172,7 +171,7 @@ within their owner's columns — see
 only on hand-written IR; there it fails loudly rather than synchronizing two
 independent buffers as one. Overlapping ranges, by contrast, share bytes —
 writing one member clobbers part of the other — and the piece table records
-exactly that entanglement.
+exactly that overlap.
 
 ## Recognizing accesses: the value-to-member map
 
@@ -201,29 +200,25 @@ for each op, in program order:
   if touches: append ONE access node (touches, op, partition)
 ```
 
-An op yields at most one access node, carrying one touch per map-hit value
-(normally one per member it reached); the ACCESS dump prints one line per
-touch, and the SYNC dump joins them on a single node. Membership is always
-the same plain map lookup — classification only decides which of the op's
-values to look up and with what effect, and an op whose values all miss the
-map contributes nothing.
+An operation yields at most one access node, carrying one touch per map-hit
+value (normally one per member it reached). Membership is always the same map
+lookup: classification only decides which values to look up and whether each
+one is read or written. An operation whose values all miss the map contributes
+nothing.
 The one write with no memdesc operand is the sourceful allocation: it
 initializes the memory its own result names (that result is already in the
 map from seeding), producing the `W m0 ttg.local_alloc {0}` lines in the
 figures. A descriptor load's destination is an ordinary memdesc operand —
 the op returns nothing.
 
-The view ops are a closed list — `memdesc_index`, `memdesc_trans`,
-`memdesc_reinterpret`, `memdesc_reshape` — operations that create another
-name for the same allocation without touching memory. (The code's whitelist
-carries a fifth, dead name, `ttg.memdesc_subview`; no such op exists in this
-repo.) A view **adds** a map entry; the old name stays valid, since later
-ops may use both. Any other operation that consumes a group memdesc and
-produces a single memdesc is rejected with a diagnostic — in particular
-`ttg.memdesc_subslice` is rejected, not followed — so a single-result
-memdesc alias can never silently escape the map (a memdesc produced among
-multiple results falls to the fallback-`W` rule instead; its result is not
-tracked).
+The recognized view names are `ttg.memdesc_index`, `ttg.memdesc_subview`,
+`ttg.memdesc_trans`, `ttg.memdesc_reinterpret`, and
+`ttg.memdesc_reshape`. They create another name for the same allocation
+without touching memory. A view **adds** a map entry; the old name stays valid
+because later operations may use both. Any other operation that consumes a
+group memdesc and produces one memdesc is rejected with a diagnostic. A
+memdesc produced among several results falls to the fallback-`W` rule instead,
+and its result is not tracked as an alias.
 
 Note what the map does and does not answer. It answers only *"which member
 is this name?"* — always unambiguous, because an SSA value derives from
@@ -239,7 +234,8 @@ Per group, the walk produces **one chain**: the program-order sequence of
 nodes over all of the group's members, interleaved as they execute. `Access`
 nodes carry (R/W, member, op, partition); a `for`/`if` becomes a node
 holding child chains, and is kept only when its body touches the group.
-The `@serialized_ring_reduces` group above:
+Ignoring boundary nodes until the [regions section](#regions-and-boundaries),
+the `@serialized_ring_reduces` group above has this access chain:
 
 ```text
 |- scf.for (WS, tag=0) effects{P0:W, P1:W, P2:W}
@@ -294,13 +290,14 @@ before any scanning (see [Pieces must connect](#pieces-must-connect)).
 Accesses inside `scf.for` and `scf.if` are supported. Passing a group's
 memdesc through an `scf.for` argument/result, an `scf.yield`, or a function
 return is rejected with a diagnostic, as is any unsupported view-shaped
-operation (the closed view-op list under "Recognizing accesses"). Other region-holding operations (for example
-`scf.while`) are not scanned: accesses inside their bodies are invisible to
-the analysis, with no diagnostic. If such an operation consumes a group
-memdesc, it is conservatively recorded as a write — unless its sole result
-is a memdesc, in which case the view-operation rule rejects it.
+operation (the closed view-op list under "Recognizing accesses"). Other
+region-holding operations (for example `scf.while`) are not scanned: accesses
+inside their bodies are invisible to the analysis, with no diagnostic. If
+such an operation consumes a group memdesc, it is conservatively recorded as
+a write — unless its sole result is a memdesc, in which case the
+view-operation rule rejects it.
 
-## Completion frontier
+## When an access finishes
 
 Normally an access completes at the memory operation itself. A `local_load`
 from one of these SMEM buffers that feeds exactly one same-block descriptor
@@ -315,13 +312,130 @@ If no descriptor-store candidate exists, the ordinary completion point is
 kept. Once a candidate exists, every extra direct load/convert user,
 control-flow crossing, or owner mismatch fails the pass with a diagnostic.
 
-## Effects inside `for` and `if`
+## Regions and boundaries
 
-For every kept `for` and `if`, ACCESS-DAG records each piece accessed in
-its body. The recorded effect is `W` if any access writes the piece, otherwise
-`R` (the `effects{...}` annotation in the figure above). No owner is assigned yet,
-and the `ENTER`/`EXIT` boundary markers are added by the next step,
-OWNER-DAG.
+A nested `for` or `if` occupies one position in its parent chain even though
+its body may change owners several times. The region node therefore records,
+for each piece its children touch:
+
+- `R` if every child access only reads the piece, otherwise `W`;
+- the owner used by that region's `ENTER` and `EXIT` boundaries.
+
+That stored boundary owner normally contributes to the parent chain too. A
+WS-tagged `for` is the exception: it stores the first owner inside the loop
+for its children, but contributes root ownership to its enclosing chain.
+
+Each child chain is enclosed by `ENTER` and `EXIT` nodes:
+
+```text
+For or If in the parent chain
+  child chain
+    ENTER pieces{piece:effect:owner}
+    ... child accesses and nested regions ...
+    EXIT  pieces{piece:effect:owner}
+```
+
+`ENTER` and `EXIT` are model nodes, not MLIR operations. They carry no
+`loop.stage` or `loop.cluster`. They give SYNC-DAG concrete child-chain
+endpoints for a value that enters or leaves a region. An `if` has one child
+chain for each branch; a missing else body is represented by an empty chain.
+
+### Choosing a boundary owner
+
+Child regions are completed before their enclosing region, so a nested
+`for` or `if` can contribute its already-known boundary owner.
+`ENTER` and `EXIT` do not participate in selecting that owner.
+
+For each piece touched by a `for`, the owner is the first owner that touches
+the piece in the body. A direct access contributes its access owner. A nested
+region contributes the owner visible on that nested region.
+
+For each piece touched by an `if`, the preferred owner is the latest owner of
+that piece before the `if` in the parent chain. If the parent has not touched
+the piece, the first owner in the then chain is used, followed by the first
+owner in the else chain.
+
+A WS-tagged loop presents root ownership to its parent because its partition
+owners are meaningful only inside that WS scope. The owner stored on the loop
+for its own children is still the first owner inside the loop. An access with
+its own WS tag resolves that tag directly even when no enclosing loop has it.
+
+These rules determine ownership at the boundary. They do not imply that the
+same owner holds the piece throughout the child, and they do not choose any
+semaphore or token.
+
+### Worked example: a loop can have a different owner per piece
+
+`test/NVWS/insert_semas_local_buffer_reuse.mlir`
+`@local_n_owner_aliased_buffers` has two staggered members:
+
+```text
+members: m0[0,128)  m1[64,192)
+pieces:  P0={m0}    P1={m0,m1}    P2={m1}
+```
+
+This is a useful stress shape because staggering gives the pieces different
+first owners. Planner-produced reuse normally nests the smaller member inside
+the larger one, as in the [pieces example](#pieces).
+
+Its access and boundary nodes are:
+
+```text
+|- scf.for (WS, tag=1) pieces{P0:W:{0}, P1:W:{0}, P2:W:{2}}
+|  |- ENTER pieces{P0:W:{0}, P1:W:{0}, P2:W:{2}}
+|  |- W  m0  ttg.local_alloc {0}
+|  |- R  m0  ttg.local_load {1}
+|  |- W  m1  ttg.local_alloc {2}
+|  |- R  m1  ttg.local_load {0}
+|  |- EXIT pieces{P0:W:{0}, P1:W:{0}, P2:W:{2}}
+```
+
+For P0 and P1, the first body access is `W m0 {0}` because m0 covers both
+pieces. Their boundary owner is therefore `{0}`. No m0 access reaches P2, so
+its first access is `W m1 {2}` and its boundary owner is `{2}`. Every piece is
+written somewhere in the body, so every merged effect is `W`.
+
+### Worked example: an `if` prefers the preceding owner
+
+In `test/NVWS/insert_semas_raw_if_token.mlir`
+`@raw_edge_token_carried_if`, the `if` contains only a read by partition
+`{1}`, but its boundary owner is `{0}`:
+
+```text
+|  |- W  m0  ttng.tmem_store {0}
+|  |- scf.if pieces{P0:R:{0}}
+|  |  |- then
+|  |  |  |- ENTER pieces{P0:R:{0}}
+|  |  |  |- R  m0  ttng.tmem_load {1}
+|  |  |  |- EXIT pieces{P0:R:{0}}
+|  |  |- else
+|  |  |  |- ENTER pieces{}
+|  |  |  |- EXIT pieces{}
+```
+
+The latest access before the `if` is the store by `{0}`, so P0 enters the
+region with boundary owner `{0}`. The merged effect is `R` because the branch
+only reads P0. The read still has owner `{1}`. SYNC-DAG therefore derives the
+`{0}` to `{1}` handoff inside the branch; matching `ENTER` and `EXIT` owners
+do not erase ownership changes inside the child.
+
+### What `ENTER` and `EXIT` record
+
+For each child chain, `ENTER` and `EXIT` contain exactly the pieces that chain
+touches. The two nodes have identical records: each piece has the child
+chain's merged effect and the owner stored on the enclosing `for` or `if`. An
+empty child has empty boundary records.
+
+When SYNC-DAG enters a child, it preserves the logical producer known by the
+parent but uses `ENTER` as the source node local to that child chain. New
+readers in the child therefore receive the value from `ENTER`, not from a
+previous child reader or directly from an outer node. At `EXIT`, the same
+boundary owner is available for a handoff to a later parent access or to the
+next loop iteration.
+
+The boundary owner and the token returned by each child path also tell
+SYNC-DAG whether a loop must carry a token or can acquire one immediately
+before its first guarded buffer use.
 
 ## The algorithm
 
@@ -338,10 +452,12 @@ OWNER-DAG.
                                          (see Recognizing accesses)
         any touches                   -> append one access node
                                          (touches, op, partition)
-      keep a for/if node (with its child chains) only when its body touched
-      the group
-3. per kept for/if: record the pieces its body touches and the merged
-   R/W effect
+      keep a for/if node only when one of its child chains touched the group
+   d. when returning from each kept for/if:
+        merge child effects per piece
+        choose each piece's boundary owner
+        wrap every child chain in matching ENTER/EXIT nodes
+        append the region node to its parent chain
 ```
 
 ## Output
@@ -352,18 +468,17 @@ The step produces, per group:
 members + pieces + view-chain map
 one program-order chain of Access/For/If nodes
 per-access owner/effect/completion facts
-pieces and R/W effects recorded on each for/if node
+pieces, R/W effects, and boundary owners recorded on each for/if node
+matching ENTER/EXIT nodes around each child chain
 ```
 
 ## Code map
 
-[`InsertSemasAccessDag.cpp`](../../third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemasAccessDag.cpp):
+[`InsertSemasAccessDag.cpp`](../../third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemasAccessDag.cpp)
+contains:
 
 - `collectGroups`
-- `buildPieces` and `piecesSingleComponent` (the pieces-must-connect check)
+- `buildPieces` (including the pieces-must-connect check)
 - `collectTouches` and `deriveCompletionAnchor`
-- `buildChainForBlock` and `computeEffectSummary`
+- `appendNode` and `buildChainForBlock`
 - `buildAccessDag`
-- the dump used in the figures: `NVWS_INSERT_SEMA_DUMP_DAG=1`
-  (`dumpGroupAccessDag` prints the group header, then delegates the tree to
-  `dumpDagTree` in `InsertSemasSyncDag.cpp`)

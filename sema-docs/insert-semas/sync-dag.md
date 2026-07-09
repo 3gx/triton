@@ -4,2659 +4,2234 @@
 
 - [Purpose](#purpose)
 - [Notation](#notation)
-- [The walk: accesses to edges](#the-walk-accesses-to-edges)
-  - [Memory edges and token supply](#memory-edges-and-token-supply)
+- [From accesses to raw edges](#from-accesses-to-raw-edges)
+  - [Piece state](#piece-state)
+  - [The access rules](#the-access-rules)
+  - [What a complete raw DAG contains](#what-a-complete-raw-dag-contains)
   - [Example: two-partition handoff](#example-two-partition-handoff)
-  - [Example: edge reduction lowers the pending count](#example-edge-reduction-lowers-the-pending-count)
   - [Example: fan-out and owner-token reuse](#example-fan-out-and-owner-token-reuse)
-  - [Example: disjoint submember protocols run independently](#example-disjoint-submember-protocols-run-independently)
-  - [The per-access rules, in full](#the-per-access-rules-in-full)
-  - [Composition: nested regions in the walk](#composition-nested-regions-in-the-walk)
-    - [Worked example: apply the same rules at both levels](#worked-example-apply-the-same-rules-at-both-levels)
-- [Edges to semaphores](#edges-to-semaphores)
-  - [Example: a redundant edge is dropped](#example-a-redundant-edge-is-dropped)
-  - [Example: a loop-closing edge is dropped](#example-a-loop-closing-edge-is-dropped)
-  - [The deletion conditions, in full](#the-deletion-conditions-in-full)
-    - [Implied ordering (`reduceEdges`)](#1-implied-ordering-reduceedges)
-    - [Repeats from one sender (`buildEdgesAndSemas`)](#2-repeats-from-one-sender-buildedgesandsemas)
-    - [Covered senders (`buildEdgesAndSemas`)](#3-covered-senders-buildedgesandsemas)
-  - [One destination node, one semaphore](#one-destination-node-one-semaphore)
-  - [Composition: why loop entry and loop recurrence share one semaphore](#composition-why-loop-entry-and-loop-recurrence-share-one-semaphore)
-- [Region flows](#region-flows)
-  - [Why this is needed](#why-this-is-needed)
-  - [Region summaries](#region-summaries)
-  - [The loop decision](#the-loop-decision)
-  - [Point of use](#point-of-use)
-  - [Trailing use](#trailing-use)
-  - [Use after the loop](#use-after-the-loop)
+  - [Example: disjoint pieces stay independent](#example-disjoint-pieces-stay-independent)
+  - [Nested regions](#nested-regions)
+  - [Example: the same rules at two region levels](#example-the-same-rules-at-two-region-levels)
+- [Reducing raw edges](#reducing-raw-edges)
+  - [Example: a straight edge is redundant](#example-a-straight-edge-is-redundant)
+  - [Example: edge reduction lowers the pending count](#example-edge-reduction-lowers-the-pending-count)
+  - [Example: a loop-closing edge is redundant](#example-a-loop-closing-edge-is-redundant)
+  - [Exact-source async edges](#exact-source-async-edges)
+  - [Release floors](#release-floors)
+  - [Reduction does not choose placement](#reduction-does-not-choose-placement)
+- [From reduced edges to semaphores](#from-reduced-edges-to-semaphores)
+  - [Repeated edges from one sender](#repeated-edges-from-one-sender)
+  - [3. Covered senders (`buildEdgesAndSemas`)](#3-covered-senders-buildedgesandsemas)
+  - [One destination, one semaphore](#one-destination-one-semaphore)
+  - [Reading one semaphore handoff](#reading-one-semaphore-handoff)
+  - [Seeding the first token](#seeding-the-first-token)
+  - [Entry and recurrence use one semaphore](#entry-and-recurrence-use-one-semaphore)
+- [Tokens through `for` and `if`](#tokens-through-for-and-if)
+  - [Region results](#region-results)
+  - [Example: an `if` returns one owner's token](#example-an-if-returns-one-owners-token)
+  - [Moving an acquire to its first use](#moving-an-acquire-to-its-first-use)
+  - [When the loop keeps a token](#when-the-loop-keeps-a-token)
+  - [A use after the loop](#a-use-after-the-loop)
   - [Nested loops](#nested-loops)
-  - [Dump labels](#dump-labels)
+  - [Branch completion must agree](#branch-completion-must-agree)
 - [Backing copies](#backing-copies)
 - [Pipeline schedule](#pipeline-schedule)
-  - [Minimal pipeliner model](#minimal-pipeliner-model)
+  - [Minimal pipeline model](#minimal-pipeline-model)
   - [Example: one-copy loop-closing handoff](#example-one-copy-loop-closing-handoff)
   - [Finalizing one handoff](#finalizing-one-handoff)
+  - [Moving an acquire repairs its schedule edge](#moving-an-acquire-repairs-its-schedule-edge)
+  - [Post-loop acquires use their owner's boundary](#post-loop-acquires-use-their-owners-boundary)
+  - [Schedule and stage offset are separate](#schedule-and-stage-offset-are-separate)
 - [Authored buffer-stage offsets](#authored-buffer-stage-offsets)
   - [Circular groups](#circular-groups)
   - [Non-circular alias handoffs](#non-circular-alias-handoffs)
-- [Code map](#code-map)
+- [Build order and code map](#build-order-and-code-map)
 
 ## Purpose
 
-SYNC-DAG converts OWNER-DAG ownership changes into a balanced semaphore
-protocol: who waits for whom, through which semaphore, with how many backing
-copies, and where in the pipeline schedule.
+SYNC-DAG turns buffer access order into a plan for
+`nvws.semaphore.acquire`, `nvws.semaphore.release`, and token operations. It
+also decides how tokens pass through `for` and `if`, how many buffer and
+semaphore copies exist, and where the new protocol operations belong in a
+scheduled loop. EMIT-IR later renders this plan and creates each
+`nvws.semaphore.buffer` at its access.
 
-The design has five moving parts:
-
-1. a **node** is one event in a chain;
-2. each piece has a **source** plus a **uses** map from owner to node;
-3. each chain has an ordered list of known **tokens**;
-4. an **edge** records one required wait or token handoff between nodes;
-5. a **region flow** summarizes the token returned by a `for` or `if` and
-   records the loop token decision.
-
-`Owner`, `Piece`, and `Effect` are attributes of those objects. Acquires,
-releases, and semaphores are the generated representation of edges, not a
-second correctness model.
+The construction order is important:
 
 ```text
-input IR ─► ACCESS-DAG ─► OWNER-DAG ─► SYNC-DAG ─► EMIT-IR ─► output IR
-            memory facts   owners      edges, semaphores,   render
-                                       region flows, schedule
+complete raw edges
+    -> choose physical backing copies
+    -> remove safely redundant edges
+    -> merge repeated edges from one sender
+    -> group remaining edges by destination
+    -> assign a semaphore and pending count
+    -> seed entry tokens and plan region tokens
+    -> choose semaphore copies
+    -> finalize stage offsets and schedules
 ```
 
-The whole step is four moves; this page is those moves in order, each with
-a worked example:
+A pending count never proves that a raw edge is redundant. The pending count
+is calculated only after raw-edge reduction and merging.
 
-```text
-1. walk the accesses in program order; every "this must wait for that"
-   becomes an edge between two concrete DAG nodes
-2. delete the redundant edges
-3. the edges converging on one destination become one acquire; each incoming
-   edge's tail becomes a release. Each completion kind carried by an edge
-   counts as one release; an edge with no completion kind also counts as one.
-   The acquire's pending count is the total number of those releases
-4. summarize `for`/`if` boundaries, select carried, point-of-use, or
-   child-owned loop handling, choose the number of backing copies, then
-   extend the pipeline schedule with the semaphore dependencies
-```
+The input [access DAG](access-dag.md#regions-and-boundaries) already contains:
+
+- one node for each buffer access;
+- an owner for each access;
+- a disjoint piece table for overlapping allocations; and
+- `ENTER` and `EXIT` nodes for each `for` and `if` path.
+
+SYNC-DAG adds raw edges between those concrete nodes. A raw edge says that the
+destination owner must wait for the source owner. Semaphore operations are
+the IR form of the reduced edges; they are not a second ordering analysis.
 
 ## Notation
 
-The `|-` listings are trimmed excerpts of actual pass dumps. State tables and
-DAG sketches reconstruct the same nodes and generated edges to explain the
-walk. Most examples come from the listed lit tests; the section explicitly
-labeled synthetic came from a temporary input run through the same pass.
-Unrelated groups, `parts{...}` fields, and some `ENTER` lines are elided;
-`; ...` and `<-` annotations are added. The command is:
+The examples use explanatory pseudo-IR and three kinds of diagrams. Each
+diagram stays at one level:
 
 ```text
-NVWS_INSERT_SEMA_DUMP_DAG=1 triton-opt <input.mlir> -split-input-file \
-    -allow-unregistered-dialect --nvws-insert-semas
+raw DAG       access, region, ENTER, and EXIT nodes joined by e1, e2, ...
+reduced DAG   the same nodes after named raw edges have been removed
+protocol DAG  acquire, access, and release nodes joined by S0, S1, ...
 ```
 
-Object shorthand (full definitions in the
-[InsertSemas overview](overview.md#core-objects)):
+`walk` marks program order when no raw edge exists. A loop-closing raw edge is
+stored as `source -> EXIT(i)`. When a diagram carries it to an access in the
+next iteration, the diagram says that it is logically unrolled.
+
+Names used throughout:
 
 ```text
-group         the allocations analyzed together (ordinarily one buffer.id)
-backing       the SMEM/TMEM allocation the group guards (mutable SMEM;
-              any TMEM)
-m0, m1        member: one allocation of the group; m0[0,64) = its interval
-P0, P1        piece: a disjoint interval of the backing; {m0, m1} = members
-              covering it (an access through a member touches ALL of that
-              member's pieces)
-{0}, {1}      owner: partition 0, 1 of the enclosing WS loop; root = no
-              partition
-{@0.1}        tag-qualified owner: partition 1 under WS tag 0
-producer      the owner that last wrote a piece (before any write: its
-              first toucher)
-version source
-              the concrete DAG node and owner from which a new reader receives
-              that version: the latest write in the same chain, the first
-              toucher before any write, or the child chain's ENTER node when
-              the version was established outside
-use           one `owner -> node` entry for the current value; `node` is
-              that owner's most recent access. A later access by that owner
-              replaces `node`; a write resets the whole map
-tokens        the chain's known owner tokens in deterministic order; the last
-              source-bearing token supplies a handoff when no memory edge or
-              owner-specific token reuse supplies one
-token reuse   a node-level proof (`reuseTokenOwner`) that an access or release
-              may use its owner's earlier token without changing token order
-hold          acquire -> protected operations -> closing release for one
-              owner; an explicitly marked owner token may be reused later
-regain        the acquire near the end of a loop body that supplies the
-              next iteration
-region flow   the token returned by each `for`/`if` path and, for a loop,
-              whether it carries the token, acquires at the first use, or
-              leaves token handling to its final child
-chain         the group's node sequence of one block, in program order; a
-              region node holds child chains
+group          allocations analyzed together, ordinarily one buffer.id
+backing        the physical SMEM or TMEM allocation guarded by the group
+m0, m1         members: allocation names or views in the group
+P0, P1         disjoint pieces of the backing
+{0}, {1}       owners: partitions 0 and 1 of the enclosing WS loop
+root           code with no partition owner
+source         node that supplies the current value to a new reader
+use            latest access to the current value by one owner
+token          value returned by an acquire and consumed by releases/buffers
 ```
 
-Dump notation:
+Pseudo-IR omits types and unrelated attributes:
 
 ```text
-|- scf.for (WS, tag=0)      loop node; (WS, tag=N) = warp-specialized loop
-|- W m0  ttg.local_store {1}   access node: W(rite)/R(ead), member, op, owner
-|- a  S1  {0}               acquire of semaphore S1 by partition 0
-|- a  S0(2)  {0}            acquire with pending count 2; waits for 2 releases
-|- r  S0  {1} [tma_load]    release when the TMA load completes
-|- r  S0(2)  {1}            release that counts twice toward pending count
-|- a  S3  root  ; entry     unpartitioned entry acquire, spliced before the
-                            group's first placement node — a top-level node of
-                            the group's chain that involves the group: an
-                            access, or a region containing one (immediately
-                            above the loop when the loop is that first node)
-pieces{P0:W:{0}}            region node: per-piece merged effect and owner
-thread{{0}}                 region node: a RegionFlow summary exists for owner
-                            {0}; only CARRIED loops necessarily add a token
-                            iter-arg and result
-holdrule{...}               loop node: selected mode and any placement
-                            details, explained in "Region flows"
-yield{X}                    EXIT node: what this chain returns for its
-                            region flow — a S<n> = that acquire's token;
-                            native = no token crosses (protocol lives
-                            inside); drop = this loop has no token result
-                            because its final nested loop returns none; pass =
-                            this branch has no acquire or nested region flow,
-                            so it returns the token available before
-                            the `if`;
-                            scf.for/scf.if =
-                            the actual yield operand is the token result of
-                            that nested scf.for/scf.if
-stage-offset=N              stage offset assigned to this protocol node
-S<n> / E<n>                 semaphore names; E<n> = dedicated entry semaphore
-SEMAS: S1{count=1 entry inherit={@0.0}}   per-semaphore summary; entry =
-                            created initially released; inherit={...} = the
-                            owner recorded on that initially released state
-                            (its `entryTokenOwner`) — read while finding the
-                            loop's input acquire and by token verification;
-                            EMIT-IR also uses it as
-                            the owner of an unpartitioned entry acquire when
-                            recording the acquired token — which is one
-                            of three: the owner of the group's
-                            first real access (`insertEntryAcquires`, both of
-                            its paths), the retargeted EXIT-handoff acquire's
-                            owner (`buildEdgesAndSemas`), or the owner selected
-                            by point-of-use lowering
-BACKING: numCopies=N        copies chosen for the backing allocation
+%t = acquire S0 {1}
+%b = semaphore.buffer S0, %t
+R m0 [%b] {1}
+release S1, %t {1}
+for iter_args(%t = %entry) { ... yield %next }
 ```
 
-Pseudo-IR strips types and attributes: `%t = a S0 {1}` / `r S0 %t {1}` are
-the token-producing acquire and token-using release, `W m0 [%t]` is an
-access made using token `%t`, and `for iter_args(%t = %t0)` —
-abbreviated `for (%t = %t0)` in the figures below — is a loop carrying the
-token.
+An edge may carry one or more completion kinds. `[none]` completes when the
+release executes. `[tma_load]` and `[tc5mma]` complete with the named async
+operation. Each completion kind contributes one arrival. An edge with no
+async kind contributes one arrival through `[none]`.
 
-Do not confuse the two layers: `P0` and edges are analysis labels that never
-appear in the IR. The semaphore *token* is an IR value — each emitted
-acquire returns a fresh one, and a release takes that token as an operand.
-One token can feed several releases. A later buffer or release can also use
-that token when SYNC-DAG explicitly marks the node for owner-specific reuse;
-EMIT-IR never infers that exception on its own.
+## From accesses to raw edges
 
-## The walk: accesses to edges
+`ChainWalker` walks one group in program order. It keeps independent state for
+each piece and a deterministic list of available owner tokens for each chain.
+The walk records every required raw edge; it does not suppress an edge merely
+because another live use may cover its ordering.
 
-The walk runs once per group, in program order over its chains
-(`ChainWalker::run`). At each access it first
-applies two memory rules:
+### Piece state
 
-1. **Read after write (RAW)** — a new reader waits for the piece's version
-   source.
-2. **Write after uses (WAR)** — a write replaces the data, so it waits for the
-   node stored for every other owner, unless that node is already ordered
-   before the write.
-
-Every wait becomes an edge between two concrete DAG nodes (`EdgeRec` stores
-the two node pointers). The complete walk state is:
+For each piece, `PieceState` contains:
 
 ```text
-source   per piece   logical producer plus the chain-local node that supplies
-                     the current version to a new reader
-uses     per piece   map `[owner -> node, ...]`; `node` is that owner's most
-                     recent access to the current value
-tokens   per chain   known owner tokens in deterministic order, with the node
-                     and completion payload when an access has established a
-                     handoff source
+source    producer, source owner, source node, and completion kinds
+uses      [owner -> latest node for the current value, ...]
 ```
 
-Source and uses decide memory edges. Tokens answer the separate supply
-question only after those rules: if no memory edge supplies the access and its
-owner cannot reuse an earlier token, the walk adds an edge from the last
-token's node. That deterministic list order preserves which legal handoff is
-emitted; it is not another memory-dependency rule. A uniform `ENTER` token is
-reusable immediately, but cannot supply a token-supply edge until an access has
-recorded its source node.
+A read moves only that owner's use. It does not move the source. New readers
+therefore fan out from the write, first touch, or `ENTER` that established the
+value. A write starts a new value and resets `uses` to that writer.
+
+The chain also keeps available tokens in deterministic handoff order:
 
 ```text
-R  m0  ttg.local_load  {1}
-└──────────┬────────┘  └┬┘
-     the ACCESS           the OWNER
-  (one event: this op     (the partition executing
-   touching the memory)    this access: partition 1)
+tokens = [{0} at W0, {1} at R1, ...]
 ```
 
-For each piece, `PieceState` stores a stable `VersionSource` and a `uses` map.
-The implementation represents each map entry with `ActiveUse`. A reread
-replaces only that owner's node in `uses`; it does not move the source.
-Independent readers therefore fan out from the write, first toucher, or ENTER
-rather than forming a reader-to-reader chain. A write waits on the node stored
-for every other owner unless that node is already ordered before the write,
-then resets both source and uses to itself.
+The last source-bearing token can supply a token-only edge when the memory
+rules add no edge. An owner can instead reuse its earlier token when every
+touched piece proves that reuse is safe. `Node::reuseTokenOwner` records that
+proof for emission.
 
-### Memory edges and token supply
+A uniform `ENTER` seeds its owner's token without a source node. The owner may
+reuse it immediately, but it cannot source a token-only edge until an access
+records a concrete node.
 
-RAW/WAR rules answer whether an access needs a memory edge. Independently, an
-access rewritten under a group's semaphore protocol must use a token-backed
-buffer view. After applying the memory rules, there are two cases:
+### The access rules
 
-1. The access's owner has a token valid for the access, so the access uses it.
-2. The access's owner has no valid token, so the pass creates an acquire that
-   produces one.
-
-An owner may reuse an earlier token only if every touched piece passes
-`canReuseTokenForPiece`: a read requires an entry for that owner in every
-piece's `uses` map; a write requires the node stored for every other owner on
-every piece already to be ordered before the write.
-
-Together, these rules produce one fan-out/fan-in access-order sketch:
+`applyTouch` applies these rules to every touched piece:
 
 ```text
-                 ┌── R {0} ──┐
-W {0} ───────────├── R {1} ──┼────────── W {3}
-                 └── R {2} ──┘
+first touch
+  raw edges: none
+  state: source = this node; uses = [owner -> this node]
+
+write by owner P
+  raw edges: latest use -> this write for every other owner,
+             unless that use is already known before P, or a WS region
+             summary is adopting a root-held use
+  state: source = this write; uses = [P -> this write]
+
+read by P when P is already in uses
+  raw edges: none
+  state: replace P's use with this read; source does not move
+
+read by a new owner P
+  raw edge: source -> this read, unless a WS region adopts a root source
+  state: add P -> this read to uses
 ```
 
-This is not an edge-only DAG: the `R {0}` branch shows an independent access
-by the source owner, with no generated edge into it. The new-reader branches
-are the generated RAW edges.
+After all pieces have advanced, `visitAccess` chooses the token:
 
-The new readers `{1}` and `{2}` receive RAW edges from `W {0}`. The returning
-`R {0}` needs no memory edge because `uses` already contains `{0}`; it reuses
-`{0}`'s earlier token and is not ordered behind either new reader. The later
-`W {3}` receives WAR edges from the nodes stored for all three owners.
+```text
+memory edge was added
+  the destination acquire supplies the token
 
-Implementation correspondence: `Tokens` stores the known owner tokens and
-their deterministic order. `Node::reuseTokenOwner` marks case 1 after the
-per-piece checks pass. This is token-supply bookkeeping, not an additional
-memory-dependency rule.
+no memory edge and P can reuse an earlier token
+  mark the access with reuseTokenOwner = P
 
-At a region's `EXIT`, each piece returns to its `EXIT` owner. If the piece
-will be used again — during the next loop iteration or after the region —
-the `EXIT` owner waits for the node stored for every other owner in `uses`.
-No new edge is added if an earlier edge already makes the `EXIT` owner wait
-for that node. EXIT then keeps only the boundary owner's entry in `uses`;
-it does not move the version source.
+no memory edge, no reusable P token, and another owner has the last token
+  add a token-only raw edge from that token's node
 
-The worked examples show the common shapes; the complete checklist follows
-them.
+otherwise
+  the token already available to P supplies the access
+```
 
-Each DAG sketch in the access-walk examples below unrolls one loop boundary.
-An `Sx` label marks a release/acquire handoff through semaphore `Sx`;
-unlabeled lines show the surrounding program and loop order.
+For a read, reuse requires a live use for the owner on every touched piece.
+For a write, every other live use on every touched piece must already be
+ordered before the writer.
 
-In state tables, `tokens=[...]` lists known owner tokens from oldest to newest
-(last at right). `:no-source` means the incoming owner token is reusable but
-cannot yet supply a token-supply edge. `uses=[{0}->W, {1}->R]` displays the
-complete uses map, not merely its owner keys.
+In a multi-member group, a later synchronous write may retain earlier async
+completion kinds only when the owner can safely reuse its token. That keeps a
+same-owner ownership wave intact and prevents the later write from hiding an
+earlier descriptor load.
+
+### What a complete raw DAG contains
+
+The raw DAG is complete when every access can answer two questions from its
+incoming state: which earlier owner makes the buffer value available, and
+which token lets this owner name the guarded backing. Usually one memory edge
+answers both questions. A token-only edge answers only the second.
+
+Completeness is checked per piece. An access that spans two pieces can need
+two raw edges even when both edges have the same endpoint nodes. Those facts
+remain separate through the walk because the pieces can diverge later. They
+are combined only after reduction, when one release from a sender can satisfy
+the destination for both pieces.
+
+The walk also records edges that are already ordered through another live
+use. That is intentional. At this point the edge still records a real buffer
+obligation, its source still constrains release placement, and a later
+reduction still has to prove that the alternate path survives.
+
+No raw edge is needed merely because two operations appear next to each
+other. Same-owner accesses normally share their current token and follow
+program order. A raw edge appears when ownership changes, when another owner
+must finish using a piece before a write, or when token ownership must move
+despite there being no new memory dependency.
+
+Region boundaries do not introduce a different rule set. `ENTER` supplies
+the incoming value inside a child path, and `EXIT` names an obligation that
+must leave that path. The same source, live-use, and token decisions apply to
+the concrete accesses between those nodes.
+
+This complete set is deliberately larger than the emitted protocol. The
+following sections first remove edges whose obligations are proved by kept
+paths, then combine repeated facts into the acquire and releases that the IR
+actually needs.
 
 ### Example: two-partition handoff
 
-`test/NVWS/insert_semas.mlir` `@local_loop_carried_and_result` — partition
-0 stores, partition 1 loads, every iteration. Post-state is shown for each
-access; the `EXIT` line shows the recurrence edge:
+`test/NVWS/insert_semas.mlir` `@local_loop_carried_and_result` stores in
+owner `{0}` and loads in owner `{1}` on every iteration.
+
+Raw-edge inventory:
 
 ```text
-walk            edge                                    state AFTER the node
-ENTER {0}       —                                        source=ENTER@{0} uses=[{0}->ENTER@{0}] tokens=[{0}:no-source]
-W store {0}     — (same-owner write)                    source=store@{0} uses=[{0}->store@{0}] tokens=[{0}]
-R load  {1}     e1: store@{0} -> load@{1}    (RAW)      source=store@{0} uses=[{0}->store@{0}, {1}->load@{1}] tokens=[{0},{1}]
-EXIT            e2: load@{1} -> store@{0}@next (WAR)
+nodes in walk order
+  N0 = ENTER(i) {0}
+  N1 = W store(i) {0}
+  N2 = R load(i) {1}
+  N3 = EXIT(i) {0}
+
+generated raw edges
+  e1: W store(i) {0} -> R load(i) {1}       read after write
+  e2: R load(i) {1} -> EXIT(i) {0}          next write waits for this read
 ```
 
-Two edges: the load waits for the store (`e1`), and the next iteration's
-store waits for this load (`e2`, raised at `EXIT`). What the
-default conversion of those two edges would emit — carried, full protocol,
-the untransformed shape every loop starts from (pseudo-IR):
+The raw DAG stores the close at `EXIT(i)`:
 
 ```text
-%t0 = a S1 root                  ; entry, seeds iteration 0; S1 is created
-for (%t = %t0) {                 ;   initially released
-  W m0 [%t]  ttg.local_store {0}
-  r  S0 %t  {0}                  ; e1: data ready
-  %t1 = a S0 {1}
-  R m0 [%t1] ttg.local_load {1}
-  r  S1 %t1 {1}                  ; e2: buffer free for the next iteration
-  %t2 = a S1 {0}                 ; recurrence acquire for the NEXT iteration
-  yield %t2                      ; carried out through the iter-arg
-}
-```
-
-The pass then selects POINT_OF_USE — the pre-loop acquire is gone and the
-recurrence acquire sits at the store instead (the node's
-`holdrule{pointofuse->...}` label; the decision itself is explained in
-[Region flows](#region-flows)). The resulting SYNC-DAG:
-
-```text
-|- scf.for (WS, tag=0) pieces{P0:W:{0}} thread{{0}} holdrule{pointofuse->ttg.local_store}
-|  |- a  S1  {0}                ; e2 satisfied: buffer free for this iteration
-|  |- W m0  ttg.local_store {0}
-|  |- r  S0  {0} [none]         ; e1: data ready
-|  |- a  S0  {1}
-|  |- R m0  ttg.local_load {1}
-|  |- r  S1  {1} [none]         ; e2: buffer free for the next iteration
-|  |- EXIT pieces{P0:W:{0}} yield{native}
-SEMAS: S0{count=1} S1{count=1 entry inherit={@0.0}}
-```
-
-```text
-                          ENTER(i)
-                              |
-                          a S1 {0}
-                              |
-                          W m0 {0}
-                              | S0
+                         ENTER(i) {0}
+                              | walk
                               v
-                          R m0 {1}
-                              | S1
+                         W store(i) {0}
+                              | e1
                               v
-                          EXIT(i)
-                              |
+                         R load(i) {1}
+                              | e2
                               v
-                         ENTER(i+1)
-                              |
-                          a S1 {0}
-                              |
-                              v
-                          W m0 {0}
+                          EXIT(i) {0}
 ```
 
-`S1` is created initially released so iteration zero's `a S1` succeeds
-before any release has run.
-
-### Example: edge reduction lowers the pending count
-
-`test/NVWS/insert_semas_transitive_reduction.mlir`
-`@serialized_ring_reduces` — members `m0` and `m1` overlap on piece P1.
-The table follows that piece as `{0}` writes, `{1}` reads, and `{2}` writes:
+After reduction, merging, grouping, and semaphore assignment, `e1` becomes
+`FULL` and `e2` becomes initially released `EMPTY`:
 
 ```text
-walk          edge                                       P1 state AFTER the node
-ENTER {0}     —                                           source=ENTER@{0} uses=[{0}->ENTER@{0}]
-W m0 {0}      — (same-owner write)                       source=W@{0} uses=[{0}->W@{0}]
-R m0 {1}      e1: W@{0} -> R@{1}             (RAW)      source=W@{0} uses=[{0}->W@{0}, {1}->R@{1}]
-W m1 {2}      e2: {0} -> {2}, e3: {1} -> {2} (WAR)      source=W@{2} uses=[{2}->W@{2}]
+%empty = acquire EMPTY {0}
+W store [%empty] {0}
+release FULL, %empty {0}
+
+%full = acquire FULL {1}
+R load [%full] {1}
+release EMPTY, %full {1}
 ```
 
-The write raises two candidates because `uses` has entries for both `{0}` and
-`{1}`.
-Reduction drops `e2`: kept edges `e1` and `e3` already order
-`{0} -> {1} -> {2}`. Only `e3` remains incoming to `{2}`'s write, so its
-acquire has pending count 1:
+The acquire of `EMPTY` is placed at the first store inside the loop. The
+initially released state supplies iteration zero; each `release EMPTY`
+supplies the next iteration.
 
 ```text
-W m0 {0}
-r S0 {0}                    ; e1: {0} releases to {1}
-a S0 {1}
-R m0 {1}
-r S1 {1}                    ; e3: {1} releases to {2}
-a S1 {2}                    ; one incoming edge -> pending count 1
-W m1 {2}
-```
+protocol DAG, logically unrolled across one iteration boundary
 
-```text
-                            ENTER(i)
-                                |
-                            a S3 {0}
-                                |
-                            W m0 {0}
-                                | S0
-                                v
-                            R m0 {1}  (also r S3 for next iteration)
-                                | S1
-                                v
-                            W m1 {2}
-                                | S2
-                                v
-                            R m1 {0}
-                                |
-                                v
-                             EXIT(i)
-                                |
-                                v
-                           ENTER(i+1)
-                                |
-                            a S3 {0}
-                                |
-                                v
-                            W m0 {0}
+                       acquire EMPTY(i) {0}
+                                  | walk
+                                  v
+                           W store(i) {0}
+                                  | walk
+                                  v
+                         release FULL(i) {0}
+                                  | FULL
+                                  v
+                         acquire FULL(i) {1}
+                                  | walk
+                                  v
+                           R load(i) {1}
+                                  | walk
+                                  v
+                        release EMPTY(i) {1}
+                                  | EMPTY
+                                  v
+                       acquire EMPTY(i+1) {0}
+                                  | walk
+                                  v
+                         W store(i+1) {0}
 ```
-
-The complete loop and the reduction proof appear in
-[Example: a redundant edge is dropped](#example-a-redundant-edge-is-dropped).
 
 ### Example: fan-out and owner-token reuse
 
-`test/NVWS/insert_semas_transitive_reduction.mlir` `@fanout_not_reduced` —
-partition 0 writes, partitions 1 and 2 read, then partition 0 *re-reads*.
-Post-state is shown for each access; the `EXIT` lines show recurrence edges:
+`test/NVWS/insert_semas_transitive_reduction.mlir`
+`@fanout_not_reduced` writes in `{0}`, reads in `{1}` and `{2}`, then rereads
+in `{0}`.
 
 ```text
-walk            edge                                    state AFTER the node
-ENTER {0}       —                                        source=ENTER@{0} uses=[{0}->ENTER@{0}] tokens=[{0}:no-source]
-W alloc {0}     — (same-owner write)                    source=alloc@{0} uses=[{0}->alloc@{0}] tokens=[{0}]
-R load  {1}     e1: alloc@{0} -> load@{1}    (RAW)      source=alloc@{0} uses=[{0}->alloc@{0}, {1}->load@{1}] tokens=[{0},{1}]
-R load  {2}     e2: alloc@{0} -> load@{2}    (RAW)      source=alloc@{0} uses=[{0}->alloc@{0}, {1}->load@{1}, {2}->load@{2}] tokens=[{0},{1},{2}]
-R load  {0}     — (reuse {0}'s token)                   source=alloc@{0} uses=[{0}->load@{0}, {1}->load@{1}, {2}->load@{2}] tokens=[{0},{1},{2}]
-EXIT            e3: load@{1} -> alloc@{0}@next (WAR)
-(recurrence)    e4: load@{2} -> alloc@{0}@next (WAR)
+walk node       generated raw edge                 state after node
+ENTER {0}       none                               source=ENTER; uses={0}:ENTER
+W alloc {0}     none                               source=W; uses={0}:W
+R load {1}      f1: W {0} -> R {1}                source=W; uses={0}:W,{1}:R1
+R load {2}      f2: W {0} -> R {2}                source=W; uses={0}:W,{1}:R1,{2}:R2
+R load {0}      none; reuse {0}'s token            source=W; uses={0}:R0,{1}:R1,{2}:R2
+EXIT {0}        f3: R1 {1} -> EXIT {0}
+                f4: R2 {2} -> EXIT {0}
 ```
 
-Both new readers take their memory edge from the unchanged version source,
-so neither reader is serialized behind the other. The fourth access is a reread
-by an owner already present in `uses`. It needs no memory edge, and `{0}` still has the
-token acquired before its write, so SYNC-DAG marks the node to reuse that
-token. Reusing a token that is not last does not reorder the token list, so
-`{2}` remains the deterministic source for any later token-supply edge.
-
-At `EXIT`, the next iteration's write waits for the nodes stored under `{1}`
-and `{2}` in `uses`. Those edges converge on `S2`, whose pending count is 2:
+The raw DAG has real fan-out. `R {1}` and `R {2}` are not ordered with
+respect to each other by a raw edge. The `{0}` reread also has no incoming
+raw edge; it appears only in program order.
 
 ```text
-|- a  S2(2)  root  ; entry
-|- scf.for (WS, tag=0) ... holdrule{gated}
-|  |- W m0  ttg.local_alloc {0}
-|  |- r  S0  {0} [none]
-|  |- r  S1  {0} [none]
-|  |- a  S0  {1}
-|  |- R m0  ttg.local_load {1}
-|  |- r  S2  {1} [none]        ; e3
-|  |- a  S1  {2}
-|  |- R m0  ttg.local_load {2}
-|  |- r  S2  {2} [none]        ; e4
-|  |- R m0  ttg.local_load {0} ; reuses {0}'s S2 token
-|  |- a  S2(2)  {0}            ; waits for readers {1} and {2}
-|  |- EXIT ... yield{a S2}
-SEMAS: S0{count=1} S1{count=1} S2{count=2 entry inherit={@0.0}}
+                              W alloc(i) {0}
+                         +----------+----------+
+                      f1 |                     | f2
+                         v                     v
+                    R load(i) {1}         R load(i) {2}
+                      f3 |                     | f4
+                         +----------+----------+
+                                    v
+                               EXIT(i) {0}
+
+walk order for the same nodes; these arrows are not raw edges
+
+W alloc(i) {0}
+      | walk
+      v
+R load(i) {1}
+      | walk
+      v
+R load(i) {2}
+      | walk
+      v
+R load(i) {0}
+      | walk
+      v
+EXIT(i) {0}
 ```
+
+`f3` and `f4` remain separate senders into one destination. They become two
+releases to one count-2 semaphore:
 
 ```text
-                           a S2(2) root
-                                 |
-                             ENTER(0)
-                                 |
-                             W m0 {0}
-                    +------------+------------+
-                 S0 |            |            | S1
-                    v            v            v
-                R m0 {1}     R m0 {0}     R m0 {2}
-                 S2 |            |            | S2
-                    +------------+------------+
-                                 |
-                           a S2(2) {0}
-                                 |
-                              EXIT(0)
-                                 |
-                              ENTER(1)
-                                 |
-                             W m0 {0}
+release EMPTY, %reader1 {1}
+release EMPTY, %reader2 {2}
+%next = acquire EMPTY pending_count=2 {0}
 ```
 
-The token-reuse mark is not printed in this dump. EMIT-IR renders it by
-building `{0}`'s final buffer view from the carried `S2` token, even though
-that same token already fed the two producer releases. Only nodes carrying
-this explicit SYNC-DAG proof receive that exception.
+The final `{0}` buffer uses the earlier `{0}` token marked by
+`reuseTokenOwner`; emission does not infer that reuse independently.
 
-### Example: disjoint submember protocols run independently
+### Example: disjoint pieces stay independent
 
-A minimal synthetic function, `@spanning_split_parallel`, uses two disjoint
-half-width members and one full-width member. It first writes and reads the
-full-width member, then writes and reads each half. Running it through
-`InsertSemas` prints:
+The following conceptual `spanning_split_parallel` shape uses `m0` for the
+first half, `m1` for the second half, and `m2` for the full backing. It is a
+compact teaching example, not the name of an in-tree test:
 
 ```text
 members:    m0[0,128)   m1[128,256)   m2[0,256)
 pieces:     P0=[0,128){m0,m2}   P1=[128,256){m1,m2}
 footprints: m0={P0}   m1={P1}   m2={P0,P1}
-
-ACCESS-DAG
-|- W m2  ttg.local_store {0}
-|- R m2  ttg.local_load  {1}
-|- W m0  ttg.local_store {2}
-|- R m0  ttg.local_load  {3}
-|- W m1  ttg.local_store {4}
-|- R m1  ttg.local_load  {0}
 ```
 
-The generated SYNC-DAG is:
+The full-width write/read establishes the common prefix. `applyTouch` records
+one raw edge per piece, so the two edges with the same full-width endpoints
+are both present before raw-edge reduction:
 
 ```text
-|- scf.for (WS, tag=0) ... holdrule{pointofuse->ttg.local_store}
-|  |- a  S5(2)  {0}
-|  |- W m2  ttg.local_store {0}
-|  |- r  S0  {0} [none]
-|  |- a  S0  {1}
-|  |- R m2  ttg.local_load {1}
-|  |- r  S1  {1} [none]
-|  |- r  S3  {1} [none]
-|  |- a  S1  {2}
-|  |- W m0  ttg.local_store {2}
-|  |- r  S2  {2} [none]
-|  |- r  S5  {2} [none]
-|  |- a  S2  {3}
-|  |- R m0  ttg.local_load {3}
-|  |- r  S5  {3} [none]
-|  |- a  S3  {4}
-|  |- W m1  ttg.local_store {4}
-|  |- r  S4  {4} [none]
-|  |- a  S4  {0}
-|  |- R m1  ttg.local_load {0}
-|  |- EXIT ... yield{native}
-SEMAS: S0{count=1} S1{count=1} S2{count=1} S3{count=1} S4{count=1}
-       S5{count=2 entry inherit={@0.0}}
+raw-edge inventory
+  d1a: W m2 {0} -> R m2 {1}       P0
+  d1b: W m2 {0} -> R m2 {1}       P1
+
+  d2a: W m2 {0} -> W m0 {2}       P0, coveredVia {1}
+  d2b: R m2 {1} -> W m0 {2}       P0
+  d3:  W m0 {2} -> R m0 {3}       P0
+
+  d4a: W m2 {0} -> W m1 {4}       P1, coveredVia {1}
+  d4b: R m2 {1} -> W m1 {4}       P1
+  d5:  W m1 {4} -> R m1 {0}       P1
+
+  d6: W m0 {2} -> EXIT(i) {0}     P0, coveredVia {3}
+  d7: R m0 {3} -> EXIT(i) {0}     P0
+  d8: W m1 {4} -> EXIT(i) {0}     P1, coveredVia {0}
 ```
 
-The full-width `W m2 {0}` releases `S0`, which `R m2 {1}` acquires. That read
-then starts two independent paths:
+The two piece DAGs expose every candidate without drawing false dependency
+between the half-width paths:
 
 ```text
-                              ENTER(i)
-                                  |
-                            a S5(2) {0}
-                                  |
-                              W m2 {0}
-                                  | S0
-                                  v
-                              R m2 {1}
-                     +------------+------------+
-                  S1 |                         | S3
-                     v                         v
-                 W m0 {2}                 W m1 {4}
-                +----+----+                    | S4
-             S2 |         | S5                 v
-                v         |                R m1 {0}
-            R m0 {3}      |                    |
-             S5 |         |                    v
-                |         |                 EXIT(i)
-                |         |                    |
-                |         |                    v
-                |         |               ENTER(i+1)
-                |         |                    |
-                +---------+---------------> a S5(2) {0}
-                                                |
-                                                v
-                                            W m2 {0}
+raw DAG for P0
+
+                             W m2 {0}
+                        +--------+--------+
+                     d2a|                 |d1a
+                        |                 v
+                        |             R m2 {1}
+                        |                 |d2b
+                        +--------+--------+
+                                 v
+                             W m0 {2}
+                        +--------+--------+
+                      d6|                 |d3
+                        |                 v
+                        |             R m0 {3}
+                        |                 |d7
+                        +--------+--------+
+                                 v
+                            EXIT(i) {0}
+
+raw DAG for P1
+
+                             W m2 {0}
+                        +--------+--------+
+                     d4a|                 |d1b
+                        |                 v
+                        |             R m2 {1}
+                        |                 |d4b
+                        +--------+--------+
+                                 v
+                             W m1 {4}
+                        +--------+--------+
+                      d8|                 |d5
+                        |                 v
+                        |             R m1 {0}
+                        |                 |walk
+                        +--------+--------+
+                                 v
+                            EXIT(i) {0}
 ```
 
-`S5` has two incoming edges because P0's `uses` map has two entries at `EXIT`. `W m0
-{2}` resets its uses to `{2}`, then `R m0 {3}` waits for that write and adds
-its use, leaving `{2,3}`. P0 returns to owner `{0}` for the next iteration,
-so the `EXIT` rule adds one close from `{2}` to `{0}` and another from `{3}`
-to `{0}`. The `S2` edge records that `{2}` is ordered before `{3}`, not that
-either stored node is already ordered before `{0}`, so neither close is
-skipped. These are memory edges from the per-piece uses; token supply adds
-nothing here.
+Straight reduction keeps `d1a`, removes same-endpoint duplicate `d1b`,
+removes `d2a` through `d1a -> d2b`, and removes `d4a` through
+`d1a -> d4b`. The loop-close reducer retains `d6`, `d7`, and `d8` because
+they return to the first owner `{0}`. Covered-sender pruning then removes
+`d6` through `d3 -> d7` and removes `d8` through `d5` followed by
+destination-owner `{0}`'s program order. Only `d7` supplies the recurrence
+arrival.
 
-EMIT-IR materializes those same two paths (unrelated operations and types
-omitted):
+The surviving `d1a` is the one full-width handoff. The P0 and P1 paths
+otherwise remain separate. The P1-only branch after `R m2` neither acquires
+nor releases recurrence semaphore `EMPTY`. `EMPTY` is group-scoped, although
+its sole surviving close `d7` came from P0:
 
 ```text
-for {
-  %t0 = a S5(2) {0}
-  W m2 [%t0] {0}
-  r S0 %t0 {0}
-
-  %t1 = a S0 {1}
-  R m2 [%t1] {1}
-  r S1 %t1 {1}
-  r S3 %t1 {1}
-
-  %t2 = a S1 {2}
-  W m0 [%t2] {2}
-  r S2 %t2 {2}
-  r S5 %t2 {2}
-  %t3 = a S2 {3}
-  R m0 [%t3] {3}
-  r S5 %t3 {3}
-
-  %t4 = a S3 {4}
-  W m1 [%t4] {4}
-  r S4 %t4 {4}
-  %t5 = a S4 {0}
-  R m1 [%t5] {0}
-}
+reduced fact   protocol semaphore
+d1a            FULL_BOTH
+d2b            LEFT_READY
+d3             LEFT_FULL
+d4b            RIGHT_READY
+d5             RIGHT_FULL
+d7             EMPTY, initially released
 ```
-
-### The per-access rules, in full
-
-`applyTouch` advances one piece's source/use state:
 
 ```text
-first touch of a piece:
-  edges:  none
-  state:  source = this node; uses = [toucher -> this node]
+%both = acquire EMPTY pending_count=1 {0}
+W m2 [%both] {0}
+release FULL_BOTH, %both {0}
 
-write by owner P:
-  edges:  for each entry Q -> node in uses where Q != P,
-            add node -> this write unless node is already ordered before it
-  state:  source = this write; uses = [P -> this write]
+%read_both = acquire FULL_BOTH {1}
+R m2 [%read_both] {1}
+release LEFT_READY,  %read_both {1}
+release RIGHT_READY, %read_both {1}
 
-read by an owner already in uses:
-  edges:  none
-  state:  replace that owner's entry with owner -> this read;
-          the source does not move
+%left = acquire LEFT_READY {2}
+W m0 [%left] {2}
+release LEFT_FULL, %left {2}
 
-read by a new owner:
-  edges:  source -> this read
-  state:  add reader -> this read to uses
+%left_read = acquire LEFT_FULL {3}
+R m0 [%left_read] {3}
+release EMPTY, %left_read {3}
+
+%right = acquire RIGHT_READY {4}
+W m1 [%right] {4}
+release RIGHT_FULL, %right {4}
+
+%right_read = acquire RIGHT_FULL {0}
+R m1 [%right_read] {0}
 ```
 
-After all touched pieces have run through `applyTouch`,
-`ChainWalker::visitAccess` chooses how the access obtains a token:
+### Nested regions
+
+A region is one summarized access in its parent chain and contains separate
+child chains:
 
 ```text
-one or more memory edges were added
-  their acquire supplies the token; record the access owner's token last
+parent chain                     child chain
 
-no memory edge, and the owner has an eligible earlier token
-  mark reuseTokenOwner; if that owner's token is not last, preserve the list
-  order; otherwise update its source node to this access
-
-no memory edge, no reusable owner token, and the last token has another owner
-  add last token's node -> this access only to supply a token; record the
-  access owner's token last
-
-otherwise
-  no extra edge; the token already available supplies the access, and a
-  partition-owned access records its token last
+... -> [for or if summary] ...   ENTER -> child nodes -> EXIT
 ```
 
-### Composition: nested regions in the walk
+The parent applies the ordinary read/write rules to the region summary. Each
+child path then starts fresh piece state at its `ENTER` owner. A new child
+reader receives its raw edge from `ENTER`, not from a concrete parent node.
+`ENTER` itself emits no acquire or release.
 
-Nested `for` and `if` regions use the same read, write, token-supply, and
-`EXIT` rules already defined above. The walk applies those rules at two DAG
-levels:
+The child's logical producer is inherited from the incoming value. When that
+producer is also the `ENTER` owner, the child imports its async completion
+kinds. Otherwise the `ENTER` source begins with `[none]`. This changes the
+completion carried by a raw edge without changing its endpoints.
 
-```text
-parent DAG                           child DAG
+After the child walk, `EXIT` closes every foreign live use when the piece may
+be needed by another loop iteration or after the region. The parent resumes
+from the state produced by its region summary; child uses never replace the
+parent's uses.
 
-... -> [region node] -> ...          ENTER -> child nodes -> EXIT
-```
+The region also resets the parent chain's available-token list. A summary
+with one partition owner records that owner's token at the region node. A
+mixed-owner or root-owned summary records no partition token, so a later
+access may need a token-only edge even when it needs no memory edge.
 
-Read those two levels in this order.
+Ordering learned inside an `if` is exported only when every path establishes
+it. An absent `else` contributes the unchanged incoming ordering. A loop that
+may execute zero times also contributes its bypass path, so its body alone
+cannot establish ordering outside the loop.
 
-1. **Walk the region node in the parent DAG.** OWNER-DAG has already put a
-   per-piece summary on that node. For example, `pieces{P0:W:{2}}` says that,
-   from the parent DAG, the whole region is one write of P0 by `{2}`. Apply the
-   ordinary write rule to that node. This determines the edges into the region
-   and the parent state after it.
-
-2. **Start a separate child DAG at `ENTER`.** Each piece on `ENTER` names that
-   piece's owner at the child boundary:
-
-```text
-ENTER pieces{P0:W:{2}, P1:W:{3}}
-
-P0 starts as: source = ENTER (owner {2}), uses = [{2} -> ENTER]
-P1 starts as: source = ENTER (owner {3}), uses = [{3} -> ENTER]
-```
-
-   `ENTER` is the child DAG's node for the version that arrived from the
-   parent. A new child reader therefore gets its RAW edge from `ENTER`, not
-   from a concrete node in the parent DAG.
-
-3. **`ENTER` adds no token operation.** Piece owners and the token owner are
-   separate facts:
-
-```text
-%t = a S {2}
-
-ENTER pieces{P0:W:{2}, P1:W:{3}}   // no acquire or release here
-
-W m0 [%t] {2}                       // m0 touches P0; uses %t
-```
-
-   `ENTER` emits no acquire or release. A child starts fresh token state; when
-   all `ENTER` pieces have one partition owner, `Tokens::remember` records
-   that incoming owner token without a source node. The owner may reuse it,
-   but it cannot supply a token-supply edge until an access records its node.
-   With the mixed owners above, no owner token is recorded. P1 owner `{3}`
-   does not retag `%t`; a later `{3}` access follows the ordinary memory and
-   token-supply rules.
-
-4. **Walk the child nodes with the rules already learned.** Reads and writes
-   use [The per-access rules, in full](#the-per-access-rules-in-full). At
-   `EXIT`, if a piece is needed by another iteration or after the region, the
-   ordinary `EXIT` rule closes the node stored for each owner other than that
-   piece's `ENTER` owner.
-
-5. **Resume the parent DAG from the region node.** Child `PieceState`s remain
-   separate from the parent `PieceState`; entries in the child's `uses` map do
-   not replace entries in the parent's map. The parent continues from the state produced when it
-   applied the region node's summary in step 1.
-
-A `for` has one child DAG. An `if` applies steps 2–4 separately to its `then`
-and `else` DAGs. The example below uses a plain inner `for`.
-
-#### Worked example: apply the same rules at both levels
+### Example: the same rules at two region levels
 
 `test/NVWS/insert_semas_release_count.mlir`
-`@release_multiplicity_unified_fanin_regain` has an outer `W m0 {3}` and a
-nested plain `for`. That region node carries `pieces{P0:W:{2}}`: from the
-parent, the whole child is one write of P0 by `{2}`. The listing and DAG below
-label that node `[for summary P0:W:{2}]`. For one outer iteration, the parent
-DAG contains these four nodes:
+`@release_multiplicity_unified_fanin_regain` contains an outer write by `{3}`
+and an inner loop summarized as a write by `{2}`.
+
+Parent raw-edge inventory:
 
 ```text
-parent DAG node              generated edge
-ENTER outer(i) {3}           —
-W m0 {3}                     —
-[for summary P0:W:{2}]       e1: W m0 {3} -> [for summary P0:W:{2}]
-EXIT outer(i) {3}            e2: [for summary P0:W:{2}] -> EXIT outer(i) {3}
-
-state after node             source                             uses                              tokens (last at right)
-ENTER outer(i) {3}           ENTER outer(i) {3}                [{3}->ENTER outer(i) {3}]          [{3}:no-source]
-W m0 {3}                     W m0 {3}                          [{3}->W m0 {3}]                    [{3}]
-[for summary P0:W:{2}]       [for summary P0:W:{2}]            [{2}->for summary P0:W:{2}]        [{2}]
-EXIT outer(i) {3}            [for summary P0:W:{2}]            [{3}->EXIT outer(i) {3}]           [{2}]
+p1: W m0 {3} -> [inner-for summary P0:W:{2}]
+p2: [inner-for summary P0:W:{2}] -> EXIT outer(i) {3}
 ```
-
-These are the ordinary rules:
-
-- `ENTER outer(i) {3}` starts P0 with source `ENTER` and
-  `uses = [{3} -> ENTER]`.
-- `W m0 {3}` writes as the existing owner, so it creates no edge and becomes
-  the new source; `uses` becomes `[{3} -> W m0 {3}]`.
-- `[for summary P0:W:{2}]` is a write by `{2}`. The write rule makes it wait
-  for the node stored under `{3}` (`e1`), then sets the source to the region
-  node and `uses` to `[{2} -> region node]`.
-- `EXIT outer(i) {3}` returns P0 to owner `{3}`. The only entry in `uses` is
-  owned by `{2}`, so the `EXIT` rule creates `e2`.
-
-The same parent walk, with generated edges overlaid, is:
 
 ```text
-                     ENTER outer(i) {3}
-                              | walk order; no generated edge
-                              v
-                          W m0 {3}
-                              | e1
-                              v
-                 [for summary P0:W:{2}]
-                              | e2
-                              v
-                     EXIT outer(i) {3}
+                         ENTER outer(i) {3}
+                                  | walk
+                                  v
+                              W m0 {3}
+                                  | p1
+                                  v
+                   [inner-for summary P0:W:{2}]
+                                  | p2
+                                  v
+                         EXIT outer(i) {3}
 ```
 
-Before applying `[for summary P0:W:{2}]`, SYNC-DAG saves that `{3}` produced
-the incoming version. P0's owner at `ENTER inner(i) {2}` is `{2}`, so the
-child starts with:
+The child starts P0 at `ENTER inner(i) {2}` and applies exactly the same
+rules:
 
 ```text
-producer                  = {3}
-source                    = ENTER inner(i) {2}
-uses                      = [{2} -> ENTER inner(i) {2}]
-tokens                    = [{2}:no-source]
+child raw-edge inventory
+  c1: ENTER inner(i) {2} -> R m0 {1}
+  c2: R m0 {2}          -> W m0 {1}
+  c3: W m0 {1}          -> R m0 {0}
+  c4: W m0 {1}          -> EXIT inner(i) {2}
+  c5: R m0 {0}          -> EXIT inner(i) {2}
 ```
 
-Now apply the same rules to the child nodes:
-
-```text
-child DAG node              generated edge
-ENTER inner(i) {2}          —
-R m0 {2}                    —
-R m0 {1}                    e3: ENTER inner(i) {2} -> R m0 {1}
-W m0 {1}                    e4: R m0 {2} -> W m0 {1}
-R m0 {0}                    e5: W m0 {1} -> R m0 {0}
-EXIT inner(i) {2}           e6: W m0 {1} -> EXIT inner(i) {2}
-                             e7: R m0 {0} -> EXIT inner(i) {2}
-
-state after node             source                    uses                                      tokens (last at right)
-ENTER inner(i) {2}          ENTER inner(i) {2}        [{2}->ENTER inner(i) {2}]                  [{2}:no-source]
-R m0 {2}                    ENTER inner(i) {2}        [{2}->R m0 {2}]                            [{2}]
-R m0 {1}                    ENTER inner(i) {2}        [{2}->R m0 {2}, {1}->R m0 {1}]             [{2},{1}]
-W m0 {1}                    W m0 {1}                  [{1}->W m0 {1}]                            [{2},{1}]
-R m0 {0}                    W m0 {1}                  [{1}->W m0 {1}, {0}->R m0 {0}]             [{2},{1},{0}]
-EXIT inner(i) {2}           W m0 {1}                  [{2}->EXIT inner(i) {2}]                   [{2},{1},{0}]
-```
-
-Read the table mechanically:
-
-- `ENTER inner(i) {2}` starts P0 with source `ENTER` and
-  `uses = [{2} -> ENTER]`.
-- `R m0 {2}` is a reread by an owner already in `uses`. It creates no memory
-  edge, changes the entry to `[{2} -> R m0 {2}]`, and reuses `{2}`'s token.
-- `R m0 {1}` is a new reader, so `e3` comes from the unchanged version source,
-  `ENTER inner(i) {2}`. `uses` gains `{1} -> R m0 {1}`.
-- `W m0 {1}` waits for every other owner's node in `uses`. The node stored
-  under `{2}` is now `R m0 {2}`, so that read is the source of `e4`. No edge
-  from `R m0 {1}` is needed because that entry is owned by `{1}`. The write
-  sets both the source and `uses` to `W m0 {1}`.
-- `R m0 {0}` is a new reader of that version, so `e5` comes from `W m0 {1}`
-  and `uses` gains `{0} -> R m0 {0}`.
-- `EXIT inner(i) {2}` returns P0 to owner `{2}`. The entries in `uses` are
-  owned by `{1}` and `{0}`, so the ordinary `EXIT` rule creates `e6` and `e7`.
-
-`e6` leaves from `W m0 {1}`, not from `R m0 {1}`, because the write makes
-the `{1}` entry in `uses` point to `W m0 {1}`. The child walk with its generated
-dependency edges overlaid is below. `walk` means walk order with no generated
-edge:
+`R m0 {2}` rereads the incoming value and moves only `{2}`'s use. Therefore
+the later write by `{1}` waits for that reread through `c2`. `R m0 {1}` does
+not source `c2`: the write is by the same owner `{1}`.
 
 ```text
                          ENTER inner(i) {2}
                                    |
                          +---------+---------+
-                    walk |                   | e3
+                    walk |                   | c1
                          v                   v
                      R m0 {2}            R m0 {1}
-                      e4 |                   | walk
+                      c2 |                   | walk
                          +---------+---------+
-                                   |
                                    v
                               W m0 {1}
-                                   |
                          +---------+---------+
-                      e5 |                   | e6
+                      c3 |                   | c4
                          v                   |
                      R m0 {0}                |
-                      e7 |                   |
+                      c5 |                   |
                          +---------+---------+
                                    v
                           EXIT inner(i) {2}
 ```
 
-Only `e3`–`e7` are generated dependency edges. In the overlaid walk,
-`ENTER -> R m0 {2}` and `R m0 {1} -> W m0 {1}` are program order only; they
-are not DAG edges. The generated `e5`/`e6` split leaves `W m0 {1}`, and `e7`
-joins `R m0 {0}` at the same EXIT.
+Only `c1` through `c5` are raw edges. The two `walk` lines are program order.
+The parent and child piece states remain separate. Semaphore sharing between
+`p1` and the child closes is explained in
+[Entry and recurrence use one semaphore](#entry-and-recurrence-use-one-semaphore).
 
-At this walk stage, `EXIT inner(i) {2}` is the destination of `e6` and `e7`.
-During edge-to-semaphore conversion, their `{2}` acquire is placed immediately
-before `EXIT inner(i) {2}`. That EXIT yields the token to inner iteration
-`i+1`, or returns it to the parent when the inner loop finishes.
+## Reducing raw edges
 
-The child and parent have separate `PieceState`s, so child uses `{1,0}` never
-replace the parent's uses. In this loop, `e6` and `e7` separately close those
-child uses to `EXIT inner(i) {2}`. The parent continues from the state already
-established at `[for summary P0:W:{2}]`: source at the region node and one use
-for `{2}`. The region also clears the pre-region token list. A uniform
-partition-owned summary records only its owner's token, using the region node
-as the handoff source; a mixed-owner or root-owned summary records no
-partition token.
+The walk produces a complete edge set. `reduceEdges` then applies two
+different reductions:
 
-This reset feeds directly into the token-supply rule learned above. For
-example, after `W m0 {0}` then `[region summary P0:R:{1}]`, `{0}` still has an
-entry in `uses`, but its pre-region token is no longer recorded. A later `R m0
-{0}` needs no RAW/WAR edge; it has no reusable owner token, so the ordinary
-token-supply rule adds the `{1} -> {0}` handoff. No new dependency rule is
-involved.
+- `reduceStraightEdges` handles edges between access nodes in one chain.
+- `reduceLoopCloses` handles access-to-`EXIT` edges whose alternate path
+  crosses the loop boundary.
 
-The logical producer is remembered state, not another child DAG node or edge
-source. Child RAW edges originate at `ENTER inner(i) {2}`. The producer
-decides whether this ENTER imports the outer completion kinds and is then
-preserved for deeper children. Its completion kind is `[none]` when its owner
-is not that producer. Here the producer is `{3}` and the ENTER owner is `{2}`,
-so this distinction changes the completion kind carried by `e3`, but does not
-change the topology of edges `e1`–`e7`.
+Both reducers use only already-kept edges and program order. A dropped edge
+does not update their known ordering or token state. A kept edge updates the
+state immediately and is never reconsidered. Later decisions therefore
+cannot invalidate an earlier proof.
 
-At this point the walk has produced only edges `e1`–`e7`; it has not assigned
-semaphore names, pending counts, or release multiplicities. Their conversion
-is shown later in
-[Composition: why loop entry and loop recurrence share one semaphore](#composition-why-loop-entry-and-loop-recurrence-share-one-semaphore).
+### Example: a straight edge is redundant
 
-## Edges to semaphores
-
-After redundant edges are deleted, `buildEdgesAndSemas` groups edges with the
-same destination and destination owner. Within one group, repeats from the
-same source owner are merged at that owner's later source node and their
-completion kinds are unioned. Each resulting incoming edge's tail becomes one
-release carrying those completion kinds. Each carried
-completion kind counts as one release; an edge carrying no completion kind
-counts as one release. The destination becomes one acquire whose pending count
-is the total number of releases from its incoming edges. An edge entering a
-loop node can instead reuse the loop's recurrence semaphore and inherit its count —
-the composition case below.
-
-Placement needs no extra information, because the walk never produced a
-placeless fact: every edge already points at two concrete nodes.
-
-```text
-release  ->  spliced immediately AFTER the edge's source node
-             (after the completionAnchor instead, when ACCESS-DAG
-             recorded one)
-acquire  ->  spliced immediately BEFORE the shared destination node
-create   ->  before the WS loop; its position carries no synchronization
-```
-
-Token reuse remains an explicit SYNC-DAG fact during this conversion. If an
-edge leaves an access marked with `reuseTokenOwner`, its inserted release is
-marked for the same owner, so both nodes use that owner's earlier token.
-`verifySyncDag` checks the resulting token and structural invariants; EMIT-IR
-checks that the named owner still has a live token. EMIT-IR only renders these
-marks; it does not decide that another node is eligible.
-
-Before conversion, `buildEdgesAndSemas` first deletes ordering already
-implied by other edges (`reduceEdges`), then groups each destination and
-coalesces repeats from one sender while building that handoff. Reduction is a
-monotonic trace over permanently kept edges;
-the complete conditions follow the two worked examples as fine print.
-
-### Example: a redundant edge is dropped
-
-`test/NVWS/insert_semas_transitive_reduction.mlir` `@serialized_ring_reduces`
-— member `m0` covers the whole backing; member `m1` is a view nested inside it:
+`test/NVWS/insert_semas_transitive_reduction.mlir`
+`@serialized_ring_reduces` has overlapping members:
 
 ```text
 members:    m0[0,256)   m1[64,192)
-pieces:     P0=[0,64){m0}   P1=[64,192){m0, m1}   P2=[192,256){m0}
-footprints: an access through m0 touches all three pieces; through m1, P1
+pieces:     P0=[0,64){m0}   P1=[64,192){m0,m1}   P2=[192,256){m0}
 ```
 
-Four accesses per iteration; the walk on the shared piece P1 raises all
-four in-body edges (P0 and P2 repeat e1), and P0/P2 raise the one
-recurrence edge at `EXIT`:
+On P1, owner `{0}` writes, owner `{1}` reads, and owner `{2}` writes. The
+second write sees live uses for both `{0}` and `{1}`.
 
 ```text
-walk             P1 state before       rule                      raw edge
-ENTER {0}        —                     seed source ENTER and     —
-                                       use {0}
-W m0 {0}         source ENTER          same-owner write; reset   —
-                 uses [{0}->ENTER]     source and uses to W
-R m0 {1}         source W@{0}          read by new owner         e1: {0} -> {1}
-                 uses [{0}->W m0 {0}]
-W m1 {2}         uses [{0}->W m0 {0},  write: edge from EVERY    e2: {0} -> {2}
-                 {1}->R m0 {1}]        other owner's stored node e3: {1} -> {2}
-R m1 {0}         source W@{2}          read by new owner         e4: {2} -> {0}
-                 uses [{2}->W m1 {2}]
-EXIT             every piece carries   P0/P2: use {1} closes;    e5: {1} -> {0}@next
-(recurrence)     owner {0}             P1: skip, e4 already
-                                       orders the node stored for {2}
-                                       before {0}
+raw-edge inventory
+  e1: W m0 {0} -> R m0 {1}
+  e2: W m0 {0} -> W m1 {2}       candidate
+  e3: R m0 {1} -> W m1 {2}
 ```
 
-The raw DAG makes `e2`'s redundant branch and `e5`'s `EXIT` close visible:
-
 ```text
-                             ENTER(i)
-                                 |
-                             W m0 {0}
-                    +------------+------------+
-                 e1 |                         | e2 (redundant)
-                    v                         |
-                R m0 {1}                      |
-           +--------+--------+                |
-        e5 |              e3 |                |
-           |                  +----------------+
-           |                                   |
-           |                                   v
-           |                               W m1 {2}
-           |                                   | e4
-           |                                   v
-           |                               R m1 {0}
-           |                                   |
-           +------------------+----------------+
-                              |
-                              v
-                         EXIT(i) {0}
-                              |
-                              v
-                         ENTER(i+1)
-                              |
-                              v
-                          W m0 {0}
-```
+raw DAG
 
-The diagram contains two edges that look redundant if we check ordering only:
-
-- `e2` has the alternate path `e1 -> e3` to the same `W m1 {2}`.
-- `e5` has the alternate path `e3 -> e4`, followed by `{0}`'s own order to
-  the next iteration's `W m0 {0}`.
-
-Deleting an edge requires more than alternate ordering: the destination must
-still receive a token in time.
-
-- **Drop `e2`.** Kept `e3` enters `W m1 {2}`, so it supplies `{2}`'s acquire
-  and token as well as completing the alternate ordering path.
-- **Keep `e5`.** `W m0 {0}` is the next iteration's first partition-owned
-  access. No earlier access in that iteration can supply its token, and the
-  token acquired by `e4` in the current iteration is not the loop-entry token
-  for the next iteration. `e5` supplies that loop-entry token, so the
-  wrap-around reducer protects it as the close into first-access owner `{0}`.
-
-In the raw DAG, `e5` ends at `EXIT(i) {0}` and represents the handoff to the
-next iteration. Region-flow placement puts its acquire immediately before
-`W m0 {0}`.
-
-The result is:
-
-```text
-dropped:  e2
-kept:     e1  e3  e4  e5
-```
-
-Reduction finishes before semaphore creation. The four kept edges have four
-different destinations: `e1` enters `R m0 {1}`, `e3` enters `W m1 {2}`, `e4`
-enters the current iteration's `R m1 {0}`, and `e5` enters `EXIT(i) {0}` for
-the next iteration. They therefore become four count-1 semaphores. In
-particular, `e5` becomes its own S3 with pending count 1; it does not increase
-another semaphore's pending count. The emitted body is:
-
-```text
-|- scf.for (WS, tag=0) ... holdrule{pointofuse->ttg.local_alloc}
-|  |- a  S3  {0}                ; e5's acquire, at the top of the body
-|  |- W m0  ttg.local_alloc {0}
-|  |- r  S0  {0} [none]         ; e1 tail: {0} releases to {1}
-|  |- a  S0  {1}                ; e1 head
-|  |- R m0  ttg.local_load {1}
-|  |- r  S1  {1} [none]         ; e3 tail: {1} releases to {2}
-|  |- r  S3  {1} [none]         ; e5 tail: releases the next iteration's {0}
-|  |- a  S1  {2}                ; e3 head
-|  |- W m1  ttg.local_alloc {2}
-|  |- r  S2  {2} [none]         ; e4 tail: {2} releases to {0}
-|  |- a  S2  {0}                ; e4 head
-|  |- R m1  ttg.local_load {0}
-|  |- EXIT ... yield{native}
-SEMAS: S0{count=1} S1{count=1} S2{count=1} S3{count=1 entry inherit={@0.0}}
-```
-
-After reduction and semaphore placement, `e2` is gone. S0/S1/S2 form the
-in-body ring, while S3 carries `e5` to the next iteration:
-
-```text
-                             ENTER(i)
-                                 |
-                             a S3 {0}
-                                 |
-                             W m0 {0}
-                                 | S0
+                            W m0 {0}
+                       +---------+---------+
+                    e1 |                   | e2
+                       v                   |
+                   R m0 {1}                |
+                    e3 |                   |
+                       +---------+---------+
                                  v
-                             R m0 {1}
-                        +--------+--------+
-                     S1 |                 | S3
-                        v                 |
-                    W m1 {2}              |
-                        | S2              |
-                        v                 |
-                    R m1 {0}              |
-                        |                 |
-                        v                 |
-                     EXIT(i)              |
-                        |                 |
-                        v                 |
-                   ENTER(i+1)             |
-                        |                 |
-                    a S3 {0} <------------+
-                        |
-                        v
-                    W m0 {0}
+                            W m1 {2}
 ```
 
-`S3`'s acquire sits at the top of the body rather than above the loop —
-that placement is what the node's `holdrule{pointofuse->...}` label stands
-for, decided in [Region flows](#region-flows) below.
-Contrast `@fanout_not_reduced` above, `holdrule{gated}`: its `S2`
-stays a pre-loop root entry and the loop uses CARRIED mode.
+`e1 -> e3` orders the same endpoints as `e2`. Kept edge `e3` also supplies
+owner `{2}`'s token at the destination. `reduceStraightEdges` drops `e2`.
 
-And contrast the semaphore count: `@fanout_not_reduced` has two RAW fan-out
-edges plus two recurrence edges sharing one destination. Its four kept
-edges therefore become three semaphores, one with pending count 2. Same
-rule both times: one destination node, one semaphore.
+```text
+reduced DAG
 
-### Example: a loop-closing edge is dropped
+                            W m0 {0}
+                                | e1
+                                v
+                            R m0 {1}
+                                | e3
+                                v
+                            W m1 {2}
+```
+
+The straight reducer does not consider root, region, `ENTER`, or `EXIT`
+endpoints. It also keeps a candidate when the alternate path does not supply
+the destination owner's token.
+
+### Example: edge reduction lowers the pending count
+
+The same example shows why reduction precedes semaphore creation. If all
+three raw edges became arrivals, the write by `{2}` would wait for releases
+from both `{0}` and `{1}`. After `e2` is removed, only `e3` enters that write:
+
+```text
+raw edges
+  e1, e2, e3
+
+after straight reduction
+  e1, e3
+
+after grouping
+  e1 -> S0 pending_count=1 at R m0 {1}
+  e3 -> S1 pending_count=1 at W m1 {2}
+```
+
+```text
+protocol DAG
+
+                            W m0 {0}
+                                | walk
+                                v
+                          release S0 {0}
+                                | S0
+                                v
+                          acquire S0 {1}
+                                | walk
+                                v
+                            R m0 {1}
+                                | walk
+                                v
+                          release S1 {1}
+                                | S1
+                                v
+                          acquire S1 {2}
+                                | walk
+                                v
+                            W m1 {2}
+```
+
+The pending count is one because one arrival remains. It is not a reason for
+dropping `e2`.
+
+### Example: a loop-closing edge is redundant
 
 `test/NVWS/insert_semas_local_buffer_reuse.mlir`
-`@local_n_owner_aliased_buffers` — the same four accesses and owners as
-`@serialized_ring_reduces`, but `m1` extends *past* `m0` instead of
-nesting inside it, so piece P2 belongs to `m1` alone, its first toucher in
-the body is `{2}`, and one recurrence edge now targets an owner other than
-the chain's first:
+`@local_n_owner_aliased_buffers` uses two partly overlapping members:
 
 ```text
 members:    m0[0,128)   m1[64,192)
-pieces:     P0=[0,64){m0}   P1=[64,128){m0, m1}   P2=[128,192){m1}
-footprints: an access through m0 touches P0 and P1; through m1, P1 and P2
+pieces:     P0=[0,64){m0}   P1=[64,128){m0,m1}   P2=[128,192){m1}
 ```
 
-The walk raises the same in-body ring as before — kept `e1 {0}->{1}`,
-`e2 {1}->{2}`, `e3 {2}->{0}` (a raw `{0}->{2}` drops exactly the way the
-previous example's `e2` did; and `R m1 {0}` raises its edge through P1 and
-P2 at once, counted once when `buildEdgesAndSemas` groups the handoff). At
-`EXIT` two closes are
-raised:
+The complete in-body raw inventory is:
 
 ```text
-e4: R m1@{0} -> {2}@next   (piece P2 — {2}'s write replaces data {0} holds)
-e5: R m0@{1} -> {0}@next   (pieces P0/P1 — same for {0}'s write)
+l1a: W m0 {0} -> R m0 {1}       P0
+l1b: W m0 {0} -> R m0 {1}       P1
+l2a: W m0 {0} -> W m1 {2}       P1, coveredVia {1}
+l2b: R m0 {1} -> W m1 {2}       P1
+l3a: W m1 {2} -> R m1 {0}       P1
+l3b: W m1 {2} -> R m1 {0}       P2
 ```
 
-The diagram below is after the ordinary in-body reduction, which already
-removed the direct `{0}->{2}` edge, but before the wrap-around reduction.
-The stored `e4` and `e5` edges enter `EXIT`; this equivalent unrolled picture
-carries each boundary owner to its next-iteration access. `walk` marks walk
-order with no generated edge. The long path from `R m1 {0}` through iteration
-`i+1` reaches the same `W m1 {2}` as `e4`:
+The walk then records three closes:
 
 ```text
-                                  ENTER(i)
-                                      | walk
-                                      v
-                                  W m0 {0}
-                                      | e1
-                                      v
-                                  R m0 {1}
-                         +------------+------------+
-                      e5 |                         | e2
-                         |                         v
-                         |                     W m1 {2}
-                         |                         | e3
-                         |                         v
-                         |                     R m1 {0}
-                         |                         +----------------+
-                         |                         | walk        e4 |
-                         |                         v                |
-                         |                      EXIT(i)             |
-                         |                         | walk           |
-                         |                         v                |
-                         |                    ENTER(i+1)            |
-                         |                         | walk           |
-                         |                         v                |
-                         +------------------> W m0 {0}              |
-                                                   | e1             |
-                                                   v                |
-                                               R m0 {1}             |
-                                                   | e2             |
-                                                   v                |
-                                               W m1 {2} <-----------+
+c0: R m0(i) {1} -> EXIT(i) {0}   P0 returns to first owner {0}
+c1: W m1(i) {2} -> EXIT(i) {0}   P1, coveredVia {0}
+c2: R m1(i) {0} -> EXIT(i) {2}   P2 returns to first owner {2}
 ```
 
-The diagram shows all three facts: the alternate path implies `e4`; kept `e2`
-has made `{2}`'s token available by P2's first touch; and `{2}` is not the
-owner of the chain's first partition-owned access. Therefore `e4` drops. `e5` targets
-`{0}`, the owner of the chain's first partition-owned access, so it is kept
-and becomes S3. The emitted body has no second loop close into `{2}`:
+`c1` starts at `W m1`, not `R m0`: that write begins a new P1 version. Its
+source use is already ordered before the P1 read by destination owner `{0}`.
+
+Straight reduction keeps `l1a` and `l3a`, drops their same-endpoint
+duplicates `l1b` and `l3b`, and drops `l2a` through `l1a -> l2b`.
+
+For the loop-close proof, the reducer input below is logically unrolled. The
+stored `c2` edge ends at `EXIT(i)`; the picture carries destination owner
+`{2}` to its first P2 access, `W m1(i+1)`.
 
 ```text
-|- scf.for (WS, tag=1) ... holdrule{pointofuse->ttg.local_alloc}
-|  |- a  S3  {0}                ; e5, the kept close
-|  |- W m0  ttg.local_alloc {0}
-|  |- r  S0  {0} [none]         ; e1 tail
-|  |- a  S0  {1}                ; e1 head
-|  |- R m0  ttg.local_load {1}
-|  |- r  S1  {1} [none]         ; e2 tail
-|  |- r  S3  {1} [none]         ; e5 tail
-|  |- a  S1  {2}                ; e2 head — the only acquire {2}'s hold
-|  |- W m1  ttg.local_alloc {2} ;   needs: e4 is gone
-|  |- r  S2  {2} [none]         ; e3 tail
-|  |- a  S2  {0}                ; e3 head
-|  |- R m1  ttg.local_load {0}
-|  |- EXIT ... yield{native}
-SEMAS: S0{count=1} S1{count=1} S2{count=1} S3{count=1 entry inherit={@1.0}}
+loop-close reducer input after straight reduction, logically unrolled
+
+                         R m1(i) {0}
+                         +-------------------------------+
+                    walk |                            c2 |
+                         v                               |
+                      EXIT(i)                            |
+                         | walk                          |
+                         v                               |
+                     ENTER(i+1)                          |
+                         | walk                          |
+                         v                               |
+                    W m0(i+1) {0}                        |
+                         | l1a                           |
+                         v                               |
+                    R m0(i+1) {1}                        |
+                         | l2b                           |
+                         v                               |
+                    W m1(i+1) {2} <----------------------+
 ```
 
-The final DAG makes the deletion visible. S3 closes into the next iteration's
-`{0}` access; there is no cross-iteration edge into `W m1 {2}` in iteration
-`i+1`:
+The kept path `l1a -> l2b` orders the next P2 write and makes `{2}`'s token
+available there. `{2}` is not the owner of the chain's first
+partition-owned access, so `reduceLoopCloses` drops `c2`.
 
 ```text
-                                  ENTER(i)
-                                      |
-                                      v
-                                  W m0 {0}
-                                      | S0
-                                      v
-                                  R m0 {1}
-                             +--------+--------+
-                          S1 |                 | S3
-                             v                 |
-                         W m1 {2}              |
-                             | S2              |
-                             v                 |
-                         R m1 {0}              |
-                             | walk            |
-                             v                 |
-                          EXIT(i)              |
-                             | walk            |
-                             v                 |
-                        ENTER(i+1)             |
-                             |                 |
-                             +------------> W m0 {0}
-                                               | S0
-                                               v
-                                           R m0 {1}
-                                               | S1
-                                               v
-                                           W m1 {2}
-```
+after loop-close reduction, logically unrolled
 
-### The deletion conditions, in full
-
-#### 1. Implied ordering (`reduceEdges`)
-
-The straight-line sweep considers only edges between partition-owned access
-nodes. It does not reduce root, `for`, `if`, `ENTER`, or `EXIT` endpoints. A
-separate wrap-around pass below considers access-to-`EXIT` loop closes.
-
-For a straight-line edge, the complete deletion shape is:
-
-```text
-                           W m0 {0}
-                      +---------+---------+
-                   e1 |                   | e2 candidate
-                      v                   |
-                  R m0 {1}                |
-                   e3 |                   |
-                      +---------+---------+
-                                v
-                           W m1 {2}
-```
-
-`e2` can be deleted because the kept `e1 -> e3` path already orders its
-endpoints, and the most recently applied kept handoff, `e3`, makes `{2}` the
-last recorded token owner. The result is:
-
-```text
-                           W m0 {0}
-                                | e1
-                                v
-                           R m0 {1}
-                                | e3
-                                v
-                           W m1 {2}
-```
-
-If either fact is missing — no alternate kept path, or the destination owner
-is not the last recorded token owner after `ENTER` and the kept handoffs — the
-candidate stays.
-
-A loop-closing candidate uses the same idea, but the alternate path crosses
-the iteration boundary. `reduceLoopCloses` simulates that wrap-around;
-the equivalent unrolled dependency picture is:
-
-```text
-                  R m1 {0} (i) ----- e4 close to {2}@next ---------+
-                       | walk                                      |
-                       v                                           |
-                    EXIT(i)                                        |
-                       | walk                                      |
-                       v                                           |
-                  ENTER(i+1)                                       |
-                       | walk                                      |
-                       v                                           |
-                  W m0 {0}  first partition-owned access           |
-                       | e1                                        |
-                       v                                           |
-                  R m0 {1}                                         |
-                       | e2  kept handoff into {2}                 |
-                       v                                           v
-                  W m1 {2}  first P2 touch <-----------------------+
-```
-
-The picture contains all three requirements for dropping `e4`: the long kept
-path implies its ordering; the kept handoff `e2` has made `{2}`'s token
-available when `{2}` first touches P2; and destination owner `{2}` is not the
-owner of the chain's first partition-owned access.
-
-The reduction is proof-by-construction. A dropped edge never updates closure
-or token state, while a kept edge is applied immediately and never
-reconsidered. Therefore each deletion is proved using only program order and
-edges already committed to the kept set; a later deletion cannot invalidate
-that proof. `reduceStraightEdges` decides ordinary candidates first, then
-`reduceLoopCloses` sees those decisions as permanent and applies each kept
-close before considering the next one. `verifySyncDag` still checks the
-resulting token, region-flow, semaphore-count, and structural invariants;
-it does not replay the reducer.
-
-#### 2. Repeats from one sender (`buildEdgesAndSemas`)
-
-`reduceEdges` has finished. While `buildEdgesAndSemas` groups a destination,
-it handles two kept edges that have the same sending owner and destination but
-leave from different nodes.
-
-Use this minimal conceptual loop; no lit test dumps this exact shape. `m0`
-touches P0 and P1, while `m1` touches only P1:
-
-```text
-node             pieces / role
-W m0 {0}         touches P0,P1; first partition-owned access
-R m0 {1}         touches P0,P1
-R m1 {1}         touches P1
-EXIT(i) {0}      returns P0,P1 to {0}
-
-at EXIT:
-  P0's latest {1} node is R m0 {1} -> e2
-  P1's latest {1} node is R m1 {1} -> e3
-```
-
-Both closes survive `reduceEdges` because they return to `{0}`, owner of the
-chain's first partition-owned access. The raw DAG entering handoff grouping is:
-
-```text
-                            W m0 {0}
-                                | e1
-                                v
-                            R m0 {1}
-                         +------+------+
-                  e2(P0) |             | walk
-                         |             v
-                         |         R m1 {1}
-                         |             | e3(P1)
-                         +------+------+
-                                v
-                           EXIT(i) {0}
-```
-
-`e2` and `e3` have the same sending owner `{1}` and the same destination
-`EXIT(i) {0}`. `R m1 {1}` follows `R m0 {1}` in the same owner's walk, so one
-release after `R m1 {1}` is also after `R m0 {1}`.
-`buildEdgesAndSemas` combines the two closes at that later node and unions
-their completion payloads. Piece
-identities have already served reduction and are not propagated into the
-semaphore record; `P0,P1` below is explanatory:
-
-```text
-                            W m0 {0}
-                                | e1
-                                v
-                            R m0 {1}
-                                | walk
-                                v
-                            R m1 {1}
-                                | e2+e3  merged close: P0,P1
-                                v
-                           EXIT(i) {0}
-```
-
-The merged edge carries one completion kind, so its release counts once and
-conversion creates one semaphore with pending count 1. If the merged edge
-carries `[none, tma_load]`, its release counts twice: once when the synchronous
-operation completes and once when the TMA load completes. The destination
-acquire therefore has pending count 2. In the unrolled edge-only protocol DAG,
-S0 represents `e1` and S1 represents merged `e2+e3`; the initial entry is
-omitted:
-
-```text
-                            ENTER(i)
-                                |
-                            W m0 {0}
-                                | S0
-                                v
-                            R m0 {1}
-                                | walk
-                                v
-                            R m1 {1}
-                         +------+------+
-                    walk |             | S1
-                         v             |
-                      EXIT(i)          |
-                         | walk        |
-                         v             |
-                    ENTER(i+1)         |
-                         +------+------+
-                                v
-                            W m0 {0}
-```
-
-#### 3. Covered senders (`buildEdgesAndSemas`)
-
-The walk annotates rather than deletes: when a WAR/WAW edge's source use is
-the piece's version source and another live use is already ordered after it
-(the source's `orderedBefore` names that use's owner), the edge is recorded
-with `coveredVia` = that owner. The fact is still true and the edge still
-participates in reduction and in the same-sender merge above — a covered
-edge of a surviving sender anchors that sender's release exactly as before.
-
-After grouping and merging, a sender whose EVERY merged edge is covered
-contributes no ordering of its own: each covered source is ordered before
-the coverer's acquire, and the coverer raises its own arrival into the same
-destination. Such a sender's arrival is deleted whole, and the semaphore's
-pending count shrinks by its contribution; a handoff whose every sender is
-covered dissolves entirely. The deletion validates that the covering path
-survives: the coverer must still arrive at this destination (leg 2), and a
-surviving release of the deleted sender — acquired by the coverer no later
-than the coverer's own release into this handoff — must certify the covered
-source (leg 1). A candidate may only rely on paths that themselves survive,
-so the candidate set shrinks to a fixpoint before it is applied.
-
-Granularity is the point of this rule. Deleting a covered edge whose sender
-keeps other edges into the destination saves nothing — the merge emits one
-release either way — but re-anchors that release at an earlier surviving
-source. A release lowers to a warp-group rendezvous plus one arrive, and
-re-anchoring it from after the sender's last write to just after a long
-TMEM read exposed the rendezvous on the read's dependency shadow, stalling
-all warps of the bottleneck partition on the slowest read every iteration
-(~7% FP16 flash-attention loss on B300). Handoff-granularity deletion can
-only remove whole arrivals or whole semaphores, never move a surviving
-release earlier, so redundancy elimination is placement-invariant by
-construction.
-
-### One destination node, one semaphore
-
-What remains is grouped by destination node and destination owner: one
-destination, one semaphore, and one acquire. Each incoming edge produces a
-release. A release counts once for each completion kind carried by its edge,
-or once when the edge carries no completion kind. Their total is the acquire's
-pending count. The next section shows the case in which a loop-entry edge
-reuses a recurrence semaphore whose pending count came from a larger fan-in.
-
-### Composition: why loop entry and loop recurrence share one semaphore
-
-This section explains why `e1`, `e6`, and `e7` use the same semaphore in the
-following example, and how its pending count affects `e1`. `e1` feeds
-iteration 0; `e6` and `e7` feed later iterations. The `e6`/`e7` fan-in gives
-`S0` pending count 2. Because `e1` is the only incoming edge at this site, its
-release is given count 2: `r S0(2)`.
-
-The loop body uses one fixed semaphore for its token iter-arg. The other edges
-use the ordinary conversion rules.
-
-The nested walk in
-[Composition: nested regions in the walk](#composition-nested-regions-in-the-walk)
-already produced the three raw edges involved here:
-
-```text
-edge  source                         destination
-e1    W m0 {3}                       [for summary P0:W:{2}]
-e6    W m0 {1}                       EXIT inner(i) {2}
-e7    R m0 {0}                       EXIT inner(i) {2}
-```
-
-No raw edge is added or changed here; semaphore sharing happens only after the
-raw DAG is complete. The three edges belong to two separate DAG levels. In
-the parent DAG, `e1` requires the inner `for` node owned by `{2}` to wait for
-`W m0 {3}`:
-
-```text
-parent DAG
-
-                     ENTER outer(i) {3}
+                         R m1(i) {0}
                               | walk
                               v
-                          W m0 {3}
-                              | e1
+                           EXIT(i)
+                              | walk
                               v
-                 [for summary P0:W:{2}]
-                              | e2
+                          ENTER(i+1)
+                              | walk
                               v
-                     EXIT outer(i) {3}
+                         W m0(i+1) {0}
+                              | l1a
+                              v
+                         R m0(i+1) {1}
+                              | l2b
+                              v
+                         W m1(i+1) {2}
 ```
 
-In the child DAG, `e6` and `e7` close the nodes stored under `{1}` and `{0}`
-to `{2}` at the end of an inner iteration:
+Both `c0` and `c1` target `{0}`, the first access owner, so the loop-close
+reducer retains them. Covered-sender pruning later removes `c1`: `l3a` hands
+P1 from `{2}` to destination owner `{0}`, whose own program order carries it
+to `EXIT`. `c0` remains as the one recurrence arrival.
+
+The two deletion steps use different facts. The loop-close reducer needs the
+first access owner, the first next-iteration touch of each piece, and token
+availability across the boundary. Covered-sender pruning needs a surviving
+two-leg handoff path into this destination.
+
+### Exact-source async edges
+
+An exact-source edge with an async completion does more than impose ordering.
+Its release carries the completion of the operation that produced the value.
+`EdgeRec::preserve` protects such an edge in both raw-edge reducers. It is not
+a guard against later covered-sender pruning.
 
 ```text
-child DAG (closing part)
-
-                              W m0 {1}
-                         +---------+---------+
-                      e5 |                   | e6
-                         v                   |
-                     R m0 {0}                |
-                      e7 |                   |
-                         +---------+---------+
-                                   v
-                          EXIT inner(i) {2}
+raw-edge inventory
+  a1: W async {0} -> R {1}       carries [tma_load]
+  a2: W async {0} -> W {2}       exact source, carries [tma_load],
+                                  coveredVia {1}
+  a3: R {1}       -> W {2}
 ```
 
-After conversion, the two acquire sites feed the same token iter-arg: `e1`
-supplies iteration 0, and `e6`/`e7` supply the next iteration:
+```text
+raw DAG
+
+                          W async {0}
+                    +-----------+-----------+
+     a1 [tma_load]  |                       | a2 [tma_load], coveredVia {1}
+                    v                       |
+                  R {1}                     |
+               a3   |                       |
+                    +-----------+-----------+
+                                v
+                              W {2}
+```
+
+The graph fact is that `a1 -> a3` orders the endpoints of `a2`. Because `a2`
+also carries the exact producer's async completion, `preserve` keeps it
+through `reduceStraightEdges` and `reduceLoopCloses`; the raw DAG is unchanged
+by those reducers.
+
+In this particular shape, `a2` is also `coveredVia {1}`. Covered-sender
+pruning can remove its whole owner-`{0}` arrival because `a1` first carries
+the TMA-load completion to `{1}`, and surviving `a3` carries the obligation
+from `{1}` to `{2}`. If either leg did not survive, `a2` would remain as a
+release. A later synchronous reread is not the exact version source and does
+not receive `preserve` in the first place.
+
+### Release floors
+
+Before either reducer runs, `buildEdgesAndSemas` records the latest source for
+every `(destination, destination owner, sender owner)` tuple. That node is the
+sender's release floor.
+
+Consider two raw edges from `{1}` into the same destination:
 
 ```text
-%first = a S0(2) {2}                 ; fed by e1
-scf.for ... iter_args(%token = %first) {
-  %view = nvws.semaphore.buffer S0, %token
+edge  exact endpoints
+r1    A {1} -> D {2}
+r2    B {1} -> D {2}      B follows A in the same chain
+```
+
+The release floor is `B`, even if reduction later removes `r2`. When the
+surviving `{1}` edges are merged, their release is placed no earlier than B:
+
+```text
+protocol placement after semaphore assignment
+
+A {1} --walk--> B {1} --walk--> release S {1} --S--> acquire S {2}
+                                                       |
+                                                     walk
+                                                       v
+                                                     D {2}
+```
+
+This gives reduction a placement-invariance rule:
+
+- reduction may remove a whole arrival;
+- reduction may remove a whole semaphore;
+- a surviving sender's release cannot move earlier.
+
+The rule matters for async and warp-group work: a release after the sender's
+last write must not move into the dependency path of an earlier read merely
+because one raw edge became redundant.
+
+### Reduction does not choose placement
+
+Reduction and placement answer different questions. Reduction asks whether a
+kept path supplies the ordering and destination token that a candidate edge
+would have supplied. Placement asks where the remaining sender may release
+that token without moving before any source fact recorded for the same
+destination.
+
+The complete raw set answers the placement question before either reducer
+runs. `releaseFloors` keeps the latest source for each destination,
+destination owner, and sender owner. The reducers may then remove facts from
+the edge set, but they do not recompute that floor from only the survivors.
+
+This separation is visible in three valid outcomes. A redundant piece edge
+can disappear while another edge from the same sender keeps one release. All
+edges from one sender can disappear and remove that arrival. If every arrival
+to a destination disappears, the acquire and semaphore can disappear too.
+Only the first outcome has a surviving release, and that release stays at or
+after its floor.
+
+Merging has a narrower purpose. It combines the surviving facts from one
+sender into one arrival and unions their completion kinds. It does not prove
+an ordering path, move a release earlier, or combine releases from different
+owners. Grouping then collects those distinct arrivals at one destination and
+derives the pending count.
+
+Keeping these questions separate makes the protocol readable from the merged
+handoffs: each merged sender is one real release, each destination is one
+real acquire, and placement does not depend on which redundant piece fact was
+chosen as the representative.
+
+## From reduced edges to semaphores
+
+`buildEdgesAndSemas` processes the reduced edge set in this order:
+
+```text
+1. merge edges with the same destination, destination owner, and sender owner
+2. group the merged arrivals by destination node and destination owner
+3. remove covered arrivals whose complete proof survives
+4. reconcile loop-entry and recurrence pending counts
+5. create one semaphore for each remaining destination group
+6. insert one acquire at the destination and releases at sender floors
+```
+
+### Repeated edges from one sender
+
+Two pieces can create edges from different nodes of the same owner into the
+same `EXIT`. Use this conceptual loop:
+
+```text
+W m0 {0}        touches P0 and P1
+R m0 {1}        latest {1} use for P0
+R m1 {1}        later {1} use for P1
+EXIT(i) {0}     returns both pieces to {0}
+```
+
+Raw-edge inventory:
+
+```text
+m1a: W m0 {0} -> R m0 {1}       P0
+m1b: W m0 {0} -> R m0 {1}       P1
+m2: R m0 {1} -> EXIT(i) {0}      P0
+m3: R m1 {1} -> EXIT(i) {0}      P1
+```
+
+```text
+raw DAG
+
+                            W m0 {0}
+                         m1a,m1b |
+                                v
+                            R m0 {1}
+                         +------+------+
+                  m2(P0) |             | walk
+                         |             v
+                         |         R m1 {1}
+                         |             | m3(P1)
+                         +------+------+
+                                v
+                           EXIT(i) {0}
+```
+
+Straight reduction keeps `m1a` and drops same-endpoint duplicate `m1b`.
+Neither loop-close fact is removed. The reduced raw set is therefore `m1a`,
+`m2`, and `m3`.
+
+`m2` and `m3` have the same sender and destination. The later source is
+`R m1 {1}`, so one merged arrival is sufficient. Completion kinds from both
+edges are unioned.
+
+```text
+same-sender merge
+
+destination       EXIT(i) {0}
+sender owner      {1}
+release floor     R m1 {1}
+represented facts m2, m3
+merged arrival    M1: R m1 {1} -> EXIT(i) {0}
+```
+
+One merged edge with `[none]` contributes one arrival. A merged edge with
+`[none, tma_load]` contributes two arrivals, so its acquire has pending count
+2 even though there is one sender owner.
+
+### 3. Covered senders (`buildEdgesAndSemas`)
+
+The access walk records a `coveredVia` owner when both of the following are
+true:
+
+1. a foreign live use is also the current version source;
+2. an existing source edge already orders that use before another live use.
+
+This annotation only creates a candidate. After edges are grouped by
+destination, `buildEdgesAndSemas` separately proves that the later live use
+still carries the obligation to this destination.
+
+Every recorded cover must satisfy two legs in the surviving handoffs. For
+leg 2, the covering owner must still release to this destination, unless it
+is itself the destination owner and its program order carries the obligation.
+For leg 1, a surviving handoff from the covered sender to the covering owner
+must release at or after the covered source and be acquired no later than the
+covering owner's contribution to this destination. Forward checks may cross
+enclosing `for` boundaries, but never one `if` path into another.
+
+The raw edge is still recorded. It participates in both reducers, sets its
+sender's release floor, and joins same-sender merging.
+
+The inner loop in
+`test/NVWS/insert_semas_release_count.mlir`
+`@release_multiplicity_unified_fanin_regain` has this closing shape. Owner
+`{1}` corrects the buffer in place; owner `{0}` reads the corrected value;
+owner `{2}` regains it at `EXIT`.
+
+```text
+raw-edge inventory
+  k1: W correct {1} -> R corrected {0}
+  k2: W correct {1} -> EXIT inner(i) {2}   coveredVia {0}
+  k3: R corrected {0} -> EXIT inner(i) {2}
+```
+
+```text
+raw DAG
+
+                           W correct {1}
+                       +---------+---------+
+                    k1 |                   | k2 coveredVia {0}
+                       v                   |
+                 R corrected {0}           |
+                    k3 |                   |
+                       +---------+---------+
+                                 v
+                        EXIT inner(i) {2}
+```
+
+Both closes are protected from the loop-close reducer because `{2}` is the
+first access owner. Covered-sender pruning works at arrival granularity after
+grouping:
+
+- leg 1: the surviving `{1} -> {0}` handoff `k1` is released after the
+  correction and acquired before the `{0}` read;
+- leg 2: `{0}` still arrives at this destination through `k3`.
+
+The whole `{1}` arrival `k2` can therefore disappear. The `{0}` arrival
+remains:
+
+```text
+reduced DAG after covered-arrival pruning
+
+                           W correct {1}
+                                 | k1
+                                 v
+                         R corrected {0}
+                                 | k3
+                                 v
+                        EXIT inner(i) {2}
+```
+
+After semaphore assignment, `k1` and `k3` become different semaphores:
+
+```text
+%corrected = acquire CORRECTED {0}
+R corrected [%corrected] {0}
+release READY, %corrected {0}
+%regain = acquire READY pending_count=1 {2}
+```
+
+If a sender has any uncovered merged edge into the destination, the sender
+stays. Its release remains at the pre-reduction floor. Covered pruning never
+removes only an early edge of a surviving sender.
+
+Cover proofs are checked against the surviving set. For example:
+
+```text
+raw-edge inventory into D
+  f1: A {0} -> B {1}
+  f2: B {1} -> C {2}
+  f3: A {0} -> D {3}     coveredVia {1}
+  f4: B {1} -> D {3}     coveredVia {2}
+  f5: C {2} -> D {3}     uncovered
+```
+
+```text
+raw DAG
+
+                              A {0}
+                       +---------+-----------------+
+                    f1 |                           | f3 coveredVia {1}
+                       v                           |
+                     B {1}                         |
+                       +---------+-----------------+
+                    f2 |                           | f4 coveredVia {2}
+                       v                           |
+                     C {2}                         |
+                  f5   |                           |
+                       +------------+--------------+
+                                    v
+                                  D {3}
+```
+
+`f4` may be removed because `{2}` survives through `f5` and `f2` certifies
+`B -> C`. `f3` cannot rely on `{1}`'s arrival after `f4` is removed, so `f3`
+is retained. The candidate set is repeatedly shrunk until every remaining
+candidate has both legs through surviving arrivals. An `if` branch cannot
+certify another path; forward proof may climb only through enclosing `for`
+regions that actually raised the obligation.
+
+Finally, loop entry and recurrence may share one semaphore. Covered pruning
+is optional, so pruning is undone when it would make the two sites unable to
+use one fixed pending count. The useful cases are:
+
+```text
+entry arrivals   recurrence arrivals   result
+1 generic        2                     entry release uses arrive_count=2
+2                2                     both sites use pending_count=2
+2                1 after pruning       restore all covered arrivals at both sites;
+                                       recheck counts
+```
+
+A handoff with no surviving arrivals disappears entirely.
+
+### One destination, one semaphore
+
+After reduction and merging, every destination node and destination owner
+receive one semaphore and one acquire. Every remaining sender receives one
+release. The pending count is:
+
+```text
+sum over remaining senders of max(1, number of completion kinds)
+```
+
+This means:
+
+- two `[none]` senders give pending count 2;
+- one sender with `[none, tma_load]` gives pending count 2;
+- two raw piece edges merged into one `[none]` sender give pending count 1.
+
+The release is placed immediately after its source floor, after any earlier
+releases there. An async source uses its physical completion point. The
+acquire is placed before the destination, except for a safe loop-close
+placement at that owner's first touch.
+
+### Reading one semaphore handoff
+
+Start at an acquire and work backward. Its destination node and destination
+owner define the handoff. Every release of that semaphore is one surviving
+sender arrival, and the pending count is the total arrival contribution of
+those releases. Releases from different owners remain separate even when
+they guard the same buffer value.
+
+Then work forward from the acquire. Its token names the guarded backing for
+the destination access. `semaphore.buffer` converts that token into the buffer
+operand used by the access. The same token can feed later releases by the
+destination owner until another acquire replaces it or region emission
+returns it through `for` or `if`.
+
+The semaphore name describes the handoff, not the allocation member that
+happened to create an edge. Overlapping members in one group can therefore
+use the same semaphore when their reduced edges have the same destination and
+owners. Disjoint paths keep separate semaphores because their destination
+nodes or owners differ.
+
+An async completion belongs on the release that represents its source. It
+adds an arrival to the same acquire; it does not create a second acquire. A
+release with `[none, tma_load]` consequently arrives twice, while a plain
+release arrives once.
+
+At this construction point, entry and recurrence sharing can make two
+acquire sites in one logical group name the same semaphore. The shared name
+is required by the loop token channel, and both sites must agree on one fixed
+pending count. Token planning can add another acquire of that semaphore, and
+EMIT-IR can fold matching circular semaphores from separate logical groups.
+
+There is no later arbitrary re-reduction or merge of these handoffs. Token
+planning may detach or move an acquire, add a post-loop acquire, or add bridge
+and close releases so a token can cross a region boundary. Those operations
+use the established semaphore and pending count. Schedule finalization may
+then change clusters or stage offsets without recomputing the reduced edges.
+
+### Seeding the first token
+
+`insertEntryAcquires` gives the group a token before its first placement node.
+The acquire is outside the first `for` when that loop is the first node. Its
+IR owner is `root`, while `entryTokenOwner` records the first access owner for
+token checks and emission.
+
+The pass scans placement nodes from last to first. When the latest placement
+loop containing an acquire has a recurrence semaphore, the entry acquire
+uses the loop body's last acquire semaphore and marks it initially released:
+
+```text
+%first = acquire READY root
+for iter_args(%token = %first) {
+  ...
+  %next = acquire READY {1}
+  yield %next
+}
+```
+
+When no recurrence channel can seed the group, the pass creates a dedicated
+count-1 entry semaphore. Its acquire guards the first placement, and its
+release follows the last placement:
+
+```text
+%entry = acquire ENTRY root
+... first access or region ...
+... last access or region ...
+release ENTRY, %last_token
+```
+
+If the only first placement is an `if` with one non-empty branch, placement
+can descend into that branch. A synchronized group with no access or placement
+node is an error.
+
+### Entry and recurrence use one semaphore
+
+A loop body has one fixed semaphore operand for a carried buffer token. Its
+initial token and next-iteration token must therefore come from the same
+semaphore.
+
+Using the two-level example above, the parent edge `p1` supplies the first
+inner iteration. Child edge `c5` supplies later iterations after covered
+arrival `c4` has been removed:
+
+```text
+acquire site                         reduced raw edges   semaphore   count
+before the inner for                 p1                  READY       1
+before EXIT inner(i) {2}             c5                  READY       1
+before R m0 {1}                      c1                  S1          1
+before W m0 {1}                      c2                  S2          1
+before R m0 {0}                      c3                  S3          1
+before EXIT outer(i) {3}             p2                  S4          1
+```
+
+```text
+%first = acquire READY {2}       // parent p1
+for iter_args(%token = %first) {
+  %view = semaphore.buffer READY, %token
   ... use %view ...
-  %next = a S0(2) {2}                ; fed by e6 and e7
+  %next = acquire READY {2}      // child c5
   yield %next
 }
 ```
 
-The loop body is emitted once, so its `nvws.semaphore.buffer` has one fixed
-semaphore operand. Only `%token` is carried; there is no second loop argument
-that selects a different semaphore on later iterations. Therefore `%first`
-and `%next` must both be tokens from `S0`. The conversion is mechanical:
-
-1. `e6` and `e7` have the same destination, `EXIT inner(i) {2}`. They create
-   `S0` with pending count 2. Their two source nodes each emit one `r S0`.
-2. `e1` enters a `for` node with acquiring owner `{2}`. Conversion finds the
-   last child destination group for the same owner — here the `e6`/`e7` group
-   — and reuses its `S0`, rather than creating a different semaphore for
-   `e1`.
-3. Every `a S0(2)` waits for two releases. `e1` has one source edge, so its
-   release has count 2: `r S0(2) {3}`.
-
-The `2` on `r S0(2)` is its release count. It does not mean that the walk
-created another raw edge. The complete raw-edge-to-semaphore mapping is:
+When recurrence has count 2 and entry has one generic `[none]` edge, the
+single entry release uses `arrive_count=2`:
 
 ```text
-acquire site                  raw edges  semaphore  pending count
-before the inner for          e1         S0         2
-before EXIT inner(i) {2}      e6,e7      S0         2
-before R m0 {1}               e3         S1         1
-before W m0 {1}               e4         S2         1
-before R m0 {0}               e5         S3         1
-before EXIT outer(i) {3}      e2         S4         1
+release READY, %outer [none] arrive_count=2
+%first = acquire READY pending_count=2
+
+... inner body ...
+
+release READY, %reader1 [none] arrive_count=1
+release READY, %reader2 [none] arrive_count=1
+%next = acquire READY pending_count=2
 ```
 
-The first two entries are two acquire sites that reuse `S0`; they are not one
-three-edge fan-in.
+Only a lone generic arrival can be scaled this way. Other mismatches are
+errors unless restoring covered arrivals makes the shared count uniform.
 
-The full converted protocol is:
+## Tokens through `for` and `if`
+
+After semaphore placement, a region may receive a token at its entry and
+produce a token on each exit path. `RegionFlow` records only what emission
+needs:
 
 ```text
-|- a  S4  root  ; entry
-|- scf.for (WS, tag=0) ... holdrule{gated}
-|  |- W m0  ttg.local_store {3}
-|  |- r  S0(2)  {3} [none]        ; e1 tail: one edge, release count 2
-|  |- a  S0(2)  {2}               ; e1 head: initial inner-loop token
-|  |- scf.for ... holdrule{gated}
-|  |  |- r  S1  {2} [none]        ; e3 tail: ENTER has no op, so this starts the child chain
-|  |  |- R m0  ttg.local_load {2}
-|  |  |- r  S2  {2} [none]        ; e4 tail
-|  |  |- a  S1  {1}               ; e3 head
-|  |  |- R m0  ttg.local_load {1}
-|  |  |- a  S2  {1}               ; e4 head
-|  |  |- W m0  ttg.local_store {1}
-|  |  |- r  S3  {1} [none]        ; e5 tail
-|  |  |- r  S0  {1} [none]        ; e6 tail: release count 1
-|  |  |- a  S3  {0}               ; e5 head
-|  |  |- R m0  ttg.local_load {0}
-|  |  |- r  S0  {0} [none]        ; e7 tail: release count 1
-|  |  |- a  S0(2)  {2}            ; e6/e7 head: next inner-loop token
-|  |  |- EXIT ... yield{a S0}
-|  |- r  S4  {2} [none]           ; e2 tail
-|  |- a  S4  {3}                  ; e2 head
-|  |- EXIT ... yield{a S4}
-SEMAS: S0{count=2} S1{count=1} S2{count=1} S3{count=1} S4{count=1 entry inherit={@0.3}}
+owner          owner of the token at the region boundary
+exits          final token-producing node on each path;
+               null means that path passes the input token through
+concreteSema   semaphore used when a result cannot inherit an input channel
 ```
 
-The parent and child remain separate DAG levels, but both levels use `S0`.
-These diagrams include the release and acquire nodes added during conversion.
-In the parent DAG, the single `r S0(2) {3}` supplies both releases required by
-the initial `a S0(2) {2}`:
+Region results are planned from inner regions to outer regions. The parent
+treats a finished child as one token-producing node; it does not inspect the
+child operations again.
+
+For a loop, the pass chooses between two observable IR shapes:
 
 ```text
-parent protocol DAG
+carry the token
+  %result = for iter_args(%token = %entry) { ... yield %next }
 
-                               a S4 root
-                                   | walk
-                            ENTER outer(0)
-                                   | walk
-                               W m0 {3}
-                                   | walk
-                                   v
-                            r S0(2) {3}
-                                   | S0
-                                   v
-                             a S0(2) {2}
-                                   | walk
-                                   v
-                 [for summary P0:W:{2}]
-                                   | walk
-                                   v
-                               r S4 {2}
-                                   | S4
-                                   v
-                               a S4 {3}
-                                   | walk
-                                   v
-                            EXIT outer(0)
+acquire at the first buffer use
+  for { %token = acquire S; ... }
 ```
 
-In the child DAG, `r S0 {1}` and `r S0 {0}` each supply one release to the
-bottom `a S0(2) {2}`. `EXIT inner(i)` yields that token to
-`ENTER inner(i+1)`:
+A final nested loop can also provide the needed token, so an outer loop may
+need no token result of its own.
+
+### Region results
+
+`summarizeRegionFlow` finds the final acquire or token-producing child on
+each path. All live paths must return the same owner. A path with no such node
+passes the incoming token when the region has a uniform entry owner.
+
+Emission selects one semaphore for the region result. A loop keeps its input
+semaphore. An `if` normally does the same; when the input is an unpartitioned
+entry acquire, a concrete semaphore from a live path can name the result.
+Without a usable input semaphore, the concrete semaphore names it. This
+allows:
+
+- both branches to return fresh tokens;
+- one branch to return a fresh token while the other passes the input; and
+- an `if` without `else` to pass the input on its implicit path.
+
+A pass-through path without an input token is not a valid token result.
+`pruneDeadIfFlows` removes an `if` token result when no buffer, release, or
+token-producing child uses it before the next acquire, provided the enclosing
+region does not itself retain a token result.
+
+A child is transparent to its parent only when it enters and returns the same
+owner and no buffer access, release, or token-producing child follows its
+final returned token on any path. Such a child can provide the parent's final
+token without exposing its internal operations.
+
+### Example: an `if` returns one owner's token
+
+`test/NVWS/insert_semas_conditional_multi_result.mlir`
+`@conditional_multi_result_if_token` has a buffer owned by `{1}` around an
+`if`. The then path lends it to `{0}` and returns it; the else path does
+nothing.
+
+Input shape:
 
 ```text
-child protocol DAG
-
-                              ENTER inner(i) {2}
-                                       | walk
-                                       v
-                                  r S1 {2}
-                             +---------+---------+
-                        walk |                   | S1
-                             v                   v
-                       R m0 {2}             a S1 {1}
-                             | walk              | walk
-                             v                   v
-                        r S2 {2}             R m0 {1}
-                          S2 |                   | walk
-                             +---------+---------+
-                                       v
-                                  a S2 {1}
-                                       | walk
-                                       v
-                                  W m0 {1}
-                                       | walk
-                                       v
-                                  r S3 {1}
-                             +---------+---------+
-                        walk |                   | S3
-                             v                   v
-                        r S0 {1}             a S3 {0}
-                          S0 |                   | walk
-                             |                   v
-                             |               R m0 {0}
-                             |                   | walk
-                             |                   v
-                             |               r S0 {0}
-                             |                   | S0
-                             +----------+--------+
-                                        v
-                                  a S0(2) {2}
-                                        | walk
-                                        v
-                               EXIT inner(i) {2}
-                                        | carried token
-                                        v
-                              ENTER inner(i+1) {2}
+%in = token owned by {1}
+W m0 [%in] {1}
+%out = if %cond {
+  R m0 {0}
+  yield token returned to {1}
+} else {
+  yield %in
+}
+release ..., %out {1}
 ```
 
-## Region flows
-
-### Why this is needed
-
-After edges become acquires and releases, a `for` or `if` may have a token at
-its entry and a token on each exit. `RegionFlow` summarizes those tokens so the
-parent can handle the region as one node. The parent does not walk the child's
-operations again.
-
-For a loop, the same summary also records one of three decisions:
+The SYNC-DAG token plan is shown below. EMIT-IR can subsequently split this
+shape into scheduler-safe release, body, and acquire conditionals, as shown in
+[Scheduler-safe conditional boundaries](emit-ir.md#scheduler-safe-conditional-boundaries).
 
 ```text
-mode           dump label                    planned loop token
-CARRIED        gated(...) or gated           iter-arg and result
-POINT_OF_USE   pointofuse->op                none
-CHILD_OWNS     passthrough-drop              none; final child owns the protocol
+%out = if %cond -> token {
+  release TO_READER, %in {1}
+  %read = acquire TO_READER {0}
+  %view = semaphore.buffer TO_READER, %read
+  R m0 [%view] {0}
+  release BACK, %read {0}
+  %returned = acquire BACK {1}
+  yield %returned
+} else {
+  yield %in
+}
+release NEXT, %out {1}
 ```
 
-Later dead-token cleanup can remove a CARRIED slot if both its iter-arg and
-result become dead. `thread{{...}}` only says the region has a `RegionFlow`;
-it does not by itself mean that a loop carries a token.
+The region boundary owner is `{1}` on both paths. The then path returns a
+fresh token; the else path returns the input token.
 
-A loop with no internal acquire and no child flow needs none of these
-decisions. One hold can cover the whole loop:
+### Moving an acquire to its first use
+
+`planLoop` can remove a loop token when the final token of iteration `i` is
+needed first at one buffer access in iteration `i+1`. The acquire moves to
+that first access.
+
+`test/NVWS/insert_semas.mlir` `@local_reg_and_smem_use` begins with this
+balanced carried protocol:
 
 ```text
-%t = a S0 {1}
+%entry = acquire EMPTY root
+for iter_args(%token = %entry) {
+  W m0 [%token] {0}
+  release FULL0, %token {0}
+
+  %r = acquire FULL0 {1}
+  R m0 [%r] {1}
+  release FULL1, %r {1}
+
+  %w = acquire FULL1 {2}
+  W m0 [%w] {2}
+  release EMPTY, %w {2}
+
+  %next = acquire EMPTY {0}
+  yield %next
+}
+```
+
+Nothing uses `%next` after its acquire. The first demand is the next
+iteration's `{0}` write, so the loop becomes:
+
+```text
 for {
-  W acc [%t] {1}
-}
-r S1 %t {1}
-```
+  %token = acquire EMPTY {0}
+  %view0 = semaphore.buffer EMPTY, %token
+  W m0 [%view0] {0}
+  release FULL0, %token {0}
 
-### Region summaries
+  %r = acquire FULL0 {1}
+  %view1 = semaphore.buffer FULL0, %r
+  R m0 [%view1] {1}
+  release FULL1, %r {1}
 
-`summarizeRegionFlow` runs from inner regions to outer regions. It records one
-boundary owner, each path's returned token or input pass, the semaphore to use
-when no input token exists, and the combined schedule needed by the later
-stage check. For a loop it also records the decision from the table above.
-
-If the region has an input token, EMIT-IR uses its semaphore for the result.
-Without an input token, it uses the semaphore recorded for a fresh result.
-This supports an `if` whose branches return fresh tokens from different
-semaphores, and an `if` whose one branch returns a fresh token while the other
-passes the input. A pass-through path without an input token is invalid.
-
-Consider `test/NVWS/insert_semas_conditional_multi_result.mlir`
-`@conditional_multi_result_if_token`. Its trimmed OWNER-DAG is:
-
-```text
-|- scf.for pieces{P0:W:{1}}
-|  |- ENTER pieces{P0:W:{1}}
-|  |- W m0  ttng.tc_gen5_mma {1}
-|  |- scf.if pieces{P0:R:{1}}
-|  |  |- then
-|  |  |  |- ENTER pieces{P0:R:{1}}
-|  |  |  |- R m0  ttng.tmem_load {0}
-|  |  |  |- EXIT pieces{P0:R:{1}}
-|  |  |- else
-|  |  |  |- ENTER
-|  |  |  |- EXIT
-|  |- EXIT pieces{P0:W:{1}}
-```
-
-The `if` is owned by `{1}` at its boundary even though its then branch hands
-the buffer to `{0}`. The matching SYNC-DAG shows the handoff back to `{1}`:
-
-```text
-|- a S1 {1}
-|- W m0  ttng.tc_gen5_mma {1}
-|- scf.if pieces{P0:R:{1}} thread{{1}}
-|  |- then
-|  |  |- ENTER pieces{P0:R:{1}}
-|  |  |- r S0 {1}
-|  |  |- a S0 {0}
-|  |  |- R m0  ttng.tmem_load {0}
-|  |  |- r S1 {0}
-|  |  |- a S1 {1}
-|  |  |- EXIT pieces{P0:R:{1}} yield{a S1}
-|  |- else
-|  |  |- ENTER
-|  |  |- EXIT yield{pass}
-|- r S1 {1}
-```
-
-The parent sees one `if` node returning owner `{1}`: a fresh token on the then
-path and the input token on the else path. The child owns the
-`{1}->{0}->{1}` handoff. The parent may still emit its ordinary closing
-release after the `if`, as above.
-
-A region is `transparent` only when the boundary owner is restored and no
-group access or protocol node follows the final returned token on any path.
-That lets a parent use the child as its final recurrence node. Different
-returned owners, a non-empty final node that cannot return a token, or an
-invalid transfer are hard verification errors. An empty path may pass the
-input token. These cases are not changed to CARRIED. The recorded schedule is
-consulted only by the stage check described below.
-
-<a id="the-decision-per-region"></a>
-
-### The loop decision
-
-`planLoopFlow` makes the decision from the loop's `RegionFlow` and its direct
-chain. It does not inspect child operations.
-
-1. The loop must be in an eligible tagged WS scope, and its enclosing regions
-   must allow the token slot to be removed.
-2. The final token must come from an acquire or a transparent child region. If
-   the final child loop already owns the protocol, choose CHILD_OWNS.
-3. If a group access, release, or child flow follows that final token, choose
-   CARRIED and print `gated(trailing-use)`.
-4. The pass must find an input acquire with the same owner. If operations
-   before the loop still use that token, the plan must have one copy.
-5. The input and body semaphores must match, or the pass must be able to add
-   the required release.
-6. The pass must find the first body use. If the final token comes from an
-   acquire, its closing release must exist; if it comes from a child, the pass
-   adds one.
-7. When a plain inner loop also needs an acquire after the loop, its known body
-   and exit stages must agree.
-8. Otherwise the pass places the acquire before the first use, removes the
-   loop token, and adds any required acquire or release immediately outside
-   the loop.
-
-A failed check keeps CARRIED. `trailing-use` and the nested-exit
-`result-consumed` case are named in the dump; other failures print bare
-`gated`. Invalid returned tokens or owners fail verification instead.
-
-### Point of use
-
-`test/NVWS/insert_semas.mlir` `@local_reg_and_smem_use` starts with this
-carried protocol:
-
-```text
-%t0 = a S2 root
-for (%t = %t0) {
-  W m0 [%t]  ttg.local_store {0}
-  r S0 %t {0}
-  %t1 = a S0 {1}
-  R m0 [%t1] ttg.local_load {1}
-  r S1 %t1 {1}
-  %t2 = a S1 {2}
-  W m0 [%t2] use_smem {2}
-  r S2 %t2 {2}
-  %next = a S2 {0}
-  yield %next
+  %w = acquire FULL1 {2}
+  %view2 = semaphore.buffer FULL1, %w
+  W m0 [%view2] {2}
+  release EMPTY, %w {2}
 }
 ```
 
-Nothing uses `%next` at the end of this iteration. Its first use is the store
-at the head of the next iteration. The pass moves `a S2` there and removes the
-loop token:
+`EMPTY` is initially released, so the in-body acquire succeeds on iteration
+zero. Every iteration releases it for the next one.
+
+The move is allowed only when the pass can match one input token, one final
+token, and one first demand without crossing another acquire, release, or
+incompatible region. In particular:
+
+- the loop is inside an eligible tagged WS scope and not hidden behind an
+  enclosing `if` boundary;
+- the final node is an acquire or a child that returns the boundary owner;
+- no buffer access, release, or token-producing child follows it;
+- the incoming token has the same owner and remains available;
+- the first demand is unambiguous and has the needed closing release;
+- a retained buffer use before the loop requires an authored single copy;
+- a plain loop with a sourceful TMEM allocation does not use this move; and
+- any required post-loop token has a compatible stage.
+
+When these conditions do not hold, the loop keeps its token.
+
+### When the loop keeps a token
+
+`test/NVWS/insert_semas_per_edge_tmem.mlir`
+`@tmem_single_producer_multi_consumer_fanout` writes in `{0}`, reads in `{1}`
+and `{2}`, then writes again in `{0}`.
 
 ```text
-|- scf.for (WS, tag=0) ... holdrule{pointofuse->ttg.local_store}
-|  |- a S2 {0}
-|  |- W m0  ttg.local_store {0}
-|  |- r S0 {0} [none]
-|  |- a S0 {1}
-|  |- R m0  ttg.local_load {1}
-|  |- r S1 {1} [none]
-|  |- a S1 {2}
-|  |- W m0  use_smem {2}
-|  |- r S2 {2} [none]
-|  |- EXIT ... yield{native}
-SEMAS: S0{count=1} S1{count=1} S2{count=1 entry inherit={@0.0}}
-```
+%entry = acquire EMPTY pending_count=2 root
+for iter_args(%token = %entry) {
+  W buf [%token] {0}
+  release TO_R1, %token {0}
+  release TO_R2, %token {0}
 
-`S2` is initially released for iteration zero. Each iteration's `r S2`
-supplies the next iteration's in-body acquire.
-
-### Trailing use
-
-In `test/NVWS/insert_semas_per_edge_tmem.mlir`
-`@tmem_single_producer_multi_consumer_fanout`, owner `{0}` writes, owners
-`{1}` and `{2}` read, and `{0}` then writes again:
-
-```text
-%t0 = a S2(2) root
-for (%t = %t0) {
-  W buf [%t] {0}
-  r S0 %t {0}
-  r S1 %t {0}
-
-  %r1 = a S0 {1}
+  %r1 = acquire TO_R1 {1}
   R buf [%r1] {1}
-  r S2 %r1 {1}
+  release EMPTY, %r1 {1}
 
-  %r2 = a S1 {2}
+  %r2 = acquire TO_R2 {2}
   R buf [%r2] {2}
-  r S2 %r2 {2}
+  release EMPTY, %r2 {2}
 
-  %next = a S2(2) {0}
+  %next = acquire EMPTY pending_count=2 {0}
   W buf [%next] {0}
   yield %next
 }
 ```
 
-`%next` protects both the last `{0}` write in iteration `i` and the first
-`{0}` write in iteration `i+1`. Splitting the hold at the loop boundary would
-add a same-owner release/acquire pair:
+`%next` protects both the final write in iteration `i` and the first write in
+iteration `i+1`. Moving its acquire to the next first write would split one
+owner's buffer use across the boundary and require an extra release/acquire
+pair. The loop carries `%next` instead.
 
 ```text
-What removing the loop token would add. Only the end of iteration i and start
-of iteration i+1 are shown. V is illustrative and is not created.
+emitted token path, logically unrolled across the loop backedge
 
-                    %next = a S2(2) {0} at i
-                                  | walk
-                                  v
-                        W buf [%next] {0}
-                                  | walk
-                                  v
-                         r V %next {0}
-                           +------+------------------+
-                      walk |                         | V
-                           v                         |
-                        EXIT(i)                      |
-                           | next iteration           |
-                           v                         |
-                       ENTER(i+1)                    |
-                      walk |                         |
-                           +-----------+-------------+
-                                       v
-                                  %t = a V {0}
-                                       | walk
-                                       v
-                                W buf [%t] {0}
+                   %next = acquire EMPTY(i) {0}
+                                | walk
+                                v
+                         W final(i) [%next] {0}
+                                | walk
+                                v
+                         scf.yield %next
+                                | loop backedge
+                                v
+                    %token = iter_arg(i+1)
+                                | walk
+                                v
+                       W first(i+1) [%token] {0}
 ```
 
-Carrying `%next` removes that pair:
+The count-2 `EMPTY` semaphore is the real fan-in from readers `{1}` and
+`{2}`. No extra boundary semaphore is folded into it.
+
+### A use after the loop
+
+A token needed after the loop does not always force a loop-carried token. The
+pass can acquire the final released semaphore once after the loop:
 
 ```text
-What the pass emits for the same two operations.
-
-                    %next = a S2(2) {0} at i
-                                  | walk
-                                  v
-                        W buf [%next] {0}
-                                  | walk
-                                  v
-                       EXIT(i) yield %next
-                                  | next iteration
-                                  | carried token
-                                  v
-                  ENTER(i+1) iter-arg %t = %next
-                                  | walk
-                                  v
-                           W buf [%t] {0}
-```
-
-The pass therefore emits CARRIED directly:
-
-```text
-|- a S2(2) root ; entry
-|- scf.for (WS, tag=0) ... holdrule{gated(trailing-use)}
-|  |- W m0  ttng.tmem_store {0}
-|  |- r S0 {0}
-|  |- r S1 {0}
-|  |- a S0 {1}
-|  |- R m0  ttng.tmem_load {1}
-|  |- r S2 {1}
-|  |- a S1 {2}
-|  |- R m0  ttng.tmem_load {2}
-|  |- r S2 {2}
-|  |- a S2(2) {0}
-|  |- W m0  ttng.tmem_store {0}
-|  |- EXIT ... yield{a S2}
-```
-
-`hasTrailingCompUse` checks for any group access, release, or child flow after
-the final token, so `gated(trailing-use)` names the check; it does not by itself
-prove the same-owner shape above.
-
-`S2` is the real count-two fan-in from the two readers. The illustrative `V`
-must not be folded into `S2`; doing so would change the pending count.
-
-### Use after the loop
-
-Using the loop result after the loop does not always require CARRIED. The pass
-can add one acquire after a POINT_OF_USE loop:
-
-```text
-%entry = a S0 {1}
+%entry = acquire READY {1}
 W buf [%entry] {1}
-r S1 %entry {1}
+release TO_READER, %entry {1}
 
 for {
-  %t = a S1 {2}
-  R buf [%t] {2}
-  r S2 %t {2}
+  %read = acquire TO_READER {2}
+  R buf [%read] {2}
+  release TO_WRITER, %read {2}
 
-  %u = a S2 {1}
-  W buf [%u] {1}
-  r S1 %u {1}
+  %write = acquire TO_WRITER {1}
+  W buf [%write] {1}
+  release TO_READER, %write {1}
 }
 
-%final = a S1 {2}              ; postLoopAcquire
-r S3 %final {2}                ; once, after the loop
-%v = a S3 {3}
-R buf [%v] {3}
+%final = acquire TO_READER {2}
+release AFTER_LOOP, %final {2}
+%consumer = acquire AFTER_LOOP {3}
+R buf [%consumer] {3}
 ```
 
-For a non-empty loop, `%final` waits for the last iteration's `r S1`. For a
-zero-trip loop, it waits for the `r S1` placed before the loop.
+For a non-empty loop, `%final` waits for the final iteration. For a zero-trip
+loop, it waits for the release before the loop. `postLoopAcquire` marks this
+synthetic acquire so schedule finalization uses the correct owner boundary.
 
-When the final token comes from a child and the same semaphore is also needed
-after the loop, the pass keeps the loop token and prints
-`gated(result-consumed):nestedExit`. Other failed checks print bare `gated`.
+If a final child supplies the loop token and that token is also consumed
+after the loop, the loop retains the token instead of taking it away from the
+child result.
 
 ### Nested loops
 
-Region flows are decided from inner to outer. After an inner loop is decided,
-the parent sees only its updated summary.
-
-In `test/NVWS/insert_semas_nested_ws_inner_loop.mlir`
-`@nested_ws_inner_loop`, the inner loop becomes POINT_OF_USE. The outer loop
-had only forwarded that token, so it chooses CHILD_OWNS and drops its slot:
+Region planning runs from inner loops to outer loops. In
+`test/NVWS/insert_semas_nested_ws_inner_loop.mlir`
+`@nested_ws_inner_loop`, the inner loop acquires at its first MMA. The outer
+loop only forwarded that token, so it needs no token slot:
 
 ```text
-|- scf.for (WS, tag=0) ... holdrule{passthrough-drop:nestedExit}
-|  |- scf.for ... holdrule{pointofuse->ttng.tc_gen5_mma}
-|  |  |- a S1 {1}
-|  |  |- W m0  ttng.tc_gen5_mma {1}
-|  |  |- r S0 {1} [tc5mma]
-|  |  |- a S0 {0}
-|  |  |- R m0  ttng.tmem_load {0}
-|  |  |- r S1 {0} [none]
-|  |  |- EXIT ... yield{native}
-|  |- EXIT ... yield{drop}
+outer for {
+  inner for {
+    %mma = acquire MMA_READY {1}
+    %acc = semaphore.buffer MMA_READY, %mma
+    W acc [%acc] {1}
+    release ACC_FULL, %mma [tc5mma] {1}
+
+    %read = acquire ACC_FULL {0}
+    %view = semaphore.buffer ACC_FULL, %read
+    R acc [%view] {0}
+    release MMA_READY, %read {0}
+  }
+}
 ```
 
-`@nested_ws_inner_loop_parent_continuation` adds a read after the inner loop.
-The inner acquire stays at the MMA. The post-loop `a S1` starts the handoff to
-the outer read; `a S2` supplies the token used by that read. The final `r S1`
-supplies the next outer iteration:
+`@nested_ws_inner_loop_parent_continuation` adds an outer read after the inner
+loop. The inner loop still acquires at its first MMA. A post-loop acquire and
+release connect the inner protocol to the outer read. A final acquire and
+release in the outer body return the permit to the next inner loop. Neither
+loop needs a semaphore token slot:
 
 ```text
-|- func @nested_ws_inner_loop_parent_continuation
-|  |- a S3 root ; entry
-|  |- scf.for (WS, tag=1) ... holdrule{gated(trailing-use)}
-|  |  |- scf.for ... holdrule{pointofuse->ttng.tc_gen5_mma:postLoopAcquire:entryBridge}
-|  |  |  |- a S1 {1}
-|  |  |  |- W m0  ttng.tc_gen5_mma {1}
-|  |  |  |- r S0 {1} [tc5mma]
-|  |  |  |- a S0 {0}
-|  |  |  |- R m0  ttng.tmem_load {0}
-|  |  |  |- r S1 {0} [none]
-|  |  |  |- EXIT ... yield{native}
-|  |  |- a S1 {1}                 ; postLoopAcquire
-|  |  |- r S2 {1} [tc5mma]
-|  |  |- a S2 {0}
-|  |  |- R m0  ttng.tmem_load {0}
-|  |  |- r S3 {0} [none]
-|  |  |- a S3 {1}
-|  |  |- r S1 {1} [none]          ; entryBridge
-|  |  |- EXIT ... yield{a S3}
+%outer_entry = acquire OUTER_EMPTY root
+
+outer for {
+  inner for {
+    %mma = acquire LOCAL_EMPTY {1}
+    ... MMA {1}, read {0} ...
+    release LOCAL_EMPTY, %read {0}
+  }
+
+  %bridge = acquire LOCAL_EMPTY {1}
+  release OUTER_FULL, %bridge [tc5mma] {1}
+  %outer_read = acquire OUTER_FULL {0}
+  %outer_view = semaphore.buffer OUTER_FULL, %outer_read
+  R acc [%outer_view] {0}
+  release OUTER_EMPTY, %outer_read {0}
+
+  %tail = acquire OUTER_EMPTY {1}
+  release LOCAL_EMPTY, %tail {1}
+}
 ```
 
-The inner and outer decisions are independent: the inner loop is
-POINT_OF_USE; the outer loop keeps its carried token because it has a trailing
-use.
+The root acquire seeds the outer cycle without becoming a loop argument. The
+inner and outer decisions are independent, and the parent consumes only the
+finished inner summary.
 
-### Dump labels
+### Branch completion must agree
 
-`holdrule` prints the loop decision:
+Token ownership can agree across an `if` while the completion schedule does
+not. `completionAfterChain` records, for one owner, whether each path uses the
+incoming completion or establishes a new completion and, when new, its
+`(loop.stage, loop.cluster)`.
+
+`test/NVWS/insert_semas_nested_carrier.mlir`
+`@branch_completion_requires_carrier` has this inner loop:
 
 ```text
-pointofuse->op
-    acquire moved to the first use; no loop token
+%result = for iter_args(%ready = %pre_loop) {
+  %first = MMA acc[%ready] {1}              stage 0, cluster 1
 
-passthrough-drop
-    CHILD_OWNS; the parent returns no token because its final child returns none
+  %branch = if %cond -> token {
+    %second = MMA acc[%first] {1}           stage 1, cluster 2
+    release BRANCH_FULL, %ready [tc5mma]
+    %read = acquire BRANCH_FULL {0}         stage 1, cluster 3
+    R acc [%read] {0}
+    release BRANCH_BACK, %read {0}
+    %returned = acquire BRANCH_BACK {1}     stage 1, cluster 2
+    yield %returned
+  } else {
+    yield %ready                            incoming stage-0 completion
+  }
 
-gated(trailing-use)
-    CARRIED; an access, release, or child flow follows the final token
-
-gated(result-consumed)
-    CARRIED; the nested final node needs an acquire after the loop
-
-gated
-    CARRIED; another check failed
+  release FINAL_FULL, %branch [tc5mma] {1}
+  %final = acquire FINAL_FULL {0}
+  R acc [%final] {0}
+  release READY, %final {0}
+  %next = acquire READY {1}
+  yield %next
+}
 ```
 
-Suffixes add details to any mode:
+The then path establishes a stage-1 completion for `{1}`. The else path
+passes the stage-0 completion into the `if`. There is no single completion
+schedule that can be moved to the first stage-0 MMA. The loop therefore keeps
+`%ready` as an iter-arg and yields `%next` for the next iteration.
 
-```text
-:nestedExit          final token comes from a child region
-:postLoopAcquire     an acquire was added after the loop
-:entryBridge         a release was added to supply the first body acquire
-```
+An absent `else` is also a pass-through path. A loop that may execute zero
+times likewise joins its body result with the incoming completion. This keeps
+the decision valid for every control-flow path, not only the last path visited.
 
 ## Backing copies
 
-`computeBackingPlan` chooses the number of copies. `buffer.copy`, when
-present, is authoritative: `@fused_alias_depth_two` (worked below in
-[Alias handoffs](#non-circular-alias-handoffs))
-carries it on its allocation —
+`computeBackingCopies` chooses physical buffer copies. A synchronized group
+with authored `buffer.copy` uses that value. Otherwise it starts with one
+copy.
+
+On the default NVWS path, a synchronized TMEM accumulator can use two copies
+when every direct-loop MMA user passes these checks:
+
+- the accumulator is not read-modify-written by the loop;
+- accumulator multibuffering is structurally possible;
+- the enclosing WS loop permits it;
+- two copies fit in the available TMEM blocks; and
+- a scaled MMA with block N of 256 is not used.
+
+Meta-NVWS does not add this automatic TMEM copy. An inconsistent or
+non-positive authored `buffer.copy` in one reuse group is an error.
+
+Semaphore copies are computed separately by `computeSemaphoreCopies`.
+Usually they equal buffer copies. A local backing with no authored
+`buffer.copy` and a TMA-load release uses at least the number of semaphore
+stages requested by `LowerSemaphore`:
 
 ```text
-%m0 = ttg.local_alloc {buffer.copy = 2, buffer.id = 500}
+numSemaphoreCopies = max(1, lowerSemaphoreNumStages)
 ```
 
-— and its dump closes with that number taken straight from it:
+This does not change the backing's `numCopies`; it ensures schedule and stage
+analysis see the semaphore copies that lowering will create.
+
+For example, `@root_entry_accumulator_adopts_without_semaphore_handoff` in
+`test/NVWS/insert_semas_root_entry_tmem.mlir` has one eligible MMA user and
+fits two accumulator copies, so its synchronized TMEM backing uses two
+copies.
+
+By contrast, the `buffer.id = 102` group in
+`test/NVWS/insert_semas.mlir` `@local_release_after_mma` keeps one local
+backing copy while its descriptor-load release gives the semaphore the
+lowering stage count:
 
 ```text
-BACKING: numCopies=2
-```
+W m0  nvws.descriptor_load {0}
+release FULL [tma_load] {0}
 
-Without `buffer.copy`, `numCopies` starts at 1 and nothing lowers it. Two
-rules can change what the later analyses see.
-
-First, synchronized TMEM may receive two copies, only on the default NVWS
-path (see [Two NVWS paths](../nvws-aws-overview.md#two-nvws-paths));
-Meta-NVWS adds no TMEM copies of its own. The decision is a trace over the
-group's MMA users, run here on the
-`@root_entry_accumulator_adopts_without_semaphore_handoff` group in
-`test/NVWS/insert_semas_root_entry_tmem.mlir`.
-Follow its one MMA user, `ttng.tc_gen5_mma {2}`: it sits directly in the
-WS `scf.for`; the `128x128xf32` accumulator is not read-modify-written in
-that loop; accumulator multibuffering is structurally possible; the loop
-carries no disallow-multibuffer flag; and two copies
-(`2 * 128 * 128 = 32768` cells) fit TMEM's 128x512 cells alongside the
-TMEM blocks already planned — every check passes, and the group's dump
-closes with the line shown in its figure:
-
-```text
-BACKING: numCopies=2
-```
-
-The checklist that trace ran (`isMultiBufferedGroup`), for every MMA user of
-the group's allocations whose immediate parent is an `scf.for`: the
-accumulator is not read-modify-written in that loop
-(`hasAccReadModifyWrite`), accumulator multibuffering is structurally
-possible (`isAccMultibufferingPossible`), the enclosing WS loop does not
-carry the disallow-multibuffer flag, and `canDoubleBufferAcc` — two copies
-of the `blockM x blockN` accumulator still fit TMEM's 128x512 cells
-alongside the TMEM blocks already planned, and the op is not a scaled MMA
-with `blockN` 256.
-
-Second, a local backing written by a TMA load records the number of semaphore
-copies that `LowerSemaphore` will give it (`g.numSemaphoreCopies = max(1,
-lowerSemaphoreNumStages)`; see the
-[pass order](../nvws-aws-overview.md#pass-order)), so the loop-carried
-dependency analysis below sees the copies that will actually exist. This is a
-separate field next to `numCopies`, and the dump does not print it —
-`test/NVWS/insert_semas.mlir` `@local_release_after_mma` (its `buffer.id
-= 102` group) is this shape, and its `BACKING` line still reads
-`numCopies=1`:
-
-```text
-|- W m0  nvws.descriptor_load {0}
-|- r  S0  {0} [tma_load]        <- the TMA-load release that triggers the rule
-   ...
-BACKING: numCopies=1            <- numCopies is unchanged;
-                                   numSemaphoreCopies is not a dump field
+numCopies = 1
+numSemaphoreCopies = max(1, lowerSemaphoreNumStages)
 ```
 
 ## Pipeline schedule
 
-InsertSemas runs after the loop schedule is chosen and before software
-pipeline expansion. It adds acquire, buffer, and release operations to an
-already scheduled loop. Before EMIT-IR, SYNC-DAG assigns schedules to the new
-operations and, when required, raises `loop.cluster` on existing operations so
-every handoff remains ordered after expansion. It never changes `loop.stage`.
+InsertSemas receives loops whose existing operations already have
+`loop.stage` and `loop.cluster`. It assigns schedules to new acquire and
+release nodes. EMIT-IR later copies each access schedule to the semaphore
+buffer that serves it. When a semaphore handoff would be ordered backwards
+after pipeline expansion, schedule finalization raises `loop.cluster` on
+affected operations. It does not change `loop.stage`.
 
-### Minimal pipeliner model
+### Minimal pipeline model
 
-`loop.stage` controls which logical loop iterations overlap. For example, a
-stage-1 operation from iteration `i` meets a stage-0 operation from iteration
-`i+1` in one expanded loop body:
+`loop.stage` determines which logical iterations share an expanded loop body:
 
 ```text
 before expansion
 
-iteration i:       W(i) [loop.stage 0]  ...  R(i) [loop.stage 1]
-iteration i+1:     W(i+1) [loop.stage 0] ... R(i+1) [loop.stage 1]
+iteration i:       W(i)   stage 0  ...  R(i)   stage 1
+iteration i+1:     W(i+1) stage 0  ...  R(i+1) stage 1
 
-after expansion: one loop body contains
+one expanded body
 
-                   W(i+1) [loop.stage 0]
-                   R(i)   [loop.stage 1]
+                   W(i+1) stage 0
+                   R(i)   stage 1
 ```
 
-The schedule builder orders lower `loop.cluster` values first, then preserves
-block order within one cluster, before passing the result to PipelineExpander.
-A loop-carried dependency's `distance` is the number of logical iterations
-from its producer to its consumer. Those three facts are the complete
-pipeliner model needed here.
+Within one stage, lower `loop.cluster` executes first. Block order breaks ties
+inside one cluster. A loop-closing semaphore may therefore connect operations
+that appear in different source iterations but execute in the same expanded
+body.
 
-The preexisting schedule has no SSA use from `R(i)` to `W(i+1)`. SYNC-DAG may
-nevertheless require that ordering because `W(i+1)` reuses the buffer copy
-that `R(i)` is finishing:
+Every emitted handoff keeps a `ProtocolArc` with:
 
 ```text
-required handoff:  R(i) -> r S  ...  a S -> W(i+1)
-
-local inheritance can produce this expanded order:
-
-cluster 1:  a S -> W(i+1)
-cluster 2:  R(i) -> r S          <- the required producer is later
+release    generated release node
+acquire    generated acquire node
+producer   source access or region
+consumer   destination access or region
+wait       acquire that currently represents the wait for scheduling
 ```
 
-Copying the schedule of the access immediately after an acquire to that
-acquire, and the schedule of the access immediately before a release to that
-release, is not enough.
+This record lets schedule finalization reason from the physical producer to
+the physical consumer even after token placement has moved an acquire.
 
 ### Example: one-copy loop-closing handoff
 
 `test/NVWS/insert_semas_recurrence_schedule.mlir`
-`@one_slot_recurrence` makes the failure concrete. `EMPTY` protects the next
-write, and `FULL` protects the following read:
+`@one_slot_recurrence` uses `EMPTY` to protect the next write and `FULL` to
+protect the following read. `(s,c)` below is `(loop.stage, loop.cluster)`.
+
+Copying schedules only from adjacent accesses gives:
 
 ```text
-Each (s, c) is (loop.stage, loop.cluster).
-
-final-read(i)      {1}  (1, 2)
-r EMPTY(i)         {1}  (1, 2)
-a EMPTY(i+1)       {3}  (0, 1)
-W(i+1)             {3}  (0, 1)
-r FULL(i+1)        {3}  (0, 1)
-a FULL(i+1)        {1}  (0, 1)
-first-read(i+1)    {1}  (0, 1)
+final-read(i)      owner {1}  (1,2)
+release EMPTY(i)   owner {1}  (1,2)
+acquire EMPTY(i+1) owner {3}  (0,1)
+W(i+1)             owner {3}  (0,1)
+release FULL(i+1)  owner {3}  (0,1)
+acquire FULL(i+1)  owner {1}  (0,1)
+first-read(i+1)    owner {1}  (0,1)
 ```
 
-Here `first-read(i+1)` is the first read of the backing copy in logical
-iteration `i+1`; `final-read(i)` is the last read of that same copy in the
-preceding logical iteration `i`. Pipeline expansion puts the stage-0 accesses
-`W(i+1)` and `first-read(i+1)` in the same loop body as the stage-1 access
-`final-read(i)`. Copying the adjacent access schedules produces the following
-top-to-bottom sequence for each owner:
+Grouped by owner in expanded execution order, both owners block before they
+can execute the release needed by the other:
 
 ```text
-WRONG
+wrong protocol schedule
 
-owner {3}, top to bottom:
+owner {3}
+  acquire EMPTY(i+1) (0,1)   waits for release EMPTY(i)
+  W(i+1)             (0,1)
+  release FULL(i+1)  (0,1)
 
-a EMPTY(i+1)       {3}  (0, 1)  BLOCKED: waits for r EMPTY(i) {1}
-W(i+1)             {3}  (0, 1)  not reached
-r FULL(i+1)        {3}  (0, 1)  not reached
-
-owner {1}, top to bottom:
-
-a FULL(i+1)        {1}  (0, 1)  BLOCKED: waits for r FULL(i+1) {3}
-first-read(i+1)    {1}  (0, 1)  not reached
-final-read(i)      {1}  (1, 2)  not reached
-r EMPTY(i)         {1}  (1, 2)  not reached
+owner {1}
+  acquire FULL(i+1)  (0,1)   waits for release FULL(i+1)
+  first-read(i+1)    (0,1)
+  final-read(i)      (1,2)
+  release EMPTY(i)   (1,2)
 ```
 
-Owner `{3}` blocks at `a EMPTY(i+1)`, waiting for `r EMPTY(i)`. Owner `{1}`
-blocks at `a FULL(i+1)`, waiting for `r FULL(i+1)`. Neither owner can reach the
-release needed by the other.
-
-SYNC-DAG must put `final-read(i) -> r EMPTY(i)` before the next write. It keeps
-the `loop.stage` values fixed and raises `W(i+1)`, `first-read(i+1)`, and their
-same-body SSA users from `loop.cluster 1` to `loop.cluster 3`. The adjacent
-acquires and releases receive those corrected schedules:
+There is one physical copy, so `final-read(i)` must precede `W(i+1)`.
+Schedule finalization raises the stage-0 chain from cluster 1 to cluster 3:
 
 ```text
-CORRECT
+correct protocol schedule
 
-Each (s, c) is (loop.stage, loop.cluster).
+owner {1}
+  final-read(i)      (1,2)
+  release EMPTY(i)   (1,2)
 
-final-read(i)      {1}  (1, 2)
-r EMPTY(i)         {1}  (1, 2)
-a EMPTY(i+1)       {3}  (0, 3)  <- changed from (0, 1)
-W(i+1)             {3}  (0, 3)  <- changed from (0, 1)
-r FULL(i+1)        {3}  (0, 3)  <- changed from (0, 1)
-a FULL(i+1)        {1}  (0, 3)  <- changed from (0, 1)
-first-read(i+1)    {1}  (0, 3)  <- changed from (0, 1)
+owner {3}
+  acquire EMPTY(i+1) (0,3)
+  W(i+1)             (0,3)
+  release FULL(i+1)  (0,3)
+
+owner {1}
+  acquire FULL(i+1)  (0,3)
+  first-read(i+1)    (0,3)
 ```
 
-The same corrected schedule grouped by owner:
+`release EMPTY(i)` can now run and unblock `{3}`. Owner `{3}` writes and
+releases `FULL`, which unblocks `{1}`.
+
+The required loop distance depends on physical copy reuse.
+`computeLoopCarriedDistance` replays writes and reads of the physical set:
 
 ```text
-CORRECT — by owner, top to bottom
-
-owner {3}:
-
-a EMPTY(i+1)       {3}  (0, 3)  waits for r EMPTY(i) {1}
-W(i+1)             {3}  (0, 3)
-r FULL(i+1)        {3}  (0, 3)  releases owner {1}
-
-owner {1}:
-
-final-read(i)      {1}  (1, 2)
-r EMPTY(i)         {1}  (1, 2)  releases owner {3}
-a FULL(i+1)        {1}  (0, 3)  waits for r FULL(i+1) {3}
-first-read(i+1)    {1}  (0, 3)
+one copy:  W(i+1) first reuses the copy released in i      distance 1
+two copies: W(i+2) first reuses that copy                  distance 2
 ```
 
-Now `r EMPTY(i)` unblocks owner `{3}`, which writes and executes `r FULL(i+1)`;
-that release then unblocks owner `{1}`.
-
-With one physical copy, changing `loop.cluster` from 1 to 3 preserves the
-original sequential reuse order, `final-read(i) -> W(i+1)`, after owner
-partitioning and pipeline expansion. It serializes reuse of this backing copy,
-not the entire loop or all work performed by the owners.
-
-This repair is conditional on the number of physical copies, not
-unconditional. `computeLoopCarriedDistance` uses `numSemaphoreCopies` — one
-here, from `buffer.copy = 1` — to find the first future iteration that reuses
-the released copy. With one copy, `W(i+1)` reuses it and the distance is 1, so
-the cluster repair above is required. With `buffer.copy = 2`, `W(i+1)` uses
-the other copy and `W(i+2)` is the first reuse; the distance is 2, the existing
-schedule is valid, and no cluster changes.
+With two copies, the running example has iteration slack and needs no cluster
+change.
 
 ### Finalizing one handoff
 
-Protocol construction and region-flow placement have already decided where the
-release and acquire go. An ordinary handoff now has one of these two shapes:
+Consider only the `EMPTY` handoff before schedules are assigned to its
+protocol nodes:
 
 ```text
-source access completion -> r ... a -> destination access
-source access completion -> r ... a -> scheduled-loop EXIT
+final-read(i)      owner {1}  (1,2)
+release EMPTY(i)   owner {1}  (?,?)
+acquire EMPTY(i+1) owner {3}  (?,?)
+W(i+1)             owner {3}  (0,1)
 ```
 
-In both shapes, the release copies the source completion's schedule. The
-acquire copies the finalized destination-access schedule or the destination
-owner's schedule at `EXIT`. SYNC-DAG determines that destination schedule
-before filling in the release and acquire schedules.
-
-The example above contains an `EMPTY` handoff and a `FULL` handoff. Keep only
-`EMPTY`. Here the acquire was placed immediately before `W(i+1)`. The two
-access schedules are known; the release and acquire schedules are not yet
-assigned:
+The physical-slot replay finds distance 1. After cluster legalization raises
+the consumer chain, the release copies the producer completion schedule and
+the acquire copies the finalized consumer schedule:
 
 ```text
-Each (s, c) is (loop.stage, loop.cluster).
-
-final-read(i)      {1}  (1, 2)
-r EMPTY(i)         {1}  (?, ?)
-a EMPTY(i+1)       {3}  (?, ?)
-W(i+1)             {3}  (0, 1)
+final-read(i)      owner {1}  (1,2)
+release EMPTY(i)   owner {1}  (1,2)
+acquire EMPTY(i+1) owner {3}  (0,3)
+W(i+1)             owner {3}  (0,3)
 ```
 
-First determine when the released physical copy is reused. With one copy,
-`W(i+1)` is the first reuse, so the distance is 1. At that distance,
-stage-1 `final-read(i)` and stage-0 `W(i+1)` land in the same expanded loop
-body. Their clusters are backwards: cluster 1 places the write before the
-cluster-2 final read.
+For an async producer, the release copies the schedule of its physical
+completion, not necessarily the access operation itself. A semaphore buffer
+copies the schedule of the access it serves.
 
-SYNC-DAG therefore raises the stage-0 chain to cluster 3. Only after that
-repair does it fill in the two unknown schedules: the release copies
-`final-read(i)`'s physical-completion schedule, and the acquire copies the
-finalized schedule of `W(i+1)`:
-
-```text
-final-read(i)      {1}  (1, 2)
-r EMPTY(i)         {1}  (1, 2)
-a EMPTY(i+1)       {3}  (0, 3)
-W(i+1)             {3}  (0, 3)
-```
-
-When the acquire is placed before an access, an in-iteration handoff has
-distance 0. For a loop-closing handoff, `computeLoopCarriedDistance` finds the
-first future iteration in which that access reuses the physical copy released
-by the source access.
-
-A handoff cannot be classified from those two stages alone. Its owners execute
-independently, so an acquire that appears early may block while its producer
-continues to the release. Let `offset[P]` be the whole-iteration delay of owner
-`P`. For a release by `P` at stage `before`, followed at loop distance
-`distance` by an acquire owned by `Q` at stage `after`, correctness requires:
+Owners execute independently. Let `offset[P]` be the whole-iteration delay
+of owner P. A release by P at stage `before`, followed at loop distance
+`distance` by an acquire owned by Q at stage `after`, requires:
 
 ```text
 offset[Q] >= offset[P] + before - after - distance
 ```
 
-The term on the right after `offset[P]` is the handoff's required owner delay.
-A positive delay on one handoff is legal backpressure. The owner offsets are
-infeasible only when the complete owner graph contains a cycle whose required
-delays sum to a positive value: every owner in that cycle would have to run
-later than itself. SYNC-DAG solves all handoff constraints for the scheduled
-loop together and rejects that owner-offset failure. A feasible zero-delay
-cycle still proceeds to cluster legalization, which rejects it if its
-same-wave operation order is itself cyclic.
-
-Per-partition stage normalization does not change this proof. Subtracting a
-constant stage from every operation of one owner is the same as adding that
-constant to its `offset`; owner offsets cancel around every cycle.
-
-After solving the offsets, a handoff either has iteration slack or is tight:
+`solveOwnerScheduleConstraints` solves all handoffs in one scheduled loop
+together. The useful cycle cases are:
 
 ```text
-adjusted delay < 0
-    an earlier iteration supplies the token; normally no cluster change
-
-adjusted delay = 0 and the edge lies on a tight owner cycle
-    the handoff is in the same expanded wave; repair loop.cluster
-
-positive-delay owner cycle
-    no owner offsets can satisfy the schedule; compilation fails
+cycle total < 0    feasible cycle with iteration slack
+cycle total = 0    same expanded wave; tight handoffs require cluster order
+cycle total > 0    every owner would need to run later than itself; error
 ```
 
-`legalizeLoopSchedule` orders every tight-cycle handoff, together with its
-same-body SSA users. This includes the direct stage equality in the running
-example and a retimed equality such as delays `+1` and `-1` around the same
-owner cycle. A directly zero-delay handoff also retains the existing local
-cluster repair when it is not part of a cycle, including when another owner
-constraint gives that edge adjusted iteration slack. The repair never changes
-`loop.stage`. For an asynchronous access, the release uses the schedule of its
-physical completion. A semaphore buffer uses the schedule of the access it
-serves. EMIT-IR only transcribes these decisions.
+A negative cycle is feasible because it has iteration slack. An individual
+zero-delay handoff on that cycle can still need cluster ordering.
 
-The representative cycles are:
+A positive delay on one edge is legal when the reverse path has enough
+negative delay. For example, a `+1` edge and `-3` return edge form a legal
+`-2` cycle. `test/NVWS/insert_semas_recurrence_owner_cycle.mlir` covers that
+shape.
 
-```text
-two-copy running example: EMPTY -1, FULL 0, cycle -1
-    -> iteration slack; unchanged
+`legalizeLoopSchedule` combines every zero-delay handoff, handoffs on tight
+zero-delay cycles, and same-stage SSA edges. It raises clusters to satisfy
+those constraints. A cycle in this same-wave order is an error. Stage values
+remain unchanged.
 
-one-copy running example: EMPTY 0, FULL 0, cycle 0
-    -> tight cycle; repair loop.cluster
-
-errors twin: EMPTY +1, FULL 0, cycle +1
-    -> impossible owner delays; compilation fails
-
-four-slot/two-advance ring: EMPTY +1, FULL -3, cycle -2
-    -> legal cross-partition backpressure; unchanged
-```
-
-The last case is the shape in
-`test/NVWS/insert_semas_recurrence_owner_cycle.mlir`: the positive `EMPTY`
-edge is not itself an error because the reverse `FULL` edge leaves two
-iterations of credit in the complete cycle.
-
-If the acquire remains at the bottom of iteration `i`, its destination is the
-scheduled loop's `EXIT`, not `W(i+1)`. Its result is already carried to the next
-iteration as a loop iter-arg, so the access-distance comparison above does not
-apply. The acquire instead uses the last cluster at which its owner performs
-work at the acquire's stage.
-
-For example, add a later access from another buffer group owned by `{3}`:
+An acquire left at loop `EXIT` has no direct destination access in the same
+chain. It is placed after the last operation of its owner at that stage:
 
 ```text
-Each (s, c) is (loop.stage, loop.cluster).
+owner {3}, stage 0
 
-owner {1}:
-
-final-read(i)          {1}  (1, 2)
-r EMPTY(i)             {1}  (1, 2)
-
-owner {3}, top to bottom:
-
-W(i)                   {3}  (0, 1)
-W other(i)             {3}  (0, 4)
-a EMPTY(i+1)           {3}  (0, 4)
+W main(i)             cluster 1
+W other(i)            cluster 4
+acquire EMPTY(i+1)    cluster 4
 EXIT
 ```
 
-Cluster 4 is the smallest valid `EXIT` position for owner `{3}` at stage 0.
-Using cluster 1 would move the blocking acquire before `W other(i)`, preventing
-the same owner from reaching that operation if the acquire waits. Within
-cluster 4, block order keeps `W other(i)` before the acquire. The release's
-cluster need not precede the acquire's cluster; the semaphore supplies that
-cross-owner ordering. The `EXIT` position only has to keep the acquire after
-all work of its own owner at that stage. Copy count is irrelevant here: it has
-already selected which physical copy the acquire addresses.
+Placing the acquire at cluster 1 could block owner `{3}` before `W other`.
+Within cluster 4, block order keeps `W other` first.
 
-A synthetic acquire immediately after a nested loop has no destination access
-and is not inside the child loop at its `EXIT`. It uses the last schedule
-recorded for its owner on the parent chain, not the schedule of an unrelated
-access that happens to follow it:
+### Moving an acquire repairs its schedule edge
+
+`planLoop` may detach a recurrence acquire from the bottom of a loop and move
+it before the first buffer use. A `ProtocolArc::wait` that still points at the
+detached recurrence position would describe a nonexistent wait.
+
+`fixupProtocolArcs` handles every arc that waited on the moved acquire:
 
 ```text
-last parent schedule   {3}  (0, 4)
-nested loop
-a EMPTY(i+1)           {3}  (0, 4)
-next access            {0}  (...)   unrelated
+acquire remains linked in the release's chain, and either the release still
+precedes it or the semaphore is an entry semaphore
+  keep wait = moved acquire
+
+same-semaphore post-loop acquire follows the release in the same chain
+  set wait = post-loop acquire
+
+neither relation holds
+  clear wait; no live scheduling relation remains
 ```
+
+`test/NVWS/insert_semas_nested_carrier.mlir`
+`@scheduled_relocated_acquire_boundaries` has:
+
+```text
+inside the inner loop
+
+%ready = acquire MMA_READY {1}      stage 0, cluster 1
+MMA acc[%ready] {1}                 stage 0, cluster 1
+release ACC_FULL, %ready [tc5mma]   stage 0, cluster 1
+
+%full = acquire ACC_FULL {0}        stage 1, cluster 2
+R acc [%full] {0}                   stage 1, cluster 2
+release MMA_READY, %full {0}        stage 1, cluster 2
+```
+
+The acquire of `MMA_READY` is at the first MMA. The stage-1 release occurs
+after it and supplies the next dynamic iteration; it is not a same-wave wait
+from the read back to this moved acquire. Its old scheduling relation is
+cleared. Otherwise a false relation
+
+```text
+R acc(i) at (1,2) -> MMA acc(i+1) at (0,1)
+```
+
+would raise the MMA path even though token placement has already selected the
+point-of-use shape. The checked output keeps the MMA acquire, buffer, MMA, and
+release at `(0,1)`.
+
+`ProtocolArc::wait` affects only schedule construction. Clearing a stale wait
+does not remove the semaphore release or acquire from IR.
+
+### Post-loop acquires use their owner's boundary
+
+A synthetic acquire after a nested loop has no following buffer use of its
+own owner. `postLoopAcquire` prevents an unrelated following access from
+becoming its schedule anchor.
+
+The same test produces:
+
+```text
+last inner owner-{1} schedule
+  MMA and release                    (stage 0, cluster 1)
+
+after inner loop
+  %bridge = acquire MMA_READY {1}    (stage 0, cluster 1)
+  release OUTER_EMPTY, %bridge {1}   (stage 0, cluster 1)
+
+  %outer = acquire OUTER_EMPTY {0}   (stage 0, cluster 4)
+  R acc [%outer] {0}                 (stage 0, cluster 4)
+```
+
+The bridge keeps owner `{1}`'s boundary schedule `(0,1)`; it does not copy
+owner `{0}`'s `(0,4)` schedule. If no following schedule anchor exists,
+`scheduleAtOwnerBoundary` scans the scheduled loop and places the acquire no
+earlier than any operation of that same owner and stage.
 
 Root entry acquires remain unscheduled.
 
+### Schedule and stage offset are separate
+
+The model carries two independent placement decisions. An acquire or release
+has a pipeline schedule, `loop.stage` and `loop.cluster`, and can have a
+`stageOffset` selecting a physical semaphore copy. An access can instead have
+a `bufferStageOffset`; EMIT-IR places that value on the
+`semaphore.buffer` created for the access.
+
+Schedule finalization follows producer-to-consumer `ProtocolArc` records. It
+uses loop distance and owner order to decide whether a cluster must move. The
+result keeps the release at the producer completion and the acquire at the
+consumer, but may delay the consumer's cluster so the release can execute
+first.
+
+Stage-offset replay follows writes and reads of a physical backing instead.
+It asks which copy contains the required value. Circular replay records a
+buffer offset on each access and transfers the adjacent values to acquire and
+release offsets. Non-circular alias replay records the required protocol
+offsets directly. Changing either offset does not move an operation in the
+pipeline; changing a cluster does not select a different copy.
+
+The distinction is especially important for a loop close. Its release and
+next acquire can be one or more logical iterations apart, while the physical
+copy can wrap modulo the semaphore depth. Loop-distance analysis handles the
+first fact. The offset attached to the release or acquire handles the second.
+
+`semaphore.buffer` receives the schedule of the access it serves. When that
+access has a `bufferStageOffset`, the buffer receives that physical stage too.
+It does not introduce another handoff. EMIT-IR uses these finalized choices
+when it creates the concrete semaphore and buffer operations.
+
 ## Authored buffer-stage offsets
 
-`loop.stage` and `loop.cluster` determine when the software pipeliner executes
-an operation. A semaphore node's `stage-offset` instead specifies a signed
-shift from the current stage of its backing buffer. The shift is applied modulo
-`buffer.copy`: `0` selects the current stage, `-1` the preceding stage, and
-`+1` the following stage.
-
-`finalizeSyncSchedule` runs one physical-stage analysis for circular
-groups and non-circular aliased backings. It replays the fresh-write cursor
-that ASP will use: a write records the cursor ordinal as the group's current
-value, and a read uses the latest ordinal recorded for its group. The analysis
-does not distinguish SMEM from TMEM. Circular metadata and alias grouping only
-determine how the allocations are represented and where the computed offsets
-are attached.
-
-Circular members are separate groups, while non-circular aliases are names in
-one group. For an access or semaphore node:
+`loop.stage` and `loop.cluster` place operations in the software pipeline. A
+release or acquire `stageOffset` instead selects a physical semaphore stage;
+an access `bufferStageOffset` selects the stage used by its emitted buffer.
+ASP applies a signed semaphore offset modulo the semaphore group's copy
+depth. For authored or circular backing, that depth is `buffer.copy`. A
+non-circular alias can instead have more semaphore copies than backing copies,
+in which case the modulus is `numSemaphoreCopies`:
 
 ```text
-stage-offset = required value ordinal - current cursor ordinal
+0     current copy
+-1    preceding copy
++1    following copy
 ```
 
-ASP applies that displacement modulo the backing's copy count. The two cases
-below use the same analysis and differ only in how their offsets are attached
-to the generated protocol.
+`finalizeSyncSchedule` replays a fresh-write cursor for each physical set.
+Every circular write begins a fresh slot and advances the cursor. For a
+non-circular group, a write advances only when an incoming direct-loop
+handoff selected it as a fresh write. Reads and other writes use the current
+cursor and the latest value ordinal recorded for their group.
+
+```text
+stage offset = required value ordinal - current cursor ordinal
+```
+
+ASP applies this displacement modulo the copy count. The same replay handles
+circular groups and non-circular aliases; their representation and attachment
+points differ.
 
 ### Circular groups
 
-For circular groups sharing one physical `buffer.id`, SYNC-DAG first validates
-the circular metadata: common type and `buffer.copy`, unique `buffer.start`
-values, and producer order. It then applies the shared analysis above. The
-resulting stage offset is stored on the access node and its adjacent
-acquire/release nodes before any IR is emitted.
+Circular members with one physical `buffer.id` are separate logical groups.
+They must agree on type and `buffer.copy`, have unique valid `buffer.start`
+values, and appear in producer order.
 
-`test/NVWS/insert_semas_circular_smem.mlir` `@circular_tutorial_1_1_to_2_2`
-— K and V share one two-copy ring (`buffer.start` 0 and 1); each circular
-member is its own group, and the contract with [EMIT-IR](emit-ir.md) is that
-it folds these groups onto the one physical ring:
+`test/NVWS/insert_semas_circular_smem.mlir`
+`@circular_tutorial_1_1_to_2_2` uses K and V in a two-copy ring with starts 0
+and 1:
 
 ```text
-store K:   counter 0 -> 1    K produced at ordinal 0    offset  0
-store V:   counter 1 -> 2    V produced at ordinal 1    offset  0
-load  K:   counter stays 2   K's latest = 1 ago         offset -1
-load  V:   counter stays 2   V's latest = current       offset  0
-
-K group (the access nodes carry no stage-offset):
-
-|- scf.for (WS, tag=1) ... holdrule{pointofuse->ttg.local_store}
-|  |- a  S1  {1}  stage-offset=0
-|  |- W m0  ttg.local_store {1}
-|  |- r  S0  {1} [none]  stage-offset=0
-|  |- a  S0  {2}  stage-offset=-1         <- K's consumer, bracketing the load
-|  |- R m0  ttg.local_load {2}
-|  |- r  S1  {2} [none]  stage-offset=-1  <- K's consumer, bracketing the load
-|  |- EXIT ... yield{native}
-
-V group:
-
-|- scf.for (WS, tag=1) ... holdrule{pointofuse->ttg.local_store}
-|  |- a  S1  {1}  stage-offset=0
-|  |- W m0  ttg.local_store {1}
-|  |- r  S0  {1} [none]  stage-offset=0
-|  |- a  S0  {2}  stage-offset=0
-|  |- R m0  ttg.local_load {2}
-|  |- r  S1  {2} [none]  stage-offset=0
-|  |- EXIT ... yield{native}
+event       cursor change   value ordinal   offset at event
+store K     -1 -> 0         K = 0           0
+store V      0 -> 1         V = 1           0
+load K       unchanged      K = 0          -1
+load V       unchanged      V = 1           0
 ```
 
-`S1` is created initially released, so iteration zero's `a S1 {1}` succeeds
-before any release has run (`S1{count=1 entry inherit={@1.1}}`). K's consumer
-must address the copy produced *before* V advanced the ring — the `-1` on
-exactly K's consumer nodes (`a S0 {2}` and `r S1 {2}`).
+K and V share one entry semaphore, `EMPTY`, and one non-entry semaphore,
+`FULL`. `emitPhysicalIR` creates those two semaphores once for the circular
+backing. Each logical group attaches its own offsets to the shared protocol.
+
+The K consumer must address the copy produced before V advanced the ring.
+Its acquire and closing release receive offset `-1`:
+
+```text
+K protocol
+
+acquire EMPTY {1}               offset  0
+W K {1}
+release FULL {1}                offset  0
+acquire FULL {2}                offset -1
+R K {2}
+release EMPTY {2}               offset -1
+```
+
+V stays on the current copy:
+
+```text
+V protocol
+
+acquire EMPTY {1}               offset 0
+W V {1}
+release FULL {1}                offset 0
+acquire FULL {2}                offset 0
+R V {2}
+release EMPTY {2}               offset 0
+```
+
+The shared `EMPTY` semaphore is initially released so iteration zero can
+acquire its copy.
 
 ### Non-circular alias handoffs
 
-Non-circular alias handoffs reuse the fresh-write stage replay described above.
-Their release shifts are derived from that replay. Planner-authored
-`buffer.copy` supplies one shared physical stage domain for every member of a
-`buffer.id` group; the member memdescs may be different views of that backing.
-Separately staged semaphores without a planner-authored multi-copy backing keep
-the narrower exact-alias requirement. This handling applies uniformly to SMEM
-and TMEM.
+Non-circular members in one group share the fresh-write replay. Authored
+`buffer.copy` gives every member of the `buffer.id` group one physical stage
+domain. Without authored copies, this rule applies only to exact aliases whose
+semaphore copy count exceeds the backing copy count. SMEM and TMEM use the
+same analysis.
 
-The motivating example happens to use SMEM: a split epilogue such as the `dV`
-store in backward attention. Two logical allocations have the same
-`buffer.id`, the same shape, and no distinct `buffer.offset`, so both name the
-full extent of one two-copy backing:
+`test/NVWS/insert_semas_fused_alias_handoff.mlir`
+`@fused_alias_depth_two` has the same SMEM structure as a split dV epilogue
+in backward attention: two allocation names use one two-copy backing.
 
 ```mlir
-%dv0_smem = ttg.local_alloc {buffer.id = 5, buffer.copy = 2}
-    : memdesc<128x32xf16>
-%dv1_smem = ttg.local_alloc {buffer.id = 5, buffer.copy = 2}
-    : memdesc<128x32xf16>
+%dv0 = ttg.local_alloc {buffer.id = 5, buffer.copy = 2}
+%dv1 = ttg.local_alloc {buffer.id = 5, buffer.copy = 2}
 
 scf.for {
-  ttg.local_store %dv0, %dv0_smem {partition = 4}
-  %dv0_read = ttg.local_load %dv0_smem {partition = 2}
-  tt.descriptor_store ..., %dv0_read {partition = 2}
+  ttg.local_store %v0, %dv0 {partition = 4}
+  %r0 = ttg.local_load %dv0 {partition = 2}
+  tt.descriptor_store ..., %r0 {partition = 2}
 
-  ttg.local_store %dv1, %dv1_smem {partition = 4}
-  %dv1_read = ttg.local_load %dv1_smem {partition = 2}
-  tt.descriptor_store ..., %dv1_read {partition = 2}
+  ttg.local_store %v1, %dv1 {partition = 4}
+  %r1 = ttg.local_load %dv1 {partition = 2}
+  tt.descriptor_store ..., %r1 {partition = 2}
 }
 ```
 
-Because both allocation names touch the same piece, the ordinary read and
-write rules produce one chain:
+Both members touch the same piece, so access rules produce one chain. This is
+a protocol diagram: semaphore names are assigned after raw-edge reduction
+and merging.
 
 ```text
-Sentry initially released
-          |
-          v
-   W dv0(i) {4}
-          | Sfull0
-          v
-   R dv0(i) {2}
-          | Shandoff
-          v
-   W dv1(i) {4}
-          | Sfull1
-          v
-   R dv1(i) {2}
-          | Sentry
-          v
- W dv0(i+1) {4}
+protocol DAG, logically unrolled
+
+                         acquire ENTRY(i) {4}
+                                  | walk
+                                  v
+                            W dv0(i) {4}
+                                  | walk
+                                  v
+                         release FULL0(i) {4}
+                                  | FULL0
+                                  v
+                         acquire FULL0(i) {2}
+                                  | walk
+                                  v
+                            R dv0(i) {2}
+                                  | walk
+                                  v
+                       release HANDOFF(i) {2}
+                                  | HANDOFF
+                                  v
+                       acquire HANDOFF(i) {4}
+                                  | walk
+                                  v
+                            W dv1(i) {4}
+                                  | walk
+                                  v
+                         release FULL1(i) {4}
+                                  | FULL1
+                                  v
+                         acquire FULL1(i) {2}
+                                  | walk
+                                  v
+                            R dv1(i) {2}
+                                  | walk
+                                  v
+                         release ENTRY(i) {2}
+                                  | ENTRY
+                                  v
+                       acquire ENTRY(i+1) {4}
+                                  | walk
+                                  v
+                          W dv0(i+1) {4}
 ```
 
-`buildEdgesAndSemas` creates a semaphore for each destination node in this
-chain. It does not fold `Sentry` with `Shandoff`, or `Sfull0` with `Sfull1`.
-The reduced IR after InsertSemas and before ASP is therefore:
+The emitted shape before ASP is:
 
 ```mlir
 %base = ttg.local_alloc {buffer.id = 5, buffer.copy = 2}
-    : memdesc<2x128x32xf16>
 
-%Sentry   = nvws.semaphore.create %base, %base true
-%Sfull0   = nvws.semaphore.create %base, %base false
-%Shandoff = nvws.semaphore.create %base, %base false
-%Sfull1   = nvws.semaphore.create %base, %base false
+%entry   = nvws.semaphore.create %base true
+%full0   = nvws.semaphore.create %base false
+%handoff = nvws.semaphore.create %base false
+%full1   = nvws.semaphore.create %base false
 
 scf.for {
-  %t0 = nvws.semaphore.acquire %Sentry[0] {partition = 4}
-  %b0:2 = nvws.semaphore.buffer %Sentry[0], %t0
-  ttg.local_store %dv0, %b0#0 {partition = 4}
-  nvws.semaphore.release %Sfull0[0], %t0 {partition = 4}
+  %t0 = nvws.semaphore.acquire %entry[0] {partition = 4}
+  %b0 = nvws.semaphore.buffer %entry[0], %t0
+  ttg.local_store %v0, %b0 {partition = 4}
+  nvws.semaphore.release %full0[0], %t0 {partition = 4}
 
-  %t1 = nvws.semaphore.acquire %Sfull0[0] {partition = 2}
-  %b1:2 = nvws.semaphore.buffer %Sfull0[0], %t1
-  %dv0_read = ttg.local_load %b1#0 {partition = 2}
-  tt.descriptor_store ..., %dv0_read {partition = 2}
-  nvws.semaphore.release %Shandoff[1], %t1 {partition = 2} // release next buffer stage
+  %t1 = nvws.semaphore.acquire %full0[0] {partition = 2}
+  %b1 = nvws.semaphore.buffer %full0[0], %t1
+  %r0 = ttg.local_load %b1 {partition = 2}
+  tt.descriptor_store ..., %r0 {partition = 2}
+  nvws.semaphore.release %handoff[1], %t1 {partition = 2}
 
-  %t2 = nvws.semaphore.acquire %Shandoff[0] {partition = 4}
-  %b2:2 = nvws.semaphore.buffer %Shandoff[0], %t2
-  ttg.local_store %dv1, %b2#1 {partition = 4}
-  nvws.semaphore.release %Sfull1[0], %t2 {partition = 4}
+  %t2 = nvws.semaphore.acquire %handoff[0] {partition = 4}
+  %b2 = nvws.semaphore.buffer %handoff[0], %t2
+  ttg.local_store %v1, %b2 {partition = 4}
+  nvws.semaphore.release %full1[0], %t2 {partition = 4}
 
-  %t3 = nvws.semaphore.acquire %Sfull1[0] {partition = 2}
-  %b3:2 = nvws.semaphore.buffer %Sfull1[0], %t3
-  %dv1_read = ttg.local_load %b3#1 {partition = 2}
-  tt.descriptor_store ..., %dv1_read {partition = 2}
-  nvws.semaphore.release %Sentry[1], %t3 {partition = 2} // release next buffer stage
+  %t3 = nvws.semaphore.acquire %full1[0] {partition = 2}
+  %b3 = nvws.semaphore.buffer %full1[0], %t3
+  %r1 = ttg.local_load %b3 {partition = 2}
+  tt.descriptor_store ..., %r1 {partition = 2}
+  nvws.semaphore.release %entry[1], %t3 {partition = 2}
 }
 ```
 
-Here the bracketed values are stage offsets, not final stage numbers. ASP
-assigns the first store and read a stage `s`. The second store is another
-fresh write, so ASP advances it and its read to `(s + 1) mod 2`.
-
-The same-stage edges need offset zero:
+The bracketed numbers are stage offsets, not final stage numbers. If the first
+write/read use physical stage `s`, the second pair uses `(s+1) mod 2`.
 
 ```text
-W dv0 at s       -> R dv0 at s
-W dv1 at s + 1   -> R dv1 at s + 1
+same-stage handoffs
+  W dv0 at s     -> R dv0 at s
+  W dv1 at s+1   -> R dv1 at s+1
+
+crossing handoffs
+  R dv0 at s     -> W dv1 at s+1
+  R dv1 at s+1   -> W dv0(i+1) at s
 ```
 
-The other two edges cross stages:
-
-```text
-R dv0 at s       -> W dv1 at s + 1
-R dv1 at s + 1   -> W dv0(i+1) at s
-```
-
-Without an authored offset, a release uses its source access's stage. The
-first crossing would therefore release `Shandoff[s]` while the acquire before
-`W dv1` waits on `Shandoff[s + 1]`. `Shandoff` was created `false`, so that
-acquire would never see the release. The loop-closing edge has the same
-problem in the opposite direction after the two-copy wrap.
-
-The shared physical-stage replay records `stage-offset=1` on those two
-releases. ASP then materializes:
-
-```text
-release Shandoff[(s + 1) mod 2] -> acquire Shandoff[(s + 1) mod 2]
-release Sentry[s]               -> acquire Sentry[s] in iteration i+1
-```
-
-Thus the offsets are required by the current separate-semaphore protocol:
-each release must address the stage used by the acquire that the SYNC-DAG
-paired with it. This case has no `buffer.circular`; `buffer.copy = 2` alone
-supplies the two stages.
+The two crossing releases receive offset `+1`. Without it, `%handoff` would
+release stage `s` while its acquire waits on stage `s+1`; the initially false
+semaphore would never satisfy that acquire. The loop-close has the same issue
+in the opposite direction after the two-copy wrap.
 
 `test/NVWS/insert_semas_fused_alias_handoff.mlir`
-`@tmem_fused_alias_depth_two` applies the same calculation to two
-non-circular TMEM aliases with planner-authored `buffer.copy = 2`. The two
-crossing releases likewise receive `stage-offset=1`.
+`@tmem_fused_alias_depth_two` applies the same replay to two non-circular TMEM
+aliases with authored `buffer.copy = 2`.
 
-## Code map
+## Build order and code map
 
+`buildSyncDag` processes one group in this order:
+
+```text
+ChainWalker                         complete raw edges
+computeBackingCopies               physical backing copies
+buildEdgesAndSemas                 reduce, merge, group, create protocol
+insertEntryAcquires                seed the first token
+buildRegionFlows                   summarize path results
+planRegionFlows / planLoop         carry tokens or move acquires
+pruneDeadIfFlows                   remove unused if token results
+computeRequiredParts               record partitions needed by regions
+computeSemaphoreCopies             semaphore-stage copies
+```
+
+After all groups are built, `finalizeSyncSchedule` assigns stage offsets,
+repairs loop clusters, and assigns schedules to protocol nodes.
+
+Current implementation map in
 [`InsertSemasSyncDag.cpp`](../../third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemasSyncDag.cpp):
 
-- `ChainWalker::run`, `applyTouch`, `VersionSource`, `ActiveUse`,
-  `PieceState`, `Tokens`, and `canReuseTokenForPiece`
-- `collectEdges`, `reduceStraightEdges`, `reduceLoopCloses`, `reduceChain`,
-  `reduceEdges`, and `buildEdgesAndSemas`
-- `insertEntryAcquires`
-- `summarizeChainBoundary`, `summarizeRegionFlow`, `buildRegionFlows`, and
-  `pruneDeadIfFlows`
-- `findInputAcquire`, `matchDemandPrefix`, `planLoopFlow`,
-  `lowerPointOfUse`, `planRegionFlows`, and `verifyPointOfUseFlow`
-- `CapabilityRef`, `SemaTransfer`, and `RegionFlow` are defined in
-  `InsertSemas.h`
-- `computeBackingPlan`
-- `assignCircularStageOffsets`, `assignAliasedHandoffStageOffsets`,
-  `PhysicalSchedules`, `replaySlots`, `computeSlotSchedule`,
-  `computeLoopCarriedDistance`,
-  `addSyncScheduleEdges`, `legalizeLoopSchedule`,
-  `scheduleAtOwnerBoundary`, `assignSyncScheduleChain`, and
-  `finalizeSyncSchedule`
-- `buildSyncDag`
-- the DAG dump used throughout: `NVWS_INSERT_SEMA_DUMP_DAG=1`
-  (`dumpDagTree`)
+- Access walk: `ActiveUse`, `VersionSource`, `PieceState`, `Tokens`,
+  `applyTouch`, `raiseForeignUseEdges`, and `ChainWalker`.
+- Raw-edge reduction: `KnownOrder`, `reduceStraightEdges`,
+  `reduceLoopCloses`, and `reduceEdges`.
+- Semaphore construction: `buildEdgesAndSemas`, `arrivalContribution`,
+  `reachesForward`, and `insertEntryAcquires`.
+- Region tokens: `summarizeRegionFlow`, `buildRegionFlows`, `findFeed`,
+  `matchDemand`, `planLoop`, `planRegionFlows`, `fixupProtocolArcs`, and
+  `pruneDeadIfFlows`.
+- Copies: `computeBackingCopies` and `computeSemaphoreCopies`.
+- Stage offsets: `replaySlots`, `assignCircularStageOffsets`,
+  `assignAliasedHandoffStageOffsets`, and `computeLoopCarriedDistance`.
+- Pipeline placement: `solveOwnerScheduleConstraints`,
+  `legalizeLoopSchedule`, `scheduleAtOwnerBoundary`, `assignSyncSchedules`,
+  and `finalizeSyncSchedule`.
+- Shared data types: `RegionFlow`, `CompletionSummary`, `ProtocolArc`, `Node`,
+  `Sema`, and `GroupDag` in
+  [`InsertSemas.h`](../../third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemas.h).
