@@ -81,8 +81,8 @@ struct Tokens {
   }
 };
 
-// Sentinel for EdgeRec::coveredVia: this edge's ordering is not known to be
-// enforced through another live use.
+// Sentinel for EdgeRec::coveredVia: no alternate live use is known to impose
+// the same ordering.
 constexpr int64_t kUncovered = std::numeric_limits<int64_t>::min();
 struct EdgeRec {
   Node *src = nullptr;
@@ -90,8 +90,8 @@ struct EdgeRec {
   Owner srcOwner, dstOwner;
   Payloads payloads;
   SmallVector<PieceId, 2> pieces;
-  // Owner key of a live use that transitively enforces this edge's ordering,
-  // or kUncovered. Doc: sync-dag.md#3-covered-senders-buildedgesandsemas
+  // Owner key of a live use through which the same ordering can be imposed,
+  // or kUncovered. Doc: sync-dag.md#removing-a-release-when-another-path-imposes-the-same-wait
   int64_t coveredVia = kUncovered;
   // An exact-source async handoff carries completion, not just ordering.
   bool preserve = false;
@@ -102,8 +102,8 @@ static bool hasAsyncPayload(ArrayRef<AsyncOp> payloads) {
                       [](AsyncOp payload) { return payload != AsyncOp::NONE; });
 }
 // Returns the owner key of a live use that already orders `use` before
-// itself, or kUncovered. Only the version-source use can be covered this
-// way: a later reread carries no dependency other uses are known to inherit.
+// itself, or kUncovered. Only the version-source use can use this alternate
+// path: a later reread carries no dependency other uses are known to inherit.
 static int64_t coveringLiveUse(const PieceState &piece, const ActiveUse &use) {
   if (use.node != piece.source.node)
     return kUncovered;
@@ -188,7 +188,7 @@ static void applyTouch(PieceState &piece, PieceId id, const Owner &owner,
                 {id},
                 kUncovered,
                 exactSource && hasAsyncPayload(piece.source.payloads)});
-    // The source edge covers the source use only while it still names that
+    // The source edge orders the source use only while it still names that
     // node; a later reread must retain its own WAR obligation.
     if (exactSource &&
         !llvm::is_contained(source->orderedBefore, ownerKey(owner)))
@@ -636,7 +636,7 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g,
     Node *dst = nullptr;
     Owner owner;
     SmallVector<EdgeRec, 2> incoming;
-    // Parallel to incoming: cover facts for each merged sender.
+    // Parallel to incoming: possible alternate paths for each merged sender.
     struct SenderFacts {
       bool allCovered = true;
       bool drop = false;
@@ -676,8 +676,8 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g,
       recordCover(handoff.facts[source - handoff.incoming.begin()], edge);
     }
   }
-  // Drop whole arrivals only, after shrinking drop candidates to a fixpoint;
-  // covered edges still anchor their sender's release.
+  // Drop a whole sender only after shrinking candidates to a fixpoint. Every
+  // edge still anchors its sender's release before this removal.
   for (Handoff &handoff : handoffs)
     for (Handoff::SenderFacts &facts : handoff.facts)
       facts.drop = facts.allCovered && !facts.covers.empty();
@@ -690,18 +690,17 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g,
   auto coverHolds = [&](const Handoff &handoff, unsigned si) {
     int64_t self = ownerKey(handoff.incoming[si].srcOwner);
     for (auto [coveredSrc, coverer] : handoff.facts[si].covers) {
-      // Leg 2: the covered obligation must reach this destination. Either
-      // the coverer still arrives here, or the coverer IS the destination
-      // owner, whose own program order carries its acquire (leg 1's
-      // destination) forward to this handoff's destination node.
+      // The intermediate owner must still release to this destination. If it
+      // is the destination owner, its own program order carries its acquire
+      // forward to this destination node.
       Node *covererSrc = coverer == ownerKey(handoff.owner)
                              ? handoff.dst
                              : survivingSender(handoff, coverer);
       if (!covererSrc)
         return false;
-      // Leg 1: a surviving release of this sender, acquired by the coverer
-      // no later than the coverer's own release into this handoff, must
-      // certify the covered source.
+      // A surviving release from this sender must occur no earlier than the
+      // original source and be acquired by the intermediate owner no later
+      // than that owner's release into this handoff.
       bool leg1 = false;
       for (const Handoff &other : handoffs) {
         if (ownerKey(other.owner) != coverer)
@@ -740,9 +739,9 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g,
     }
     return stats;
   };
-  // Loop entry and recurrence sites share one fixed-count semaphore. Covered
-  // pruning is optional; retain the original arrivals when independent
-  // pruning would make either site unable to meet the recurrence count.
+  // Loop entry and recurrence sites share one fixed-count semaphore. This
+  // removal is optional; retain the original senders when removing them would
+  // make either site unable to meet the recurrence count.
   for (bool changed = true; changed;) {
     changed = false;
     for (Handoff &entry : handoffs) {
@@ -774,7 +773,7 @@ static LogicalResult buildEdgesAndSemas(GroupDag &g,
     llvm::erase_if(handoff.incoming,
                    [&](const EdgeRec &) { return handoff.facts[si++].drop; });
   }
-  // A handoff whose every arrival is covered dissolves whole.
+  // Remove a destination group when no sender remains.
   llvm::erase_if(handoffs, [](const Handoff &h) { return h.incoming.empty(); });
   dstIndex.clear();
   for (auto [hi, handoff] : llvm::enumerate(handoffs))

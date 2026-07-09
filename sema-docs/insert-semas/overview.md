@@ -51,7 +51,7 @@ ACCESS-DAG
   wrap region bodies with ENTER/EXIT boundaries
       |
 SYNC-DAG
-  build raw edges; choose backing copies; reduce and merge edges;
+  build synchronization edges; choose backing copies; reduce and merge edges;
   choose semaphores, tokens, and semaphore copies;
   assign stage offsets, legalize clusters, and schedule acquires/releases
       |
