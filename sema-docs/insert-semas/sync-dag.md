@@ -1335,7 +1335,7 @@ semaphore DAG
                                 | S0
                                 v
                          t1 = acquire S0 {1}
-                                t1 |
+                                |
                                 v
                        R m0 [t1] {1}
                                 | walk
@@ -1344,7 +1344,7 @@ semaphore DAG
                                 | S1
                                 v
                          t2 = acquire S1 {2}
-                                t2 |
+                                |
                                 v
                        W m1 [t2] {2}
 ```
