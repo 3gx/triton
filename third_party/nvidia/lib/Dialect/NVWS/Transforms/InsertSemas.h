@@ -19,6 +19,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
+#include <array>
 #include <cstdlib>
 #include <functional>
 #include <memory>
@@ -91,6 +92,7 @@ struct RegionFlow {
 
 struct Node {
   enum Kind { Func, For, If, Enter, Exit, Access, Acquire, Release };
+  static constexpr size_t NumKinds = Release + 1;
   Kind kind = Access;
   Operation *op = nullptr;
   Operation *completionAnchor = nullptr;
@@ -102,6 +104,9 @@ struct Node {
   SemaId sema = 0;
   unsigned count = 0;
   SmallVector<AsyncOp, 1> payloads;
+  // Aggregate memory effect for structural slot events. Protocol nodes have
+  // no value; Access DAG construction seals Access/region effects once.
+  std::optional<Effect> slotEffect;
   gpu::StageCluster stageCluster;
   std::optional<int64_t> stageOffset;
   std::optional<int64_t> bufferStageOffset;
@@ -113,6 +118,9 @@ struct Node {
   // inherited record whose token this node consumes. Assigned by the SYNC-DAG
   // token sweep; EmitIR routes by this fact and never guesses by owner.
   Node *tokenSource = nullptr;
+  // Effective owner of an Acquire token or Region token placeholder/result.
+  // The outer optional distinguishes "not a producer" from a root-owned token.
+  std::optional<Owner> producedTokenOwner;
   Node *sat = nullptr;
   Node *scheduleAnchor = nullptr;
   std::optional<RegionFlow> flow;
@@ -175,13 +183,28 @@ struct GroupDag {
   SmallVector<Value> backing;
   bool isTmem() const { return memory == MemKind::Tmem; }
   bool isCircular() const { return circular; }
+  ArrayRef<Node *> nodesOfKind(Node::Kind kind) const {
+    return nodesByKind[kind];
+  }
   Node *newNode(Node::Kind k, Operation *op, Node *parent) {
     Node *n = nodes.emplace_back(std::make_unique<Node>()).get();
     n->kind = k;
     n->op = op;
     n->parent = parent;
+    nodesByKind[k].push_back(n);
     return n;
   }
+  void discardLastNode(Node *node) {
+    assert(nodes.back().get() == node && "only the newest node can be discarded");
+    assert(nodesByKind[node->kind].back() == node &&
+           "kind index must follow allocation order");
+    nodesByKind[node->kind].pop_back();
+    nodes.pop_back();
+  }
+
+private:
+  // Allocation-order index. Only newNode/discardLastNode may mutate it.
+  std::array<SmallVector<Node *, 0>, Node::NumKinds> nodesByKind;
 };
 inline bool canOwnMixedDepthTmem(const GroupDag &owner, const GroupDag &reuser) {
   if (!owner.isTmem() || !reuser.isTmem() || owner.pieceTable.members.size() != 1 ||

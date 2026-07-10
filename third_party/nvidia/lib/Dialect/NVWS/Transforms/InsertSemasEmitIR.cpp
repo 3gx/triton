@@ -1088,8 +1088,7 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
       break; // markers; yield wiring is the parent's job
     case Node::Acquire: {
       const Sema &sema = g.semas[n->sema];
-      Owner tokenOwner =
-          sema.entryOwner && !n->owner ? *sema.entryOwner : n->owner;
+      assert(n->producedTokenOwner && "acquire token owner must be sealed");
       Operation *before = nextRealOp(n->next);
       OpBuilder b(ctx.func);
       if (before) {
@@ -1110,7 +1109,7 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
       if (n->stageOffset)
         acq.setStage(materializeI32Before(acq, *n->stageOffset));
       rs.recordToken(acq.getToken(), sema.create,
-                     TokenRef{n, n->sema, tokenOwner});
+                     TokenRef{n, n->sema, *n->producedTokenOwner});
       rs.clearViews();
       lastReal = acq;
       break;

@@ -206,7 +206,9 @@ static void appendNode(GroupDag &g, Chain &chain, Node *node) {
   else
     chain.head = node;
   chain.tail = node;
+  node->slotEffect = Effect::R;
   auto record = [&](PieceId piece, Effect effect, const Owner &owner) {
+    node->slotEffect = joinEffect(*node->slotEffect, effect);
     mergeEffect(chain.effects, piece, effect);
     chain.firstOwners.try_emplace(piece, owner);
     chain.lastOwners[piece] = owner;
@@ -297,7 +299,7 @@ static FailureOr<Chain> buildChainForBlock(GroupDag &g, Block &block, Node *pare
       assert((kind != Node::If || branches.size() == 2) &&
              "If node carries then+else slots");
       if (llvm::all_of(branches, [](const Chain &branch) { return !branch.head; })) {
-        g.nodes.pop_back();
+        g.discardLastNode(region);
         continue;
       }
       for (const Chain &branch : branches)
