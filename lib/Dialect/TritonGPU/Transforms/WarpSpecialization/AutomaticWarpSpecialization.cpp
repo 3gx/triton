@@ -4,6 +4,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
+#include "third_party/nvidia/hopper/include/Transforms/Passes.h"
 #include "third_party/nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
@@ -13,6 +14,11 @@
 using namespace mlir;
 using namespace triton;
 using namespace triton::gpu;
+
+namespace mlir {
+void removeRedundantTmemZeroStores(triton::FuncOp &funcOp);
+void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp);
+} // namespace mlir
 
 //===----------------------------------------------------------------------===//
 // Pass Definition
@@ -24,6 +30,48 @@ namespace mlir::triton::gpu {
 } // namespace mlir::triton::gpu
 
 namespace {
+static bool hasWarpSpecializeLoop(FuncOp func) {
+  bool found = false;
+  func.walk([&](scf::ForOp loop) {
+    if (!loop->hasAttr(kWarpSpecializeAttrName))
+      return WalkResult::advance();
+    found = true;
+    return WalkResult::interrupt();
+  });
+  return found;
+}
+
+// These two canonical Meta prefix steps expose function implementations but
+// not standalone pass factories. Wrap them here so AutomaticWarpSpecialization
+// still owns an explicit pass pipeline and MetaToNVWSConvert remains a pure
+// representation conversion.
+struct MetaRemoveRedundantTmemZeroStores
+    : PassWrapper<MetaRemoveRedundantTmemZeroStores,
+                  OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      MetaRemoveRedundantTmemZeroStores)
+
+  void runOnOperation() override {
+    getOperation().walk([&](FuncOp func) {
+      if (hasWarpSpecializeLoop(func))
+        removeRedundantTmemZeroStores(func);
+    });
+  }
+};
+
+struct MetaValidateTMAStoreAnnotations
+    : PassWrapper<MetaValidateTMAStoreAnnotations, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      MetaValidateTMAStoreAnnotations)
+
+  void runOnOperation() override {
+    getOperation().walk([&](FuncOp func) {
+      if (hasWarpSpecializeLoop(func))
+        doValidateTMAStoreAnnotations(func);
+    });
+  }
+};
+
 struct VerifyWarpSpecializationPartitions
     : PassWrapper<VerifyWarpSpecializationPartitions, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
@@ -102,25 +150,41 @@ void AutomaticWarpSpecialization::runOnOperation() {
   };
 
   if (useMetaPartitioner) {
-    NVWSPartitionSchedulingMetaOptions options;
-    pm.nest<FuncOp>().addPass(createNVWSPartitionSchedulingMeta(options));
-    pm.nest<FuncOp>().addPass(createNVWSStripPartitionAttrsOutsideWS());
-    pm.addPass(createVerifyWarpSpecializationPartitionsPass());
+    // Canonical Meta temporarily leaves verifier-incomplete ownership metadata
+    // between PartitionSchedulingMeta and task-id propagation. Run the actual
+    // Meta pass objects as one atomic planning prefix, convert its completed
+    // result, and expose only verifier-valid NVWS IR to the mechanism suffix.
+    PassManager metaPM(getOperation().getContext());
+    metaPM.enableVerifier(false);
+    metaPM.addPass(createNVGPUPartitionSchedulingMeta());
+
+    NVGPUTestWSTaskIdPropagateOptions taskIdOptions;
+    taskIdOptions.numWarpGroups = 2;
+    metaPM.addPass(createNVGPUTestWSTaskIdPropagate(taskIdOptions));
+    metaPM.addPass(std::make_unique<MetaRemoveRedundantTmemZeroStores>());
+    metaPM.addPass(createNVGPUTestWSBufferAllocation());
+    metaPM.addPass(createNVGPUTestWSHoistTMEMStore());
+    // Pack each data-partitioned merged-epilogue producer/store slice before
+    // planning so MemoryPlanner sees the shortened register live ranges.
+    metaPM.addPass(createNVWSPackEpilogueSlices());
+
+    NVGPUTestWSMemoryPlannerOptions memoryPlannerOptions;
+    memoryPlannerOptions.numBuffers = numStages;
+    memoryPlannerOptions.smemAllocAlgo = 1;
+    memoryPlannerOptions.smemBudget = std::max<int32_t>(smemBudget, 0);
+    memoryPlannerOptions.smemCircularReuse = false;
+    metaPM.addPass(createNVGPUTestWSMemoryPlanner(memoryPlannerOptions));
+    metaPM.addPass(createNVGPUTestAnnotateTMAStoreWaits());
+    metaPM.addPass(std::make_unique<MetaValidateTMAStoreAnnotations>());
+    if (failed(metaPM.run(getOperation())))
+      return signalPassFailure();
+    addPassWithPartitionVerifier(createNVWSMetaToNVWSConvert());
   } else {
     addPassWithPartitionVerifier(createTritonGPUPartitionScheduling());
+    addPassWithPartitionVerifier(createNVWSHoistTmemStore());
+    addPassWithPartitionVerifier(createNVWSInsertAllocas());
   }
 
-  addPassWithPartitionVerifier(createNVWSHoistTmemStore());
-  addPassWithPartitionVerifier(createNVWSInsertAllocas());
-  if (useMetaPartitioner) {
-    NVWSMemoryPlannerOptions memoryPlannerOptions;
-    memoryPlannerOptions.numBuffers = numStages;
-    memoryPlannerOptions.smemBudget = smemBudget;
-    // Match Meta WS's production fallback. Individual loops can still
-    // override the choice through tt.smem_alloc_algo.
-    memoryPlannerOptions.smemAllocAlgo = 1;
-    addPassWithPartitionVerifier(createNVWSMemoryPlanner(memoryPlannerOptions));
-  }
   NVWSInsertSemasOptions insertSemasOptions;
   insertSemasOptions.useMetaPartitioner = useMetaPartitioner;
   insertSemasOptions.numStages = numStages;

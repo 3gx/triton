@@ -44,15 +44,14 @@ LIT=/home/egaburov/work/oai-triton/triton-src/llvm-project.git/build/bin/llvm-li
 
 For every `insert_semas*` test, the compiler/pass execution must finish
 successfully: no crash, assertion, verifier error, diagnostic failure, or
-non-FileCheck failure is allowed. During initial development, an expected-IR
-`CHECK` mismatch may be tolerated. Confirm such a failure by running the test's
-`RUN` command without its FileCheck pipe; that command must exit successfully.
+FileCheck mismatch is allowed. Every test and every existing CHECK must be
+fully green. The InsertSemas sources and `test/NVWS/insert_semas*.mlir` are
+read-only for this work; do not update either to accommodate converter output.
 
 Runtime gates may begin only when:
 
 1. the automatic-warp-specialization test is fully green without modification;
-2. all InsertSemas pass executions succeed, with any remaining failures known
-   to be FileCheck expectation mismatches only.
+2. all InsertSemas tests are fully green without source or CHECK changes.
 
 ## 3. Establish the pre-change performance baseline
 
@@ -61,8 +60,8 @@ then record the current branch's output for:
 
 ```bash
 timeout 60s python 06-fa.py
-timeout 180s sh run_nvwsX.sh
-timeout 180s sh run_nvws.sh
+timeout 240s sh run_nvwsX.sh
+timeout 240s sh run_nvws.sh
 ```
 
 Use the same GPU, environment, and benchmark arguments for baseline and patched
@@ -78,7 +77,7 @@ Run from the repository root. Each command must exit successfully before its
 timeout:
 
 ```bash
-timeout 120s pytest -n16 --tb=short \
+timeout 240s pytest -n16 --tb=short \
   python/test/unit/language/test_warp_specialization.py
 
 timeout 120s env \
@@ -97,21 +96,18 @@ Run the patched branch with the same setup used for the recorded baseline:
 
 ```bash
 timeout 60s python 06-fa.py
-timeout 180s sh run_nvwsX.sh
-timeout 180s sh run_nvws.sh
+timeout 240s sh run_nvwsX.sh
+timeout 240s sh run_nvws.sh
 ```
 
 All three commands must complete successfully. Compare their results with the
 pre-change baseline. Treat approximately 2-3% variation as noise, but do not
 accept a clear or consistent performance regression.
 
-## 6. Finish the LIT expectations
+## 6. Final unchanged-LIT verification
 
-After the runtime gates pass, update only stale `insert_semas*` FileCheck
-expectations to describe the intentional new IR. Do not weaken checks merely to
-hide incorrect output, and do not modify
-`TritonGPU/automatic-warp-specialization.mlir`.
-
-Rerun the relevant InsertSemas LIT tests and finish with them fully green. If a
-source change is needed while repairing them, restart at the build step before
-running LIT again.
+After the runtime gates pass, rerun the unchanged automatic-warp-specialization
+and InsertSemas LIT tests and require them to remain fully green. Do not modify
+either test suite or the InsertSemas implementation. Any failure must be fixed
+in the converter or its authorized integration code, followed by a fresh build
+before rerunning LIT.

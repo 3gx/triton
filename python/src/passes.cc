@@ -70,16 +70,15 @@ void init_triton_passes_ttgpuir(py::module &&m) {
                             int, bool);
   ADD_PASS_OPTION_WRAPPER_2("add_pipeline", createTritonGPUPipeline, int, bool);
   m.def("add_warp_specialize",
-        [](mlir::PassManager &pm, int numStages, int numWarpGroups,
-           bool useMetaPartitioner, int smemBudget) {
+        [](mlir::PassManager &pm, int numStages, bool useMetaPartitioner,
+           int smemBudget) {
           TritonGPUAutomaticWarpSpecializationOptions options;
           options.numStages = numStages;
-          options.numWarpGroups = numWarpGroups;
           options.useMetaPartitioner = useMetaPartitioner;
           options.smemBudget = smemBudget;
           pm.addPass(createTritonGPUAutomaticWarpSpecialization(options));
         },
-        py::arg("pm"), py::arg("num_stages"), py::arg("num_warp_groups") = 3,
+        py::arg("pm"), py::arg("num_stages"),
         py::arg("use_meta_partitioner") = false, py::arg("smem_budget") = 0);
   ADD_PASS_WRAPPER_0("add_prefetch", createTritonGPUPrefetch);
   ADD_PASS_WRAPPER_0("add_accelerate_matmul", createTritonGPUAccelerateMatmul);
