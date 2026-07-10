@@ -20,25 +20,18 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner, int 
     return success();
 
   FailureOr<SmallVector<GroupDag, 0>> groupsOr = collectGroups(funcOp);
-  if (failed(groupsOr))
-    return failure();
+  if (failed(groupsOr)) return failure();
   SmallVector<GroupDag, 0> groups = std::move(*groupsOr);
-  for (GroupDag &g : groups)
-    if (failed(buildAccessDag(g, funcOp)))
-      return failure();
+  if (llvm::any_of(groups, [&](GroupDag &g) { return failed(buildAccessDag(g, funcOp)); }))
+    return failure();
   int numTmemBlocks = 0;
-  for (GroupDag &g : groups)
-    if (failed(buildSyncDag(g, useMetaPartitioner, lowerSemaphoreNumStages, numTmemBlocks)))
-      return failure();
+  if (llvm::any_of(groups, [&](GroupDag &g) {
+        return failed(buildSyncDag(g, useMetaPartitioner, lowerSemaphoreNumStages, numTmemBlocks));
+      }))
+    return failure();
   if (failed(finalizeSyncSchedule(groups)))
     return failure();
-  if (shouldDumpDag()) {
-    llvm::errs() << "==== NVWS InsertSemas SYNC-DAG ====\n";
-    llvm::errs() << "function: @" << funcOp.getName() << "\n";
-    llvm::errs() << "groups: " << groups.size() << "\n";
-    for (GroupDag &g : groups)
-      dumpGroupSyncDag(g, funcOp);
-  }
+  dumpSyncDags(groups, funcOp);
   return emitIR(funcOp, groups);
 }
 } // namespace

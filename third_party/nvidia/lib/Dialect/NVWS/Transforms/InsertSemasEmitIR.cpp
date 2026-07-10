@@ -5,6 +5,210 @@
 
 namespace mlir::triton::nvws_semas {
 
+namespace {
+class SyncDagDumper {
+public:
+  SyncDagDumper(GroupDag &group, llvm::raw_ostream &stream)
+      : g(group), os(stream) {}
+
+  void printTree() {
+    for (Node *head : g.root->children)
+      printChain(head, 1, nullptr, 0);
+  }
+
+  void print(triton::FuncOp func) {
+    os << "SYNC-DAG\n|- func @" << func.getName() << "\n";
+    printTree();
+    if (g.semas.empty()) {
+      os << "  BACKING: untouched (no semaphores)\n";
+      return;
+    }
+    os << "  SEMAS: ";
+    llvm::interleave(g.semas, os, [&](const Sema &sema) {
+      os << sema.name << "{count=" << sema.count;
+      if (sema.entryOwner)
+        os << " entry inherit=" << ownerStr(nullptr, *sema.entryOwner);
+      os << "}";
+    }, " ");
+    os << "\n  BACKING: numCopies=" << g.numCopies << "\n";
+  }
+
+private:
+  void printPrefix(unsigned depth) {
+    for (unsigned i = 0; i < depth; ++i)
+      os << "|  ";
+  }
+
+  StringRef semaName(const Node *node) const {
+    return node->sema < g.semas.size() ? g.semas[node->sema].name
+                                       : "<unformed>";
+  }
+
+  void printPieces(const Node *node, Operation *anchor) {
+    if (node->pieceInfo.empty())
+      return;
+    os << " pieces{";
+    llvm::interleaveComma(sortedPieceInfo(node), os, [&](const auto &entry) {
+      os << "P" << entry.first << ":"
+         << (entry.second.effect == Effect::W ? "W" : "R") << ":"
+         << ownerStr(anchor, entry.second.owner);
+    });
+    os << "}";
+  }
+
+  void printYield(const Node *region, unsigned index) {
+    if (!region || !region->flow)
+      return;
+    Node *final = index < region->flow->exits.size()
+                      ? region->flow->exits[index]
+                      : nullptr;
+    os << " yield{";
+    if (!final) {
+      os << "pass";
+    } else {
+      switch (final->kind) {
+      case Node::Acquire:
+      case Node::Release:
+        os << (final->kind == Node::Acquire ? "a " : "r ")
+           << semaName(final);
+        break;
+      case Node::For:
+      case Node::If:
+        os << (final->kind == Node::For ? "scf.for" : "scf.if");
+        break;
+      default:
+        llvm_unreachable("invalid region result");
+      }
+    }
+    os << "}";
+  }
+
+  void printRegion(const Node *node, Operation *anchor) {
+    printPieces(node, anchor);
+    if (!node->requiredParts.empty()) {
+      os << " parts{";
+      llvm::interleaveComma(node->requiredParts, os);
+      os << "}";
+    }
+    if (node->flow)
+      os << " thread{" << ownerStr(node->op, node->flow->owner) << "}";
+    os << "\n";
+  }
+
+  void printAccess(const Node *node, unsigned depth) {
+    printPrefix(depth);
+    os << "|- ";
+    llvm::interleaveComma(node->touches, os, [&](const Touch &touch) {
+      os << (touch.effect == Effect::W ? "W" : "R") << " m"
+         << touch.member;
+    });
+    os << "  " << node->op->getName().getStringRef() << " "
+       << ownerStr(node->op, node->owner) << "\n";
+  }
+
+  void printProtocol(const Node *node, unsigned depth, Operation *anchor) {
+    printPrefix(depth);
+    os << "|- " << (node->kind == Node::Acquire ? "a" : "r") << "  "
+       << semaName(node);
+    if (node->count > 1)
+      os << "(" << node->count << ")";
+    os << "  " << ownerStr(anchor, node->owner);
+    if (node->kind == Node::Acquire) {
+      if (node->sema < g.semas.size() && g.semas[node->sema].entryOwner &&
+          !node->owner)
+        os << "  ; entry";
+    } else {
+      os << " [";
+      llvm::interleaveComma(node->payloads, os, [&](AsyncOp payload) {
+        os << nvws::stringifyAsyncOp(payload);
+      });
+      os << "]";
+    }
+    if (node->stageOffset)
+      os << "  stage-offset=" << *node->stageOffset;
+    os << "\n";
+  }
+
+  void printChain(const Node *head, unsigned depth, const Node *parent,
+                  unsigned index) {
+    for (const Node *node = head; node; node = node->next) {
+      Operation *anchor = node->parent ? node->parent->op : nullptr;
+      switch (node->kind) {
+      case Node::Access:
+        printAccess(node, depth);
+        break;
+      case Node::Acquire:
+      case Node::Release:
+        printProtocol(node, depth, anchor);
+        break;
+      case Node::For:
+        printPrefix(depth);
+        os << "|- scf.for";
+        if (gpu::hasWarpSpecializeTag(node->op))
+          os << " (WS, tag=" << *gpu::getWarpSpecializeTag(node->op) << ")";
+        printRegion(node, node->op);
+        printChain(node->children[0], depth + 1, node, 0);
+        break;
+      case Node::If:
+        printPrefix(depth);
+        os << "|- scf.if";
+        printRegion(node, anchor);
+        printPrefix(depth + 1);
+        os << "|- then\n";
+        printChain(node->children[0], depth + 2, node, 0);
+        printPrefix(depth + 1);
+        os << "|- else"
+           << (cast<scf::IfOp>(node->op).elseBlock() ? "" : " (virtual)")
+           << "\n";
+        printChain(node->children[1], depth + 2, node, 1);
+        break;
+      case Node::Enter:
+      case Node::Exit:
+        printPrefix(depth);
+        os << (node->kind == Node::Enter ? "|- ENTER" : "|- EXIT");
+        printPieces(node, anchor);
+        if (node->kind == Node::Exit)
+          printYield(parent, index);
+        os << "\n";
+        break;
+      case Node::Func:
+        break;
+      }
+    }
+  }
+
+  GroupDag &g;
+  llvm::raw_ostream &os;
+};
+} // namespace
+
+bool shouldDumpDag() {
+  const char *env = ::getenv("NVWS_INSERT_SEMA_DUMP_DAG");
+  return env && StringRef(env) == "1";
+}
+
+void dumpSyncDagTree(GroupDag &g) {
+  if (shouldDumpDag())
+    SyncDagDumper(g, llvm::errs()).printTree();
+}
+
+void dumpSyncDagTrees(MutableArrayRef<GroupDag> groups) {
+  if (!shouldDumpDag())
+    return;
+  for (GroupDag &g : groups)
+    SyncDagDumper(g, llvm::errs()).printTree();
+}
+
+void dumpSyncDags(MutableArrayRef<GroupDag> groups, triton::FuncOp func) {
+  if (!shouldDumpDag())
+    return;
+  llvm::errs() << "==== NVWS InsertSemas SYNC-DAG ====\n";
+  llvm::errs() << "function: @" << func.getName() << "\n";
+  llvm::errs() << "groups: " << groups.size() << "\n";
+  for (GroupDag &g : groups)
+    SyncDagDumper(g, llvm::errs()).print(func);
+}
+
 struct EmitCtx {
   triton::FuncOp func;
   Value poison; // the single function-level ub.poison token (contract E)

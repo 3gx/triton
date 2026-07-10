@@ -17,6 +17,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdlib>
 #include <functional>
@@ -112,9 +113,7 @@ struct Node {
   // inherited record whose token this node consumes. Assigned by the SYNC-DAG
   // token sweep; EmitIR routes by this fact and never guesses by owner.
   Node *tokenSource = nullptr;
-  // Exact acquire sites satisfied by a release.  More than one is legal only
-  // for mutually exclusive continuation paths sharing the same channel.
-  SmallVector<Node *, 2> consumers;
+  Node *sat = nullptr;
   Node *scheduleAnchor = nullptr;
   std::optional<RegionFlow> flow;
   SmallVector<int, 2> requiredParts;
@@ -263,16 +262,6 @@ inline bool isSupportedAliasOp(Operation *op) {
   return name == "ttg.memdesc_index" || name == "ttg.memdesc_subview" ||
          name == "ttg.memdesc_trans" || name == "ttg.memdesc_reinterpret" || name == "ttg.memdesc_reshape";
 }
-inline std::string treePrefix(unsigned depth) {
-  std::string s;
-  for (unsigned i = 0; i < depth; ++i)
-    s += "|  ";
-  return s;
-}
-inline bool shouldDumpDag() {
-  const char *env = ::getenv("NVWS_INSERT_SEMA_DUMP_DAG");
-  return env && StringRef(env) == "1";
-}
 template <typename Fn>
 inline void forEachNode(Node *head, Fn &&fn) {
   for (Node *n = head; n; n = n->next) {
@@ -310,13 +299,15 @@ template <typename Map>
 inline void mergeEffect(Map &effects, PieceId piece, Effect effect) {
   effects[piece] = joinEffect(effects[piece], effect);
 }
-
+bool shouldDumpDag();
+void dumpSyncDagTree(GroupDag &g);
+void dumpSyncDagTrees(MutableArrayRef<GroupDag> groups);
+void dumpSyncDags(MutableArrayRef<GroupDag> groups, triton::FuncOp func);
 FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp);
 LogicalResult buildAccessDag(GroupDag &g, triton::FuncOp funcOp);
 LogicalResult buildSyncDag(GroupDag &g, bool useMetaPartitioner,
                            int lowerSemaphoreNumStages, int &numTmemBlocks);
 LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups);
 LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups);
-void dumpGroupSyncDag(GroupDag &g, triton::FuncOp funcOp);
 } // namespace mlir::triton::nvws_semas
 #endif // NVWS_TRANSFORMS_INSERT_SEMAS_H_
