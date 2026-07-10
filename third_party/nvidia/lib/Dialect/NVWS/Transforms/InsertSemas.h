@@ -17,6 +17,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include <array>
@@ -38,7 +39,6 @@ using SemaId = unsigned;
 using PartitionId = std::pair<int /*ttg.partition*/, int /*ws tag*/>;
 using Owner = std::optional<PartitionId>;
 
-enum class PlacementMode : uint8_t { Auto, FirstTouch, POU };
 struct POURejection {
   Operation *loop = nullptr;
   std::string reason;
@@ -343,8 +343,8 @@ FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp);
 LogicalResult buildAccessDag(GroupDag &g, triton::FuncOp funcOp);
 FailureOr<std::optional<POURejection>>
 buildSyncDag(GroupDag &g, bool useMetaPartitioner, int lowerSemaphoreNumStages,
-             int &numTmemBlocks, PlacementMode placementMode,
-             const DenseSet<Operation *> &firstTouchLoops);
+             int &numTmemBlocks,
+             llvm::function_ref<bool(Operation *)> useFirstTouch);
 LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups);
 LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups);
 } // namespace mlir::triton::nvws_semas

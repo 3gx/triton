@@ -68,8 +68,7 @@ FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp) {
   };
   for (auto &[id, allocs] : tmemBuckets) {
     auto firstCopy = getI64Attr(allocs.front(), kBufferCopyAttrName);
-    bool split = firstCopy &&
-                 llvm::all_of(allocs, [&](Operation *op) {
+    bool split = llvm::all_of(allocs, [&](Operation *op) {
                    return getI64Attr(op, kBufferCopyAttrName).has_value();
                  }) &&
                  llvm::any_of(allocs, [&](Operation *op) {
@@ -230,12 +229,10 @@ static LogicalResult deriveCompletionAnchor(Node *access) {
   if (!load)
     return success();
   Operation *forward = nullptr, *store = nullptr;
-  unsigned paths = 0;
   for (Operation *user : load.getResult().getUsers()) {
     if (isa<triton::DescriptorStoreOp>(user)) {
       forward = nullptr;
       store = user;
-      ++paths;
       continue;
     }
     if (auto convert = dyn_cast<gpu::ConvertLayoutOp>(user))
@@ -243,14 +240,10 @@ static LogicalResult deriveCompletionAnchor(Node *access) {
         if (isa<triton::DescriptorStoreOp>(convertUser)) {
           forward = user;
           store = convertUser;
-          ++paths;
         }
   }
-  if (!paths)
+  if (!store)
     return success();
-  if (paths != 1)
-    return semaError(load) << "managed local_load reaches multiple descriptor "
-                              "stores; ownership completion is ambiguous";
   auto onlyUser = [](Value value, Operation *expected) {
     return llvm::hasSingleElement(value.getUsers()) && *value.getUsers().begin() == expected;
   };
@@ -316,17 +309,13 @@ static FailureOr<Chain> buildChainForBlock(GroupDag &g, Block &block, Node *pare
         return it == owners.end() ? nullptr : &it->second;
       };
       for (auto [piece, info] : sortedPieceInfo(region)) {
-        const Owner *owner = nullptr;
-        if (region->kind == Node::If)
-          owner = lookup(chain.lastOwners, piece);
+        const Owner *owner = region->kind == Node::If
+                                 ? lookup(chain.lastOwners, piece)
+                                 : nullptr;
         for (const Chain &branch : branches)
           if (!owner)
             owner = lookup(branch.firstOwners, piece);
-        if (!owner) {
-          semaError(region->op) << "no toucher resolves the owner for a piece in this region's "
-                                   "summary (stage-1/stage-2 inconsistency)";
-          return failure();
-        }
+        assert(owner && "piece summary must have a first toucher");
         region->pieceInfo[piece].owner = *owner;
       }
       for (const Chain &branch : branches) {

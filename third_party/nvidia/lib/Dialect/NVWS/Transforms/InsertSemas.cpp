@@ -10,6 +10,7 @@ namespace mlir::triton {
 
 namespace {
 using namespace nvws_semas;
+enum class PlacementMode : uint8_t { Auto, FirstTouch, POU };
 
 FailureOr<PlacementMode> parsePlacementMode(StringRef value,
                                             Operation *anchor) {
@@ -36,7 +37,6 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner,
     return success();
 
   using FirstTouchLoops = DenseMap<Operation *, DenseSet<Operation *>>;
-  const DenseSet<Operation *> noFirstTouchLoops;
   std::optional<POURejection> rejection;
   auto buildPlan = [&](PlacementMode mode, const FirstTouchLoops &overrides)
       -> FailureOr<SmallVector<GroupDag, 0>> {
@@ -53,11 +53,13 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner,
     for (GroupDag &g : candidate) {
       Operation *key = g.pieceTable.members.front().allocOp;
       auto override = overrides.find(key);
-      const DenseSet<Operation *> &loops =
-          override == overrides.end() ? noFirstTouchLoops : override->second;
-      FailureOr<std::optional<POURejection>> result =
-          buildSyncDag(g, useMetaPartitioner, lowerSemaphoreNumStages,
-                       numTmemBlocks, mode, loops);
+      auto useFirstTouch = [&](Operation *loop) {
+        return mode == PlacementMode::FirstTouch ||
+               (override != overrides.end() && override->second.contains(loop));
+      };
+      auto result = buildSyncDag(g, useMetaPartitioner,
+                                 lowerSemaphoreNumStages, numTmemBlocks,
+                                 useFirstTouch);
       if (failed(result))
         return failure();
       if (*result) {
@@ -78,16 +80,6 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner,
     for (auto &[op, attrs] : authoredAttrs)
       op->setAttrs(attrs);
   };
-  auto emitRejection = [&](PlacementMode mode) {
-    if (rejection)
-      semaError(rejection->loop)
-          << (mode == PlacementMode::POU
-                  ? "point-of-use placement is unavailable for this loop: "
-                  : "canonical first-touch placement could not satisfy this "
-                    "loop: ")
-          << rejection->reason;
-  };
-
   FailureOr<SmallVector<GroupDag, 0>> groupsOr = failure();
   const FirstTouchLoops noOverrides;
   if (placementMode != PlacementMode::Auto) {
@@ -118,15 +110,18 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner,
     }
   }
   if (failed(groupsOr)) {
-    emitRejection(placementMode == PlacementMode::POU
-                      ? PlacementMode::POU
-                      : PlacementMode::FirstTouch);
+    if (rejection)
+      semaError(rejection->loop)
+          << (placementMode == PlacementMode::POU
+                  ? "point-of-use placement is unavailable for this loop: "
+                  : "canonical first-touch placement could not satisfy this "
+                    "loop: ")
+          << rejection->reason;
     restoreAttrs();
     return failure();
   }
-  SmallVector<GroupDag, 0> groups = std::move(*groupsOr);
-  dumpSyncDags(groups, funcOp);
-  return emitIR(funcOp, groups);
+  dumpSyncDags(*groupsOr, funcOp);
+  return emitIR(funcOp, *groupsOr);
 }
 } // namespace
 

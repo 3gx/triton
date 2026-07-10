@@ -219,19 +219,9 @@ struct EmitCtx {
   };
   llvm::MapVector<Operation *, SmallVector<Slot, 2>> slots;
   DenseSet<Operation *> exactReuseBufferOps;
-  // Mechanical emission contract only: each buffer op must retain the exact
-  // capability operands and complete result type vector selected at emission.
-  struct BufferContract {
-    Operation *op = nullptr;
-    Value token;
-    Value semaphore;
-    SmallVector<Type, 2> resultTypes;
-  };
-  SmallVector<BufferContract, 4> bufferContracts;
   struct CachedReuseContract {
-    Operation *bufferOp = nullptr;
+    Value view;
     Value token;
-    MemberId member = 0;
   };
   SmallVector<CachedReuseContract, 2> cachedReuseContracts;
 };
@@ -250,40 +240,34 @@ struct RenderState {
   SmallVector<Token, 2> tokens;
   DenseSet<Node *> releasedSources;
   struct ViewBundle {
-    Operation *op = nullptr;
     Node *producer = nullptr;
     SemaId channel = 0;
     Value token;
     Value semaphore;
     Owner owner;
     std::optional<int64_t> bufferStageOffset;
-    SmallVector<Type, 2> resultTypes;
     SmallVector<Value, 2> buffers;
   };
   // Keep the current capability as an explicit exact key rather than a lossy
   // owner-only hash surrogate.
-  SmallVector<ViewBundle, 2> views;
-  void clearViews() { views.clear(); }
+  std::optional<ViewBundle> view;
+  void clearViews() { view.reset(); }
   ViewBundle *findViewBundle(const Token &source, const Owner &owner,
                              std::optional<int64_t> bufferStageOffset,
                              MemberId member, Type resultType) {
-    auto it = llvm::find_if(views, [&](const ViewBundle &bundle) {
-      return bundle.producer == source.ref.producer &&
-             bundle.channel == source.ref.sema &&
-             bundle.token == source.value &&
-             bundle.semaphore == source.sema &&
-             sameOwner(bundle.owner, owner) &&
-             bundle.bufferStageOffset == bufferStageOffset &&
-             member < bundle.resultTypes.size() &&
-             sameViewType(bundle.resultTypes[member], resultType);
-    });
-    return it == views.end() ? nullptr : &*it;
+    if (!view || view->producer != source.ref.producer ||
+        view->channel != source.ref.sema || view->token != source.value ||
+        view->semaphore != source.sema || !sameOwner(view->owner, owner) ||
+        view->bufferStageOffset != bufferStageOffset ||
+        !sameViewType(view->buffers[member].getType(), resultType))
+      return nullptr;
+    return &*view;
   }
   // Exact routing: the record whose producer is the node's recorded token
   // source. No owner guessing.
   const Token *tokenForSource(const Node *producer) const {
     for (const Token &token : tokens)
-      if (token.ref.producer == producer && token.value && token.sema)
+      if (token.ref.producer == producer)
         return &token;
     return nullptr;
   }
@@ -404,9 +388,7 @@ static gpu::MemDescType genericViewType(gpu::MemDescType backing) {
                                /*mutableMemory=*/true, backing.getShape());
 }
 static bool sameViewType(Type a, Type b) {
-  auto x = dyn_cast<gpu::MemDescType>(a), y = dyn_cast<gpu::MemDescType>(b);
-  if (!x || !y)
-    return false;
+  auto x = cast<gpu::MemDescType>(a), y = cast<gpu::MemDescType>(b);
   return x.getShape() == y.getShape() && x.getElementType() == y.getElementType() &&
          x.getEncoding() == y.getEncoding() && x.getMemorySpace() == y.getMemorySpace() &&
          x.getMutableMemory() == y.getMutableMemory();
@@ -421,9 +403,7 @@ static gpu::MemDescType viewType(const GroupDag &g, MemberId member,
     if (step.op->getName().getStringRef() != "ttg.memdesc_index") break;
     type = step.resultType;
   }
-  if (auto view = dyn_cast<gpu::MemDescType>(type))
-    return withMutable(view, true);
-  return genericViewType(backing);
+  return withMutable(cast<gpu::MemDescType>(type), true);
 }
 
 static Operation *backingAnchor(GroupDag &g) {
@@ -873,11 +853,9 @@ static void refreshAliasResultTypes(Operation *op, Value source) {
       return;
     }
   }
-  if (op->getNumResults() == 1)
-    if (auto resultType = dyn_cast<gpu::MemDescType>(op->getResult(0).getType()))
-      op->getResult(0).setType(withMutable(
-          resultType,
-          cast<gpu::MemDescType>(source.getType()).getMutableMemory()));
+  op->getResult(0).setType(withMutable(
+      cast<gpu::MemDescType>(op->getResult(0).getType()),
+      cast<gpu::MemDescType>(source.getType()).getMutableMemory()));
 }
 static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs, Node *node,
                      const Touch &touch, Operation *accessOp,
@@ -894,7 +872,7 @@ static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs, Node *node,
       types[touch.member]);
   if (bundle && rs.releasedSources.contains(source.ref.producer))
     ctx.cachedReuseContracts.push_back(
-        {bundle->op, source.value, touch.member});
+        {bundle->buffers[touch.member], source.value});
   if (!bundle) {
     OpBuilder b(accessOp);
     auto buf = emitInto<nvws::SemaphoreBufferOp>(
@@ -904,32 +882,20 @@ static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs, Node *node,
       ctx.exactReuseBufferOps.insert(buf.getOperation());
     if (node->bufferStageOffset)
       buf.setStage(materializeI32Before(buf, *node->bufferStageOffset));
-    ctx.bufferContracts.push_back(EmitCtx::BufferContract{
-        buf.getOperation(), source.value, source.sema,
-        SmallVector<Type, 2>(types.begin(), types.end())});
-    RenderState::ViewBundle emitted;
-    emitted.op = buf.getOperation();
-    emitted.producer = source.ref.producer;
-    emitted.channel = source.ref.sema;
-    emitted.token = source.value;
-    emitted.semaphore = source.sema;
-    emitted.owner = owner;
-    emitted.bufferStageOffset = node->bufferStageOffset;
-    emitted.resultTypes.assign(types.begin(), types.end());
-    for (Value buffer : buf.getBuffers())
-      emitted.buffers.push_back(buffer);
     // Keep one current bundle, matching the emitter's established locality
     // behavior while making every reuse an exact-capability comparison.
-    rs.views.clear();
-    rs.views.push_back(std::move(emitted));
-    bundle = &rs.views.back();
+    rs.view = RenderState::ViewBundle{
+        source.ref.producer, source.ref.sema, source.value, source.sema, owner,
+        node->bufferStageOffset,
+        SmallVector<Value, 2>(buf.getBuffers().begin(), buf.getBuffers().end())};
+    bundle = &*rs.view;
   }
   Value base = bundle->buffers[touch.member];
   Value cur = base;
   OpBuilder b(accessOp);
   for (const AliasStep &step : touch.alias) {
     Operation *old = step.op;
-    if (old->getName().getStringRef() == "ttg.memdesc_index" && old->getNumResults() == 1 &&
+    if (old->getName().getStringRef() == "ttg.memdesc_index" &&
         sameViewType(step.resultType, cur.getType()))
       continue;
     IRMapping mapping;
@@ -997,7 +963,7 @@ static void recordProducerAlias(RenderState &state, Node *producer,
 static const RenderState::Token *
 regionExitToken(const RegionFlow &flow, unsigned branch, RenderState &state,
                 const RenderState::Token *passThrough) {
-  Node *final = branch < flow.exits.size() ? flow.exits[branch] : nullptr;
+  Node *final = flow.exits[branch];
   if (!final)
     return passThrough;
   return state.tokenForSource(final);
@@ -1319,44 +1285,24 @@ static nvws::SemaphoreAcquireOp resolveAcquireThroughIfs(Value v) {
 static LogicalResult
 verifyEmittedIR(triton::FuncOp func,
                 const DenseSet<Operation *> &exactReuseBufferOps,
-                ArrayRef<EmitCtx::BufferContract> bufferContracts,
                 ArrayRef<EmitCtx::CachedReuseContract> cachedReuseContracts) {
-  for (const EmitCtx::BufferContract &contract : bufferContracts) {
-    auto buffer = dyn_cast_if_present<nvws::SemaphoreBufferOp>(contract.op);
-    if (!buffer)
-      return semaError(func)
-             << "emitter contract: materialized buffer op was removed";
-    if (buffer.getToken() != contract.token ||
-        buffer.getSemaphore() != contract.semaphore)
-      return semaError(buffer)
-             << "emitter contract: buffer lost its exact capability operands";
-    if (buffer.getNumResults() != contract.resultTypes.size())
-      return semaError(buffer)
-             << "emitter contract: buffer result count changed";
-    for (auto [result, type] :
-         llvm::zip(buffer.getResults(), contract.resultTypes))
-      if (result.getType() != type)
-        return semaError(buffer)
-               << "emitter contract: buffer result type changed";
-  }
   for (const EmitCtx::CachedReuseContract &contract : cachedReuseContracts) {
-    auto buffer = dyn_cast_if_present<nvws::SemaphoreBufferOp>(contract.bufferOp);
-    if (!buffer || buffer.getToken() != contract.token ||
-        contract.member >= buffer.getNumResults())
+    auto buffer = contract.view.getDefiningOp<nvws::SemaphoreBufferOp>();
+    if (!buffer || buffer.getToken() != contract.token)
       return semaError(func)
              << "emitter contract: malformed exact cached-view reuse";
     Operation *bufferOp = buffer.getOperation();
-    Value view = buffer.getResult(contract.member);
     bool witnessed = false;
     for (Operation *tokenUser : contract.token.getUsers()) {
       if (!isa<nvws::SemaphoreReleaseOp>(tokenUser) ||
           tokenUser->getBlock() != bufferOp->getBlock() ||
           !bufferOp->isBeforeInBlock(tokenUser))
         continue;
-      witnessed |= llvm::any_of(view.getUsers(), [&](Operation *viewUser) {
-        return viewUser->getBlock() == tokenUser->getBlock() &&
-               tokenUser->isBeforeInBlock(viewUser);
-      });
+      witnessed |=
+          llvm::any_of(contract.view.getUsers(), [&](Operation *viewUser) {
+            return viewUser->getBlock() == tokenUser->getBlock() &&
+                   tokenUser->isBeforeInBlock(viewUser);
+          });
     }
     if (!witnessed)
       return semaError(buffer)
@@ -1509,6 +1455,6 @@ LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups) {
   if (ctx.poison.use_empty())
     ctx.poison.getDefiningOp()->erase();
   return verifyEmittedIR(funcOp, ctx.exactReuseBufferOps,
-                         ctx.bufferContracts, ctx.cachedReuseContracts);
+                         ctx.cachedReuseContracts);
 }
 } // namespace mlir::triton::nvws_semas

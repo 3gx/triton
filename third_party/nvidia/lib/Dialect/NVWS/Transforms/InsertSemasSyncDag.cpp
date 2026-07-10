@@ -685,10 +685,10 @@ static bool hasCompletionStageMismatch(Node *loop, Node *demand,
 class DirectBuilder {
 public:
   DirectBuilder(GroupDag &group, MutableArrayRef<EdgeRec> edges,
-                const DenseSet<Node *> &reuse, PlacementMode placementMode,
-                const DenseSet<Operation *> &firstTouchLoops)
-      : g(group), edges(edges), reusable(reuse), placementMode(placementMode),
-        firstTouchLoops(firstTouchLoops) {
+                const DenseSet<Node *> &reuse,
+                llvm::function_ref<bool(Operation *)> useFirstTouch)
+      : g(group), edges(edges), reusable(reuse),
+        useFirstTouch(useFirstTouch) {
     for (EdgeRec &edge : edges) {
       atDst[edge.dst].push_back(&edge);
       remainingEdges.insert(&edge);
@@ -740,13 +740,10 @@ private:
   using BoundaryKey = std::pair<Node *, Owner>;
   using PendingSupplies = std::map<BoundaryKey, Supply>;
   struct Watch {
-    struct Demand {
-      Node *node = nullptr, *channel = nullptr, *anchor = nullptr;
-    };
     std::optional<Owner> owner;
     bool hasRealInput = false;
     Node *lastCompletion = nullptr;
-    std::map<Owner, Demand> demands;
+    std::map<Owner, Node *> demands;
     void observe(std::optional<Owner> candidate, Node *completion) {
       if (owner && candidate && completion && sameOwner(*owner, *candidate))
         lastCompletion = completion;
@@ -803,19 +800,13 @@ private:
     semaError(node && node->op ? node->op : g.root->op) << message;
     hadError = true;
   }
-  bool selectsFirstTouch(Node *loop) const {
-    return placementMode == PlacementMode::FirstTouch ||
-           (placementMode == PlacementMode::Auto &&
-            firstTouchLoops.contains(loop->op));
-  }
   void rejectPOU(Node *loop, StringRef reason) {
     if (!pouRejection)
       pouRejection = POURejection{loop->op, reason.str()};
     hadError = true;
   }
   void recordPOU(Node *loop, Node *acquire, bool mustPreserveBoundary = false) {
-    if (acquire)
-      pouPlanSites.push_back({loop, acquire, mustPreserveBoundary});
+    pouPlanSites.push_back({loop, acquire, mustPreserveBoundary});
   }
   void appendAlternative(Supply &paths, Supply branch, Node *region) {
     if (branch.empty()) {
@@ -872,8 +863,7 @@ private:
     bool deferred = chain.supplies.count(boundaryKey(region, *owner));
     if (!region->flow && !region->tokenSource && !channel && !deferred)
       return;
-    Node *anchor = region->scheduleAnchor ? region->scheduleAnchor : region;
-    watch.demands.try_emplace(*owner, Watch::Demand{region, channel, anchor});
+    watch.demands.try_emplace(*owner, region);
   }
   Node *precedingChannel(Node *node, const Owner &owner) const {
     for (Node *cursor = node; cursor && cursor->parent; cursor = cursor->parent)
@@ -1354,8 +1344,8 @@ private:
         fail(region, "mixed-owner loop close has no point-of-use demand");
         continue;
       }
-      Node *first = demandIt->second.node;
-      Node *acquire = demandIt->second.channel;
+      Node *first = demandIt->second;
+      Node *acquire = regionChannelFor(first, owner);
       if (!acquire)
         acquire = first->tokenSource;
       if (!acquire || acquire->kind != Node::Acquire) {
@@ -1373,7 +1363,7 @@ private:
                       supply, true);
       acquire->count = std::max(acquire->count, 1u);
       regionChannels[boundaryKey(region, owner)] = acquire;
-      if (!selectsFirstTouch(region))
+      if (!useFirstTouch(region->op))
         recordPOU(region, acquire);
       incoming.eraseOwner(owner);
     }
@@ -1392,13 +1382,13 @@ private:
     bodyState.tokens.record(owner, region, body, {AsyncOp::NONE});
     setEntryToken(body, {owner, region, body, {AsyncOp::NONE}});
     placeChain(body, bodyState);
+    bool firstTouch = useFirstTouch(region->op);
     lastOwnerAccess = bodyState.watch.lastCompletion;
-    Watch::Demand boundaryDemand;
     auto demandIt = bodyState.watch.demands.find(owner);
-    if (demandIt != bodyState.watch.demands.end())
-      boundaryDemand = demandIt->second;
-    Node *demand = boundaryDemand.node;
-    Node *childChannel = boundaryDemand.channel;
+    Node *demand = demandIt == bodyState.watch.demands.end()
+                       ? nullptr
+                       : demandIt->second;
+    Node *childChannel = regionChannelFor(demand, owner);
     Tokens &bodyTokens = bodyState.tokens;
     LoopSupplies supplies = indexLoopSupplies(exit, rawEntry);
     auto closeSupply = [&](Node *acquire, LoopSupply &supply) {
@@ -1409,7 +1399,8 @@ private:
     };
     LoopSupply &supply = supplies[owner];
     const Tokens::Token *initial = loopInputs.findOpen(owner);
-    Node *demandAnchor = boundaryDemand.anchor;
+    Node *demandAnchor =
+        demand && demand->scheduleAnchor ? demand->scheduleAnchor : demand;
     Node *continuation = region->next && region->next->kind != Node::Exit
                              ? region->next
                              : nullptr;
@@ -1477,7 +1468,7 @@ private:
       publishRegionFlow(region, input, owner, {tail}, {AsyncOp::NONE},
                         std::move(incoming), chain.tokens);
     };
-    if (hasSupply && selectsFirstTouch(region)) {
+    if (hasSupply && firstTouch) {
       placeCarried();
       return;
     }
@@ -1502,7 +1493,7 @@ private:
       }
       regionChannels[boundaryKey(region, owner)] = childChannel;
       dropOwner(chain.tokens, std::move(incoming), owner);
-      if (hasSupply && !selectsFirstTouch(region))
+      if (hasSupply && !firstTouch)
         recordPOU(region, childChannel, mustPreserveBoundary);
       return;
     }
@@ -1524,7 +1515,7 @@ private:
     for (const EdgeRec *edge : supply.entry)
       incoming.eraseOwner(edge->srcOwner);
     dropOwner(chain.tokens, std::move(incoming), owner);
-    if (hasSupply && !selectsFirstTouch(region))
+    if (hasSupply && !firstTouch)
       recordPOU(region, recurrence, mustPreserveBoundary);
   }
   void placeFor(Node *region, Chain &chain, Node *&lastOwnerAccess) {
@@ -1552,8 +1543,7 @@ private:
         placeAccess(node, chain);
         chain.watch.observe(std::optional<Owner>(std::in_place, node->owner),
                             node);
-        chain.watch.demands.try_emplace(node->owner,
-                                        Watch::Demand{node, nullptr, node});
+        chain.watch.demands.try_emplace(node->owner, node);
         break;
       case Node::If:
         placeIf(node, chain, continuation);
@@ -1569,8 +1559,6 @@ private:
       default:
         break;
       }
-      if (hadError)
-        return;
       node = next;
     }
   }
@@ -1641,8 +1629,7 @@ private:
   GroupDag &g;
   MutableArrayRef<EdgeRec> edges;
   const DenseSet<Node *> &reusable;
-  PlacementMode placementMode;
-  const DenseSet<Operation *> &firstTouchLoops;
+  llvm::function_ref<bool(Operation *)> useFirstTouch;
   DenseMap<Node *, EdgeRefs> atDst;
   DenseMap<Node *, Node *> channelParent;
   std::map<BoundaryKey, Node *> regionChannels;
@@ -1856,17 +1843,15 @@ static LogicalResult verifySyncDag(GroupDag &g) {
         n->kind == Node::For || llvm::is_contained(c.exits, nullptr);
     if ((needsInput && !n->tokenSource) ||
         (n->tokenSource && !compatible(n->tokenSource, c.owner)) || !c.sema ||
+        *c.sema >= g.semas.size() ||
         c.exits.size() != n->children.size() || !used.contains(n))
-      return semaError(n->op) << "region has incomplete exact token flow";
-    if (*c.sema >= g.semas.size())
       return semaError(n->op) << "region has incomplete exact token flow";
     for (auto [index, final] : llvm::enumerate(c.exits)) {
       if (!final)
         continue;
       const std::optional<Owner> &owner = final->producedTokenOwner;
-      if (!owner)
-        return semaError(n->op) << "region path exports no compatible token";
-      if (!sameOwner(*owner, c.owner) || !contains(n->children[index], final))
+      if (!owner || !sameOwner(*owner, c.owner) ||
+          !contains(n->children[index], final))
         return semaError(n->op) << "region path exports no compatible token";
     }
     return success();
@@ -1879,9 +1864,8 @@ static LogicalResult verifySyncDag(GroupDag &g) {
     case Node::Release: {
       if (n->sema >= g.semas.size() || !n->sat || !n->scheduleAnchor ||
           n->payloads.empty() || !n->count || !n->tokenSource ||
-          !compatible(n->tokenSource, n->owner))
-        return semaError(g.root->op) << "release has no exact token source";
-      if (n->sat->kind != Node::Acquire)
+          !compatible(n->tokenSource, n->owner) ||
+          n->sat->kind != Node::Acquire)
         return semaError(g.root->op) << "release has no exact token source";
       const Sema &sema = g.semas[n->sema];
       bool exactAnchor = n->scheduleAnchor == n->tokenSource ||
@@ -1905,9 +1889,8 @@ static LogicalResult verifySyncDag(GroupDag &g) {
         return semaError(n->op) << "buffer access has no valid owner token";
       return success();
     case Node::Acquire: {
-      if (n->sema >= g.semas.size() || !n->scheduleAnchor || !n->count)
-        return semaError(g.root->op) << "acquire has no valid supply";
-      if ((!g.semas[n->sema].entryOwner && releases[n->sema].empty()) ||
+      if (n->sema >= g.semas.size() || !n->scheduleAnchor || !n->count ||
+          (!g.semas[n->sema].entryOwner && releases[n->sema].empty()) ||
           n->count != g.semas[n->sema].count)
         return semaError(g.root->op) << "acquire has no valid supply";
       const Sema &sema = g.semas[n->sema];
@@ -2018,9 +2001,6 @@ static LogicalResult assignCircularStageOffsets(PhysicalSets &physical) {
     DenseSet<int64_t> starts;
     DenseMap<Operation *, SmallVector<SlotEvent, 1>> eventsByOp;
     for (GroupDag *g : set) {
-      if (g->pieceTable.members.size() != 1)
-        return semaError(g->root->op)
-               << "malformed circular local logical group";
       const Member &member = g->pieceTable.members.front();
       if (member.type != type)
         return semaError(member.allocOp)
@@ -2459,11 +2439,9 @@ static LogicalResult legalizeLoopSchedule(scf::ForOp loop,
   OpBuilder builder(loop.getContext());
   for (auto [op, legalized] : cluster) {
     gpu::StageCluster oldSchedule = gpu::getStageCluster(op);
-    if (legalized > std::numeric_limits<int32_t>::max() - rebase)
-      return semaError(op) << "legalized loop.cluster exceeds i32 range";
+    assert(legalized <= std::numeric_limits<int32_t>::max() - rebase &&
+           "legalized loop.cluster must fit i32");
     int64_t newCluster = legalized + rebase;
-    if (newCluster < oldSchedule->second)
-      return semaError(op) << "legalization lowered an authored loop.cluster";
     if (newCluster == oldSchedule->second)
       continue;
     gpu::setStageCluster(
@@ -2567,8 +2545,8 @@ LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups) {
 
 FailureOr<std::optional<POURejection>>
 buildSyncDag(GroupDag &g, bool useMetaPartitioner, int lowerSemaphoreNumStages,
-             int &numTmemBlocks, PlacementMode placementMode,
-             const DenseSet<Operation *> &firstTouchLoops) {
+             int &numTmemBlocks,
+             llvm::function_ref<bool(Operation *)> useFirstTouch) {
   SmallVector<EdgeRec> edges;
   DenseSet<Node *> reusable;
   for (Node *head : g.root->children) {
@@ -2580,7 +2558,7 @@ buildSyncDag(GroupDag &g, bool useMetaPartitioner, int lowerSemaphoreNumStages,
       computeBackingCopies(g, edges, useMetaPartitioner, numTmemBlocks);
   if (failed(plannedCopy))
     return failure();
-  DirectBuilder builder(g, edges, reusable, placementMode, firstTouchLoops);
+  DirectBuilder builder(g, edges, reusable, useFirstTouch);
   if (!edges.empty() && failed(builder.run())) {
     if (builder.getPOURejection()) {
       POURejection rejection = *builder.getPOURejection();
