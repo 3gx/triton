@@ -39,6 +39,11 @@ using PartitionId = std::pair<int /*ttg.partition*/, int /*ws tag*/>;
 using Owner = std::optional<PartitionId>;
 
 enum class PlacementMode : uint8_t { Auto, FirstTouch, POU };
+struct POURejection {
+  Operation *loop = nullptr;
+  std::string reason;
+  Operation *group = nullptr;
+};
 inline int64_t ownerKey(const Owner &o) {
   return o ? (static_cast<int64_t>(o->second) << 32) |
                  static_cast<uint32_t>(o->first) : -1;
@@ -336,9 +341,10 @@ void dumpSyncDagTrees(MutableArrayRef<GroupDag> groups);
 void dumpSyncDags(MutableArrayRef<GroupDag> groups, triton::FuncOp func);
 FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp);
 LogicalResult buildAccessDag(GroupDag &g, triton::FuncOp funcOp);
-LogicalResult buildSyncDag(GroupDag &g, bool useMetaPartitioner,
-                           int lowerSemaphoreNumStages, int &numTmemBlocks,
-                           PlacementMode placementMode);
+FailureOr<std::optional<POURejection>>
+buildSyncDag(GroupDag &g, bool useMetaPartitioner, int lowerSemaphoreNumStages,
+             int &numTmemBlocks, PlacementMode placementMode,
+             const DenseSet<Operation *> &firstTouchLoops);
 LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups);
 LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups);
 } // namespace mlir::triton::nvws_semas

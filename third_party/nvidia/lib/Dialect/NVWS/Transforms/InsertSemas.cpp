@@ -35,8 +35,12 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner,
   if (!walkResult.wasInterrupted())
     return success();
 
-  auto buildPlan = [&](PlacementMode mode)
+  using FirstTouchLoops = DenseMap<Operation *, DenseSet<Operation *>>;
+  const DenseSet<Operation *> noFirstTouchLoops;
+  std::optional<POURejection> rejection;
+  auto buildPlan = [&](PlacementMode mode, const FirstTouchLoops &overrides)
       -> FailureOr<SmallVector<GroupDag, 0>> {
+    rejection.reset();
     FailureOr<SmallVector<GroupDag, 0>> groupsOr = collectGroups(funcOp);
     if (failed(groupsOr))
       return failure();
@@ -46,45 +50,80 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner,
         }))
       return failure();
     int numTmemBlocks = 0;
-    if (llvm::any_of(candidate, [&](GroupDag &g) {
-          return failed(buildSyncDag(g, useMetaPartitioner,
-                                     lowerSemaphoreNumStages, numTmemBlocks,
-                                     mode));
-        }))
-      return failure();
+    for (GroupDag &g : candidate) {
+      Operation *key = g.pieceTable.members.front().allocOp;
+      auto override = overrides.find(key);
+      const DenseSet<Operation *> &loops =
+          override == overrides.end() ? noFirstTouchLoops : override->second;
+      FailureOr<std::optional<POURejection>> result =
+          buildSyncDag(g, useMetaPartitioner, lowerSemaphoreNumStages,
+                       numTmemBlocks, mode, loops);
+      if (failed(result))
+        return failure();
+      if (*result) {
+        rejection = std::move(**result);
+        return failure();
+      }
+    }
     if (failed(finalizeSyncSchedule(candidate)))
       return failure();
     return candidate;
   };
 
+  SmallVector<std::pair<Operation *, DictionaryAttr>, 0> authoredAttrs;
+  funcOp.walk([&](Operation *op) {
+    authoredAttrs.push_back({op, op->getAttrDictionary()});
+  });
+  auto restoreAttrs = [&] {
+    for (auto &[op, attrs] : authoredAttrs)
+      op->setAttrs(attrs);
+  };
+  auto emitRejection = [&](PlacementMode mode) {
+    if (rejection)
+      semaError(rejection->loop)
+          << (mode == PlacementMode::POU
+                  ? "point-of-use placement is unavailable for this loop: "
+                  : "canonical first-touch placement could not satisfy this "
+                    "loop: ")
+          << rejection->reason;
+  };
+
   FailureOr<SmallVector<GroupDag, 0>> groupsOr = failure();
+  const FirstTouchLoops noOverrides;
   if (placementMode != PlacementMode::Auto) {
-    groupsOr = buildPlan(placementMode);
+    groupsOr = buildPlan(placementMode, noOverrides);
   } else {
-    SmallVector<std::pair<Operation *, DictionaryAttr>, 0> authoredAttrs;
-    funcOp.walk([&](Operation *op) {
-      authoredAttrs.push_back({op, op->getAttrDictionary()});
-    });
-    {
+    FirstTouchLoops overrides;
+    while (true) {
       // Auto may abandon a complete optimized candidate after construction or
       // schedule validation. Suppress only errors from that disposable
       // attempt; warnings still flow to the normal diagnostic handlers.
-      ScopedDiagnosticHandler capture(
-          funcOp.getContext(), [](Diagnostic &diag) -> LogicalResult {
-            return diag.getSeverity() == DiagnosticSeverity::Error
-                       ? success()
-                       : failure();
-          });
-      groupsOr = buildPlan(PlacementMode::Auto);
-    }
-    if (failed(groupsOr)) {
-      for (auto &[op, attrs] : authoredAttrs)
-        op->setAttrs(attrs);
-      groupsOr = buildPlan(PlacementMode::FirstTouch);
+      {
+        ScopedDiagnosticHandler capture(
+            funcOp.getContext(), [](Diagnostic &diag) -> LogicalResult {
+              return diag.getSeverity() == DiagnosticSeverity::Error
+                         ? success()
+                         : failure();
+            });
+        groupsOr = buildPlan(PlacementMode::Auto, overrides);
+      }
+      if (succeeded(groupsOr))
+        break;
+      restoreAttrs();
+      if (rejection &&
+          overrides[rejection->group].insert(rejection->loop).second)
+        continue;
+      groupsOr = buildPlan(PlacementMode::FirstTouch, noOverrides);
+      break;
     }
   }
-  if (failed(groupsOr))
+  if (failed(groupsOr)) {
+    emitRejection(placementMode == PlacementMode::POU
+                      ? PlacementMode::POU
+                      : PlacementMode::FirstTouch);
+    restoreAttrs();
     return failure();
+  }
   SmallVector<GroupDag, 0> groups = std::move(*groupsOr);
   dumpSyncDags(groups, funcOp);
   return emitIR(funcOp, groups);
