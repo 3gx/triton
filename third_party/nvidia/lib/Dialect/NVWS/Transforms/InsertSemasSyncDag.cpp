@@ -1325,6 +1325,13 @@ private:
       supplies[edge->dstOwner].entry.push_back(edge);
     return supplies;
   }
+  void satisfyLoopClose(Node *exit, const Owner &owner, Node *acquire,
+                        LoopSupply &supply, Chain &bodyState) {
+    Supply paths =
+        collectSupply(acquire, supply.closes, bodyState.tokens, bodyState);
+    paths.appendExecuted(takeSupply(bodyState, exit, owner));
+    applySupply(acquire, paths);
+  }
   void placeMixedOwnerFor(Node *region, Chain &chain,
                           ArrayRef<EdgeRec *> rawEntry, Tokens incoming) {
     // A mixed-owner loop has no single boundary token to carry. Canonical
@@ -1334,7 +1341,6 @@ private:
     Chain bodyState = enterChain(Chain{}, incoming, body);
     Tokens loopInputs = bodyState.tokens;
     placeChain(body, bodyState);
-    Tokens &bodyTokens = bodyState.tokens;
     LoopSupplies supplies = indexLoopSupplies(exit, rawEntry);
     for (const auto &[key, _] : bodyState.supplies)
       supplies[key.second];
@@ -1355,10 +1361,7 @@ private:
         if (old)
           replaceTokenSource(first, old, acquire);
       }
-      Supply paths =
-          collectSupply(acquire, supply.closes, bodyTokens, bodyState);
-      paths.appendExecuted(takeSupply(bodyState, exit, owner));
-      applySupply(acquire, paths);
+      satisfyLoopClose(exit, owner, acquire, supply, bodyState);
       supplyLoopEntry(region, chain, incoming, loopInputs, acquire, owner,
                       supply, true);
       acquire->count = std::max(acquire->count, 1u);
@@ -1369,6 +1372,36 @@ private:
     }
     chain.tokens = std::move(incoming);
   }
+  Node *materializeLoopInput(Node *region, Chain &chain, Tokens &incoming,
+                             const Tokens &loopInputs, const Owner &owner,
+                             LoopSupply &supply) {
+    const Tokens::Token *initial = loopInputs.findOpen(owner);
+    if (supply.entry.empty() && initial) {
+      incoming.record(initial->owner, initial->producer, initial->last,
+                      initial->payloads);
+      return initial->producer;
+    }
+    Node *acquire = makeAcquire(region, owner);
+    supplyLoopEntry(region, chain, incoming, loopInputs, acquire, owner, supply,
+                    true);
+    if (seeded.contains(acquire))
+      acquire->count = 1;
+    incoming.record(owner, acquire, acquire, {AsyncOp::NONE});
+    return acquire;
+  }
+  Node *materializeLoopTail(Node *exit, Node *demandAnchor, Node *input,
+                            const Owner &owner, LoopSupply &supply,
+                            Chain &bodyState, bool distanceOne) {
+    assert(input && "loop close requires an input");
+    Node *tail = makeAcquire(exit, owner);
+    tail->scheduleAnchor = demandAnchor ? demandAnchor : exit;
+    tail->recurrenceDistance = distanceOne ? std::optional<int64_t>(1)
+                                           : std::nullopt;
+    satisfyLoopClose(exit, tail->owner, tail, supply, bodyState);
+    if (input->kind == Node::Acquire)
+      uniteChannels(tail, input);
+    return tail;
+  }
   void placeUniformOwnerFor(Node *region, Chain &chain, Node *&lastOwnerAccess,
                             const Owner &owner, ArrayRef<EdgeRec *> rawEntry,
                             Tokens incoming) {
@@ -1376,124 +1409,96 @@ private:
     Chain bodyState = enterChain(Chain{}, incoming, body);
     Tokens loopInputs = bodyState.tokens;
     bodyState.watch.owner.emplace(owner);
-    if (const Tokens::Token *watchedInput = loopInputs.findOpen(owner))
-      bodyState.watch.hasRealInput = watchedInput->last->kind != Node::Enter;
+    if (const Tokens::Token *input = loopInputs.findOpen(owner))
+      bodyState.watch.hasRealInput = input->last->kind != Node::Enter;
     region->producedTokenOwner.emplace(owner);
     bodyState.tokens.record(owner, region, body, {AsyncOp::NONE});
     setEntryToken(body, {owner, region, body, {AsyncOp::NONE}});
     placeChain(body, bodyState);
     bool firstTouch = useFirstTouch(region->op);
     lastOwnerAccess = bodyState.watch.lastCompletion;
+
     auto demandIt = bodyState.watch.demands.find(owner);
     Node *demand = demandIt == bodyState.watch.demands.end()
                        ? nullptr
                        : demandIt->second;
     Node *childChannel = regionChannelFor(demand, owner);
-    Tokens &bodyTokens = bodyState.tokens;
-    LoopSupplies supplies = indexLoopSupplies(exit, rawEntry);
-    auto closeSupply = [&](Node *acquire, LoopSupply &supply) {
-      Supply paths =
-          collectSupply(acquire, supply.closes, bodyTokens, bodyState);
-      paths.appendExecuted(takeSupply(bodyState, exit, acquire->owner));
-      applySupply(acquire, paths);
-    };
-    LoopSupply &supply = supplies[owner];
-    const Tokens::Token *initial = loopInputs.findOpen(owner);
     Node *demandAnchor =
         demand && demand->scheduleAnchor ? demand->scheduleAnchor : demand;
-    Node *continuation = region->next && region->next->kind != Node::Exit
-                             ? region->next
-                             : nullptr;
-    const Tokens::Token *output = bodyTokens.findOpen(owner);
+    LoopSupplies supplies = indexLoopSupplies(exit, rawEntry);
+    LoopSupply &supply = supplies[owner];
+    const Tokens::Token *output = bodyState.tokens.findOpen(owner);
     bool hasSupply = !supply.closes.empty() ||
                      bodyState.supplies.count(boundaryKey(exit, owner));
-    bool returnsToken = output && !hasSupply;
-    auto loopInput = [&]() -> Node * {
-      if (supply.entry.empty() && initial) {
-        incoming.record(initial->owner, initial->producer, initial->last,
-                        initial->payloads);
-        return initial->producer;
-      }
-      Node *acquire = makeAcquire(region, owner);
-      supplyLoopEntry(region, chain, incoming, loopInputs, acquire, owner,
-                      supply, true);
-      if (seeded.contains(acquire))
-        acquire->count = 1;
-      incoming.record(owner, acquire, acquire, {AsyncOp::NONE});
-      return acquire;
-    };
-    if (returnsToken) {
-      Node *input = loopInput();
+
+    if (output && !hasSupply) {
+      Node *input = materializeLoopInput(region, chain, incoming, loopInputs,
+                                         owner, supply);
       assert(input && "loop input must have an exact producer");
       Node *outputChannel = concreteAcquire(output->producer);
       if (seeded.contains(input) && outputChannel &&
-          (g.numCopies != 1 ||
-           !hasCompletionStageMismatch(region, demandAnchor, owner)))
+           (g.numCopies != 1 ||
+            !hasCompletionStageMismatch(region, demandAnchor, owner)))
         uniteChannels(input, outputChannel);
       publishRegionFlow(region, input, owner, {output->producer},
                         output->payloads, std::move(incoming), chain.tokens);
       return;
     }
-    auto closeAtExit = [&](Node *input, bool distanceOne) {
-      assert(input && "loop close requires an input");
-      Node *tail = makeAcquire(exit, owner);
-      tail->scheduleAnchor = demandAnchor ? demandAnchor : exit;
-      if (distanceOne)
-        tail->recurrenceDistance = 1;
-      closeSupply(tail, supply);
-      if (input->kind == Node::Acquire)
-        uniteChannels(tail, input);
-      return tail;
-    };
+    if (hasSupply && firstTouch) {
+      Node *input = materializeLoopInput(region, chain, incoming, loopInputs,
+                                         owner, supply);
+      Node *tail = materializeLoopTail(exit, demandAnchor, input, owner, supply,
+                                       bodyState, true);
+      region->scheduleAnchor = demandAnchor ? demandAnchor : exit;
+      publishRegionFlow(region, input, owner, {tail}, {AsyncOp::NONE},
+                        std::move(incoming), chain.tokens);
+      return;
+    }
+    if (!demand && supply.entry.empty() && !hasSupply) {
+      dropOwner(chain.tokens, std::move(incoming), owner);
+      return;
+    }
+    if (!demand) {
+      rejectPOU(region, "the loop has no exact point-of-use demand");
+      return;
+    }
+
     Node *firstUse = demand;
     bool nestedInput = false;
     for (Node *node = body; node && node != demand; node = node->next) {
-      nestedInput |= llvm::any_of(node->children, [&](Node *child) {
-        return usesTokenSource(child, region);
-      });
+      for (Node *child : node->children)
+        nestedInput |= usesTokenSource(child, region);
       if (firstUse == demand && node->kind != Node::Enter &&
           node->tokenSource == region)
         firstUse = node;
     }
     bool forwardedInput =
-        nestedInput || (demand && demand->isRegion() && !demand->flow &&
+        nestedInput || (demand->isRegion() && !demand->flow &&
                         demand->tokenSource == region);
+    Node *continuation = region->next && region->next->kind != Node::Exit
+                             ? region->next
+                             : nullptr;
     bool mustPreserveBoundary =
         (bodyState.watch.hasRealInput || forwardedInput) &&
         !reusableUse(continuation, owner);
-    auto placeCarried = [&]() {
-      Node *input = loopInput();
-      Node *tail = closeAtExit(input, true);
-      region->scheduleAnchor = demandAnchor ? demandAnchor : exit;
-      publishRegionFlow(region, input, owner, {tail}, {AsyncOp::NONE},
-                        std::move(incoming), chain.tokens);
-    };
-    if (hasSupply && firstTouch) {
-      placeCarried();
-      return;
-    }
-    if (!demand) {
-      if (supply.entry.empty() && !hasSupply)
-        dropOwner(chain.tokens, std::move(incoming), owner);
-      else
-        rejectPOU(region, "the loop has no exact point-of-use demand");
-      return;
-    }
+
     if (childChannel) {
       if (!hasSupply) {
         supplyLoopEntry(region, chain, incoming, loopInputs, childChannel,
                         owner, supply, false);
         region->scheduleAnchor = demandAnchor;
       } else {
-        Node *input = loopInput();
-        Node *tail = closeAtExit(input, g.numCopies == 1);
+        Node *input = materializeLoopInput(region, chain, incoming, loopInputs,
+                                           owner, supply);
+        Node *tail = materializeLoopTail(exit, demandAnchor, input, owner,
+                                         supply, bodyState, g.numCopies == 1);
         Tokens::Token bridge{owner, tail, tail, {AsyncOp::NONE}};
-        materializeRelease(bridge, bridge.owner, childChannel, nullptr)->count =
-            std::max(1u, childChannel->count);
+        materializeRelease(bridge, bridge.owner, childChannel, nullptr)
+            ->count = std::max(1u, childChannel->count);
       }
       regionChannels[boundaryKey(region, owner)] = childChannel;
       dropOwner(chain.tokens, std::move(incoming), owner);
-      if (hasSupply && !firstTouch)
+      if (hasSupply)
         recordPOU(region, childChannel, mustPreserveBoundary);
       return;
     }
@@ -1507,7 +1512,7 @@ private:
                 "the exact recurrence cannot be represented at its demand");
       return;
     }
-    closeSupply(recurrence, supply);
+    satisfyLoopClose(exit, recurrence->owner, recurrence, supply, bodyState);
     supplyLoopEntry(region, chain, incoming, loopInputs, recurrence, owner,
                     supply, true);
     region->scheduleAnchor = demandAnchor;
@@ -1515,7 +1520,7 @@ private:
     for (const EdgeRec *edge : supply.entry)
       incoming.eraseOwner(edge->srcOwner);
     dropOwner(chain.tokens, std::move(incoming), owner);
-    if (hasSupply && !firstTouch)
+    if (hasSupply)
       recordPOU(region, recurrence, mustPreserveBoundary);
   }
   void placeFor(Node *region, Chain &chain, Node *&lastOwnerAccess) {
