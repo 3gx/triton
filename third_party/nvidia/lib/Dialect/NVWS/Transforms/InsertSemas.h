@@ -37,6 +37,8 @@ using PieceId = unsigned;
 using SemaId = unsigned;
 using PartitionId = std::pair<int /*ttg.partition*/, int /*ws tag*/>;
 using Owner = std::optional<PartitionId>;
+
+enum class PlacementMode : uint8_t { Auto, FirstTouch };
 inline int64_t ownerKey(const Owner &o) {
   return o ? (static_cast<int64_t>(o->second) << 32) |
                  static_cast<uint32_t>(o->first) : -1;
@@ -56,12 +58,18 @@ struct PieceInfo {
 struct AliasStep {
   Operation *op = nullptr;
   unsigned operandIdx = 0;
+  // Snapshot the authored result type before EmitIR remaps operands and
+  // refreshes cloned alias result types.
+  Type resultType;
 };
 
 struct Touch {
   MemberId member = 0;
   Effect effect = Effect::R;
   Value accessValue;
+  // Snapshot the authored access type.  The original SSA value may be
+  // rewritten while another group is still rendering.
+  Type accessType;
   SmallVector<AliasStep, 2> alias;
 };
 
@@ -329,7 +337,8 @@ void dumpSyncDags(MutableArrayRef<GroupDag> groups, triton::FuncOp func);
 FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp);
 LogicalResult buildAccessDag(GroupDag &g, triton::FuncOp funcOp);
 LogicalResult buildSyncDag(GroupDag &g, bool useMetaPartitioner,
-                           int lowerSemaphoreNumStages, int &numTmemBlocks);
+                           int lowerSemaphoreNumStages, int &numTmemBlocks,
+                           PlacementMode placementMode);
 LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups);
 LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups);
 } // namespace mlir::triton::nvws_semas

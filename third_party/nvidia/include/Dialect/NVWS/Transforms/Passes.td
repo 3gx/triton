@@ -162,6 +162,9 @@ def NVWSInsertSemas: Pass<"nvws-insert-semas", "mlir::ModuleOp"> {
     Option<"useMetaPartitioner", "use-meta-partitioner",
            "bool", /*default*/"false",
            "If true, InsertSemas is running after the NVWS meta partitioner">,
+    Option<"placementMode", "placement-mode", "std::string",
+           /*default*/"\"auto\"",
+           "Eligible loop-recurrence placement: auto or first-touch">,
     Option<"numStages", "num-stages", "int32_t", /*default*/"3",
            "pipeline depth used by LowerSemaphore auto-multibuffering">
   ];

@@ -503,8 +503,10 @@ static bool precedesInChain(Node *before, Node *after) {
 // are formed only after no placement can change.
 class DirectBuilder {
 public:
-  DirectBuilder(GroupDag &group, MutableArrayRef<EdgeRec> edges, const DenseSet<Node *> &reuse)
-      : g(group), edges(edges), reusable(reuse) {
+  DirectBuilder(GroupDag &group, MutableArrayRef<EdgeRec> edges,
+                const DenseSet<Node *> &reuse, PlacementMode placementMode)
+      : g(group), edges(edges), reusable(reuse),
+        placementMode(placementMode) {
     for (EdgeRec &edge : edges) {
       atDst[edge.dst].push_back(&edge);
       remainingEdges.insert(&edge);
@@ -574,6 +576,69 @@ private:
     std::optional<Tokens::Token> token;
     bool passesInput = false;
   };
+  // A topology-only summary used when every structured path has one uniform
+  // concrete completion stage.  Path-local exact releases remain authoritative
+  // when paths differ; this summary never chooses token or placement facts.
+  struct CompletionSummary {
+    bool valid = true;
+    bool usesInput = true;
+    bool hasFallback = false;
+    gpu::StageCluster fallback;
+  };
+  static bool sameCompletionStage(gpu::StageCluster a,
+                                  gpu::StageCluster b) {
+    if (!a || !b)
+      return a.has_value() == b.has_value();
+    return a->first == b->first;
+  }
+  static CompletionSummary joinCompletion(CompletionSummary a,
+                                          CompletionSummary b) {
+    if (!a.valid || !b.valid ||
+        (a.hasFallback && b.hasFallback &&
+         !sameCompletionStage(a.fallback, b.fallback)))
+      return {false};
+    return {true, a.usesInput || b.usesInput,
+            a.hasFallback || b.hasFallback,
+            a.hasFallback ? a.fallback : b.fallback};
+  }
+  static CompletionSummary applyCompletion(CompletionSummary flow,
+                                           CompletionSummary input) {
+    if (!flow.valid || !input.valid ||
+        (flow.usesInput && flow.hasFallback && input.hasFallback &&
+         !sameCompletionStage(flow.fallback, input.fallback)))
+      return {false};
+    if (!flow.usesInput)
+      return {true, false, true, flow.fallback};
+    return {true, input.usesInput,
+            flow.hasFallback || input.hasFallback,
+            input.hasFallback ? input.fallback : flow.fallback};
+  }
+  static CompletionSummary completionAfterChain(
+      Node *head, const Owner &owner, CompletionSummary state) {
+    for (Node *node = head; node; node = node->next) {
+      if (node->kind == Node::Access && sameOwner(node->owner, owner)) {
+        Operation *completion =
+            node->completionAnchor ? node->completionAnchor : node->op;
+        state = {true, false, true, gpu::getStageCluster(completion)};
+        continue;
+      }
+      if (!node->isRegion() ||
+          (node->kind == Node::For &&
+           gpu::hasWarpSpecializeTag(node->op)))
+        continue;
+      CompletionSummary flow{true, false, false, {}};
+      for (Node *child : node->children)
+        flow = joinCompletion(
+            flow, completionAfterChain(child, owner, CompletionSummary{}));
+      bool hasImplicitInput =
+          node->kind == Node::For ||
+          (node->kind == Node::If && node->children.size() < 2);
+      if (hasImplicitInput)
+        flow = joinCompletion(flow, {});
+      state = applyCompletion(flow, state);
+    }
+    return state;
+  }
   static BoundaryKey boundaryKey(Node *region, const Owner &owner) { return {region, owner}; }
   static void setEntryToken(Node *enter, const Tokens::Token &token) {
     enter->tokenSource = token.producer;
@@ -1116,6 +1181,8 @@ private:
     bodyState.tokens.record(owner, region, body, {AsyncOp::NONE});
     setEntryToken(body, {owner, region, body, {AsyncOp::NONE}});
     placeChain(body, bodyState);
+    CompletionSummary completion =
+        completionAfterChain(body, owner, CompletionSummary{});
     lastOwnerAccess = bodyState.watch.lastCompletion;
     Watch::Demand boundaryDemand;
     auto demandIt = bodyState.watch.demands.find(owner);
@@ -1137,9 +1204,11 @@ private:
       return node && node->op ? gpu::getStageCluster(node->op) : std::nullopt;
     };
     gpu::StageCluster firstSchedule = scheduleOf(demandAnchor);
-    gpu::StageCluster lastSchedule = scheduleOf(bodyState.watch.lastCompletion);
-    bool crossStage = g.numCopies == 1 && demand && demand->tokenSource == region && firstSchedule && lastSchedule &&
-                      firstSchedule->first != lastSchedule->first;
+    bool directCarrier = demand && !childChannel && demand->tokenSource == region;
+    bool crossStage =
+        completion.valid && g.numCopies == 1 && directCarrier &&
+        completion.hasFallback && firstSchedule && completion.fallback &&
+        firstSchedule->first != completion.fallback->first;
     const Tokens::Token *output = bodyTokens.findOpen(owner);
     bool hasSupply = !supply.closes.empty() || bodyState.supplies.count(boundaryKey(exit, owner));
     bool returnsToken = output && !hasSupply;
@@ -1167,7 +1236,7 @@ private:
     auto closeAtExit = [&](Node *input, bool distanceOne) {
       assert(input && "loop close requires an input");
       Node *tail = makeAcquire(exit, owner);
-      tail->scheduleAnchor = demandAnchor;
+      tail->scheduleAnchor = demandAnchor ? demandAnchor : exit;
       if (distanceOne) tail->recurrenceDistance = 1;
       closeSupply(tail, supply);
       if (input->kind == Node::Acquire) uniteChannels(tail, input);
@@ -1183,18 +1252,26 @@ private:
     }
     bool forwardsInput = nestedInput ||
                          (demand && demand->isRegion() && !demand->flow && demand->tokenSource == region);
-    bool carryInput = hasSupply && (bodyState.watch.hasRealInput || forwardsInput) &&
+    bool carryInput = hasSupply &&
+                      (bodyState.watch.hasRealInput || forwardsInput) &&
                       !reusableUse(continuation, owner);
-    if (crossStage || carryInput) {
+    auto placeCarried = [&]() {
       Node *input = loopInput();
       Node *tail = closeAtExit(input, true);
-      region->scheduleAnchor = demandAnchor;
+      region->scheduleAnchor = demandAnchor ? demandAnchor : exit;
       publishRegionFlow(region, input, owner, {tail}, {AsyncOp::NONE}, std::move(incoming), chain.tokens);
+    };
+    bool forceFirstTouch = placementMode == PlacementMode::FirstTouch &&
+                           hasSupply && directCarrier;
+    if (crossStage || carryInput || forceFirstTouch) {
+      placeCarried();
       return;
     }
     if (!demand) {
-      if (supply.entry.empty() && !hasSupply) dropOwner(chain.tokens, std::move(incoming), owner);
-      else fail(region, "loop has no recorded point-of-use demand");
+      if (supply.entry.empty() && !hasSupply)
+        dropOwner(chain.tokens, std::move(incoming), owner);
+      else
+        fail(region, "loop has no recorded point-of-use demand");
       return;
     }
     if (childChannel) {
@@ -1326,6 +1403,7 @@ private:
   GroupDag &g;
   MutableArrayRef<EdgeRec> edges;
   const DenseSet<Node *> &reusable;
+  PlacementMode placementMode;
   DenseMap<Node *, EdgeRefs> atDst;
   DenseMap<Node *, Node *> channelParent;
   std::map<BoundaryKey, Node *> regionChannels;
@@ -2037,7 +2115,9 @@ LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups) {
   return success();
 }
 
-LogicalResult buildSyncDag(GroupDag &g, bool useMetaPartitioner, int lowerSemaphoreNumStages, int &numTmemBlocks) {
+LogicalResult buildSyncDag(GroupDag &g, bool useMetaPartitioner,
+                           int lowerSemaphoreNumStages, int &numTmemBlocks,
+                           PlacementMode placementMode) {
   SmallVector<EdgeRec> edges;
   DenseSet<Node *> reusable;
   for (Node *head : g.root->children) {
@@ -2049,7 +2129,7 @@ LogicalResult buildSyncDag(GroupDag &g, bool useMetaPartitioner, int lowerSemaph
       g, edges, useMetaPartitioner, numTmemBlocks);
   if (failed(plannedCopy)) return failure();
   if (!edges.empty() &&
-      failed(DirectBuilder(g, edges, reusable).run()))
+      failed(DirectBuilder(g, edges, reusable, placementMode).run()))
     return failure();
   for (Node *head : g.root->children) computeRequiredParts(head);
   computeSemaphoreCopies(g, lowerSemaphoreNumStages, *plannedCopy);

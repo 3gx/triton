@@ -134,15 +134,16 @@ static LogicalResult collectTouches(GroupDag &g, Operation *op, SmallVectorImpl<
       if (!isSupportedAliasOp(op))
         return semaError(op) << "unsupported memdesc alias use " << op->getName();
       auto alias = it->second;
-      alias.second.push_back({op, static_cast<unsigned>(index)});
+      alias.second.push_back(
+          {op, static_cast<unsigned>(index), op->getResult(0).getType()});
       g.aliases.try_emplace(op->getResult(0), std::move(alias));
       return success();
     }
   auto touch = [&](Value value, Effect effect) {
     auto it = g.aliases.find(value);
     if (it != g.aliases.end())
-      touches.push_back(
-          Touch{it->second.first, effect, value, it->second.second});
+      touches.push_back(Touch{it->second.first, effect, value, value.getType(),
+                              it->second.second});
   };
   if (auto tmemAlloc = dyn_cast<nvidia_gpu::TMEMAllocOp>(op)) {
     if (tmemAlloc.getSrc())
