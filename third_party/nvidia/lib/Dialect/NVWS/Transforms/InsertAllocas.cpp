@@ -2,6 +2,7 @@
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Support/DebugStringHelper.h"
 #include "mlir/Transforms/Passes.h"
@@ -292,6 +293,69 @@ void createRank1TmemStore(OpBuilder &builder, Location loc, Value src,
       builder, loc, partitions, stageCluster, wsTag, true, 1);
   createInto<TMEMStoreOp>(builder, loc, partitions, stageCluster, wsTag, Type(),
                           dataBuf, Value(), storeSrc, pred);
+}
+
+static void copyTmemInitPlacementAttrs(Operation *from, Operation *to) {
+  for (StringRef name :
+       {StringRef(kPartitionAttrName), StringRef(kLoopStageAttrName),
+        StringRef(kLoopClusterAttrName), StringRef(kWarpSpecializeTagAttrName),
+        StringRef("async_task_id")}) {
+    if (Attribute attr = from->getAttr(name))
+      to->setAttr(name, attr);
+  }
+}
+
+static bool isTmemInitPlacementAttr(StringRef name) {
+  return name == kPartitionAttrName || name == kLoopStageAttrName ||
+         name == kLoopClusterAttrName ||
+         name == kWarpSpecializeTagAttrName || name == "async_task_id";
+}
+
+// Make TMEM initialization an ordinary memory access before MemoryPlanner and
+// InsertSemas. The backing allocation is hoisted, while the explicit store
+// remains at the sourceful allocation's original scheduled point.
+void normalizeSourcefulTmemAlloc(TMEMAllocOp alloc) {
+  assert(alloc.getSrc() && "expected a sourceful TMEM allocation");
+
+  Operation *anchor = alloc;
+  if (auto parentFor = alloc->getParentOfType<scf::ForOp>()) {
+    if (auto wsLoop = getOuterWSLoop(parentFor))
+      anchor = wsLoop;
+  }
+
+  OpBuilder allocBuilder(anchor);
+  MemDescType backingType = withMutableMemory(alloc.getType(), true);
+  auto backing = TMEMAllocOp::create(allocBuilder, alloc.getLoc(), backingType,
+                                     Value());
+  // Physical allocation metadata stays on the backing. ODS segment sizes are
+  // reconstructed by the tokenless/sourceless builder and must not be copied.
+  for (NamedAttribute attr : alloc->getAttrs()) {
+    StringRef name = attr.getName().strref();
+    if (isTmemInitPlacementAttr(name) || name == "operandSegmentSizes" ||
+        name == "resultSegmentSizes")
+      continue;
+    backing->setAttr(attr.getName(), attr.getValue());
+  }
+
+  if (Value token = alloc.getToken(); token && !token.use_empty()) {
+    Value poison = ub::PoisonOp::create(allocBuilder, alloc.getLoc(),
+                                        token.getType());
+    token.replaceAllUsesWith(poison);
+  }
+
+  OpBuilder storeBuilder(alloc);
+  auto pred = arith::ConstantIntOp::create(storeBuilder, alloc.getLoc(), true, 1);
+  auto store = TMEMStoreOp::create(storeBuilder, alloc.getLoc(),
+                                   backing.getResult(), alloc.getSrc(), pred);
+  copyTmemInitPlacementAttrs(alloc, pred);
+  copyTmemInitPlacementAttrs(alloc, store);
+
+  if (alloc.getType() == backing.getType()) {
+    alloc.getResult().replaceAllUsesWith(backing.getResult());
+  } else {
+    replaceUsesAndPropagateType(storeBuilder, alloc, backing.getResult());
+  }
+  alloc.erase();
 }
 
 Value createRank1TmemLoad(OpBuilder &builder, Location loc,
@@ -1062,6 +1126,20 @@ public:
       if (loop->hasAttr(triton::kWarpSpecializeAttrName) && hasPartition(loop))
         loops.push_back(loop);
     });
+
+    if (loops.empty())
+      return;
+
+    // Canonicalize every sourceful TMEM allocation in a function participating
+    // in AutoWS. This is intentionally independent of whether a particular
+    // allocation crosses partitions: InsertSemas analyzes every TMEM backing.
+    SmallVector<TMEMAllocOp> sourcefulTmemAllocs;
+    func.walk([&](TMEMAllocOp alloc) {
+      if (alloc.getSrc())
+        sourcefulTmemAllocs.push_back(alloc);
+    });
+    for (TMEMAllocOp alloc : sourcefulTmemAllocs)
+      normalizeSourcefulTmemAlloc(alloc);
 
     for (scf::ForOp loop : loops) {
       // Communicate iter_args across partitions
