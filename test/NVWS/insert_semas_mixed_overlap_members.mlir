@@ -1,4 +1,9 @@
-// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas -cse | FileCheck %s
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect '--nvws-insert-semas=placement-mode=auto' -cse -o %t.auto
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect '--nvws-insert-semas=placement-mode=pou' -cse -o %t.pou
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect '--nvws-insert-semas=placement-mode=first-touch' -cse -o %t.first
+// RUN: diff %t.auto %t.pou
+// RUN: diff %t.auto %t.first
+// RUN: FileCheck %s < %t.auto
 
 // Dedicated mirror of the meta-FA stats group (GROUP buffer.id=4 in
 // insert_semas_meta_fa_fwd: m0[64,65) m1[66,67) m2[65,66) m3[0,128)

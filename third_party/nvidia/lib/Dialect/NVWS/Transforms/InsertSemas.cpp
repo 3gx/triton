@@ -1,5 +1,6 @@
 // Four-step dispatcher; see sema-docs/insert-semas/overview.md.
 #include "InsertSemas.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 
@@ -16,8 +17,10 @@ FailureOr<PlacementMode> parsePlacementMode(StringRef value,
     return PlacementMode::Auto;
   if (value == "first-touch")
     return PlacementMode::FirstTouch;
+  if (value == "pou")
+    return PlacementMode::POU;
   anchor->emitError() << "nvws-insert-semas: invalid placement mode '" << value
-                      << "' (expected auto or first-touch)";
+                      << "' (expected auto, first-touch, or pou)";
   return failure();
 }
 
@@ -32,20 +35,57 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner,
   if (!walkResult.wasInterrupted())
     return success();
 
-  FailureOr<SmallVector<GroupDag, 0>> groupsOr = collectGroups(funcOp);
-  if (failed(groupsOr)) return failure();
+  auto buildPlan = [&](PlacementMode mode)
+      -> FailureOr<SmallVector<GroupDag, 0>> {
+    FailureOr<SmallVector<GroupDag, 0>> groupsOr = collectGroups(funcOp);
+    if (failed(groupsOr))
+      return failure();
+    SmallVector<GroupDag, 0> candidate = std::move(*groupsOr);
+    if (llvm::any_of(candidate, [&](GroupDag &g) {
+          return failed(buildAccessDag(g, funcOp));
+        }))
+      return failure();
+    int numTmemBlocks = 0;
+    if (llvm::any_of(candidate, [&](GroupDag &g) {
+          return failed(buildSyncDag(g, useMetaPartitioner,
+                                     lowerSemaphoreNumStages, numTmemBlocks,
+                                     mode));
+        }))
+      return failure();
+    if (failed(finalizeSyncSchedule(candidate)))
+      return failure();
+    return candidate;
+  };
+
+  FailureOr<SmallVector<GroupDag, 0>> groupsOr = failure();
+  if (placementMode != PlacementMode::Auto) {
+    groupsOr = buildPlan(placementMode);
+  } else {
+    SmallVector<std::pair<Operation *, DictionaryAttr>, 0> authoredAttrs;
+    funcOp.walk([&](Operation *op) {
+      authoredAttrs.push_back({op, op->getAttrDictionary()});
+    });
+    {
+      // Auto may abandon a complete optimized candidate after construction or
+      // schedule validation. Suppress only errors from that disposable
+      // attempt; warnings still flow to the normal diagnostic handlers.
+      ScopedDiagnosticHandler capture(
+          funcOp.getContext(), [](Diagnostic &diag) -> LogicalResult {
+            return diag.getSeverity() == DiagnosticSeverity::Error
+                       ? success()
+                       : failure();
+          });
+      groupsOr = buildPlan(PlacementMode::Auto);
+    }
+    if (failed(groupsOr)) {
+      for (auto &[op, attrs] : authoredAttrs)
+        op->setAttrs(attrs);
+      groupsOr = buildPlan(PlacementMode::FirstTouch);
+    }
+  }
+  if (failed(groupsOr))
+    return failure();
   SmallVector<GroupDag, 0> groups = std::move(*groupsOr);
-  if (llvm::any_of(groups, [&](GroupDag &g) { return failed(buildAccessDag(g, funcOp)); }))
-    return failure();
-  int numTmemBlocks = 0;
-  if (llvm::any_of(groups, [&](GroupDag &g) {
-        return failed(buildSyncDag(g, useMetaPartitioner,
-                                   lowerSemaphoreNumStages, numTmemBlocks,
-                                   placementMode));
-      }))
-    return failure();
-  if (failed(finalizeSyncSchedule(groups)))
-    return failure();
   dumpSyncDags(groups, funcOp);
   return emitIR(funcOp, groups);
 }

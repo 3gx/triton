@@ -1,5 +1,6 @@
 // RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas | FileCheck %s
 // RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas --nvws-assign-stage-phase -cse | FileCheck %s --check-prefix=ASP
+// RUN: not triton-opt %s -allow-unregistered-dialect '--nvws-insert-semas=placement-mode=pou' 2>&1 | FileCheck %s --check-prefix=POU-REJECT
 
 // Meta flash attention forward (persistent) IR, captured from
 // meta-aws-logs/run-22may26-nvws-meta-tmem-crash/passes/
@@ -213,6 +214,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       // and the Q FULL tokens are loop-invariant captures; ACC0/ACC1 are
       // re-acquired in-body.
       // CHECK:           [[INNER:%.*]]:6 = scf.for {{.*}} iter_args({{.*}}, [[I_R5:%.*]] = [[C_R5]]) -> (i32, {{.*}}, !ttg.async.token)  : i32 {
+      // POU-REJECT: error: nvws-insert-semas: point-of-use placement is unavailable for this loop: fixed loop.stage constraints require a carried recurrence
       %offsetkv_y_40:9 = scf.for %offsetkv_y_88 = %c0_i32 to %c16384_i32 step %c128_i32 iter_args(%offset_y_89 = %offset_y_22, %arg12 = %cst_2, %arg13 = %cst_1, %qk_0_90 = %qk_0_32, %acc_91 = %acc_0_34, %arg16 = %cst_2, %arg17 = %cst_1, %qk_1_92 = %qk_1_33, %acc_93 = %acc_1_35) -> (i32, tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, !ttg.async.token, !ttg.async.token, tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>, !ttg.async.token, !ttg.async.token)  : i32 {
         // K descriptor load: acquire EMPTY (K_E), point-of-use buffer, release FULL.
         // CHECK:             [[KIN_AE:%.*]] = nvws.semaphore.acquire [[K_E]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]> -> !ttg.async.token

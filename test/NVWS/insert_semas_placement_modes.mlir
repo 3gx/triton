@@ -1,5 +1,6 @@
 // RUN: triton-opt %s -allow-unregistered-dialect '--nvws-insert-semas=placement-mode=auto' -cse | FileCheck %s --check-prefix=AUTO
 // RUN: triton-opt %s -allow-unregistered-dialect '--nvws-insert-semas=placement-mode=first-touch' -cse | FileCheck %s --check-prefix=FIRST
+// RUN: triton-opt %s -allow-unregistered-dialect '--nvws-insert-semas=placement-mode=pou' -cse | FileCheck %s --check-prefix=POU
 // RUN: not triton-opt %s -allow-unregistered-dialect '--nvws-insert-semas=placement-mode=invalid' 2>&1 | FileCheck %s --check-prefix=BAD
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
@@ -13,6 +14,12 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // AUTO: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] true
   // AUTO: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} : i32 {
   // AUTO: [[WRITE:%.*]] = nvws.semaphore.acquire [[EMPTY]]
+
+  // POU-LABEL: tt.func @placement_mode
+  // POU: [[BASE:%.*]] = ttg.local_alloc
+  // POU: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] true
+  // POU: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} : i32 {
+  // POU: [[WRITE:%.*]] = nvws.semaphore.acquire [[EMPTY]]
 
   // FIRST-LABEL: tt.func @placement_mode
   // FIRST: [[BASE:%.*]] = ttg.local_alloc
@@ -34,4 +41,4 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   }
 }
 
-// BAD: error: nvws-insert-semas: invalid placement mode 'invalid' (expected auto or first-touch)
+// BAD: error: nvws-insert-semas: invalid placement mode 'invalid' (expected auto, first-touch, or pou)

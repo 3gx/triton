@@ -38,7 +38,7 @@ using SemaId = unsigned;
 using PartitionId = std::pair<int /*ttg.partition*/, int /*ws tag*/>;
 using Owner = std::optional<PartitionId>;
 
-enum class PlacementMode : uint8_t { Auto, FirstTouch };
+enum class PlacementMode : uint8_t { Auto, FirstTouch, POU };
 inline int64_t ownerKey(const Owner &o) {
   return o ? (static_cast<int64_t>(o->second) << 32) |
                  static_cast<uint32_t>(o->first) : -1;

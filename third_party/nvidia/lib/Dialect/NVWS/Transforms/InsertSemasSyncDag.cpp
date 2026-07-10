@@ -498,15 +498,148 @@ static bool precedesInChain(Node *before, Node *after) {
     if (next == after) return true;
   return false;
 }
+
+static Operation *findScheduleAnchor(const Node *anchor,
+                                     bool producer = false);
+
+// A synchronization plan owns an isolated copy of the AccessDag. Candidate
+// placement may freely populate that copy; the selected plan is moved into the
+// real group exactly once. Operation/Value identities remain those of the
+// authored IR, while every Node pointer is remapped into the plan.
+static GroupDag cloneGroupDag(const GroupDag &source) {
+  GroupDag result;
+  result.bufferId = source.bufferId;
+  result.mixedDepthPhysicalAlias = source.mixedDepthPhysicalAlias;
+  result.memory = source.memory;
+  result.circular = source.circular;
+  result.pieceTable = source.pieceTable;
+  result.aliases = source.aliases;
+  result.ttDescriptorFedMembers = source.ttDescriptorFedMembers;
+  result.accessNodeOps = source.accessNodeOps;
+  result.semas = source.semas;
+  result.numCopies = source.numCopies;
+  result.numSemaphoreCopies = source.numSemaphoreCopies;
+  result.backing = source.backing;
+
+  DenseMap<const Node *, Node *> nodes;
+  for (const std::unique_ptr<Node> &owned : source.nodes) {
+    const Node *old = owned.get();
+    Node *copy = result.newNode(old->kind, old->op, nullptr);
+    *copy = *old;
+    nodes[old] = copy;
+  }
+  auto mapNode = [&](Node *node) -> Node * {
+    return node ? nodes.lookup(node) : nullptr;
+  };
+  for (const std::unique_ptr<Node> &owned : source.nodes) {
+    const Node *old = owned.get();
+    Node *copy = nodes.lookup(old);
+    copy->parent = mapNode(old->parent);
+    copy->prev = mapNode(old->prev);
+    copy->next = mapNode(old->next);
+    for (Node *&child : copy->children)
+      child = mapNode(child);
+    copy->tokenSource = mapNode(old->tokenSource);
+    copy->sat = mapNode(old->sat);
+    copy->scheduleAnchor = mapNode(old->scheduleAnchor);
+    if (copy->flow)
+      for (Node *&exit : copy->flow->exits)
+        exit = mapNode(exit);
+  }
+  result.root = mapNode(source.root);
+  return result;
+}
+
+struct POURejection {
+  Operation *loop = nullptr;
+  std::string reason;
+};
+
+struct POUPlanSite {
+  Node *loop = nullptr;
+  Node *acquire = nullptr;
+  bool mustPreserveBoundary = false;
+};
+
+struct ReturnChannelSite {
+  Node *loop = nullptr;
+  Node *demand = nullptr;
+  Owner owner;
+};
+
+// Path summary used only to validate a proposed channel union. It does not
+// select POU versus FirstTouch and never chooses a token or protocol site.
+struct CompletionFlow {
+  bool valid = true;
+  bool usesInput = true;
+  bool hasConcreteStage = false;
+  gpu::StageCluster stage;
+};
+
+static bool sameCompletionStage(gpu::StageCluster a, gpu::StageCluster b) {
+  if (!a || !b)
+    return a.has_value() == b.has_value();
+  return a->first == b->first;
+}
+
+static CompletionFlow joinCompletion(CompletionFlow a, CompletionFlow b) {
+  if (!a.valid || !b.valid ||
+      (a.hasConcreteStage && b.hasConcreteStage &&
+       !sameCompletionStage(a.stage, b.stage)))
+    return {false};
+  return {true, a.usesInput || b.usesInput,
+          a.hasConcreteStage || b.hasConcreteStage,
+          a.hasConcreteStage ? a.stage : b.stage};
+}
+
+static CompletionFlow applyCompletion(CompletionFlow flow,
+                                      CompletionFlow input) {
+  if (!flow.valid || !input.valid ||
+      (flow.usesInput && flow.hasConcreteStage && input.hasConcreteStage &&
+       !sameCompletionStage(flow.stage, input.stage)))
+    return {false};
+  if (!flow.usesInput)
+    return {true, false, true, flow.stage};
+  return {true, input.usesInput,
+          flow.hasConcreteStage || input.hasConcreteStage,
+          input.hasConcreteStage ? input.stage : flow.stage};
+}
+
+static CompletionFlow completionAfterChain(Node *head, const Owner &owner,
+                                           CompletionFlow state = {}) {
+  for (Node *node = head; node; node = node->next) {
+    if (node->kind == Node::Access && sameOwner(node->owner, owner)) {
+      Operation *completion =
+          node->completionAnchor ? node->completionAnchor : node->op;
+      state = {true, false, true, gpu::getStageCluster(completion)};
+      continue;
+    }
+    if (!node->isRegion() ||
+        (node->kind == Node::For && gpu::hasWarpSpecializeTag(node->op)))
+      continue;
+    CompletionFlow flow{true, false, false, {}};
+    for (Node *child : node->children)
+      flow = joinCompletion(flow, completionAfterChain(child, owner));
+    if (node->kind == Node::For ||
+        (node->kind == Node::If && node->children.size() < 2))
+      flow = joinCompletion(flow, {});
+    state = applyCompletion(flow, state);
+  }
+  return state;
+}
+
 // Direct protocol placement.  Acquires and releases are first placed with
 // exact token sources and completion anchors.  Semaphore channels and counts
 // are formed only after no placement can change.
 class DirectBuilder {
 public:
   DirectBuilder(GroupDag &group, MutableArrayRef<EdgeRec> edges,
-                const DenseSet<Node *> &reuse, PlacementMode placementMode)
+                const DenseSet<Node *> &reuse, PlacementMode placementMode,
+                const DenseSet<Operation *> &firstTouchLoops,
+                const DenseSet<Operation *> &separateReturnChannels)
       : g(group), edges(edges), reusable(reuse),
-        placementMode(placementMode) {
+        placementMode(placementMode), firstTouchLoops(firstTouchLoops),
+        separateReturnChannels(separateReturnChannels) {
     for (EdgeRec &edge : edges) {
       atDst[edge.dst].push_back(&edge);
       remainingEdges.insert(&edge);
@@ -528,6 +661,13 @@ public:
     }
     return semaError(g.root->op) << "conditional release path was not consumed ("
                                  << placed.supplies.size() << ")";
+  }
+  const std::optional<POURejection> &getPOURejection() const {
+    return pouRejection;
+  }
+  ArrayRef<POUPlanSite> getPOUPlanSites() const { return pouPlanSites; }
+  ArrayRef<ReturnChannelSite> getReturnChannelSites() const {
+    return returnChannelSites;
   }
 private:
   using EdgeRefs = SmallVector<EdgeRec *, 2>;
@@ -576,69 +716,6 @@ private:
     std::optional<Tokens::Token> token;
     bool passesInput = false;
   };
-  // A topology-only summary used when every structured path has one uniform
-  // concrete completion stage.  Path-local exact releases remain authoritative
-  // when paths differ; this summary never chooses token or placement facts.
-  struct CompletionSummary {
-    bool valid = true;
-    bool usesInput = true;
-    bool hasFallback = false;
-    gpu::StageCluster fallback;
-  };
-  static bool sameCompletionStage(gpu::StageCluster a,
-                                  gpu::StageCluster b) {
-    if (!a || !b)
-      return a.has_value() == b.has_value();
-    return a->first == b->first;
-  }
-  static CompletionSummary joinCompletion(CompletionSummary a,
-                                          CompletionSummary b) {
-    if (!a.valid || !b.valid ||
-        (a.hasFallback && b.hasFallback &&
-         !sameCompletionStage(a.fallback, b.fallback)))
-      return {false};
-    return {true, a.usesInput || b.usesInput,
-            a.hasFallback || b.hasFallback,
-            a.hasFallback ? a.fallback : b.fallback};
-  }
-  static CompletionSummary applyCompletion(CompletionSummary flow,
-                                           CompletionSummary input) {
-    if (!flow.valid || !input.valid ||
-        (flow.usesInput && flow.hasFallback && input.hasFallback &&
-         !sameCompletionStage(flow.fallback, input.fallback)))
-      return {false};
-    if (!flow.usesInput)
-      return {true, false, true, flow.fallback};
-    return {true, input.usesInput,
-            flow.hasFallback || input.hasFallback,
-            input.hasFallback ? input.fallback : flow.fallback};
-  }
-  static CompletionSummary completionAfterChain(
-      Node *head, const Owner &owner, CompletionSummary state) {
-    for (Node *node = head; node; node = node->next) {
-      if (node->kind == Node::Access && sameOwner(node->owner, owner)) {
-        Operation *completion =
-            node->completionAnchor ? node->completionAnchor : node->op;
-        state = {true, false, true, gpu::getStageCluster(completion)};
-        continue;
-      }
-      if (!node->isRegion() ||
-          (node->kind == Node::For &&
-           gpu::hasWarpSpecializeTag(node->op)))
-        continue;
-      CompletionSummary flow{true, false, false, {}};
-      for (Node *child : node->children)
-        flow = joinCompletion(
-            flow, completionAfterChain(child, owner, CompletionSummary{}));
-      bool hasImplicitInput =
-          node->kind == Node::For ||
-          (node->kind == Node::If && node->children.size() < 2);
-      if (hasImplicitInput)
-        flow = joinCompletion(flow, {});
-      state = applyCompletion(flow, state);
-    }
-    return state;
-  }
   static BoundaryKey boundaryKey(Node *region, const Owner &owner) { return {region, owner}; }
   static void setEntryToken(Node *enter, const Tokens::Token &token) {
     enter->tokenSource = token.producer;
@@ -667,6 +744,21 @@ private:
     semaError(node && node->op ? node->op : g.root->op) << message;
     hadError = true;
   }
+  bool selectsFirstTouch(Node *loop) const {
+    return placementMode == PlacementMode::FirstTouch ||
+           (placementMode == PlacementMode::Auto &&
+            firstTouchLoops.contains(loop->op));
+  }
+  void rejectPOU(Node *loop, StringRef reason) {
+    if (!pouRejection)
+      pouRejection = POURejection{loop->op, reason.str()};
+    hadError = true;
+  }
+  void recordPOU(Node *loop, Node *acquire,
+                 bool mustPreserveBoundary = false) {
+    if (acquire)
+      pouPlanSites.push_back({loop, acquire, mustPreserveBoundary});
+  }
   void appendAlternative(Supply &paths, Supply branch, Node *region) {
     if (branch.empty()) {
       fail(region, "conditional path provides no semaphore arrival");
@@ -694,6 +786,12 @@ private:
   }
   static bool scalableRelease(const Node *release) {
     return llvm::all_of(release->payloads, [](AsyncOp p) { return p == AsyncOp::NONE || p == AsyncOp::WGMMA; });
+  }
+  static bool usesTokenSource(Node *head, Node *source) {
+    bool used = false;
+    forEachNode(head,
+                [&](Node *node) { used |= node->tokenSource == source; });
+    return used;
   }
   static Node *chainExit(Node *head) {
     while (head->next) head = head->next;
@@ -727,11 +825,6 @@ private:
     }
     default: return false;
     }
-  }
-  static bool usesTokenSource(Node *head, Node *source) {
-    bool used = false;
-    forEachNode(head, [&](Node *node) { used |= node->tokenSource == source; });
-    return used;
   }
   Node *findChannel(Node *acquire) {
     Node *parent = channelParent.lookup(acquire);
@@ -1133,6 +1226,9 @@ private:
   }
   void placeMixedOwnerFor(Node *region, Chain &chain,
                           ArrayRef<EdgeRec *> rawEntry, Tokens incoming) {
+    // A mixed-owner loop has no single boundary token to carry. Canonical
+    // FirstTouch and POU therefore share this per-owner, first-demand form;
+    // the common protocol verifier and scheduler validate the result.
     Node *body = region->children.front(), *exit = chainExit(body);
     Chain bodyState = enterChain(Chain{}, incoming, body);
     Tokens loopInputs = bodyState.tokens;
@@ -1163,14 +1259,15 @@ private:
                       supply, true);
       acquire->count = std::max(acquire->count, 1u);
       regionChannels[boundaryKey(region, owner)] = acquire;
+      if (!selectsFirstTouch(region))
+        recordPOU(region, acquire);
       incoming.eraseOwner(owner);
     }
     chain.tokens = std::move(incoming);
   }
   void placeUniformOwnerFor(Node *region, Chain &chain,
                             Node *&lastOwnerAccess, const Owner &owner,
-                            ArrayRef<EdgeRec *> rawEntry, Tokens incoming,
-                            Node *continuation) {
+                            ArrayRef<EdgeRec *> rawEntry, Tokens incoming) {
     Node *body = region->children.front(), *exit = chainExit(body);
     Chain bodyState = enterChain(Chain{}, incoming, body);
     Tokens loopInputs = bodyState.tokens;
@@ -1181,8 +1278,6 @@ private:
     bodyState.tokens.record(owner, region, body, {AsyncOp::NONE});
     setEntryToken(body, {owner, region, body, {AsyncOp::NONE}});
     placeChain(body, bodyState);
-    CompletionSummary completion =
-        completionAfterChain(body, owner, CompletionSummary{});
     lastOwnerAccess = bodyState.watch.lastCompletion;
     Watch::Demand boundaryDemand;
     auto demandIt = bodyState.watch.demands.find(owner);
@@ -1200,15 +1295,9 @@ private:
     LoopSupply &supply = supplies[owner];
     const Tokens::Token *initial = loopInputs.findOpen(owner);
     Node *demandAnchor = boundaryDemand.anchor;
-    auto scheduleOf = [](Node *node) -> gpu::StageCluster {
-      return node && node->op ? gpu::getStageCluster(node->op) : std::nullopt;
-    };
-    gpu::StageCluster firstSchedule = scheduleOf(demandAnchor);
-    bool directCarrier = demand && !childChannel && demand->tokenSource == region;
-    bool crossStage =
-        completion.valid && g.numCopies == 1 && directCarrier &&
-        completion.hasFallback && firstSchedule && completion.fallback &&
-        firstSchedule->first != completion.fallback->first;
+    Node *continuation =
+        region->next && region->next->kind != Node::Exit ? region->next
+                                                         : nullptr;
     const Tokens::Token *output = bodyTokens.findOpen(owner);
     bool hasSupply = !supply.closes.empty() || bodyState.supplies.count(boundaryKey(exit, owner));
     bool returnsToken = output && !hasSupply;
@@ -1227,8 +1316,12 @@ private:
       Node *input = loopInput();
       assert(input && "loop input must have an exact producer");
       Node *outputChannel = concreteAcquire(output->producer);
-      if (seeded.contains(input) && outputChannel && !crossStage)
+      if (seeded.contains(input) && outputChannel &&
+          !separateReturnChannels.contains(region->op)) {
+        returnChannelSites.push_back(
+            {region, demandAnchor, owner});
         uniteChannels(input, outputChannel);
+      }
       publishRegionFlow(region, input, owner, {output->producer}, output->payloads,
                         std::move(incoming), chain.tokens);
       return;
@@ -1242,28 +1335,29 @@ private:
       if (input->kind == Node::Acquire) uniteChannels(tail, input);
       return tail;
     };
-    crossStage &= hasSupply;
-    bool nestedInput = false;
     Node *firstUse = demand;
+    bool nestedInput = false;
     for (Node *node = body; node && node != demand; node = node->next) {
-      nestedInput |= llvm::any_of(node->children, [&](Node *child) { return usesTokenSource(child, region); });
+      nestedInput |= llvm::any_of(
+          node->children,
+          [&](Node *child) { return usesTokenSource(child, region); });
       if (firstUse == demand && node->kind != Node::Enter && node->tokenSource == region)
         firstUse = node;
     }
-    bool forwardsInput = nestedInput ||
-                         (demand && demand->isRegion() && !demand->flow && demand->tokenSource == region);
-    bool carryInput = hasSupply &&
-                      (bodyState.watch.hasRealInput || forwardsInput) &&
-                      !reusableUse(continuation, owner);
+    bool forwardedInput =
+        nestedInput ||
+        (demand && demand->isRegion() && !demand->flow &&
+         demand->tokenSource == region);
+    bool mustPreserveBoundary =
+        (bodyState.watch.hasRealInput || forwardedInput) &&
+        !reusableUse(continuation, owner);
     auto placeCarried = [&]() {
       Node *input = loopInput();
       Node *tail = closeAtExit(input, true);
       region->scheduleAnchor = demandAnchor ? demandAnchor : exit;
       publishRegionFlow(region, input, owner, {tail}, {AsyncOp::NONE}, std::move(incoming), chain.tokens);
     };
-    bool forceFirstTouch = placementMode == PlacementMode::FirstTouch &&
-                           hasSupply && directCarrier;
-    if (crossStage || carryInput || forceFirstTouch) {
+    if (hasSupply && selectsFirstTouch(region)) {
       placeCarried();
       return;
     }
@@ -1271,7 +1365,7 @@ private:
       if (supply.entry.empty() && !hasSupply)
         dropOwner(chain.tokens, std::move(incoming), owner);
       else
-        fail(region, "loop has no recorded point-of-use demand");
+        rejectPOU(region, "the loop has no exact point-of-use demand");
       return;
     }
     if (childChannel) {
@@ -1287,6 +1381,8 @@ private:
       }
       regionChannels[boundaryKey(region, owner)] = childChannel;
       dropOwner(chain.tokens, std::move(incoming), owner);
+      if (hasSupply && !selectsFirstTouch(region))
+        recordPOU(region, childChannel, mustPreserveBoundary);
       return;
     }
     Node *recurrence = demand->tokenSource;
@@ -1295,7 +1391,8 @@ private:
       replaceTokenSource(body, region, recurrence);
     }
     if (!recurrence || recurrence->kind != Node::Acquire) {
-      fail(region, "loop recurrence has no acquire at its recorded demand");
+      rejectPOU(region,
+                "the exact recurrence cannot be represented at its demand");
       return;
     }
     closeSupply(recurrence, supply);
@@ -1304,9 +1401,10 @@ private:
     regionChannels[boundaryKey(region, owner)] = recurrence;
     for (const EdgeRec *edge : supply.entry) incoming.eraseOwner(edge->srcOwner);
     dropOwner(chain.tokens, std::move(incoming), owner);
+    if (hasSupply && !selectsFirstTouch(region))
+      recordPOU(region, recurrence, mustPreserveBoundary);
   }
-  void placeFor(Node *region, Chain &chain, Node *&lastOwnerAccess,
-                Node *continuation) {
+  void placeFor(Node *region, Chain &chain, Node *&lastOwnerAccess) {
     EdgeRefs rawEntry = atDst.lookup(region);
     rawEntry.append(chain.pending.begin(), chain.pending.end());
     chain.pending.clear();
@@ -1318,10 +1416,12 @@ private:
       return;
     }
     placeUniformOwnerFor(region, chain, lastOwnerAccess, *boundaryOwner,
-                         rawEntry, std::move(incoming), continuation);
+                         rawEntry, std::move(incoming));
   }
   void placeChain(Node *head, Chain &chain) {
     for (Node *node = head; node;) {
+      if (hadError)
+        return;
       Node *next = node->next;
       Node *continuation =
           next && next->kind != Node::Exit ? next : nullptr;
@@ -1338,13 +1438,15 @@ private:
         break;
       case Node::For: {
         Node *completion = nullptr;
-        placeFor(node, chain, completion, continuation);
+        placeFor(node, chain, completion);
         chain.watch.observe(uniformPieceOwner(node), completion);
         observeRegionDemand(node, chain);
         break;
       }
       default: break;
       }
+      if (hadError)
+        return;
       node = next;
     }
   }
@@ -1404,14 +1506,111 @@ private:
   MutableArrayRef<EdgeRec> edges;
   const DenseSet<Node *> &reusable;
   PlacementMode placementMode;
+  const DenseSet<Operation *> &firstTouchLoops;
+  const DenseSet<Operation *> &separateReturnChannels;
   DenseMap<Node *, EdgeRefs> atDst;
   DenseMap<Node *, Node *> channelParent;
   std::map<BoundaryKey, Node *> regionChannels;
   DenseSet<Node *> seeded;
   DenseSet<Node *> exitSources;
   llvm::SmallSetVector<EdgeRec *, 8> remainingEdges;
+  std::optional<POURejection> pouRejection;
+  SmallVector<POUPlanSite, 2> pouPlanSites;
+  SmallVector<ReturnChannelSite, 2> returnChannelSites;
   bool hadError = false;
 };
+
+// Validate the completed symbolic POU plan rather than selecting placement
+// from ad-hoc loop predicates. Alternative release paths may complete in
+// different stages; only a uniform fixed-stage recurrence establishes an
+// incompatible one-copy constraint.
+static std::optional<POURejection>
+validatePOUPlan(GroupDag &g, ArrayRef<POUPlanSite> sites) {
+  for (const POUPlanSite &site : sites) {
+    if (site.mustPreserveBoundary)
+      return POURejection{
+          site.loop->op,
+          "the exact boundary token must remain available across the loop"};
+    if (g.numCopies != 1)
+      continue;
+    Node *demand = site.loop->scheduleAnchor
+                       ? site.loop->scheduleAnchor
+                       : site.acquire->scheduleAnchor;
+    Operation *consumer = findScheduleAnchor(demand, false);
+    gpu::StageCluster consumerSchedule =
+        consumer ? gpu::getStageCluster(consumer) : std::nullopt;
+    if (!consumerSchedule)
+      continue;
+    CompletionFlow completion = completionAfterChain(
+        site.loop->children.front(), site.acquire->owner);
+    if (completion.valid && completion.hasConcreteStage && completion.stage &&
+        completion.stage->first != consumerSchedule->first) {
+      return POURejection{
+          site.loop->op,
+          "fixed loop.stage constraints require a carried recurrence"};
+    }
+  }
+  return std::nullopt;
+}
+
+static Operation *
+incompatibleReturnChannel(GroupDag &g, ArrayRef<ReturnChannelSite> sites) {
+  if (g.numCopies != 1)
+    return nullptr;
+  for (const ReturnChannelSite &site : sites) {
+    Operation *consumer = findScheduleAnchor(site.demand, false);
+    gpu::StageCluster consumerSchedule =
+        consumer ? gpu::getStageCluster(consumer) : std::nullopt;
+    CompletionFlow completion =
+        completionAfterChain(site.loop->children.front(), site.owner);
+    if (completion.valid && completion.hasConcreteStage && consumerSchedule &&
+        completion.stage &&
+        consumerSchedule->first != completion.stage->first)
+      return site.loop->op;
+  }
+  return nullptr;
+}
+
+// A candidate is not a realizable POU plan when a structured region is still
+// named as an exact producer but has neither an incoming producer nor an SSA
+// token flow. This is checked after construction: the POU builder first gets a
+// chance to replace the symbolic boundary token with a concrete acquire.
+static std::optional<POURejection>
+validatePOUConnectivity(GroupDag &g, ArrayRef<POUPlanSite> sites) {
+  DenseSet<Node *> used;
+  forEachNode(g, [&](Node *node) {
+    if (node->tokenSource &&
+        (node->kind == Node::Access || node->kind == Node::Release ||
+         node->isRegion()))
+      used.insert(node->tokenSource);
+  });
+  std::optional<POURejection> rejection;
+  forEachNode(g, [&](Node *node) {
+    if (rejection || !node->isRegion() || node->flow || node->tokenSource ||
+        !used.contains(node))
+      return;
+    Node *loop = nullptr;
+    for (const POUPlanSite &site : sites) {
+      for (Node *parent = site.loop; parent; parent = parent->parent)
+        if (parent == node) {
+          loop = site.loop;
+          break;
+        }
+      if (loop)
+        break;
+    }
+    if (!loop) {
+      loop = node;
+      while (loop && loop->kind != Node::For)
+        loop = loop->parent;
+    }
+    if (loop)
+      rejection = POURejection{
+          loop->op,
+          "an exact incoming token cannot be materialized across this loop"};
+  });
+  return rejection;
+}
 
 using RequiredParts = llvm::SmallSetVector<int, 4>;
 static RequiredParts computeRequiredParts(Node *head) {
@@ -1499,10 +1698,12 @@ static void computeSemaphoreCopies(GroupDag &g, int lowerSemaphoreNumStages, std
 }
 static LogicalResult verifySyncDag(GroupDag &g) {
   if (g.semas.empty()) return success();
-  DenseSet<Node *> used;
+  DenseSet<Node *> used, exactSources;
   SmallVector<SmallVector<Node *, 2>, 4> releases(g.semas.size());
   forEachNode(g, [&](Node *n) {
     used.insert(n->tokenSource);
+    if (n->kind == Node::Access || n->kind == Node::Release || n->isRegion())
+      exactSources.insert(n->tokenSource);
     if (n->flow) for (Node *exit : n->flow->exits) used.insert(exit);
     if (n->kind == Node::Release && n->sema < releases.size()) releases[n->sema].push_back(n);
   });
@@ -1523,7 +1724,12 @@ static LogicalResult verifySyncDag(GroupDag &g) {
   };
   SmallVector<std::optional<int64_t>> acqClass(g.semas.size(), std::nullopt);
   auto verifyFlow = [&](Node *n) -> LogicalResult {
-    if (!n->flow) return success();
+    if (!n->flow) {
+      if (exactSources.contains(n) && !n->tokenSource)
+        return semaError(n->op)
+               << "region token source has no materializable incoming flow";
+      return success();
+    }
     const RegionFlow &c = *n->flow;
     bool needsInput = n->kind == Node::For || llvm::is_contained(c.exits, nullptr);
     if ((needsInput && !n->tokenSource) ||
@@ -1714,7 +1920,7 @@ static LogicalResult assignCircularStageOffsets(PhysicalSets &physical) {
   }
   return success();
 }
-static Operation *findScheduleAnchor(const Node *anchor, bool producer = false) {
+static Operation *findScheduleAnchor(const Node *anchor, bool producer) {
   for (const Node *n = anchor; n; n = producer ? n->prev : n->next) {
     if (n->kind == Node::Access) return producer && n->completionAnchor ? n->completionAnchor : n->op;
     if (n->isRegion()) return n->op;
@@ -2115,29 +2321,113 @@ LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups) {
   return success();
 }
 
+struct SyncPlan {
+  GroupDag dag;
+  int numTmemBlocks = 0;
+};
+
+struct SyncPlanAttempt {
+  std::optional<SyncPlan> plan;
+  std::optional<POURejection> rejection;
+  Operation *separateReturnChannel = nullptr;
+};
+
+static FailureOr<SyncPlanAttempt>
+tryBuildSyncPlan(const GroupDag &accessDag, bool useMetaPartitioner,
+                 int lowerSemaphoreNumStages, int initialTmemBlocks,
+                 PlacementMode placementMode,
+                 const DenseSet<Operation *> &firstTouchLoops,
+                 const DenseSet<Operation *> &separateReturnChannels) {
+  GroupDag trial = cloneGroupDag(accessDag);
+  SmallVector<EdgeRec> edges;
+  DenseSet<Node *> reusable;
+  for (Node *head : trial.root->children) {
+    ChainState top; // function chain starts at bottom (first-touch)
+    ChainWalker(trial, top, edges, reusable, /*underFor=*/false).run(head);
+  }
+  reduceEdges(trial, edges, reusable);
+  int plannedTmemBlocks = initialTmemBlocks;
+  FailureOr<std::optional<int>> plannedCopy = computeBackingCopies(
+      trial, edges, useMetaPartitioner, plannedTmemBlocks);
+  if (failed(plannedCopy))
+    return failure();
+  SmallVector<POUPlanSite, 2> pouSites;
+  SmallVector<ReturnChannelSite, 2> returnChannelSites;
+  if (!edges.empty()) {
+    DirectBuilder builder(trial, edges, reusable, placementMode,
+                          firstTouchLoops, separateReturnChannels);
+    if (failed(builder.run())) {
+      if (builder.getPOURejection())
+        return SyncPlanAttempt{std::nullopt, builder.getPOURejection()};
+      return failure();
+    }
+    pouSites.append(builder.getPOUPlanSites().begin(),
+                    builder.getPOUPlanSites().end());
+    returnChannelSites.append(builder.getReturnChannelSites().begin(),
+                              builder.getReturnChannelSites().end());
+  }
+  for (Node *head : trial.root->children)
+    computeRequiredParts(head);
+  computeSemaphoreCopies(trial, lowerSemaphoreNumStages, *plannedCopy);
+  if (Operation *loop =
+          incompatibleReturnChannel(trial, returnChannelSites))
+    return SyncPlanAttempt{std::nullopt, std::nullopt, loop};
+  if (std::optional<POURejection> rejection =
+          validatePOUPlan(trial, pouSites))
+    return SyncPlanAttempt{std::nullopt, std::move(rejection), nullptr};
+  if (std::optional<POURejection> rejection =
+          validatePOUConnectivity(trial, pouSites))
+    return SyncPlanAttempt{std::nullopt, std::move(rejection), nullptr};
+  if (!trial.semas.empty() && !trial.ttDescriptorFedMembers.empty())
+    return semaError(trial.ttDescriptorFedMembers.front())
+           << "managed local_alloc sourced from a tt-form descriptor load — "
+           "nvws-insert-allocas must convert this upstream (pipeline invariant violated)";
+  if (failed(verifySyncDag(trial)))
+    return failure();
+  SyncPlanAttempt result;
+  result.plan.emplace(
+      SyncPlan{std::move(trial), plannedTmemBlocks});
+  return result;
+}
+
+static void materializeSyncPlan(GroupDag &group, SyncPlan &&plan,
+                                int &numTmemBlocks) {
+  group = std::move(plan.dag);
+  numTmemBlocks = plan.numTmemBlocks;
+}
+
 LogicalResult buildSyncDag(GroupDag &g, bool useMetaPartitioner,
                            int lowerSemaphoreNumStages, int &numTmemBlocks,
                            PlacementMode placementMode) {
-  SmallVector<EdgeRec> edges;
-  DenseSet<Node *> reusable;
-  for (Node *head : g.root->children) {
-    ChainState top; // function chain starts at bottom (first-touch)
-    ChainWalker(g, top, edges, reusable, /*underFor=*/false).run(head);
+  DenseSet<Operation *> firstTouchLoops;
+  DenseSet<Operation *> separateReturnChannels;
+  while (true) {
+    FailureOr<SyncPlanAttempt> attempt = tryBuildSyncPlan(
+        g, useMetaPartitioner, lowerSemaphoreNumStages, numTmemBlocks,
+        placementMode, firstTouchLoops, separateReturnChannels);
+    if (failed(attempt))
+      return failure();
+    if (attempt->plan) {
+      materializeSyncPlan(g, std::move(*attempt->plan), numTmemBlocks);
+      return success();
+    }
+    if (attempt->separateReturnChannel) {
+      if (!separateReturnChannels.insert(attempt->separateReturnChannel).second)
+        return semaError(attempt->separateReturnChannel)
+               << "cannot form schedule-compatible loop return channels";
+      continue;
+    }
+    assert(attempt->rejection && "plan attempt has no result");
+    if (placementMode == PlacementMode::POU)
+      return semaError(attempt->rejection->loop)
+             << "point-of-use placement is unavailable for this loop: "
+             << attempt->rejection->reason;
+    if (placementMode == PlacementMode::FirstTouch ||
+        !firstTouchLoops.insert(attempt->rejection->loop).second)
+      return semaError(attempt->rejection->loop)
+             << "canonical first-touch placement could not satisfy this loop: "
+             << attempt->rejection->reason;
   }
-  reduceEdges(g, edges, reusable);
-  FailureOr<std::optional<int>> plannedCopy = computeBackingCopies(
-      g, edges, useMetaPartitioner, numTmemBlocks);
-  if (failed(plannedCopy)) return failure();
-  if (!edges.empty() &&
-      failed(DirectBuilder(g, edges, reusable, placementMode).run()))
-    return failure();
-  for (Node *head : g.root->children) computeRequiredParts(head);
-  computeSemaphoreCopies(g, lowerSemaphoreNumStages, *plannedCopy);
-  if (!g.semas.empty() && !g.ttDescriptorFedMembers.empty())
-    return semaError(g.ttDescriptorFedMembers.front())
-           << "managed local_alloc sourced from a tt-form descriptor load — "
-           "nvws-insert-allocas must convert this upstream (pipeline invariant violated)";
-  return verifySyncDag(g);
 }
 
 } // namespace mlir::triton::nvws_semas
