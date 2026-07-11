@@ -9,7 +9,7 @@ using Payloads = SmallVector<AsyncOp, 1>;
 using PieceEffects = std::map<PieceId, Effect>;
 using OrderFacts = SmallVector<int64_t, 2>;
 using ExitFacts = std::map<PieceId, OrderFacts>;
-// Doc: sync-dag.md#the-walk-accesses-to-edges
+// Doc: sync-dag.md#what-the-pass-remembers-for-each-piece
 struct ActiveUse {
   Owner owner;
   Node *node = nullptr;
@@ -165,7 +165,7 @@ static void raiseForeignUseEdges(PieceState &piece, PieceId id,
                                   hasAsyncPayload(use.payloads)});
 }
 
-// Doc: sync-dag.md#the-per-access-rules-in-full
+// Doc: sync-dag.md#read-and-write-rules
 static void applyTouch(PieceState &piece, PieceId id, const Owner &owner,
                        Effect effect, Node *node, const Payloads &payloads,
                        EdgeList &edges, bool wsAdopt) {
@@ -207,7 +207,7 @@ static bool pieceTouchedAfter(GroupDag &g, Node *region, PieceId piece) {
   return false;
 }
 
-// Doc: sync-dag.md#the-walk-accesses-to-edges
+// Doc: sync-dag.md#from-buffer-accesses-to-synchronization-edges
 class ChainWalker {
 public:
   ChainWalker(GroupDag &group, ChainState &state, EdgeList &edges,
@@ -249,7 +249,7 @@ public:
   }
 
 private:
-  // Doc: sync-dag.md#memory-edges-and-token-supply
+  // Doc: sync-dag.md#ensuring-every-access-has-a-token
   void visitAccess(Node *node) {
     PieceEffects effects;
     forEachTouchedPiece(group, node, [&](PieceId id, Effect effect) {
@@ -298,7 +298,7 @@ private:
       chainTokens.record(node->owner, node, node, payloads);
   }
 
-  // Doc: sync-dag.md#composition-nested-regions-in-the-walk
+  // Doc: sync-dag.md#nested-loops-and-branches
   void visitRegion(Node *node) {
     struct RegionInput {
       std::optional<VersionSource> source;
@@ -450,7 +450,7 @@ static ArrayRef<unsigned> edgesAt(const EdgeBuckets &buckets, Node *node) {
   return it == buckets.end() ? ArrayRef<unsigned>{}
                              : ArrayRef<unsigned>(it->second);
 }
-// Doc: sync-dag.md#1-implied-ordering-reduceedges. Drops use only kept edges.
+// Doc: sync-dag.md#waits-in-one-path. Drops use only kept edges.
 static void reduceStraightEdges(Node *head, const Positions &positions,
                                 ArrayRef<EdgeRec> edges,
                                 const EdgeBuckets &atDst,
