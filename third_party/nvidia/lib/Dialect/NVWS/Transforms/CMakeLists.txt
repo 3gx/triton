@@ -4,6 +4,7 @@ add_triton_library(NVWSTransforms
   LowerWarpGroup.cpp
   InsertAllocas.cpp
   MetaToNVWSConvert.cpp
+  OrderBufferGroups.cpp
   PackEpilogueSlices.cpp
   InsertSemaphore.cpp
   Utilities.cpp

@@ -179,6 +179,10 @@ void AutomaticWarpSpecialization::runOnOperation() {
     if (failed(metaPM.run(getOperation())))
       return signalPassFailure();
     addPassWithPartitionVerifier(createNVWSMetaToNVWSConvert());
+    // InsertSemas emits co-located blocking waits in buffer-group discovery
+    // order.  Make that order an explicit latency policy rather than inheriting
+    // the Meta memory planner's allocation order.
+    addPassWithPartitionVerifier(createNVWSOrderBufferGroups());
   } else {
     addPassWithPartitionVerifier(createTritonGPUPartitionScheduling());
     addPassWithPartitionVerifier(createNVWSHoistTmemStore());

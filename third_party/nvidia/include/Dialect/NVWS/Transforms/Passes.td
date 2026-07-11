@@ -144,6 +144,26 @@ def NVWSMetaToNVWSConvert
   ];
 }
 
+def NVWSOrderBufferGroups
+    : Pass<"nvws-order-buffer-groups", "mlir::ModuleOp"> {
+  let summary = "Order NVWS buffer groups by predicted producer readiness";
+
+  let description = [{
+    Orders eligible source-free entry-block TMEM allocation representatives so
+    that InsertSemas processes groups which are predicted to become ready later
+    before groups predicted to become ready earlier.  This makes the order of
+    co-located blocking waits an explicit pre-InsertSemas policy instead of an
+    accidental consequence of memory-planner allocation order.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def NVWSPackEpilogueSlices
     : Pass<"nvws-pack-epilogue-slices", "mlir::ModuleOp"> {
   let summary = "Pack data-partitioned epilogue producer/store slices";
