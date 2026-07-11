@@ -19,9 +19,22 @@ The pass expects warp-specialized loops with finalized partition ownership:
 
 It handles loop iter-args, ranked-tensor WS-loop results, sourceful
 `ttg.local_alloc` operations, descriptor loads/gathers, ordinary tensor/scalar
-results, and values produced by regular `tt.load`.
+results, values produced by regular `tt.load`, and sourceful
+`ttng.tmem_alloc` operations.
 
 ## Algorithm
+
+Before materializing SSA communication, a function containing a partitioned WS
+loop normalizes each sourceful `ttng.tmem_alloc` whose producer and consumers
+span more than one partition. Same-partition allocations remain sourceful:
+
+- a sourceless mutable backing is placed before the outer WS loop while
+  remaining in the allocation's top-level CFG block;
+- an explicit `ttng.tmem_store` remains at the original scheduled point;
+- physical planning attributes stay on the backing, while partition and loop
+  schedule attributes stay on the store; and
+- an initializer token seed is replaced with poison without breaking a
+  loop-carried MMA token recurrence.
 
 For each produced value:
 
@@ -55,10 +68,11 @@ carries none of these annotations.
 ## Output contract
 
 The output contains explicit producer writes and consumer reads over mutable
-allocations. There are no `nvws.semaphore.*` operations, and the buffers keep
-their direct shape — no extra leading dimension for buffered copies is added
-(depth is decided later). `InsertSemas` then observes the resulting memory
-accesses.
+allocations. Cross-partition TMEM communication has no sourceful allocations,
+while same-partition TMEM remains unchanged. There are no
+`nvws.semaphore.*` operations. The buffers keep their direct shape — no extra
+leading dimension for buffered copies is added (depth is decided later).
+`InsertSemas` then observes the resulting memory accesses.
 
 ## Separation from synchronization
 
@@ -70,6 +84,8 @@ derives *who owns it and when ownership moves*.
 [`InsertAllocas.cpp`](../third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertAllocas.cpp):
 
 - `createCommunicationBuffer`: memory-space and allocation choice.
+- `normalizeSourcefulTmemAlloc`: hoisted TMEM backing and explicit initializer
+  store.
 - `createSemaphoreProducer` / `createSemaphoreConsumer`: retained historical
   names for producer/consumer access materialization.
 - `insertSemaphoresForUses`: per-produced-value transformation.

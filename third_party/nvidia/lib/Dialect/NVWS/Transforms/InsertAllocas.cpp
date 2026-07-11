@@ -2,6 +2,7 @@
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Support/DebugStringHelper.h"
 #include "mlir/Transforms/Passes.h"
@@ -292,6 +293,124 @@ void createRank1TmemStore(OpBuilder &builder, Location loc, Value src,
       builder, loc, partitions, stageCluster, wsTag, true, 1);
   createInto<TMEMStoreOp>(builder, loc, partitions, stageCluster, wsTag, Type(),
                           dataBuf, Value(), storeSrc, pred);
+}
+
+static void copyTmemInitPlacementAttrs(Operation *from, Operation *to) {
+  for (StringRef name :
+       {StringRef(kPartitionAttrName), StringRef(kLoopStageAttrName),
+        StringRef(kLoopClusterAttrName), StringRef(kWarpSpecializeTagAttrName),
+        StringRef("async_task_id")}) {
+    if (Attribute attr = from->getAttr(name))
+      to->setAttr(name, attr);
+  }
+}
+
+static bool isTmemInitPlacementAttr(StringRef name) {
+  return name == kPartitionAttrName || name == kLoopStageAttrName ||
+         name == kLoopClusterAttrName ||
+         name == kWarpSpecializeTagAttrName || name == "async_task_id";
+}
+
+static bool isTmemMemDescAlias(Operation *op) {
+  StringRef name = op->getName().getStringRef();
+  return name == "ttg.memdesc_index" || name == "ttg.memdesc_subview" ||
+         name == "ttg.memdesc_subslice" || name == "ttg.memdesc_trans" ||
+         name == "ttg.memdesc_reinterpret" ||
+         name == "ttg.memdesc_reshape";
+}
+
+static bool isUsedInMultiplePartitions(TMEMAllocOp alloc) {
+  SetVector<int> partitions;
+  bool hasRootOwner = false;
+  auto addOwner = [&](Operation *op) {
+    if (!hasPartition(op)) {
+      hasRootOwner = true;
+    } else {
+      SetVector<int> ids = getPartitionIds(op);
+      partitions.insert(ids.begin(), ids.end());
+    }
+    return partitions.size() + static_cast<unsigned>(hasRootOwner) > 1;
+  };
+  auto addUseOwner = [&](OpOperand &use) {
+    Operation *user = use.getOwner();
+    if (!hasPartition(user)) {
+      hasRootOwner = true;
+    } else {
+      SetVector<int> ids = getPartitionIds(&use);
+      partitions.insert(ids.begin(), ids.end());
+    }
+    return partitions.size() + static_cast<unsigned>(hasRootOwner) > 1;
+  };
+
+  if (addOwner(alloc))
+    return true;
+
+  SmallVector<Value, 4> worklist{alloc.getResult()};
+  DenseSet<Value> seen;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!seen.insert(value).second)
+      continue;
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
+      if (isTmemMemDescAlias(user) && user->getNumResults() == 1 &&
+          isa<MemDescType>(user->getResult(0).getType())) {
+        worklist.push_back(user->getResult(0));
+        continue;
+      }
+      if (addUseOwner(use))
+        return true;
+    }
+  }
+  return false;
+}
+
+// Make TMEM initialization an ordinary memory access before InsertSemas. The
+// backing allocation is hoisted, while the explicit store remains at the
+// sourceful allocation's original scheduled point.
+void normalizeSourcefulTmemAlloc(TMEMAllocOp alloc) {
+  assert(alloc.getSrc() && "expected a sourceful TMEM allocation");
+
+  Operation *anchor = alloc;
+  if (auto parentFor = alloc->getParentOfType<scf::ForOp>()) {
+    if (auto wsLoop = getOuterWSLoop(parentFor))
+      anchor = wsLoop;
+  }
+
+  OpBuilder allocBuilder(anchor);
+  MemDescType backingType = withMutableMemory(alloc.getType(), true);
+  auto backing =
+      TMEMAllocOp::create(allocBuilder, alloc.getLoc(), backingType, Value());
+  // Physical allocation metadata stays on the backing. ODS segment sizes are
+  // reconstructed by the tokenless/sourceless builder and must not be copied.
+  for (NamedAttribute attr : alloc->getAttrs()) {
+    StringRef name = attr.getName().strref();
+    if (isTmemInitPlacementAttr(name) || name == "operandSegmentSizes" ||
+        name == "resultSegmentSizes")
+      continue;
+    backing->setAttr(attr.getName(), attr.getValue());
+  }
+
+  if (Value token = alloc.getToken(); token && !token.use_empty()) {
+    Value poison =
+        ub::PoisonOp::create(allocBuilder, alloc.getLoc(), token.getType());
+    token.replaceAllUsesWith(poison);
+  }
+
+  OpBuilder storeBuilder(alloc);
+  auto pred =
+      arith::ConstantIntOp::create(storeBuilder, alloc.getLoc(), true, 1);
+  auto store = TMEMStoreOp::create(storeBuilder, alloc.getLoc(),
+                                   backing.getResult(), alloc.getSrc(), pred);
+  copyTmemInitPlacementAttrs(alloc, pred);
+  copyTmemInitPlacementAttrs(alloc, store);
+
+  if (alloc.getType() == backing.getType()) {
+    alloc.getResult().replaceAllUsesWith(backing.getResult());
+  } else {
+    replaceUsesAndPropagateType(storeBuilder, alloc, backing.getResult());
+  }
+  alloc.erase();
 }
 
 Value createRank1TmemLoad(OpBuilder &builder, Location loc,
@@ -1063,6 +1182,20 @@ public:
         loops.push_back(loop);
     });
 
+    if (loops.empty())
+      return;
+
+    // Canonicalize sourceful TMEM allocations only when ownership crosses a
+    // partition boundary. Same-partition allocations need no semaphore and
+    // keep their compact sourceful representation.
+    SmallVector<TMEMAllocOp> sourcefulTmemAllocs;
+    func.walk([&](TMEMAllocOp alloc) {
+      if (alloc.getSrc() && isUsedInMultiplePartitions(alloc))
+        sourcefulTmemAllocs.push_back(alloc);
+    });
+    for (TMEMAllocOp alloc : sourcefulTmemAllocs)
+      normalizeSourcefulTmemAlloc(alloc);
+
     for (scf::ForOp loop : loops) {
       // Communicate iter_args across partitions
       loop.walk([&](scf::ForOp forOp) {
@@ -1110,7 +1243,8 @@ public:
       loop.walk([&](Operation *op) {
         if (!preExistingOps.contains(op))
           return WalkResult::advance();
-        if (op == loop || isa<MMAv5OpInterface, TMEMAllocOp, TMEMStoreOp>(op)) {
+        if (op == loop || op->hasTrait<OpTrait::MemDescViewTrait>() ||
+            isa<MMAv5OpInterface, TMEMAllocOp, TMEMStoreOp>(op)) {
           return WalkResult::advance();
         }
         auto producedValues = getProducedValues(op, loop.getBody());
