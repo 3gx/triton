@@ -70,7 +70,7 @@ ACCESS-DAG chains
         |
         v
 ChainWalker
-  derive raw memory and token-supply edges
+  find where one partition must wait for another
         |
         v
 reduceEdges
