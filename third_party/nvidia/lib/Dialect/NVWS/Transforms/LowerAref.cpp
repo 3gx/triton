@@ -1333,16 +1333,7 @@ public:
     });
 
     for (scf::ForOp loop : loops) {
-      // Semaphore combine disabled (12jun26, ported from the
-      // egx/nvws-semaphore-insert-semas experiment branch): verified inert
-      // for the FA fwd WS kernel, and its grouping/protocol analysis holds
-      // the only stamped-acquire assumptions in this pass, which would
-      // crash on the attr-less ROOT-OUTSIDE entry acquires now emitted by
-      // insert-semas. Kept commented for easy re-enable (would need the
-      // attr-less tolerance guards of
-      // fable/attr-less-acquire-release-handoff.md section 5.1).
-      // combineSemaphores(loop);
-      (void)loop;
+      combineSemaphores(loop);
     }
 
     auto getSemaGroups = [&]() {
