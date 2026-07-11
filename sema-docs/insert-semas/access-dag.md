@@ -76,9 +76,13 @@ and `buffer.id` normally form one `GroupDag`. An allocation without a
 `buffer.id` receives a private synthetic group id, so unrelated anonymous
 allocations are never merged accidentally.
 
-The current implementation recursively analyzes the first block of each
-structured `scf.for` or `scf.if` region, beginning at
-`funcOp.getBody().front()`. It does not model additional top-level CFG blocks.
+The implementation recursively analyzes the first block of each structured
+`scf.for` or `scf.if` region. For a function with top-level CFG blocks, each
+group is analyzed from the unique function block containing its allocations.
+All group members and all managed memdesc flows must remain in that block;
+cross-block groups or alias flows are rejected explicitly. This supports an
+early-return CFG when the complete managed lifetime is contained in its work
+block without pretending to model general CFG dataflow.
 
 ## Groups and members
 
