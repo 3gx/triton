@@ -603,16 +603,18 @@ p2      inner summary {2}      EXIT outer(i) {3}
 ```
 
 ```text
-                         ENTER outer(i) {3}
-                                  | walk
-                                  v
-                              W m0(i) {3}
-                                  | p1
-                                  v
-                   [inner summary P0:W:{2}]
-                                  | p2
-                                  v
-                         EXIT outer(i) {3}
+           ENTER outer(i) {3}
+                    | walk
+                    v
+               W m0(i) {3}
+                    +--------------- > ----------------+
+                                                       | p1
+                                                       v
+                                           [inner summary P0:W:{2}]
+                    +--------------- < ----------------+
+                    | p2
+                    v
+            EXIT outer(i) {3}
 ```
 
 The child has its own edge list:
@@ -627,23 +629,23 @@ c5      R m0(i,j) {0}      EXIT inner(i,j) {2}
 ```
 
 ```text
-                         ENTER inner(i,j) {2}
-                         +---------+---------+
-                    walk |                   | c1
-                         v                   v
-                     R m0 {2}            R m0 {1}
-                      c2 |                   | walk
-                         +---------+---------+
-                                   v
-                              W m0 {1}
-                         +---------+---------+
-                      c3 |                   | c4
-                         v                   |
-                     R m0 {0}                |
-                      c5 |                   |
-                         +---------+---------+
-                                   v
-                          EXIT inner(i,j) {2}
+                                             ENTER inner(i,j) {2}
+                                                       +--------------- > ----------------+
+                                                       | walk                             | c1
+                                                       v                                  v
+                                                   R m0 {2}                           R m0 {1}
+                                                       | c2                          walk |
+                                                       +--------------- > ----------------+
+                                                                                          v
+                                                                                      W m0 {1}
+                                                                           +----- < ------+--------------- > ----------------+
+                                                                           | c4                                              | c3
+                                                                           v                                                 v
+                                                                           |                                             R m0 {0}
+                                                                           |                                                 | c5
+                                                       +-------- < --------+----------------------- < -----------------------+
+                                                       v
+                                              EXIT inner(i,j) {2}
 ```
 
 The path through `c3` and `c5` already makes `EXIT` wait for the owner-`{1}`
@@ -679,92 +681,144 @@ first inner iteration, or when the inner loop has zero trips, `p1` releases
 both run and contribute one arrival each. Every `FULL` acquire therefore has
 `pending_count=2`.
 
-The complete semaphore DAG uses four equidistant owner lanes. Every operation
-stays on its owner's lane; only semaphore relationships cross lanes. The
-`continue` and `finish` rails are alternatives. On the finish path, `done`
-uses `c4+c5` after a nonempty loop or `p1` after a zero-trip loop.
+The semaphore sequence uses the same compact `{3}|{2}|{1}|{0}` columns in
+every view. First, `p1` supplies the first inner acquire when the loop runs:
 
 ```text
-                owner {3}                          owner {2}                          owner {1}                          owner {0}
-
-             ENTER outer(i)
+           ENTER outer(i) {3}
                     | walk
                     v
-       outer = acquire OUTER_EMPTY
+     outer = acquire OUTER_EMPTY {3}
               outer |
                     v
-             W m0(i) [outer]
+           W m0(i) [outer] {3}
               outer |
                     v
-        release FULL(2), outer p1
-                    +--------------+
-                                   | FULL(2)   ENTER inner(i,0)
+      release FULL(2), outer {3} p1
+                    +----- > ------+
+                                   | FULL(2)
+                                   |         ENTER inner(i,0) {2}
                                    |                   | walk
                                    |                   v
-                                   +-------->t2 = acquire FULL(2)
+                                   +-------- > --------+
+                                                       v
+                                           t2 = acquire FULL(2) {2}
+                                                    t2 |
+```
+
+If the inner loop has zero trips, the same real `p1` release instead supplies
+the post-loop `done` acquire:
+
+```text
+      release FULL(2), outer {3} p1
+                    +----- > ------+
+                                   | FULL(2)
+                                   |       EXIT inner(zero trip) {2}
+                                   |                   | loop finishes
+                                   |                   v
+                                   +-------- > --------+
+                                                       v
+                                          done = acquire FULL(2) {2}
+                                                  done |
+```
+
+The common inner body starts from `t2` and ends at the two real `FULL`
+releases:
+
+```text
+                                           t2 = acquire FULL(2) {2}
                                                     t2 |
                                                        v
-                                            release R1_READY, t2 c1
-                                                       +----------------------------------+
+                                          release R1_READY, t2 {2} c1
+                                                       +--------------- > ----------------+
                                                   walk |                                  | R1_READY
                                                        v                                  v
-                                                   R m0 [t2]                   t1r = acquire R1_READY
+                                                 R m0 [t2] {2}               t1r = acquire R1_READY {1}
                                                        | walk                         t1r |
                                                        v                                  v
-                                          release WRITE_READY, t2 c2                 R m0 [t1r]
-                                                       +----------------------------------+
-                                                                                          | WRITE_READY
+                                        release WRITE_READY, t2 {2} c2             R m0 [t1r] {1}
+                                                       | c2                          walk |
+                                                       +--------------- > ----------------+
                                                                                           v
-                                                                              t1w = acquire WRITE_READY
+                                                                            t1w = acquire WRITE_READY {1}
                                                                                       t1w |
                                                                                           v
-                                                                                     W m0 [t1w]
+                                                                                   W m0 [t1w] {1}
                                                                                       t1w |
                                                                                           v
-                                                                              release R0_READY, t1w c3
-                                                                                          +----------------------------------+
+                                                                            release R0_READY, t1w {1} c3
+                                                                                          +--------------- > ----------------+
                                                                                      walk |                                  | R0_READY
                                                                                           v                                  v
-                                                                                release FULL, t1w c4               t0 = acquire R0_READY
+                                                                              release FULL, t1w {1} c4           t0 = acquire R0_READY {0}
                                                                                           |                               t0 |
                                                                                           |                                  v
-                                                                                          |                              R m0 [t0]
+                                                                                          |                            R m0 [t0] {0}
                                                                                           |                                  | walk
                                                                                           |                                  v
-                                                                                          |                         release FULL, t0 c5
+                                                                                          |                       release FULL, t0 {0} c5
+```
+
+For another inner iteration, the two releases join and supply `next` after
+the next `ENTER`:
+
+```text
+                                                                              release FULL, t1w {1} c4            release FULL, t0 {0} c5
                                                                                           |                                  |
-                                                       +----------------------------------+----------------------------------+
-                                                       | FULL(2)
-                                        +--------------+-------------------+
-                                        | continue                         | finish
-                                        |       EXIT inner(i,j)            |
-                                        |              | next iteration    |
-                                        |     ENTER inner(i,j+1)           |
-                                        |              | walk              |
-                                        |              v                   |
-                                        +-->next = acquire FULL(2)         |
-                                                  next |                   |
-                                                       v                   |
-                                           release R1_READY, next c1       |
-                                                OR: finish path            |
-                                        EXIT inner(final or zero trip)     |
-                                                       | loop finishes     |
-                                                       v                   |
-  release FULL(2), outer p1 [zero trip]                                    | FULL(2), nonzero
-                    +---------------------->done = acquire FULL(2)<--------+
+                                   +------------------------- < --------------------------+--------------- < ----------------+
+                                   | FULL(2)
+                                   |          EXIT inner(i,j) {2}
+                                   |                   | next iteration
+                                   |                   v
+                                   |        ENTER inner(i,j+1) {2}
+                                   |                   | walk
+                                   |                   v
+                                   +-------- > --------+
+                                                       v
+                                          next = acquire FULL(2) {2}
+                                                  next |
+                                                       v
+                                         release R1_READY, next {2} c1
+```
+
+After the final inner iteration, the same two releases instead supply
+`done`:
+
+```text
+                                                                              release FULL, t1w {1} c4            release FULL, t0 {0} c5
+                                                                                          |                                  |
+                                   +------------------------- < --------------------------+--------------- < ----------------+
+                                   | FULL(2)
+                                   |        EXIT inner(i,last) {2}
+                                   |                   | loop finishes
+                                   |                   v
+                                   +-------- > --------+
+                                                       v
+                                          done = acquire FULL(2) {2}
+                                                  done |
+```
+
+The third view starts from either real `done` acquire above. It implements
+`p2` and the next outer iteration.
+
+```text
+                                          done = acquire FULL(2) {2}
                                                   done |
                                                        v
-                                         release OUTER_EMPTY, done p2
-                                        +--------------+
-              EXIT outer(i)             | OUTER_EMPTY
-                    | next iteration    |
-            ENTER outer(i+1)            |
-                    | walk              |
-                    v                   |
-     nextOuter = acquire OUTER_EMPTY<---+
-            nextOuter |
+                                       release OUTER_EMPTY, done {2} p2
+                                             +--- < ---+
+            EXIT outer(i) {3}                | OUTER_EMPTY
+                    | next iteration         |
+                    v                        |
+          ENTER outer(i+1) {3}               |
+                    | walk                   |
+                    v                        |
+                    +--------- < ------------+
                     v
-          W m0(i+1) [nextOuter]
+   nextOuter = acquire OUTER_EMPTY {3}
+          nextOuter |
+                    v
+        W m0(i+1) [nextOuter] {3}
 ```
 
 Thus every `FULL` acquire waits for exactly two arrivals. Neither loop has a
@@ -810,16 +864,16 @@ EXIT outer(i) {3}                 none
 ```
 
 ```text
-                         ENTER outer(i) {3}
-                                  | walk
-                                  v
-                              W m0(i) {3}
-                                  | walk
-                                  v
-                   [inner summary P0:W:{3}]
-                                  | walk
-                                  v
-                         EXIT outer(i) {3}
+           ENTER outer(i) {3}
+                    | walk
+                    v
+               W m0(i) {3}
+                    | walk
+                    v
+       [inner summary P0:W:{3}]
+                    | walk
+                    v
+            EXIT outer(i) {3}
 ```
 
 No parent synchronization edge is needed. The child still has six initial
@@ -836,23 +890,23 @@ c6      R m0(i,j) {0}          EXIT inner(i,j) {3}
 ```
 
 ```text
-                         ENTER inner(i,j) {3}
-                         +---------+---------+
-                    walk |                   | c1
-                         v                   v
-                     R m0 {3}            R m0 {2}
-                      c2 |                   | c3
-                         +---------+---------+
-                                   v
-                              W m0 {1}
-                         +---------+---------+
-                      c4 |                   | c5
-                         v                   |
-                     R m0 {0}                |
-                      c6 |                   |
-                         +---------+---------+
-                                   v
-                          EXIT inner(i,j) {3}
+          ENTER inner(i,j) {3}
+                    +--------------- > ----------------+
+                    | walk                             | c1
+                    v                                  v
+                R m0 {3}                           R m0 {2}
+                    | c2                               | c3
+                    +--------------- > ----------------+--------------- > ----------------+
+                                                                                          v
+                                                                                      W m0 {1}
+                                                                      +-------- < --------+--------------- > ----------------+
+                                                                      | c5                                                   | c4
+                                                                      v                                                      v
+                                                                      |                                                  R m0 {0}
+                                                                      |                                                      | c6
+                    +----------------------- < -----------------------+------------------------- < --------------------------+
+                    v
+           EXIT inner(i,j) {3}
 ```
 
 The path through `c4` and `c6` already makes `EXIT` wait for the owner-`{1}`
@@ -878,86 +932,141 @@ There is no parent release/acquire pair between them. The entry token passes
 through both same-owner boundaries:
 
 ```text
-initial = a READY(2) {3}
-             initial |
-                     v
-        ENTER outer(i) {3}
-             initial |
-                     v
-        W m0(i) [initial] {3}
-             initial |
-                     v
-       ENTER inner(i,0) {3}
-               itok = initial
+     initial = acquire READY(2) {3}
+            initial |
+                    v
+           ENTER outer(i) {3}
+            initial |
+                    v
+          W m0(i) [initial] {3}
+            initial |
+                    v
+          ENTER inner(i,0) {3}
+              itok = initial
 ```
 
-Owner `{3}` releases `R2_READY`, performs its read, and then releases
-`WRITE_READY`. Owner `{1}` must receive both the owner-`{2}` token and the
-`WRITE_READY` signal before writing:
+The common inner body uses the same `{3}|{2}|{1}|{0}` columns as the edge
+DAG. Owner `{3}` releases `c1`, reads, and releases `c2`. Owners `{3}` and
+`{2}` then supply the count-2 write acquire. Owner `{1}` releases `c4` before
+its `READY` arrival `c5`, and owner `{0}` supplies `c6`:
 
 ```text
-itok
-  | walk
-  v
-r R2_READY, itok {3} c1
-  | walk
-  v
-R m0 [itok] {3}
-  | walk
-  v
-r WRITE_READY, itok {3} c2
-
-r R2_READY, itok {3} c1 -- R2_READY --> t2 = a R2_READY {2}
-t2 --walk--> R m0 [t2] {2} --walk--> r WRITE_READY, t2 {2} c3
-
-r WRITE_READY, itok {3} c2 --+
-                             +-- WRITE_READY --> t1 = a WRITE_READY(2) {1}
-r WRITE_READY, t2   {2} c3 --+
-t1 --walk--> W m0 [t1] {1}
+                  itok
+                    | walk
+                    v
+      release R2_READY, itok {3} c1
+                    +--------------- > ----------------+
+                    | walk                             | R2_READY
+                    v                                  v
+             R m0 [itok] {3}               t2 = acquire R2_READY {2}
+                    | walk                          t2 |
+                    v                                  v
+    release WRITE_READY, itok {3} c2             R m0 [t2] {2}
+                    | c2                               | c3
+                    +--------------- > ----------------+--------------- > ----------------+
+                                                                                          | WRITE_READY(2)
+                                                                                          v
+                                                                           t1 = acquire WRITE_READY(2) {1}
+                                                                                       t1 |
+                                                                                          v
+                                                                                    W m0 [t1] {1}
+                                                                                       t1 |
+                                                                                          v
+                                                                             release R0_READY, t1 {1} c4
+                                                                                          +--------------- > ----------------+
+                                                                                     walk |                                  | R0_READY
+                                                                                          v                                  v
+                                                                              release READY, t1 {1} c5           t0 = acquire R0_READY {0}
+                                                                                                                          t0 |
+                                                                                                                             v
+                                                                                                                       R m0 [t0] {0}
+                                                                                                                             | walk
+                                                                                                                             v
+                                                                                                                 release READY, t0 {0} c6
 ```
 
-After that write, owner `{1}` releases `R0_READY` before its `READY` arrival.
-The final reader supplies the other `READY` arrival:
+The two real `READY` releases join at one count-2 acquire for owner `{3}`:
 
 ```text
-W m0 [t1] {1}
-      | walk
-      v
-r R0_READY, t1 {1} c4 --walk--> r READY, t1 {1} c5
-      |
-      | R0_READY
-      v
-t0 = a R0_READY {0} --walk--> R m0 [t0] {0}
-                                      | walk
-                                      v
-                              r READY, t0 {0} c6
-
-r READY, t1 {1} c5 --+
-                     +-- READY --> next = a READY(2) {3}
-r READY, t0 {0} c6 --+
+                                                                              release READY, t1 {1} c5           release READY, t0 {0} c6
+                                                                                          |                                  |
+                    +--------------------------------- < ---------------------------------+--------------- < ----------------+
+                    | READY(2)
+                    v
+       next = acquire READY(2) {3}
+               next |
 ```
 
-The count-2 acquire produces `next`. If the inner loop continues, `next`
-crosses its `EXIT` and becomes the next inner input:
+If the inner loop continues, `next` crosses its `EXIT` and becomes the next
+inner input:
 
 ```text
-next = a READY(2) {3}
-          next |
-               v
-     EXIT inner(i,j) {3}
-          next | next inner iteration
-               v
-    ENTER inner(i,j+1) {3}
+       next = acquire READY(2) {3}
+               next |
+                    v
+          EXIT inner(i,j) {3}
+               next | next inner iteration
+                    v
+        ENTER inner(i,j+1) {3}
+              itok = next
 ```
 
-If the inner loop finishes, the same token becomes its result. The outer loop
-either passes that result to its next iteration or returns it:
+If a nonempty inner loop finishes, that same token becomes its result:
 
 ```text
-next --> EXIT inner(i,last) --> result = next --> EXIT outer(i)
+       next = acquire READY(2) {3}
+               next |
+                    v
+       EXIT inner(i,last) {3}
+               next |
+                    v
+          result = next
+```
 
-outer continues: result --> ENTER outer(i+1) {3} --> W m0(i+1) [result] {3}
-outer finishes:  result --> final token
+If the inner loop has zero trips, it returns its incoming outer token instead:
+
+```text
+                  outer
+              outer | inner loop has zero trips
+                    v
+             result = outer
+```
+
+When the outer loop continues, `result` crosses its boundary and supplies the
+next outer write:
+
+```text
+                 result
+             result |
+                    v
+            EXIT outer(i) {3}
+                    | next outer iteration
+                    v
+          ENTER outer(i+1) {3}
+             result |
+                    v
+         W m0(i+1) [result] {3}
+```
+
+When the outer loop finishes, it returns `result`:
+
+```text
+                 result
+             result |
+                    v
+          EXIT outer(last) {3}
+                    |
+                    v
+             final = result
+```
+
+A zero-trip outer loop returns the original acquired token:
+
+```text
+     initial = acquire READY(2) {3}
+            initial | outer loop has zero trips
+                    v
+             final = initial
 ```
 
 The two `READY` releases always execute together, so the acquire count is
@@ -1191,21 +1300,22 @@ EXIT(i) {0}            a4: C {2} -> EXIT(i) {0} [none]
 ```
 
 ```text
-                         ENTER(i) {0}
-                                  | walk
-                                  v
-                         A: W async m0 {0}
-                         +---------+---------+
-          a1 [tma_load]  |                   | a2 [tma_load]
-                         v                   |
-                      B: R m0 {1}             |
-                       a3 |                   |
-                         +---------+---------+
-                                   v
-                              C: W m0 {2}
-                                   | a4
-                                   v
-                              EXIT(i) {0}
+                  ENTER(i) {0}
+                        | walk
+                        v
+              A: W async m0(i) {0}
+                        +-------------------->----------------------+-------------------->----------------------+
+                        | walk                                   a1 |                                           | a2
+                        v                                           v                                           |
+                        |                                    B: R m0(i) {1}                                     |
+                        |                                        a3 |                                           |
+                        |                                           +-------------------->----------------------+
+                        |                                                                                       v
+                        |                                                                                C: W m0(i) {2}
+                        |                                                                                    a4 |
+                        +------------------------------------------<--------------------------------------------+
+                        v
+                   EXIT(i) {0}
 ```
 
 No other path makes B wait for A, so `a1` must remain. The path `a1 -> a3`
@@ -1223,50 +1333,60 @@ a1             READ_READY     {0}              1                blocked
 a2,a3          WRITE_READY    {0}, {1}         2                blocked
 ```
 
-The semaphore DAG keeps the two owner-`{0}` releases in program order:
+The semaphore DAG keeps owner `{0}` on one uninterrupted spine. Owner `{1}`
+branches from `a1`; its `a3` release and owner `{0}`'s later `a2` release
+provide the two arrivals required by owner `{2}`:
 
 ```text
-owner {0} spine
-  ENTER(i) {0}
-    -> t0 = a EMPTY(i) {0}
-    -> A: W async m0 [t0] {0}
-    -> r READ_READY, t0 [tma_load] {0} a1
-    -> r WRITE_READY, t0 [tma_load] {0} a2
-
-reader path started by a1
-  r READ_READY, t0 {0} -- READ_READY --> t1 = a READ_READY {1}
-    -> B: R m0 [t1] {1}
-    -> r WRITE_READY, t1 [none] {1} a3
-
-count-2 writer path
-  r WRITE_READY, t0 {0} a2 ----+
-                               +-- WRITE_READY --> t2 = a WRITE_READY(2) {2}
-  r WRITE_READY, t1 {1} a3 ----+
-  t2 -> C: W m0 [t2] {2} -> r EMPTY, t2 {2} a4
+                  ENTER(i) {0}
+                        | walk
+                        v
+            t0 = acquire EMPTY(i) {0}
+                     t0 |
+                        v
+       A: W async m0(i) [t0] {0}
+                        | walk
+                        v
+    release READ_READY, t0 [tma_load] {0} a1
+                        +-------------------->----------------------+
+                        | walk                           READ_READY |
+                        v                                           v
+                        |                              t1 = acquire READ_READY {1}
+                        |                                        t1 |
+                        |                                           v
+                        |                                B: R m0(i) [t1] {1}
+                        |                                           | walk
+                        |                                           v
+                        |                         release WRITE_READY, t1 [none] {1} a3
+                        |                                           +-------------------->----------------------+
+                        |                                                                           WRITE_READY |
+                        |                                                                                       v
+    release WRITE_READY, t0 [tma_load] {0} a2                                                                   |
+                        +------------------------------------------->-------------------------------------------+
+                   walk |                                                                        WRITE_READY(2) |
+                        v                                                                                       v
+                   EXIT(i) {0}                                                                   t2 = acquire WRITE_READY(2) {2}
+                        | next iteration                                                                     t2 |
+                        v                                                                                       v
+                 ENTER(i+1) {0}                                                                      C: W m0(i) [t2] {2}
+                        | walk                                                                                  | walk
+                        v                                                                                       v
+                        |                                                                        release EMPTY, t2 [none] {2} a4
+                        |                                                                                 EMPTY |
+                        +------------------------------------------ < ------------------------------------------+
+                        v
+          next = acquire EMPTY(i+1) {0}
+                   next |
+                        v
+     A: W async m0(i+1) [next] {0}
 ```
 
 The direct and reader-path releases use different tokens, so InsertSemas keeps
 them as two arrivals rather than merging them into one release. This inline
-case documents the InsertSemas plan only; no current test checks the
-emitted IR for this two-release async case.
-
-For iteration zero, `EMPTY` starts released. On later iterations, `a4`
-supplies the acquire before A:
-
-```text
-r EMPTY, t2(i) {2} a4 ------------------- EMPTY --------------------+
-                                                                    |
-EXIT(i) {0}                                                         |
-     | next iteration                                               |
-     v                                                              |
-ENTER(i+1) {0}                                                      |
-     | walk                                                         |
-     v                                                              |
-next = a EMPTY(i+1) {0} <-------------------------------------------+
-     next |
-          v
-A: W async m0(i+1) [next] {0}
-```
+case documents the InsertSemas plan only; no current test checks the emitted
+IR for this two-release async case. For iteration zero, `EMPTY` starts
+released. On later iterations, `a4` supplies the acquire before A, as shown in
+the same diagram.
 
 The final `a4` release has no later acquire. A zero-trip loop executes none of
 the shown operations and leaves `EMPTY` released.
@@ -1299,14 +1419,22 @@ EXIT(i) {0}        m2: R whole {1} -> EXIT(i) {0}     P1
 ```
 
 ```text
-ENTER(i) {0} -- walk --> W whole {0} -- f1a,f1b --> R whole {1}
-                                                        | walk
-                                                        v
-                                                   R part {1}
-
-R whole {1} -- m2 --+
-                     +--> EXIT(i) {0}
-R part  {1} -- m3 --+
+              ENTER(i) {0}
+                    | walk
+                    v
+               W whole {0}
+                    +-------------------->--------------------+
+                    | walk                                    | f1a,f1b
+                    v                                         v
+                    |                                    R whole {1}
+                    |                             +-----<-----+
+                    |                             | m2   walk |
+                    |                             v           v
+                    |                             |      R part {1}
+                    |                             |           | m3
+                    +--------------<--------------+-----<-----+
+                    v
+               EXIT(i) {0}
 ```
 
 Both reads use the token returned by the same owner-`{1}` acquire. The pass
@@ -1316,14 +1444,22 @@ keeps `f1a` first. That edge already gives owner `{1}` the token used by
 ```text
 after removing f1b
 
-ENTER(i) {0} -- walk --> W whole {0} -- f1a --> R whole {1}
-                                                    | walk
-                                                    v
-                                               R part {1}
-
-R whole {1} -- m2 --+
-                     +--> EXIT(i) {0}
-R part  {1} -- m3 --+
+              ENTER(i) {0}
+                    | walk
+                    v
+               W whole {0}
+                    +-------------------->--------------------+
+                    | walk                                    | f1a
+                    v                                         v
+                    |                                    R whole {1}
+                    |                             +-----<-----+
+                    |                             | m2   walk |
+                    |                             v           v
+                    |                             |      R part {1}
+                    |                             |           | m3
+                    +--------------<--------------+-----<-----+
+                    v
+               EXIT(i) {0}
 ```
 
 No other edge is removed. The pass records both exit-edge source nodes before
@@ -1341,49 +1477,49 @@ f1a            FULL         {0}              1                blocked
 ```
 
 ```text
-                         ENTER(i) {0}
-                              | walk
-                              v
-                      t0 = a EMPTY {0}
-                               t0 |
-                                  v
-                       W whole [t0] {0}
-                               t0 |
-                                  v
-                  r FULL, t0 [none] {0} f1a
-                              FULL |
-                                   v
-                       t1 = a FULL {1}
-                                t1 |
-                                   v
-                       R whole [t1] {1}
-                                t1 | walk
-                                   v
-                       R part  [t1] {1}
-                                t1 |
-                                   v
-          r EMPTY, t1 [none] {1} merged m2,m3
+              ENTER(i) {0}
+                    | walk
+                    v
+         t0 = acquire EMPTY {0}
+                 t0 |
+                    v
+           W whole(i) [t0] {0}
+                 t0 |
+                    v
+     release FULL, t0 [none] {0} f1a
+                    +-------------------->--------------------+
+                    | walk                                    | FULL
+                    v                                         v
+                    |                               t1 = acquire FULL {1}
+                    |                                      t1 |
+                    |                                         v
+                    |                                R whole(i) [t1] {1}
+                    |                                      t1 | walk
+                    |                                         v
+                    |                                R part(i) [t1] {1}
+                    |                                      t1 |
+                    |                                         v
+                    |                        release EMPTY, t1 [none] {1} m2,m3
+                    |                           +------<------+
+               EXIT(i) {0}                      | EMPTY
+                    | next iteration            |
+                    v                           |
+             ENTER(i+1) {0}                     |
+                    | walk                      |
+                    v                           |
+                    +------------ < ------------+
+                    v
+        next = acquire EMPTY {0}
+               next |
+                    v
+         W whole(i+1) [next] {0}
 ```
 
 The current DAG dump has exactly two semaphores with pending count 1 and
 places the `EMPTY` release after the second read. The pass uses the list of
 earlier reads only to choose that release position; it emits no extra IR
-operation for the list. The wait across the loop boundary is:
-
-```text
-r EMPTY, t1(i) {1} m2,m3 ------------------ EMPTY ------------------+
-                                                                    |
-EXIT(i) {0}                                                         |
-     | next iteration                                               |
-     v                                                              |
-ENTER(i+1) {0}                                                      |
-     | walk                                                         |
-     v                                                              |
-next = a EMPTY(i+1) {0} <-------------------------------------------+
-     next |
-          v
-W whole(i+1) [next] {0}
-```
+operation for the list. The same diagram shows `EMPTY` bypassing `EXIT` and
+`ENTER` to reach the next owner-`{0}` acquire.
 
 On the final iteration, no later acquire consumes the release. A zero-trip
 loop executes no acquire or release and leaves `EMPTY` released.
@@ -1431,26 +1567,26 @@ The complete initial DAG keeps every operation as one node. Labels on the
 same arrow name the separate piece edges with those endpoints:
 
 ```text
-                         ENTER(i) {0}
-                              | walk
-                              v
-                         W m0 {0}
-             +----------------+----------------+
-s1a(P0),     |                                 | s2(P1)
-s1b(P1),     v                                 |
-s1c(P2)   R m0 {1}                             |
-             +----------------+                |
-c0a(P0),     |                | s3(P1)         |
-c0b(P2)      |                +----------------+
-             |                                 v
-             |                             W m1 {2}
-             |                                 | s4(P1)
-             |                                 v
-             |                             R m1 {0}
-             |                                 | walk
-             +----------------+----------------+
-                              v
-                          EXIT(i) {0}
+              ENTER(i) {0}
+                    | walk
+                    v
+                W m0 {0}
+                    +-------------------->--------------------+-------------------->--------------------+
+                    | walk                                    | s1a,s1b,s1c                             | s2
+                    v                                         v                                         v
+                    |                                     R m0 {1}                                      |
+                    |                                         +-------------------->--------------------+-------->--------+
+                    |                                                                                   | s2,s3           | c0a,c0b
+                    |                                                                                   v                 |
+                    |                                                                               W m1 {2}              |
+                    |                                                                                   | s4              |
+                    +-----------------------------------------<-----------------------------------------+                 |
+                    v                                                                                                     |
+                R m1 {0}                                                                                                  |
+                    | walk                                                                                                |
+                    +--------------------------------------------------<--------------------------------------------------+
+                    v
+               EXIT(i) {0}
 ```
 
 There is no edge from `W m1` to `EXIT` for P1. Edge `s4` already makes owner
@@ -1475,24 +1611,26 @@ source owner, so they become one release when semaphores are formed.
 The resulting synchronization-edge DAG is:
 
 ```text
-                         ENTER(i) {0}
-                              | walk
-                              v
-                         W m0(i) {0}
-                              | s1a
-                              v
-                         R m0(i) {1}
-                         +----+----------------+
-                      s3 |                     | c0a,c0b
-                         v                     |
-                    W m1(i) {2}                |
-                         | s4                  |
-                         v                     |
-                    R m1(i) {0}                |
-                         | walk                |
-                         +----------+----------+
-                                    v
-                                EXIT(i) {0}
+              ENTER(i) {0}
+                    | walk
+                    v
+                W m0(i) {0}
+                    +-------------------->--------------------+
+                    | walk                                    | s1a
+                    v                                         v
+                    |                                     R m0(i) {1}
+                    |                                         +-------------------->--------------------+-------->--------+
+                    |                                                                                   | s3              | c0a,c0b
+                    |                                                                                   v                 |
+                    |                                                                               W m1(i) {2}           |
+                    |                                                                                   | s4              |
+                    +-----------------------------------------<-----------------------------------------+                 |
+                    v                                                                                                     |
+                R m1(i) {0}                                                                                               |
+                    | walk                                                                                                |
+                    +--------------------------------------------------<--------------------------------------------------+
+                    v
+               EXIT(i) {0}
 ```
 
 The four remaining waits become four count-1 semaphores. The entry row is the
@@ -1513,53 +1651,58 @@ starts owner `{2}`; the second supplies owner `{0}` in the next iteration.
 They are one ordered owner-`{1}` path, not parallel branches:
 
 ```text
-                              ENTER(i) {0}
-                                   | walk
-                                   v
-                         t0 = a EMPTY(i) {0}
-                                t0 |
-                                   v
-                            W m0(i) [t0] {0}
-                                   | walk
-                                   v
-                         r F01, t0 {0} s1a
-                               F01 |
-                                   v
-                            t1 = a F01 {1}
-                                t1 |
-                                   v
-                            R m0(i) [t1] {1}
-                                   | walk
-                                   v
-                         r F12, t1 {1} s3
-                    +--------------+----------------+
-               walk |                               | F12
-                    v                               v
-      r EMPTY, t1 {1} c0a,c0b             t2 = a F12 {2}
-              EMPTY |                            t2 |
-                    |                               v
-                    |                      W m1(i) [t2] {2}
-                    |                               | walk
-                    |                               v
-                    |                     r F20, t2 {2} s4
-                    |                           F20 |
-                    |                               v
-                    |                     t0b = a F20 {0}
-                    |                           t0b |
-                    |                               v
-                    |                      R m1(i) [t0b] {0}
-                    |                               | walk
-                    |                               v
-                    |                          EXIT(i) {0}
-                    |                               | next iteration
-                    |                               v
-                    |                         ENTER(i+1) {0}
-                    |                               | walk
-                    |                               v
-                    +--------------------> next = a EMPTY(i+1) {0}
-                                               next |
-                                                    v
-                                           W m0(i+1) [next] {0}
+              ENTER(i) {0}
+                    | walk
+                    v
+         t0 = acquire EMPTY {0}
+                 t0 |
+                    v
+            W m0(i) [t0] {0}
+                 t0 |
+                    v
+         release F01, t0 {0} s1a
+                    +-------------------->--------------------+
+                    | walk                                    | F01
+                    v                                         v
+                    |                               t1 = acquire F01 {1}
+                    |                                      t1 |
+                    |                                         v
+                    |                                 R m0(i) [t1] {1}
+                    |                                      t1 | walk
+                    |                                         v
+                    |                              release F12, t1 {1} s3
+                    |                                         +-------------------->--------------------+
+                    |                                    walk |                                         | F12
+                    |                                         v                                         v
+                    |                           release EMPTY, t1 {1} c0a,c0b                 t2 = acquire F12 {2}
+                    |                                         +----------------------------->-----------------------------+
+                    |                                                                                t2 |                 | EMPTY
+                    |                                                                                   v                 |
+                    |                                                                           W m1(i) [t2] {2}          |
+                    |                                                                                t2 | walk            |
+                    |                                                                                   v                 |
+                    |                                                                        release F20, t2 {2} s4       |
+                    +-----------------------------------------<-----------------------------------------+                 |
+                    | F20                                                                                                 |
+                    v                                                                                                     |
+          t0b = acquire F20 {0}                                                                                           |
+                t0b |                                                                                                     |
+                    v                                                                                                     |
+            R m1(i) [t0b] {0}                                                                                             |
+                    | walk                                                                                                |
+                    v                                                                                                     |
+               EXIT(i) {0}                                                                                                |
+                    | next iteration                                                                                      |
+                    v                                                                                                     |
+             ENTER(i+1) {0}                                                                                               |
+                    | walk                                                                                                |
+                    v                                                                                                     |
+                    +------------------------------------------------- < -------------------------------------------------+
+                    v
+        next = acquire EMPTY {0}
+               next |
+                    v
+          W m0(i+1) [next] {0}
 ```
 
 There is no extra `{0}->{2}` semaphore. The test checks these four semaphores
@@ -1616,26 +1759,26 @@ The complete initial DAG keeps one node for each operation. Labels on one
 arrow retain every piece edge:
 
 ```text
-                         ENTER(i) {0}
-                              | walk
-                              v
-                         W m0 {0}
-             +----------------+----------------+
- l1a(P0),    |                                 | l2a(P1)
- l1b(P1)     v                                 |
-          R m0 {1}                             |
-             +----------------+                |
-      c0(P0) |                | l2b(P1)        |
-             |                +----------------+
-             |                                 v
-             |                             W m1 {2}
-             |                                 | l3a(P1), l3b(P2)
-             |                                 v
-             |                             R m1 {0}
-             |                                 | c2(P2)
-             +----------------+----------------+
-                              v
-                          EXIT(i)
+              ENTER(i)
+                    | walk
+                    v
+                W m0 {0}
+                    +-------------------->--------------------+-------------------->--------------------+
+                    | walk                                    | l1a,l1b                                  | l2a
+                    v                                         v                                         v
+                    |                                     R m0 {1}                                      |
+                    |                                         +-------------------->--------------------+-------->--------+
+                    |                                                                                   | l2a,l2b         | c0
+                    |                                                                                   v                 |
+                    |                                                                               W m1 {2}              |
+                    |                                                                                   | l3a,l3b         |
+                    +-----------------------------------------<-----------------------------------------+                 |
+                    v                                                                                                     |
+                R m1 {0}                                                                                                  |
+                    | c2                                                                                                  |
+                    +--------------------------------------------------<--------------------------------------------------+
+                    v
+                EXIT(i)
 ```
 
 The pass removes four edges. For `c2`, the kept path starts with owner `{0}`'s
@@ -1656,24 +1799,26 @@ access of the next iteration. No other edge is removed.
 The final synchronization-edge DAG is:
 
 ```text
-                         ENTER(i)
-                              | walk
-                              v
-                         W m0(i) {0}
-                              | l1a
-                              v
-                         R m0(i) {1}
-                         +----+----------------+
-                     l2b |                     | c0
-                         v                     |
-                    W m1(i) {2}                |
-                         | l3a                 |
-                         v                     |
-                    R m1(i) {0}                |
-                         | walk                |
-                         +----------+----------+
-                                    v
-                                EXIT(i)
+              ENTER(i)
+                    | walk
+                    v
+                W m0(i) {0}
+                    +-------------------->--------------------+
+                    | walk                                    | l1a
+                    v                                         v
+                    |                                     R m0(i) {1}
+                    |                                         +-------------------->--------------------+-------->--------+
+                    |                                                                                   | l2b             | c0
+                    |                                                                                   v                 |
+                    |                                                                               W m1(i) {2}           |
+                    |                                                                                   | l3a             |
+                    +-----------------------------------------<-----------------------------------------+                 |
+                    v                                                                                                     |
+                R m1(i) {0}                                                                                               |
+                    | walk                                                                                                |
+                    +--------------------------------------------------<--------------------------------------------------+
+                    v
+                EXIT(i)
 ```
 
 The emitted POU plan therefore has exactly four semaphores with pending count
@@ -1692,53 +1837,58 @@ As in the previous example, owner `{1}` executes its two releases in order.
 The first starts owner `{2}` and the second supplies the next iteration:
 
 ```text
-                              ENTER(i)
-                                   | walk
-                                   v
-                         t0 = a EMPTY(i) {0}
-                                t0 |
-                                   v
-                            W m0(i) [t0] {0}
-                                t0 | walk
-                                   v
-                         r F01, t0 {0} l1a
-                               F01 |
-                                   v
-                            t1 = a F01 {1}
-                                t1 |
-                                   v
-                            R m0(i) [t1] {1}
-                                t1 | walk
-                                   v
-                         r F12, t1 {1} l2b
-                    +--------------+----------------+
-               walk |                               | F12
-                    v                               v
-          r EMPTY, t1 {1} c0               t2 = a F12 {2}
-              EMPTY |                            t2 |
-                    |                               v
-                    |                      W m1(i) [t2] {2}
-                    |                            t2 | walk
-                    |                               v
-                    |                    r F20, t2 {2} l3a
-                    |                           F20 |
-                    |                               v
-                    |                     t0b = a F20 {0}
-                    |                           t0b |
-                    |                               v
-                    |                      R m1(i) [t0b] {0}
-                    |                               | walk
-                    |                               v
-                    |                           EXIT(i)
-                    |                               | next iteration
-                    |                               v
-                    |                          ENTER(i+1)
-                    |                               | walk
-                    |                               v
-                    +--------------------> next = a EMPTY(i+1) {0}
-                                               next |
-                                                    v
-                                           W m0(i+1) [next] {0}
+              ENTER(i)
+                    | walk
+                    v
+         t0 = acquire EMPTY {0}
+                 t0 |
+                    v
+            W m0(i) [t0] {0}
+                 t0 |
+                    v
+         release F01, t0 {0} l1a
+                    +-------------------->--------------------+
+                    | walk                                    | F01
+                    v                                         v
+                    |                               t1 = acquire F01 {1}
+                    |                                      t1 |
+                    |                                         v
+                    |                                 R m0(i) [t1] {1}
+                    |                                      t1 | walk
+                    |                                         v
+                    |                              release F12, t1 {1} l2b
+                    |                                         +-------------------->--------------------+
+                    |                                    walk |                                         | F12
+                    |                                         v                                         v
+                    |                                release EMPTY, t1 {1} c0                 t2 = acquire F12 {2}
+                    |                                         +----------------------------->-----------------------------+
+                    |                                                                                t2 |                 | EMPTY
+                    |                                                                                   v                 |
+                    |                                                                           W m1(i) [t2] {2}          |
+                    |                                                                                t2 | walk            |
+                    |                                                                                   v                 |
+                    |                                                                       release F20, t2 {2} l3a       |
+                    +-----------------------------------------<-----------------------------------------+                 |
+                    | F20                                                                                                 |
+                    v                                                                                                     |
+          t0b = acquire F20 {0}                                                                                           |
+                t0b |                                                                                                     |
+                    v                                                                                                     |
+            R m1(i) [t0b] {0}                                                                                             |
+                    | walk                                                                                                |
+                    v                                                                                                     |
+               EXIT(i)                                                                                                    |
+                    | next iteration                                                                                      |
+                    v                                                                                                     |
+              ENTER(i+1)                                                                                                  |
+                    | walk                                                                                                |
+                    v                                                                                                     |
+                    +------------------------------------------------- < -------------------------------------------------+
+                    v
+        next = acquire EMPTY {0}
+               next |
+                    v
+          W m0(i+1) [next] {0}
 ```
 
 The kept path from `R m1(i)` through the next `W m0`, `l1a`, and `l2b`
@@ -1877,16 +2027,16 @@ EXIT(i) {0}    e2: R m0 {1} -> EXIT(i) {0}
 No edge is removed or merged. The synchronization-edge DAG is:
 
 ```text
-                         ENTER(i) {0}
-                              | walk
-                              v
-                          W m0(i) {0}
-                              | e1
-                              v
-                          R m0(i) {1}
-                              | e2
-                              v
-                          EXIT(i) {0}
+                  ENTER(i) {0}
+                        | walk
+                        v
+                   W m0(i) {0}
+                        +----------------- e1 > ------------------+
+                   walk |                                         v
+                        |                                    R m0(i) {1}
+                        +----------------- < e2 ------------------+
+                        v
+                   EXIT(i) {0}
 ```
 
 Both placement modes use the same semaphore assignment:
@@ -1901,36 +2051,38 @@ e2              EMPTY        {1}              1                same semaphore
 Auto selects POU for this input:
 
 ```text
-                         ENTER(i) {0}
-                              | walk
-                              v
-                    tw = a EMPTY(i) {0}
-                             tw |
-                                v
-                       W m0(i) [tw] {0}
-                             tw | walk
-                                v
-                    r FULL, tw {0} e1
-                           FULL |
-                                v
-                       tr = a FULL {1}
-                             tr |
-                                v
-                       R m0(i) [tr] {1}
-                             tr | walk
-                                v
-                    r EMPTY, tr(i) {1} e2 --------- EMPTY ---------+
-                                                                   |
-                         EXIT(i) {0}                               |
-                              | next iteration                     |
-                              v                                    |
-                        ENTER(i+1) {0}                             |
-                              | walk                               |
-                              v                                    |
-              tw2 = a EMPTY(i+1) {0} <-----------------------------+
-                             tw2 |
-                                 v
-                     W m0(i+1) [tw2] {0}
+                  ENTER(i) {0}
+                        | walk
+                        v
+            tw = acquire EMPTY(i) {0}
+                     tw |
+                        v
+                W m0(i) [tw] {0}
+                     tw | walk
+                        v
+             release FULL, tw {0} e1
+                        +---------------- FULL > -----------------+
+                   walk |                                         v
+                        |                               tr = acquire FULL {1}
+                        |                                      tr |
+                        |                                         v
+                        |                                 R m0(i) [tr] {1}
+                        |                                      tr | walk
+                        |                                         v
+                        |                             release EMPTY, tr {1} e2
+                        |                                         |
+                   EXIT(i) {0}                                    |
+                        | next iteration                          |
+                        v                                         |
+                 ENTER(i+1) {0}                                   |
+                        | walk                                    |
+                        v                                         |
+                        +--------------- < EMPTY -----------------+
+                        v
+          tw2 = acquire EMPTY(i+1) {0}
+                    tw2 |
+                        v
+               W m0(i+1) [tw2] {0}
 ```
 
 The loop does not carry a semaphore token. `EMPTY` is acquired immediately
@@ -1939,42 +2091,72 @@ before each write that needs it.
 FirstTouch:
 
 ```text
-                         initial = a EMPTY at root
-                                  initial |
-                                          v
-                    scf.for iter_arg carry=initial
-                                  +-------+----------------+
-                    loop executes |                        | zero trip
-                                  v                        v
-                            ENTER(i) {0}             result=initial
-                            carry |
-                                  v
-                     W m0(i) [carry] {0}
-                            carry | walk
-                                  v
-                  r FULL, carry {0} e1
-                             FULL |
-                                  v
-                       tr = a FULL {1}
-                               tr |
-                                  v
-                       R m0(i) [tr] {1}
-                               tr | walk
-                                  v
-                   r EMPTY, tr {1} e2
-                            EMPTY |
-                                  v
-                     next = a EMPTY {0}
-                             next |
-                                  v
-                    EXIT(i) yields next
-                                  +------------------------+
-                   next iteration |                        | loop finishes
-                                  v                        v
-                           ENTER(i+1) {0}             result=next
-                       carry=next |
-                                  v
-                      W m0(i+1) [carry] {0}
+         initial = acquire EMPTY at root
+                initial |
+                        v
+         scf.for iter_arg carry=initial
+                  carry |
+                        v
+                  ENTER(i) {0}
+                  carry |
+                        v
+               W m0(i) [carry] {0}
+                  carry | walk
+                        v
+           release FULL, carry {0} e1
+                        +---------------- FULL > -----------------+
+                   walk |                                         v
+                        |                               tr = acquire FULL {1}
+                        |                                      tr |
+                        |                                         v
+                        |                                 R m0(i) [tr] {1}
+                        |                                      tr | walk
+                        |                                         v
+                        |                             release EMPTY, tr {1} e2
+                        +--------------- < EMPTY -----------------+
+                        v
+            next = acquire EMPTY {0}
+```
+
+If the loop continues, that `next` token becomes the next iteration's
+`carry`:
+
+```text
+            next = acquire EMPTY {0}
+                   next |
+                        v
+               EXIT(i) yields next
+                        | next iteration
+                        v
+                 ENTER(i+1) {0}
+             carry=next |
+                        v
+              W m0(i+1) [carry] {0}
+```
+
+If the executed iteration is final, the same token becomes the loop result:
+
+```text
+            next = acquire EMPTY {0}
+                   next |
+                        v
+            EXIT(last) yields next
+                        | loop finishes
+                        v
+                  result=next
+```
+
+On a zero-trip loop, the body does not execute and the root token is the
+result:
+
+```text
+         initial = acquire EMPTY at root
+                initial |
+                        v
+      scf.for executes zero trips
+                initial |
+                        v
+               result=initial
 ```
 
 If owner `{0}` already has a valid token before a FirstTouch loop, the loop
@@ -2015,31 +2197,31 @@ There is one piece, P0. The outer DAG contains only the inner summary between
 owner-`{0}` boundaries, so it has no synchronization edge:
 
 ```text
-                         ENTER outer {0}
-                                | walk
-                                v
-                 [inner summary P0:W:{0}]
-                                | walk
-                                v
-                          EXIT outer {0}
+                  ENTER outer {0}
+                        | walk
+                        v
+         [inner summary P0:W:{0}]
+                        | walk
+                        v
+                   EXIT outer {0}
 ```
 
 No inner edge is removed or merged. Its synchronization-edge DAG is:
 
 ```text
-                         ENTER inner {0}
-                                | walk
-                                v
-                        touch0 m0 {0}
-                                | walk
-                                v
-                        touch1 m0 {0}
-                                | e1
-                                v
-                        touch2 m0 {1}
-                                | e2
-                                v
-                         EXIT inner {0}
+                  ENTER inner {0}
+                        | walk
+                        v
+                 touch0 m0 {0}
+                        | walk
+                        v
+                 touch1 m0 {0}
+                        +----------------- e1 > ------------------+
+                   walk |                                         v
+                        |                                touch2 m0 {1}
+                        +----------------- < e2 ------------------+
+                        v
+                   EXIT inner {0}
 ```
 
 The completed FirstTouch plan uses three count-1 semaphores:
@@ -2081,55 +2263,116 @@ point-of-use placement is unavailable for this loop:
 fixed loop.stage constraints require a carried recurrence
 ```
 
-The final plan carries the same token through both loops. The two same-owner
-touches use `carry` in program order:
+The final plan carries the same token through both loops. The common body
+keeps owner `{0}` on the left and owner `{1}` on the right. The two
+same-owner touches use `carry` in program order:
 
 ```text
-initial = a ENTRY at root
-     |
-     v
-ENTER outer {0} receives outerToken=initial
-     | walk into inner loop
-     v
-ENTER inner {0} receives carry=outerToken
-     | walk
-     v
-touch0 [carry] {0}
-     | walk
-     v
-touch1 [carry] {0}
-     | walk
-     v
-r TO1, carry {0} e1
-     | TO1
-     v
-t1 = a TO1 {1}
-     |
-     v
-touch2 [t1] {1}
-     | walk
-     v
-r NEXT, t1 {1} e2
-     | NEXT
-     v
-next = a NEXT {0}
-     |
-     v
-EXIT inner(i,j) yields next
-     +-- next inner iteration --> ENTER inner(i,j+1) receives carry=next
-     |                               |
-     |                               v
-     |                          touch0 [carry] {0}
-     |
-     +-- inner finishes --> inner-result=next --> EXIT outer(i)
-                                                        |
-                                      +-----------------+-----------------+
-                         next outer   |                                   | outer finishes
-                                      v                                   v
-                              ENTER outer(i+1)                       result=next
-                                      |
-                                      v
-                            ENTER inner(i+1,0)
+     initial = acquire ENTRY at root
+            initial |
+                    v
+           ENTER outer(i) {0}
+         outerToken = initial
+         outerToken |
+                    v
+          ENTER inner(i,j) {0}
+             carry = outerToken
+              carry |
+                    v
+          touch0 m0 [carry] {0}
+              carry | walk
+                    v
+          touch1 m0 [carry] {0}
+              carry |
+                    v
+        release TO1, carry {0} e1
+                    +------------------- > -------------------+
+                    | walk                                    | TO1
+                    v                                         v
+                    |                               t1 = acquire TO1 {1}
+                    |                                      t1 |
+                    |                                         v
+                    |                                touch2 m0 [t1] {1}
+                    |                                      t1 | walk
+                    |                                         v
+                    |                              release NEXT, t1 {1} e2
+                    +------------------- < -------------------+
+                    v
+         next = acquire NEXT {0}
+               next |
+```
+
+If the inner loop continues, `next` becomes its next `carry`:
+
+```text
+         next = acquire NEXT {0}
+               next |
+                    v
+       EXIT inner(i,j) yields next
+               next | next inner iteration
+                    v
+         ENTER inner(i,j+1) {0}
+             carry = next
+              carry |
+                    v
+          touch0 m0 [carry] {0}
+```
+
+If the inner loop finishes and the outer loop continues, `next` becomes the
+inner result and then the next outer token:
+
+```text
+         next = acquire NEXT {0}
+               next |
+                    v
+     EXIT inner(i,last) yields next
+                    |
+                    v
+           innerResult = next
+        innerResult |
+                    v
+    EXIT outer(i) yields innerResult
+                    | next outer iteration
+                    v
+          ENTER outer(i+1) {0}
+        outerToken = innerResult
+         outerToken |
+                    v
+         ENTER inner(i+1,0) {0}
+             carry = outerToken
+              carry |
+                    v
+          touch0 m0 [carry] {0}
+```
+
+A zero-trip inner loop returns its incoming outer token:
+
+```text
+               outerToken
+          outerToken | inner loop has zero trips
+                    v
+        innerResult = outerToken
+```
+
+When the outer loop finishes, it returns the inner result:
+
+```text
+               innerResult
+        innerResult |
+                    v
+   EXIT outer(last) yields innerResult
+                    |
+                    v
+        outerResult = innerResult
+```
+
+A zero-trip outer loop returns the root token unchanged:
+
+```text
+     initial = acquire ENTRY at root
+            initial | outer loop has zero trips
+                    v
+          outerResult = initial
 ```
 
 If the inner loop continues, `next` is its next `carry`. If it finishes,
@@ -2183,33 +2426,33 @@ The parent and child DAGs are separate:
 ```text
 parent
 
-                         ENTER loop {1}
-                                | walk
-                                v
-                           W MMA {1}
-                                | walk
-                                v
-                 [if summary P0:R:{1}]
-                                | walk
-                                v
-                          EXIT loop {1}
+                  ENTER loop {1}
+                        | walk
+                        v
+                   W MMA {1}
+                        | walk
+                        v
+         [if summary P0:R:{1}]
+                        | walk
+                        v
+                   EXIT loop {1}
 
 then child
 
-                         ENTER if {1}
-                                | e1
-                                v
-                           R acc {0}
-                                | e2
-                                v
-                          EXIT if {1}
+                  ENTER if {1}
+                        +----------------- e1 > ------------------+
+                   walk |                                         v
+                        |                                    R acc {0}
+                        +----------------- < e2 ------------------+
+                        v
+                   EXIT if {1}
 
 else child
 
-                         ENTER if {1}
-                                | walk
-                                v
-                          EXIT if {1}
+                  ENTER if {1}
+                        | walk
+                        v
+                   EXIT if {1}
 ```
 
 The parent has no synchronization edge around the `if`. The two then-path
@@ -2236,71 +2479,78 @@ else supply     EMPTY        {1}              1                same semaphore (e
 The else release is not a synchronization edge. It supplies the same next
 `EMPTY` phase that `e2` supplies when the then branch runs.
 
-Only one branch runs, so the semaphore DAG is shown as two complete
-alternative paths. On the then path:
+The acquire and MMA are common to both paths and appear once:
 
 ```text
-                         tw = a EMPTY(i) {1}
-                                  tw |
-                                     v
-                           W MMA(i) [tw] {1}
-                                  tw |
-                                     v
-                  r FULL, tw [tc5mma] {1}
-                                FULL |
-                                     v
-                         tr = a FULL {0}
-                                  tr |
-                                     v
-                           R acc(i) [tr] {0}
-                                  tr |
-                                     v
- r EMPTY, tr [none] {0} e2 ---------------- EMPTY -----------------+
-                                                                  |
-                         EXIT if {1}                              |
-                              | branch completes                  |
-                              v                                   |
-                         EXIT loop(i) {1}                         |
-                              | next iteration                    |
-                              v                                   |
-                        ENTER loop(i+1) {1}                       |
-                              | walk                              |
-                              v                                   |
-              next = a EMPTY(i+1) {1} <---------------------------+
-                             next |
-                                  v
-                    W MMA(i+1) [next] {1}
+            tw = acquire EMPTY(i) {1}
+                     tw |
+                        v
+              W MMA(i) [tw] {1}
+                     tw | walk
+                        v
+                   scf.if cond
 ```
 
-On the else path:
+The branch continuations use the same owner columns. They are exclusive
+control paths, not parallel lanes. On the then path:
 
 ```text
-                         tw = a EMPTY(i) {1}
-                                  tw |
-                                     v
-                           W MMA(i) [tw] {1}
-                                  tw |
-                                     v
- r EMPTY, tw [tc5mma] {1} ---------------- EMPTY ------------------+
-                                                                  |
-                         EXIT if {1}                              |
-                              | branch completes                  |
-                              v                                   |
-                         EXIT loop(i) {1}                         |
-                              | next iteration                    |
-                              v                                   |
-                        ENTER loop(i+1) {1}                       |
-                              | walk                              |
-                              v                                   |
-              next = a EMPTY(i+1) {1} <---------------------------+
-                             next |
-                                  v
-                    W MMA(i+1) [next] {1}
+                  ENTER if {1}
+                     tw | walk
+                        v
+        release FULL, tw [tc5mma] {1} e1
+                        +---------------- FULL > -----------------+
+                   walk |                                         v
+                        |                               tr = acquire FULL {0}
+                        |                                      tr |
+                        |                                         v
+                        |                                 R acc(i) [tr] {0}
+                        |                                      tr | walk
+                        |                                         v
+                        |                          release EMPTY, tr [none] {0} e2
+                        +--------------- < EMPTY -----------------+
+                        v
+                   EXIT if {1}
+                        | branch completes
+                        v
+                EXIT loop(i) {1}
+                        | next iteration
+                        v
+               ENTER loop(i+1) {1}
+                        | walk
+                        v
+          next = acquire EMPTY(i+1) {1}
+                   next |
+                        v
+              W MMA(i+1) [next] {1}
 ```
 
-Whichever branch runs, its one `EMPTY` release supplies the next reuse after
-the loop boundary. The two diagrams are alternatives, not two inputs to one
-acquire.
+On the else path, owner `{0}` does not execute:
+
+```text
+                  ENTER if {1}
+                     tw | walk
+                        v
+    release EMPTY, tw [tc5mma] {1}
+                  EMPTY |
+                        v
+                   EXIT if {1}
+                        | branch completes
+                        v
+                EXIT loop(i) {1}
+                        | next iteration
+                        v
+               ENTER loop(i+1) {1}
+                        | walk
+                        v
+          next = acquire EMPTY(i+1) {1}
+                   next |
+                        v
+              W MMA(i+1) [next] {1}
+```
+
+Whichever branch runs, its one `EMPTY` release supplies the next reuse. The
+two diagrams are alternatives, not two inputs to one acquire.
 
 Only one `EMPTY` release executes each time the `if` runs. Neither the `if`
 nor the loop returns a semaphore token: each branch releases `EMPTY`, and the
@@ -2345,21 +2595,19 @@ No edge is removed or merged. The two reader paths are independent and join
 at the final write:
 
 ```text
-                         ENTER(i) {0}
-                              | walk
-                              v
-                         W first {0}
-                    +---------+---------+
-                 e1 |                   | e2
-                    v                   v
-              R reader1 {1}       R reader2 {2}
-                 e3 |                   | e4
-                    +---------+---------+
-                              v
-                         W final {0}
-                              | walk
-                              v
-                          EXIT(i) {0}
+                                                        ENTER(i) {0}
+                                                              | walk
+                                                              v
+                                                       W first(i) {0}
+                    +----------------- < e1 ------------------+----------------- e2 > ------------------+
+                    v                                    walk |                                         v
+            R reader1(i) {1}                                  |                                 R reader2(i) {2}
+                    +----------------- e3 > ------------------+----------------- < e4 ------------------+
+                                                              v
+                                                       W final(i) {0}
+                                                              | walk
+                                                              v
+                                                         EXIT(i) {0}
 ```
 
 Edges `e3` and `e4` share a destination and destination owner, so they use
@@ -2382,46 +2630,48 @@ semaphore DAG keeps the two owner-`{0}` releases on one ordered spine and the
 reader paths separate:
 
 ```text
-                              initial = a EMPTY(2) at root
-                                         |
-                                         v
-                                   ENTER(i) {0}
-                                      carry |
-                                            v
-                            W first(i) [carry] {0}
-                                      carry |
-                                            v
-                          r TO_R1, carry {0} e1
-                    +-------------------+-------------------+
-              TO_R1 |                                       | walk
-                    v                                       v
-          t1 = a TO_R1 {1}                      r TO_R2, carry {0} e2
-                 t1 |                                       | TO_R2
-                    v                                       v
-       R reader1(i) [t1] {1}                      t2 = a TO_R2 {2}
-                 t1 |                                    t2 |
-                    v                                       v
-       r EMPTY, t1 {1} e3                      R reader2(i) [t2] {2}
-              EMPTY |                                    t2 |
-                    |                                       v
-                    |                         r EMPTY, t2 {2} e4
-                    |                                  EMPTY |
-                    +-------------------+-------------------+
-                                        v
-                              next = a EMPTY(2) {0}
-                                     next |
-                                          v
-                              W final(i) [next] {0}
-                                     next |
-                                          v
-                              EXIT(i) yields next
-                         +--------------+--------------+
-          next iteration |                             | loop finishes
-                         v                             v
-                  ENTER(i+1) {0}                  result=next
-                         | receives next
-                         v
-               W first(i+1) [next] {0}
+                                             initial = acquire EMPTY(2) at root
+                                                      initial |
+                                                              v
+                                               scf.for iter_arg carry=initial
+                                                              +---------------------------------- > ------------------------------------+
+                                                     executes |                                                               zero trip |
+                                                              v                                                                         v
+                                                        ENTER(i) {0}                                                             result=initial
+                                                        carry |
+                                                              v
+                                                   W first(i) [carry] {0}
+                                                        carry | walk
+                                                              v
+                                                 release TO_R1, carry {0} e1
+                    +--------------- < TO_R1 -----------------+
+                    v                                    walk |
+         t1 = acquire TO_R1 {1}                  release TO_R2, carry {0} e2
+                 t1 |                                         +--------------- TO_R2 > -----------------+
+                    v                                         |                                         v
+          R reader1(i) [t1] {1}                               |                              t2 = acquire TO_R2 {2}
+                 t1 | walk                                    |                                      t2 |
+                    v                                         |                                         v
+        release EMPTY, t1 {1} e3                              |                               R reader2(i) [t2] {2}
+                    |                                         |                                      t2 | walk
+                    |                                         |                                         v
+                    |                                         |                             release EMPTY, t2 {2} e4
+                    +--------------- EMPTY > -----------------+--------------- < EMPTY -----------------+
+                                                              v
+                                                 next = acquire EMPTY(2) {0}
+                                                         next |
+                                                              v
+                                                    W final(i) [next] {0}
+                                                         next | walk
+                                                              v
+                                                     EXIT(i) yields next
+                                                              +---------------------------------- > ------------------------------------+
+                                               next iteration |                                                           loop finishes |
+                                                              v                                                                         v
+                                                       ENTER(i+1) {0}                                                              result=next
+                                                   carry=next |
+                                                              v
+                                                  W first(i+1) [carry] {0}
 ```
 
 POU and FirstTouch produce the same placement here. The count-2 acquire is
@@ -2479,16 +2729,16 @@ EXIT inner(i,j) {1}      c2: R acc(i,j) {0} -> EXIT inner(i,j) {1}
 ```
 
 ```text
-                         ENTER inner(i,j) {1}
-                                  | walk
-                                  v
-                            W acc(i,j) {1}
-                                  | c1
-                                  v
-                            R acc(i,j) {0}
-                                  | c2
-                                  v
-                         EXIT inner(i,j) {1}
+                  ENTER inner(i,j) {1}
+                            | walk
+                            v
+                     W acc(i,j) {1}
+                            +-------------------c1 >--------------------+
+                            | walk                                      v
+                            |                                    R acc(i,j) {0}
+                            +-------------------< c2--------------------+
+                            v
+                   EXIT inner(i,j) {1}
 ```
 
 No edge is removed or merged.
@@ -2503,52 +2753,78 @@ c2              EMPTY        {0}              1                same semaphore
 ```
 
 The pass places both acquires immediately before the inner buffer accesses
-that need them. The parent DAG contains the child as one summary; the
-semaphore DAG below shows only the child body:
+that need them. The parent DAG contains the child as one summary. The
+following views keep the same owner lanes for the child body and both
+exclusive control paths to the next executed inner turn:
 
 ```text
-                         ENTER inner(i,j) {1}
-                                  | walk
-                                  v
-                         tw = a EMPTY {1}
-                                  tw |
-                                     v
-                           W acc(i,j) [tw] {1}
-                                  tw |
-                                     v
-                  r FULL, tw [tc5mma] {1}
-                                FULL |
-                                     v
-                         tr = a FULL {0}
-                                  tr |
-                                     v
-                           R acc(i,j) [tr] {0}
-                                  tr |
-                                     v
- r EMPTY, tr(i,j) [none] {0} c2 ---------------- EMPTY ---------------+
-                                                                      |
-                         EXIT inner(i,j) {1}                          |
-                    +-------------+-------------+                     |
-    next inner turn |                           | inner finishes      |
-                    v                           v                     |
-         ENTER inner(i,j+1) {1}          EXIT outer(i) {1}            |
-                    |                           | later outer turn     |
-                    |                           v                     |
-                    |                    ENTER outer(k) {1}            |
-                    |                           | walk                 |
-                    |                           v                     |
-                    |                    ENTER inner(k,0) {1}          |
-                    +-------------+-------------+                     |
-                                  v                                   |
-                  next = a EMPTY {1} <--------------------------------+
-                             next |
-                                  v
-                         W acc [next] {1}
+                  ENTER inner(i,j) {1}
+                            | walk
+                            v
+                 tw = acquire EMPTY {1}
+                         tw |
+                            v
+                 W acc(i,j) [tw] {1}
+                            | walk
+                            v
+            release FULL, tw [tc5mma] {1} c1
+                            +------------------FULL >-------------------+
+                            | walk                                      v
+                            |                                 tr = acquire FULL {0}
+                            |                                        tr |
+                            |                                           v
+                            |                                R acc(i,j) [tr] {0}
+                            |                                           | walk
+                            |                                           v
+                            |                            release EMPTY, tr [none] {0} c2
 ```
 
-The two control branches reach the same static acquire before the next
-executed inner write. The semaphore arrow bypasses both the inner and outer
-loop boundaries.
+If the next inner turn is in the same outer iteration, `c2` reaches the
+static acquire through this control path:
+
+```text
+                            |                            release EMPTY, tr [none] {0} c2
+                            +---------------- < EMPTY ------------------+
+                            v
+                   EXIT inner(i,j) {1}
+                            | next inner iteration
+                            v
+                 ENTER inner(i,j+1) {1}
+                            | walk
+                            v
+                next = acquire EMPTY {1}
+                       next |
+                            v
+                 W acc(i,j+1) [next] {1}
+```
+
+If the next executed inner turn is in a later outer iteration, the same
+release reaches the same static acquire through the outer boundary:
+
+```text
+                            |                            release EMPTY, tr [none] {0} c2
+                            +---------------- < EMPTY ------------------+
+                            v
+                 EXIT inner(i,last) {1}
+                            | inner finishes
+                            v
+                    EXIT outer(i) {1}
+                            | later outer iteration
+                            v
+                   ENTER outer(k) {1}
+                            | walk
+                            v
+                  ENTER inner(k,0) {1}
+                            | walk
+                            v
+                first = acquire EMPTY {1}
+                      first |
+                            v
+                 W acc(k,0) [first] {1}
+```
+
+The two views are exclusive. The semaphore arrow bypasses the inner and
+outer loop boundaries.
 
 After the final inner iteration, its `EMPTY` release has no following acquire
 in that run of the inner loop. It remains ready for the next time the inner
@@ -2588,29 +2864,29 @@ p2      R outer {0}                  EXIT outer {1}
 ```text
 parent synchronization-edge DAG
 
-                         ENTER outer(i) {1}
-                                  | walk
-                                  v
-                    [inner summary P0:W:{1}]
-                                  | p1
-                                  v
-                         R outer(i) {0}
-                                  | p2
-                                  v
-                         EXIT outer(i) {1}
+                  ENTER outer(i) {1}
+                        | walk
+                        v
+          [inner summary P0:W:{1}]
+                        +----------------- p1 > ------------------+
+                   walk |                                         v
+                        |                                 R outer(i) {0}
+                        +----------------- < p2 ------------------+
+                        v
+                  EXIT outer(i) {1}
 
 child synchronization-edge DAG
 
-                         ENTER inner(i,j) {1}
-                                  | walk
-                                  v
-                         W inner(i,j) {1}
-                                  | c1
-                                  v
-                         R inner(i,j) {0}
-                                  | c2
-                                  v
-                         EXIT inner(i,j) {1}
+                  ENTER inner(i,j) {1}
+                        | walk
+                        v
+                  W inner(i,j) {1}
+                        +----------------- c1 > ------------------+
+                   walk |                                         v
+                        |                                 R inner(i,j) {0}
+                        +----------------- < c2 ------------------+
+                        v
+                  EXIT inner(i,j) {1}
 ```
 
 No edge is removed or merged. Parent and child edges remain separate.
@@ -2629,99 +2905,138 @@ The semaphore assignment is:
 ```text
 edge / role        semaphore      release owner       pending_count    initial state
 c1                 LOCAL_FULL     {1}                 1                blocked
-entry,c2,prepare   LOCAL_EMPTY    c2:{0}; prepare:{1} 1                released
+entry               LOCAL_EMPTY    none                1                released
+c2                  LOCAL_EMPTY    {0}                 1                same semaphore
+prepare             LOCAL_EMPTY    {1}                 1                same semaphore
 p1                 OUTER_FULL     {1}                 1                blocked
-entry,p2           OUTER_EMPTY    {0}                 1                released
+entry               OUTER_EMPTY    none                1                released
+p2                  OUTER_EMPTY    {0}                 1                same semaphore
 ```
 
-An acquire before the outer loop consumes `OUTER_EMPTY`'s initially released
-state. Without it, the later owner-`{1}` acquire could finish before the outer
-read releases `OUTER_EMPTY`. The root acquire's token is not used by a buffer
-access. The complete semaphore DAG is one scaffold. At each `LOCAL_EMPTY`
-fork, only the acquire on the executed control-flow path runs:
+An acquire before the outer loop drains `OUTER_EMPTY`'s initially released
+state. Its token is not used by a buffer access:
 
 ```text
-                            initial = a OUTER_EMPTY {1}    (drains initial state)
-
-                                            ENTER inner(i,j) {1}
-                                                      | walk
-                                                      v
-                                           tw = a LOCAL_EMPTY {1}
-                                                   tw |
-                                                      v
-                                         W inner(i,j) [tw] {1}
-                                                      | walk
-                                                      v
-                                      r LOCAL_FULL, tw [tc5mma] {1} c1
-                                                      | LOCAL_FULL
-                                                      v
-                                            tr = a LOCAL_FULL {0}
-                                                   tr |
-                                                      v
-                                         R inner(i,j) [tr] {0}
-                                                      | walk
-                                                      v
-                                       r LOCAL_EMPTY, tr [none] {0} c2
-+---------------------LOCAL_EMPTY---------------------+---------------------LOCAL_EMPTY---------------------+
-|                                            EXIT inner(i,j) {1}                                            |
-|                          +--------------------------+--------------------------+                          |
-|                          | inner continues                                     | inner finishes           |
-|                          v                                                     v                          |
-|               ENTER inner(i,j+1) {1}                                  inner loop finishes                 |
-|                          | walk                                                | loop finishes            |
-|                          v                                                     v                          |
-+------------->next = a LOCAL_EMPTY {1}                              done = a LOCAL_EMPTY {1} <-------------+
-                      next |                                                done |
-                           v                                                     v
-            W inner(i,j+1) [next] {1}                            r OUTER_FULL, done [none] {1} p1
-                           | walk                                                | OUTER_FULL
-                           v                                                     v
-                   repeat inner body                                   to = a OUTER_FULL {0}
-                                                                              to |
-                                                                                 v
-                                                                      R outer(i) [to] {0}
-                                                                                 | walk
-                                                                                 v
-                                                                  r OUTER_EMPTY, to [none] {0} p2
-                                                                                 | OUTER_EMPTY
-                                                                                 v
-                                                                    prepare = a OUTER_EMPTY {1}
-                                                                         prepare |
-                                                                                 v
-                                                                 r LOCAL_EMPTY, prepare [none] {1}
-+----------------------------------LOCAL_EMPTY-----------------------------------+-------LOCAL_EMPTY--------+
-|                                                                        EXIT outer(i) {1}                  |
-|                                                                                | next outer iteration     |
-|                                                                                v                          |
-|                                                                      ENTER outer(i+1) {1}                 |
-|                          +-----------------------------------------------------+                          |
-|                          | inner executes                                      | inner has zero trips     |
-|                          v                                                     v                          |
-|               ENTER inner(i+1,0) {1}                                  inner loop finishes                 |
-|                          | walk                                                | loop finishes            |
-|                          v                                                     v                          |
-+------------->first = a LOCAL_EMPTY {1}                             done = a LOCAL_EMPTY {1} <-------------+
-                     first |                                                done |
-                           v                                                     v
-            W inner(i+1,0) [first] {1}                         r OUTER_FULL, done [none] {1} p1
-                           | walk                                                | OUTER_FULL
-                           v                                                     v
-                   repeat inner body                                 repeat outer-body handoff
+initial = acquire OUTER_EMPTY at root {1}    token unused
 ```
 
-The left inner-boundary path repeats the inner body. The right path performs
-the outer read and `prepare` release. On the next outer iteration, that
-release supplies either the first inner write or `done` when the inner loop
-has zero trips.
+Every executed inner iteration uses the same two owner lanes:
 
-The acquire before the loop consumes the initial `OUTER_EMPTY` release. The
-later `prepare` acquire must therefore wait for the outer read's release.
-Neither loop carries a semaphore token.
+```text
+              ENTER inner(i,j) {1}
+                        | walk
+                        v
+         wtok = acquire LOCAL_EMPTY {1}
+                   wtok |
+                        v
+             W inner(i,j) [wtok] {1}
+                   wtok | walk
+                        v
+    release LOCAL_FULL, wtok [tc5mma] {1} c1
+                        +------------- LOCAL_FULL > --------------+
+                   walk |                                         v
+                        |                           rtok = acquire LOCAL_FULL {0}
+                        |                                    rtok |
+                        |                                         v
+                        |                              R inner(i,j) [rtok] {0}
+                        |                                    rtok | walk
+                        |                                         v
+                        |                      release LOCAL_EMPTY, rtok [none] {0} c2
+```
 
-If the inner loop is zero-trip, `done` consumes `LOCAL_EMPTY`: its initially
-released state on the first outer iteration, or the release from the previous
-`prepare` on a later one. If the outer loop is zero-trip, only the
-unconditional `OUTER_EMPTY` acquire before the loop executes.
+If the inner loop continues, `c2` supplies the next inner acquire. This is
+one control path, not a fanout:
+
+```text
+                        |                      release LOCAL_EMPTY, rtok [none] {0} c2
+                        +------------ < LOCAL_EMPTY --------------+
+                        v
+              EXIT inner(i,j) {1}
+                        | next inner iteration
+                        v
+            ENTER inner(i,j+1) {1}
+                        | walk
+                        v
+         next = acquire LOCAL_EMPTY {1}
+                   next |
+                        v
+             W inner(i,j+1) [next] {1}
+```
+
+If an executed inner loop finishes, `done` consumes `c2`. For a zero-trip
+inner loop, `done` instead consumes `LOCAL_EMPTY`'s initial state on the first
+outer iteration or the previous `prepare` release on a later iteration. The
+executed-inner path and the common post-loop handoff are:
+
+```text
+                        |                      release LOCAL_EMPTY, rtok [none] {0} c2
+                        +------------ < LOCAL_EMPTY --------------+
+                        v
+           EXIT inner(i,last) {1}
+                        | loop finishes
+                        v
+         done = acquire LOCAL_EMPTY {1}
+                   done |
+                        v
+  release OUTER_FULL, done [none] {1} p1
+                        +------------- OUTER_FULL > --------------+
+                   walk |                                         v
+                        |                             to = acquire OUTER_FULL {0}
+                        |                                      to |
+                        |                                         v
+                        |                               R outer(i) [to] {0}
+                        |                                      to | walk
+                        |                                         v
+                        |                  release OUTER_EMPTY, to [none] {0} p2
+                        +------------ < OUTER_EMPTY --------------+
+                        v
+      prepare = acquire OUTER_EMPTY {1}
+                prepare |
+                        v
+release LOCAL_EMPTY, prepare [none] {1}
+```
+
+The `prepare` release has two exclusive consumers in the next outer
+iteration. When the inner loop executes, it supplies the first inner acquire:
+
+```text
+release LOCAL_EMPTY, prepare [none] {1}
+            LOCAL_EMPTY |
+                        v
+              EXIT outer(i) {1}
+                        | next outer iteration
+                        v
+            ENTER outer(i+1) {1}
+                        | walk
+                        v
+          ENTER inner(i+1,0) {1}
+                        | walk
+                        v
+        first = acquire LOCAL_EMPTY {1}
+                  first |
+                        v
+            W inner(i+1,0) [first] {1}
+```
+
+When that inner loop has zero trips, the same `prepare` release supplies the
+post-loop `done` acquire instead:
+
+```text
+release LOCAL_EMPTY, prepare [none] {1}
+            LOCAL_EMPTY |
+                        v
+              EXIT outer(i) {1}
+                        | next outer iteration
+                        v
+            ENTER outer(i+1) {1}
+                        | inner scf.for executes zero trips
+                        v
+         done = acquire LOCAL_EMPTY {1}
+```
+
+The root drain makes the later `prepare` acquire wait for the outer read's
+`p2` release. Neither loop carries a semaphore token. If the outer loop is
+zero-trip, only the unconditional root drain executes.
 
 ### Example: fixed stages in a nested POU loop
 
@@ -2760,32 +3075,32 @@ child edges
 ```text
 parent synchronization-edge DAG
 
-                         ENTER outer(i) {0}
-                                  | walk
-                                  v
-                         W outer(i) {0}
-                                  | p1
-                                  v
-                    [inner summary P0:W:{1}]
-                                  | p2
-                                  v
-                          R post(i) {0}
-                                  | walk
-                                  v
-                         EXIT outer(i) {0}
+                  ENTER outer(i) {0}
+                        | walk
+                        v
+                   W outer(i) {0}
+                        +----------------- p1 > ------------------+
+                   walk |                                         v
+                        |                       [inner summary P0:W:{1}]
+                        +----------------- < p2 ------------------+
+                        v
+                   R post(i) {0}
+                        | walk
+                        v
+                  EXIT outer(i) {0}
 
 child synchronization-edge DAG
 
-                         ENTER inner(i,j) {1}
-                                  | walk
-                                  v
-                          W MMA(i,j) {1}
-                                  | c1
-                                  v
-                         R inner(i,j) {0}
-                                  | c2
-                                  v
-                         EXIT inner(i,j) {1}
+                                                        ENTER inner(i,j) {1}
+                                                                  | walk
+                                                                  v
+                                                           W MMA(i,j) {1}
+                        +----------------- < c1 ------------------+
+                        v                                    walk |
+                R inner(i,j) {0}                                  |
+                        +----------------- c2 > ------------------+
+                                                                  v
+                                                         EXIT inner(i,j) {1}
 ```
 
 No edge is removed or merged.
@@ -2802,118 +3117,131 @@ c1             LOCAL_FULL     {1}              1                blocked
 The generated schedule locations are:
 
 ```text
-operation                              owner    cluster    stage
-a LOCAL_EMPTY at inner MMA             {1}      3          0
-r LOCAL_FULL after MMA [tc5mma]         {1}      3          0
-a LOCAL_FULL at inner read              {0}      2          1
-r LOCAL_EMPTY after inner read          {0}      2          1
-post-inner a LOCAL_EMPTY                {1}      inner boundary
-r OUTER_EMPTY after inner loop          {1}      3          0
-a OUTER_EMPTY at post-inner read        {0}      4          0
+operation                                    owner    cluster    stage
+acquire LOCAL_EMPTY at inner MMA             {1}      3          0
+release LOCAL_FULL after MMA [tc5mma]         {1}      3          0
+acquire LOCAL_FULL at inner read              {0}      2          1
+release LOCAL_EMPTY after inner read          {0}      2          1
+post-inner acquire LOCAL_EMPTY                {1}      inner boundary
+release OUTER_EMPTY after inner loop          {1}      3          0
+acquire OUTER_EMPTY at post-inner read        {0}      4          0
 ```
 
-The root acquire supplies the first outer iteration. Parent edge `p1`
-supplies either the first inner use or the post-inner `done` acquire when the
-inner loop has zero trips. Child edge `c2` supplies either the next inner use
-or that same `done` acquire after the final inner iteration. The diagram uses
+The root acquire and outer token stay in owner `{0}`. The diagram uses
 `[cN,sM]` for cluster `N`, stage `M`:
 
 ```text
-                          owner {0}                                                   owner {1}
-
-            initial = acquire OUTER_EMPTY at root
-                      initial |
-                              v
-                     ENTER outer(0) {0}
-                      initial |
-                              v
-                  W outer(0) [initial] {0}
-                              | walk
-                              v
-             release LOCAL_EMPTY, initial {0} p1
-                              +------------------------LOCAL_EMPTY: first use or zero-trip done-------------------------+
-                                                                                ENTER inner(0,0) {1}                    |
-                                                                                          | walk                        |
-                                                                                          v                             |
-                                                                        tw = acquire LOCAL_EMPTY {1} [c3,s0] <----------+
-                                                                                       tw |                             |
-                                                                                          v                             |
-                                                                             W MMA(0,0) [tw] {1} [c3,s0]                |
-                                                                                          | walk                        |
-                                                                                          v                             |
-                                                                   release LOCAL_FULL, tw [tc5mma] {1} c1 [c3,s0]       |
-                              +------------------------LOCAL_FULL-------------------------+                             |
-                              v                                                                                         |
-             tr = acquire LOCAL_FULL {0} [c2,s1]                                                                        |
-                           tr |                                                                                         |
-                              v                                                                                         |
-                R inner(0,0) [tr] {0} [c2,s1]                                                                           |
-                              | walk                                                                                    |
-                              v                                                                                         |
-        release LOCAL_EMPTY, tr [none] {0} c2 [c2,s1]                                                                   |
-                              +------------------------------LOCAL_EMPTY: next use or done------------------------------+
-                                                                                 EXIT inner(i,j) {1}                    |
-                                                                      +------control------+                             |
-                                                                      | finish            | next iteration              |
-                                                                      v                   v                             |
-                                                                      |        ENTER inner(i,j+1) {1}                   |
-                                                                      |                   | walk                        |
-                                                                      |                   v                             |
-                                                                      |    next = acquire LOCAL_EMPTY {1} <-------------+
-                                                                      |              next |                             |
-                                                                      |                   v                             |
-                                                                      |    W MMA(i,j+1) [next] {1} [c3,s0]              |
-                                                                      |                   | walk                        |
-                                                                      |                   v                             |
-                                                                      |           repeat inner body                     |
-                                                                      +--->done = acquire LOCAL_EMPTY {1} <-------------+
-                                                                                     done |
-                                                                                          v
-                                                                   release OUTER_EMPTY, done [none] {1} p2 [c3,s0]
-                              +------------------------OUTER_EMPTY------------------------+
-                              v
-            out = acquire OUTER_EMPTY {0} [c4,s0]
-                          out |
-                              v
-                 R post(i) [out] {0} [c4,s0]
-                          out |
-                              v
-                  EXIT outer(i) yields out
-                              | next outer iteration
-                              v
-                ENTER outer(i+1) receives out
-                          out |
-                              v
-                   W outer(i+1) [out] {0}
-                              | walk
-                              v
-               release LOCAL_EMPTY, out {0} p1
-                              +---------------------LOCAL_EMPTY: repeat first use or zero-trip done---------------------+
-                                                                               ENTER inner(i+1,0) {1}                   |
-                                                                                          | walk                        |
-                                                                                          v                             |
-                                                                       first = acquire LOCAL_EMPTY {1} [c3,s0] <--------+
-                                                                                    first |
-                                                                                          v
-                                                                          W MMA(i+1,0) [first] {1} [c3,s0]
-                                                                                          | repeat inner body
+      initial = acquire OUTER_EMPTY at root
+                initial |
+                        v
+          scf.for iter_arg out=initial
+                        +--------------------------------- > -----------------------------------+
+               executes |                                                             zero trip |
+                        v                                                                       v
+               ENTER outer(i) {0}                                                        result=initial
+                    out |
+                        v
+              W outer(i) [out] {0}
+                    out | walk
+                        v
+         release LOCAL_EMPTY, out {0} p1
 ```
 
-The right `LOCAL_EMPTY` rail from `p1` is used only when the inner loop has
-zero trips; that path skips the inner `ENTER`/`EXIT` rows and reaches the same
-static `done` acquire. An executed inner loop consumes `p1` at `tw`. After an
-executed iteration, an inner continuation consumes `c2` at `next`, while a
-finished inner loop consumes it at `done`. The `out` token then crosses the
-outer boundary unchanged and supplies the next `W outer`.
+When the inner loop executes, `p1` supplies its first acquire. The child has
+no token `iter_arg`:
 
-After the inner loop, owner `{1}` acquires `LOCAL_EMPTY` and releases
-`OUTER_EMPTY`. That release uses owner `{1}`'s schedule. The following
-owner-`{0}` acquire uses the outer read's schedule. These locations are final
-before EMIT-IR starts.
+```text
+         release LOCAL_EMPTY, out {0} p1
+                        +------------ LOCAL_EMPTY > --------------+
+                   walk |                                         v
+                        |                      first = acquire LOCAL_EMPTY {1} [c3,s0]
+                        |                                   first |
+                        |                                         v
+                        |                          W MMA(i,0) [first] {1} [c3,s0]
+                        |                                   first | walk
+                        |                                         v
+                        |                 release LOCAL_FULL, first [tc5mma] {1} c1 [c3,s0]
+                        +------------- < LOCAL_FULL --------------+
+                        v                                    walk |
+       tr = acquire LOCAL_FULL {0} [c2,s1]                        |
+                     tr |                                         |
+                        v                                         |
+          R inner(i,0) [tr] {0} [c2,s1]                           |
+                     tr | walk                                    |
+                        v                                         |
+  release LOCAL_EMPTY, tr [none] {0} c2 [c2,s1]                   |
+```
 
-If the inner loop is zero-trip, `done` consumes the `p1` release from
-`W outer`. If the outer loop is zero-trip, it returns the root-acquired
-`initial` token. After the final outer iteration, it returns `out`.
+`c2` has two exclusive consumers. If the inner loop continues, it supplies
+the next owner-`{1}` acquire:
+
+```text
+release LOCAL_EMPTY, tr [none] {0} c2 [c2,s1]
+                        +------------ LOCAL_EMPTY > --------------+
+                                                                  v
+                                      next = acquire LOCAL_EMPTY {1} [c3,s0]
+                                                             next |
+                                                                  v
+                                            W MMA(i,j+1) [next] {1} [c3,s0]
+```
+
+If the inner loop finishes, `c2` supplies the post-loop acquire. That acquire
+is intentionally unstamped; its following release uses owner `{1}`'s
+`[c3,s0]` schedule:
+
+```text
+release LOCAL_EMPTY, tr [none] {0} c2 [c2,s1]
+                        +------------ LOCAL_EMPTY > --------------+
+                                                                  v
+                                  done = acquire LOCAL_EMPTY {1} [unstamped]
+                                                             done |
+                                                                  v
+                           release OUTER_EMPTY, done [none] {1} p2 [c3,s0]
+```
+
+When the inner loop has zero trips, `p1` supplies that same unstamped `done`
+site instead:
+
+```text
+release LOCAL_EMPTY, out {0} p1
+                        +------------ LOCAL_EMPTY > --------------+
+                                                                  v
+                                  done = acquire LOCAL_EMPTY {1} [unstamped]
+                                                             done |
+                                                                  v
+                           release OUTER_EMPTY, done [none] {1} p2 [c3,s0]
+```
+
+The outer read acquires `OUTER_EMPTY` at `[c4,s0]`. Its `out` token crosses
+the outer loop boundary unchanged and supplies the next outer write:
+
+```text
+                                           release OUTER_EMPTY, done [none] {1} p2 [c3,s0]
+                        +------------ < OUTER_EMPTY --------------+
+                        v
+      out = acquire OUTER_EMPTY {0} [c4,s0]
+                    out |
+                        v
+           R post(i) [out] {0} [c4,s0]
+                    out | walk
+                        v
+            EXIT outer(i) yields out
+                        +--------------------------------- > -----------------------------------+
+         next iteration |                                                         loop finishes |
+                        v                                                                       v
+              ENTER outer(i+1) {0}                                                         result=out
+                    out |
+                        v
+             W outer(i+1) [out] {0}
+                    out | walk
+                        v
+         release LOCAL_EMPTY, out {0} p1
+```
+
+Thus `p1` chooses first-inner versus zero-trip `done`, and `c2` chooses
+next-inner versus final `done`; none of those alternatives execute together.
+The inner loop has no carrier. If the outer loop is zero-trip, it returns
+`initial`; after the final executed outer iteration, it returns `out`.
 
 ### Example: each branch keeps its own schedule
 
@@ -2958,57 +3286,61 @@ inner
 ```text
 parent synchronization-edge DAG
 
-                         ENTER outer(i) {0}
-                                  | walk
-                                  v
-                         W outer(i) {0}
-                                  | p1
-                                  v
-                    [inner summary P0:W:{1}]
-                                  | p2
-                                  v
-                          R post(i) {0}
-                                  | walk
-                                  v
-                         EXIT outer(i) {0}
+                   ENTER outer(i) {0}
+                            | walk
+                            v
+                     W outer(i) {0}
+                            +-------------------p1 >--------------------+
+                            | walk                                      v
+                            |                               [inner summary P0:W:{1}]
+                            +-------------------< p2--------------------+
+                            v
+                      R post(i) {0}
+                            | walk
+                            v
+                    EXIT outer(i) {0}
+```
 
+```text
 inner synchronization-edge DAG
 
-                         ENTER inner(i,j) {1}
-                                  | walk
-                                  v
-                          W mma0(i,j) {1}
-                                  | walk
-                                  v
-                    [if summary P0:W:{1}]
-                                  | c2
-                                  v
-                         R final(i,j) {0}
-                                  | c3
-                                  v
-                         EXIT inner(i,j) {1}
+                                                              ENTER inner(i,j) {1}
+                                                                        | walk
+                                                                        v
+                                                                 W mma0(i,j) {1}
+                                                                        | walk
+                                                                        v
+                                                              [if summary P0:W:{1}]
+                            +-------------------< c2--------------------+
+                            v
+                    R final(i,j) {0}
+                            +-------------------c3 >--------------------+
+                                                                        v
+                                                               EXIT inner(i,j) {1}
+```
 
-`if` child synchronization-edge DAGs
+```text
+then-child synchronization-edge DAG
 
-then
+                                                                  ENTER if {1}
+                                                                        | walk
+                                                                        v
+                                                                   W mma1 {1}
+                            +-------------------< c1--------------------+
+                            v
+                      R branch {0}
+                            +-------------------b2 >--------------------+
+                                                                        v
+                                                                   EXIT if {1}
+```
 
-                         ENTER if {1}
-                              | walk
-                              v
-                         W mma1 {1}
-                              | c1
-                              v
-                       R branch {0}
-                              | b2
-                              v
-                          EXIT if {1}
+```text
+else-child synchronization-edge DAG
 
-else
-
-                         ENTER if {1}
-                              | walk
-                              v
-                          EXIT if {1}
+                                                                  ENTER if {1}
+                                                                        | walk
+                                                                        v
+                                                                   EXIT if {1}
 ```
 
 No edge is removed or merged. The parent, inner, and `if` child DAGs remain
@@ -3027,127 +3359,150 @@ c1                 BRANCH_FULL     {1}                 1                blocked
 b2,c2 alternatives CONVERGE        then:{0}; else:{1}  1                blocked
 ```
 
-The root token supplies the first outer write. Parent edge `p1` then supplies
-the first inner MMA:
+All semaphore views use owner `{0}` on the left and owner `{1}` on the right.
+`[cN,sM]` means cluster `N`, stage `M`. The common prefix supplies the first
+inner MMA:
 
 ```text
-                           initial = a OUTER_EMPTY at root
-                                  initial |
-                                          v
-                              ENTER outer(0) {0}
-                                  initial |
-                                          v
-                           W outer(0) [initial] {0}
-                                          | walk
-                                          v
-                    r LOCAL_EMPTY, initial {0} p1 -------- LOCAL_EMPTY --------+
-                                          | walk                              |
-                                          v                                   |
-                               ENTER inner(0,0) {1}                            |
-                                          | walk                              |
-                                          v                                   |
-                    tw = a LOCAL_EMPTY {1} [stage 0] <-------------------------+
-                                       tw |
-                                          v
-                                W mma0 [tw] {1}
+          initial = acquire OUTER_EMPTY at root
+                    initial |
+                            v
+                   ENTER outer(0) {0}
+                    initial |
+                            v
+                 W outer(0) [initial] {0}
+                            | walk
+                            v
+           release LOCAL_EMPTY, initial {0} p1
+                            +---LOCAL_EMPTY >---+
+                                                |             ENTER inner(0,0) {1}
+                                                |                       | walk
+                                                |                       v
+                                                +-----LOCAL_EMPTY >-----+
+                                                                        v
+                                                      tw = acquire LOCAL_EMPTY {1} [c5,s0]
+                                                                     tw |
+                                                                        v
+                                                            W mma0(0,0) [tw] {1} [c5,s0]
 ```
 
-The two `if` paths are mutually exclusive. Each path releases `CONVERGE`
-exactly once, and the common acquire is after the `if`:
+The two `if` paths are mutually exclusive. Each complete path below performs
+one `CONVERGE` release and then the same count-1 acquire after the `if`; the
+two releases are never drawn or counted as a parallel fan-in.
+
+Then path:
 
 ```text
-                              W mma0 [tw] {1}
-                                      | walk
-                                      v
-                                  scf.if cond
-                       +--------------+--------------+
-                  then |                             | else
-                       v                             v
-              W mma1 [tw] {1}    r CONVERGE, tw [tc5mma] {1} [stage 0] c2 else
-                       | walk                         CONVERGE |
-                       v                                      |
-   r BRANCH_FULL, tw [tc5mma] {1} c1                          |
-              BRANCH_FULL |                                  |
-                          v                                  |
-        tb = a BRANCH_FULL {0}                               |
-                       tb |                                  |
-                          v                                  |
-             R branch [tb] {0}                               |
-                          | walk                             |
-                          v                                  |
- r CONVERGE, tb [none] {0} [stage 1] b2,c2                   |
-                 CONVERGE |                                  |
-                          +---------------+------------------+
-                                          v
-                               tf = a CONVERGE {0}
-                                       tf |
-                                          v
-                               R final [tf] {0}
+                                                                 W mma0 [tw] {1} [c5,s0]
+                                                                        | walk
+                                                                        v
+                                                                 W mma1 [tw] {1} [c2,s1]
+                                                                        | walk
+                                                                        v
+                                                 release BRANCH_FULL, tw [tc5mma] {1} c1 [c2,s1]
+                            +---------------< BRANCH_FULL---------------+
+                            v                                           | walk
+          tb = acquire BRANCH_FULL {0} [c3,s1]                          |
+                         tb |                                           |
+                            v                                           |
+                   R branch [tb] {0} [c3,s1]                            |
+                            | walk                                      |
+                            v                                           |
+      release CONVERGE, tb [none] {0} b2,c2 [c3,s1]                    |
+                            +----CONVERGE >-----+                       |
+                                                |                       v
+                                                |              EXIT if (then) {1}
+                            +----< CONVERGE-----+
+                            v
+            tf = acquire CONVERGE {0} [c4,s1]
+                         tf |
+                            v
+                    R final [tf] {0} [c4,s1]
+                            | walk
+                            v
+      release LOCAL_EMPTY, tf [none] {0} c3 [c4,s1]
 ```
 
-Both paths then execute the same release to the next inner iteration and the
-same acquire/release sequence after the inner loop:
+Else path:
 
 ```text
-R final [tf] {0}
-             | walk
-             v
-r LOCAL_EMPTY, tf [none] {0} c3
+                                                                 W mma0 [tw] {1} [c5,s0]
+                                                                        | walk
+                                                                        v
+                                            release CONVERGE, tw [tc5mma] {1} c2 else [c5,s0]
+                                                +------< CONVERGE-------+
+                                                |                       v
+                                                |              EXIT if (else) {1}
+                            +----< CONVERGE-----+
+                            v
+            tf = acquire CONVERGE {0} [c4,s1]
+                         tf |
+                            v
+                    R final [tf] {0} [c4,s1]
+                            | walk
+                            v
+      release LOCAL_EMPTY, tf [none] {0} c3 [c4,s1]
 ```
 
-If the inner loop continues, `c3` supplies the next `mma0` acquire:
+After either branch, `LOCAL_EMPTY` is consumed by exactly one control path.
+If the inner loop continues:
 
 ```text
-r LOCAL_EMPTY, tf(i,j) {0} c3 ------------- LOCAL_EMPTY ------------+
-                                                                    |
-EXIT inner(i,j) {1}                                                 |
-     | next inner iteration                                         |
-     v                                                              |
-ENTER inner(i,j+1) {1}                                              |
-     | walk                                                         |
-     v                                                              |
-next = a LOCAL_EMPTY {1} <------------------------------------------+
-     next |
-          v
-W mma0(i,j+1) [next] {1}
+      release LOCAL_EMPTY, tf [none] {0} c3 [c4,s1]
+                            +---LOCAL_EMPTY >---+
+                                                |              EXIT inner(i,j) {1}
+                                                |                       | next iteration
+                                                |                       v
+                                                |            ENTER inner(i,j+1) {1}
+                                                |                       | walk
+                                                |                       v
+                                                +-----LOCAL_EMPTY >-----+
+                                                                        v
+                                                     next = acquire LOCAL_EMPTY {1} [c5,s0]
+                                                                   next |
+                                                                        v
+                                                          W mma0(i,j+1) [next] {1} [c5,s0]
 ```
 
-If it finishes, the acquire after the inner loop consumes the same release:
+If it finishes, owner `{1}` acquires the same phase at `done`, releases
+`OUTER_EMPTY`, and owner `{0}` carries `out` through the outer boundary:
 
 ```text
-r LOCAL_EMPTY, tf(i,last) {0} c3 ----------- LOCAL_EMPTY -----------+
-                                                                    |
-EXIT inner(i,last) {1}                                              |
-     | loop finishes                                                |
-     v                                                              |
-done = a LOCAL_EMPTY {1} <------------------------------------------+
-     done |
-          v
-r OUTER_EMPTY, done {1} p2
-    OUTER_EMPTY |
-                v
-out = a OUTER_EMPTY {0}
-             out |
-                 v
-         R post(i) [out] {0}
-             out |
-                 v
-      EXIT outer(i) yields out
-             out | next outer iteration
-                 v
-     ENTER outer(i+1) receives out
-             out |
-                 v
-       W outer(i+1) [out] {0}
+      release LOCAL_EMPTY, tf [none] {0} c3 [c4,s1]
+                            +---LOCAL_EMPTY >---+
+                                                |            EXIT inner(i,last) {1}
+                                                |                       | loop finishes
+                                                |                       v
+                                                +-----LOCAL_EMPTY >-----+
+                                                                        v
+                                                         done = acquire LOCAL_EMPTY {1}
+                                                                   done |
+                                                                        v
+                                                 release OUTER_EMPTY, done [none] {1} p2 [c2,s1]
+                            +---------------< OUTER_EMPTY---------------+
+                            v
+              out = acquire OUTER_EMPTY {0}
+                        out |
+                            v
+                  R post(i) [out] {0}
+                        out |
+                            v
+                EXIT outer(i) yields out
+                            | next outer iteration
+                            v
+              ENTER outer(i+1) receives out
+                        out |
+                            v
+               W outer(i+1) [out] {0}
+                            | walk
+                            v
+             release LOCAL_EMPTY, out {0} p1
 ```
 
-The then release follows the stage-1 read. The else release waits for the
-stage-0 MMA. The final acquire is shared because either path provides exactly
-one `CONVERGE` release. The `if` itself does not take or return a token.
-
-If the inner loop is zero-trip, `done` consumes the release from `p1`. If the
-outer loop is zero-trip, it returns `initial`. After the final executed outer
-iteration, it returns `out`.
+The `if` itself takes and returns no semaphore token. If the inner loop is
+zero-trip, `p1` supplies the same unstamped `done` acquire before the finish
+view's `OUTER_EMPTY` release. If the outer loop is zero-trip, it returns
+`initial`; after the final executed outer iteration, it returns `out`.
 
 ## Assigning semaphores and counts
 
@@ -3342,34 +3697,37 @@ W MMA {2}                      e1: W acc {1} -> W MMA {2}
 EXIT(i) {1}                    e2: W MMA {2} -> EXIT(i) {1}
 ```
 
-The parent and child are separate DAGs:
+The parent and child are separate DAGs. The parent token rail is not a
+synchronization edge; it shows the exact root token adopted by owner `{1}`:
 
 ```text
-parent
+parent synchronization-edge DAG
 
-                         W acc root
-                              | walk, same token
-                              v
-                    [loop summary P0:W:{1}]
-                              | p1
-                              v
-                         R acc root
+               W acc root
+                    +----------------token >----------------+
+                                                            v
+                                                 [loop summary P0:W:{1}]
+                    +-----------------< p1------------------+
+                    v
+               R acc root
+```
 
-child
+```text
+child synchronization-edge DAG
 
-                         ENTER(i) {1}
-                              | walk
-                              v
-                          R acc {1}
-                              | walk
-                              v
-                          W acc {1}
-                              | e1
-                              v
-                         W MMA {2}
-                              | e2
-                              v
-                         EXIT(i) {1}
+                                                      ENTER(i) {1}
+                                                            | walk
+                                                            v
+                                                      R acc(i) {1}
+                                                            | walk
+                                                            v
+                                                      W acc(i) {1}
+                                                            +-----------------e1 >------------------+
+                                                            | walk                                  v
+                                                            |                                 W MMA(i) {2}
+                                                            +-----------------< e2------------------+
+                                                            v
+                                                       EXIT(i) {1}
 ```
 
 The semaphores are:
@@ -3383,64 +3741,88 @@ p1             AFTER        {1}              1                blocked
 ```
 
 Auto uses FirstTouch for this loop because the token created before the loop
-must remain available through the loop. The loop carries that token. The
-semaphore DAG preserves the child edge DAG's vertical order:
+must remain available through the loop. The entry view shows token adoption,
+the two semaphore handoffs, and the owner-`{1}` acquire carried through
+`EXIT`:
 
 ```text
-                              root = a EMPTY
-                                      root |
-                                           v
-                               W acc [root] root
-                                      same token
-                                           |
-                                           v
-                                  ENTER(0) {1}
-                                           |
-                                           v
-                               R acc [root] {1}
-                                           | walk
-                                           v
-                               W acc [root] {1}
-                                           | walk
-                                           v
-                           r TO_MMA, root {1} e1
-                                    TO_MMA |
-                                           v
-                              mma = a TO_MMA {2}
-                                       mma |
-                                           v
-                              W MMA [mma] {2}
-                                           | walk
-                                           v
-                    r EMPTY, mma [tc5mma] {2} e2
-                                      EMPTY |
-                                            v
-                               next = a EMPTY {1}
-                                      next |
-                                            v
-                                   EXIT(i) {1}
-                              +-------------+-------------+
-              another iteration            |             | loop finishes
-                              next           |             | next
-                                v            |             v
-                     ENTER(i+1) {1}          |       result = next
-                              next |         |          result |
-                                   v         |                 v
-                    R acc(i+1) [next] {1}    |   r AFTER, result {1} p1
-                                   | walk    |          AFTER |
-                                   v         |                v
-                    W acc(i+1) [next] {1}    |   out = a AFTER root
-                                   |         |           out |
-                              repeat body ---+               v
-                                                    R acc [out] root
+          root = acquire EMPTY
+               root |
+                    v
+              W acc [root] root
+                    +-------------root token >--------------+
+                                                            v
+                                                      ENTER(0) {1}
+                                                       root |
+                                                            v
+                                                   R acc(0) [root] {1}
+                                                            | walk
+                                                            v
+                                                   W acc(0) [root] {1}
+                                                            | walk
+                                                            v
+                                               release TO_MMA, root {1} e1
+                                                            +---------------TO_MMA >----------------+
+                                                            | walk                                  v
+                                                            |                           mma = acquire TO_MMA {2}
+                                                            |                                   mma |
+                                                            |                                       v
+                                                            |                              W MMA(0) [mma] {2}
+                                                            |                                       | walk
+                                                            |                                       v
+                                                            |                      release EMPTY, mma [tc5mma] {2} e2
+                                                            +----------------< EMPTY----------------+
+                                                            v
+                                                next = acquire EMPTY {1}
+                                                       next |
+                                                            v
+                                                   EXIT(0) yields next
 ```
 
-If the loop continues, `next` becomes the next `iter_arg`. If it finishes,
-the same token becomes the loop result and is released on `AFTER` for parent
-edge `p1`.
+If the loop continues, the same owner-`{1}` token crosses the boundary and is
+used by the next iteration's first read and write:
 
-For a zero-trip loop, `result` is the original root token and is released on
-`AFTER`. This buffer has synchronization edges, no explicit `buffer.copy`, an MMA shape
+```text
+                                                          next
+                                                       next |
+                                                            v
+                                                   EXIT(i) yields next
+                                                            | next iteration
+                                                            v
+                                                ENTER(i+1) receives next
+                                                       next |
+                                                            v
+                                                 R acc(i+1) [next] {1}
+                                                            | walk
+                                                            v
+                                                 W acc(i+1) [next] {1}
+                                                            | walk
+                                                            v
+                                               release TO_MMA, next {1} e1
+```
+
+If the loop finishes, `next` becomes `result`. The release to `AFTER`
+implements parent edge `p1`:
+
+```text
+                                                          next
+                                                       next |
+                                                            v
+                                                EXIT(last) yields result
+                                                     result |
+                                                            v
+                                              release AFTER, result {1} p1
+                    +----------------< AFTER----------------+
+                    v
+        out = acquire AFTER root
+                out |
+                    v
+              R acc [out] root
+```
+
+For a zero-trip loop, the continuation view is skipped: `result` is the
+original root token and enters the same owner-`{1}` `AFTER` release. This
+buffer has synchronization edges, no explicit `buffer.copy`, an MMA shape
 that permits two copies, and enough TMEM capacity. The result is:
 
 ```text
@@ -3507,16 +3889,16 @@ e2      R MMA operand {1}       EXIT {0}
 ```
 
 ```text
-                         ENTER(i) {0}
-                              | walk
-                              v
-                    W descriptor_load {0}
-                              | e1
-                              v
-                       R MMA operand {1}
-                              | e2
-                              v
-                          EXIT(i) {0}
+                      ENTER(i) {0}
+                            | walk
+                            v
+                W descriptor_load(i) {0}
+                            +-------------------e1 >--------------------+
+                            | walk                                      v
+                            |                                 R MMA operand(i) {1}
+                            +-------------------< e2--------------------+
+                            v
+                       EXIT(i) {0}
 ```
 
 `e1` uses `FULL`. `e2` uses `EMPTY`, which starts released for iteration zero.
@@ -3528,41 +3910,44 @@ e1      FULL         {0}              1                blocked
 e2      EMPTY        {1}              1                released for owner {0}
 ```
 
-The semaphore DAG keeps the stage-0 producer and stage-1 consumer on one
-vertical path. The `EMPTY` arrow then bypasses the loop boundary and reaches
-the next stage-0 producer:
+The two fixed lanes keep each owner's operations vertical. `[cN,sM]` means
+cluster `N`, stage `M`. The `EMPTY` rail stays between the owner lanes while
+control crosses `EXIT` and `ENTER`:
 
 ```text
-                         ENTER(i) {0}
-                              | walk
-                              v
-              empty = a EMPTY(i) {0} [stage 0]
-                           empty |
-                                 v
-       W descriptor_load(i) [empty] {0} [stage 0]
-                                 | walk
-                                 v
-   r FULL, empty [tma_load] {0} e1 [stage 0]
-                            FULL |
-                                 v
-                full = a FULL {1} [stage 1]
-                            full |
-                                 v
-       R MMA operand(i) [full] {1} [stage 1]
-                                 | walk
-                                 v
-r EMPTY, full [tc5mma] {1} e2 [stage 1] -------- EMPTY -----------+
-                                                                    |
-                         EXIT(i) {0}                                |
-                              | next iteration                      |
-                              v                                     |
-                       ENTER(i+1) {0}                               |
-                              | walk                                |
-                              v                                     |
-       next = a EMPTY(i+1) {0} [stage 0] <-------------------------+
-                          next |
-                               v
-  W descriptor_load(i+1) [next] {0} [stage 0]
+                      ENTER(i) {0}
+                            | walk
+                            v
+          empty = acquire EMPTY(i) {0} [c1,s0]
+                      empty |
+                            v
+       W descriptor_load(i) [empty] {0} [c1,s0]
+                            | walk
+                            v
+      release FULL, empty [tma_load] {0} e1 [c1,s0]
+                            +------------------FULL >-------------------+
+                            | walk                                      v
+                            |                            full = acquire FULL {1} [c0,s1]
+                            |                                      full |
+                            |                                           v
+                            |                          R MMA operand(i) [full] {1} [c0,s1]
+                            |                                           | walk
+                            |                                           v
+                            |                      release EMPTY, full [tc5mma] {1} e2 [c0,s1]
+                            |                           +---< EMPTY-----+
+                            v                           |
+                       EXIT(i) {0}                      |
+                            | next iteration            |
+                            v                           |
+                     ENTER(i+1) {0}                     |
+                            | walk                      |
+                            v                           |
+                            +---------< EMPTY-----------+
+                            v
+          next = acquire EMPTY(i+1) {0} [c1,s0]
+                       next |
+                            v
+     W descriptor_load(i+1) [next] {0} [c1,s0]
 ```
 
 Both waits are required. `[tma_load]` keeps the `FULL` release waiting until
@@ -3702,29 +4087,29 @@ V      EXIT(i) {1}       v2: R V(i) {2} -> EXIT(i) {1}
 ```text
 K synchronization-edge DAG
 
-                         ENTER(i) {1}
-                              | walk
-                              v
-                          W K(i) {1}
-                              | k1
-                              v
-                          R K(i) {2}
-                              | k2
-                              v
-                          EXIT(i) {1}
+                      ENTER(i) {1}
+                            | walk
+                            v
+                       W K(i) {1}
+                            +-------------------k1 >--------------------+
+                            | walk                                      v
+                            |                                      R K(i) {2}
+                            +-------------------< k2--------------------+
+                            v
+                       EXIT(i) {1}
 
 V synchronization-edge DAG
 
-                         ENTER(i) {1}
-                              | walk
-                              v
-                          W V(i) {1}
-                              | v1
-                              v
-                          R V(i) {2}
-                              | v2
-                              v
-                          EXIT(i) {1}
+                      ENTER(i) {1}
+                            | walk
+                            v
+                       W V(i) {1}
+                            +-------------------v1 >--------------------+
+                            | walk                                      v
+                            |                                      R V(i) {2}
+                            +-------------------< v2--------------------+
+                            v
+                       EXIT(i) {1}
 ```
 
 No synchronization edge is removed or merged within either logical group.
@@ -3740,73 +4125,67 @@ v1      FULL         {1}              1                blocked
 v2      EMPTY        {2}              1                released for owner {1}
 ```
 
-The semaphore DAG keeps the two owners in fixed columns. K and V remain in
-program order within each owner; the horizontal arrows are the two `FULL`
-waits:
+The semaphore DAG keeps K before V in both owner lanes. Both logical groups
+use the same physical `FULL`/`EMPTY` pair. The two vertical `EMPTY` rails are
+different stages of that pair, not different semaphores:
 
 ```text
-              owner {1}                                      owner {2}
-
-         kt = a EMPTY {1}
-                  kt |
-                     v
-            W K [kt] {1}
-                     | walk
-                     v
-r FULL, kt {1} k1 -------- FULL --------> kr = a FULL {2}
-                     | walk                       kr |
-                     v                               v
-         vt = a EMPTY {1}                    R K [kr] {2}
-                  vt |                               | walk
-                     v                               v
-            W V [vt] {1}             r EMPTY, kr {2} k2
-                     | walk                           | walk
-                     v                               v
-r FULL, vt {1} v1 -------- FULL --------> vr = a FULL {2}
-                                                   vr |
-                                                      v
-                                             R V [vr] {2}
-                                                      | walk
-                                                      v
-                                   r EMPTY, vr {2} v2
-```
-
-The two `EMPTY` releases cross the loop boundary to different acquires. Their
-semaphore arrows bypass the shared `EXIT`/`ENTER` control path:
-
-```text
-K re-entry
-
-r EMPTY, kr(i) {2} k2 ---------------- EMPTY(K) -------------------+
-                                                                    |
-                          EXIT(i) {1}                               |
-                               | next iteration                     |
-                               v                                    |
-                        ENTER(i+1) {1}                              |
-                               | walk                               |
-                               v                                    |
-            next kt = a EMPTY {1} <--------------------------------+
-                         next kt |
-                                 v
-                    W K(i+1) [next kt] {1}
-
-V re-entry
-
-r EMPTY, vr(i) {2} v2 ---------------- EMPTY(V) -------------------+
-                                                                    |
-                          EXIT(i) {1}                               |
-                               | next iteration                     |
-                               v                                    |
-                        ENTER(i+1) {1}                              |
-                               | walk                               |
-                               v                                    |
-                  W K(i+1) {1}                                     |
-                               | walk                               |
-                               v                                    |
-            next vt = a EMPTY {1} <--------------------------------+
-                         next vt |
-                                 v
-                    W V(i+1) [next vt] {1}
+                      ENTER(i) {1}
+                            | walk
+                            v
+                 kt = acquire EMPTY {1}
+                         kt |
+                            v
+                     W K(i) [kt] {1}
+                            | walk
+                            v
+                 release FULL, kt {1} k1
+                            +------------------FULL >-------------------+
+                            | walk                                      v
+                 vt = acquire EMPTY {1}                       kr = acquire FULL {2}
+                         vt |                                        kr |
+                            v                                           v
+                     W V(i) [vt] {1}                             R K(i) [kr] {2}
+                            | walk                                      | walk
+                            v                                           v
+                            |                               release EMPTY, kr {2} k2
+                            |                   +--------< EMPTY--------+
+                 release FULL, vt {1} v1        |                       | walk
+                            |                   |                       v
+                            +------------------FULL >-------------------+
+                            | walk              |                       v
+                            |                   |             vr = acquire FULL {2}
+                            |                   |                    vr |
+                            |                   |                       v
+                            |                   |                R V(i) [vr] {2}
+                            |                   |                       | walk
+                            |                   |                       v
+                            |                   |           release EMPTY, vr {2} v2
+                            |                   |       +----< EMPTY----+
+                            v                   |       |
+                       EXIT(i) {1}              |       |
+                            | next iteration    |       |
+                            v                   |       |
+                     ENTER(i+1) {1}             |       |
+                            | walk              |       |
+                            v                   |       |
+                            +-----< EMPTY-------+       |
+                            v                           |
+                nextK = acquire EMPTY {1}               |
+                      nextK |                           |
+                            v                           |
+                   W K(i+1) [nextK] {1}                 |
+                            | walk                      |
+                            v                           |
+               release FULL, nextK {1} k1               |
+                            | walk                      |
+                            v                           |
+                            +---------< EMPTY-----------+
+                            v
+                nextV = acquire EMPTY {1}
+                      nextV |
+                            v
+                   W V(i+1) [nextV] {1}
 ```
 
 Each write therefore acquires `EMPTY` immediately before it, and the loop
@@ -3825,42 +4204,74 @@ R V          1                      V producer = 1           0
 Adding offsets to the same two-lane DAG gives:
 
 ```text
-              owner {1}                                      owner {2}
-
-kt = a EMPTY {1} [offset 0]
-                  kt |
-                     v
- W K [kt] {1} [buffer offset 0]
-                     | walk
-                     v
-r FULL, kt {1} k1 [offset 0] -- FULL --> kr = a FULL {2} [offset -1]
-                     | walk                              kr |
-                     v                                      v
-vt = a EMPTY {1} [offset 0]             R K [kr] {2} [buffer offset -1]
-                  vt |                                      | walk
-                     v                                      v
- W V [vt] {1} [buffer offset 0]      r EMPTY, kr {2} k2 [offset -1]
-                     | walk                                  | walk
-                     v                                      v
-r FULL, vt {1} v1 [offset 0] -- FULL --> vr = a FULL {2} [offset 0]
-                                                       vr |
-                                                          v
-                                  R V [vr] {2} [buffer offset 0]
-                                                          | walk
-                                                          v
-                                  r EMPTY, vr {2} v2 [offset 0]
+                      ENTER(i) {1}
+                            | walk
+                            v
+            kt = acquire EMPTY {1} [offset 0]
+                         kt |
+                            v
+                     W K(i) [kt] {1} [buffer 0]
+                            | walk
+                            v
+           release FULL, kt {1} k1 [offset 0]
+                            +-----------------FULL[0] >-----------------+
+                            | walk                                      v
+            vt = acquire EMPTY {1} [offset 0]           kr = acquire FULL {2} [offset -1]
+                         vt |                                        kr |
+                            v                                           v
+                     W V(i) [vt] {1} [buffer 0]                  R K(i) [kr] {2} [buffer -1]
+                            | walk                                      | walk
+                            v                                           v
+                            |                         release EMPTY, kr {2} k2 [offset -1]
+                            |                   +--------< EMPTY--------+
+           release FULL, vt {1} v1 [offset 0]   |                       | walk
+                            |                   |                       v
+                            +-----------------FULL[0] >-----------------+
+                            | walk              |                       v
+                            |                   |       vr = acquire FULL {2} [offset 0]
+                            |                   |                    vr |
+                            |                   |                       v
+                            |                   |                R V(i) [vr] {2} [buffer 0]
+                            |                   |                       | walk
+                            |                   |                       v
+                            |                   |      release EMPTY, vr {2} v2 [offset 0]
+                            |                   |       +----< EMPTY----+
+                            v                   |       |
+                       EXIT(i) {1}              |       |
+                            | next iteration    |       |
+                            v                   |       |
+                     ENTER(i+1) {1}             |       |
+                            | walk              |       |
+                            v                   |       |
+                            +-----< EMPTY-------+       |
+                            v                           |
+          nextK = acquire EMPTY {1} [offset 0]          |
+                      nextK |                           |
+                            v                           |
+                   W K(i+1) [nextK] {1} [buffer 0]      |
+                            | walk                      |
+                            v                           |
+          release FULL, nextK {1} k1 [offset 0]         |
+                            | walk                      |
+                            v                           |
+                            +---------< EMPTY-----------+
+                            v
+          nextV = acquire EMPTY {1} [offset 0]
+                      nextV |
+                            v
+                   W V(i+1) [nextV] {1} [buffer 0]
 ```
 
 The offsets select these physical copies relative to the latest shared write:
 
 ```text
-operation           stage offset       physical copy
-W K / r FULL        0                  copy 0
-W V / r FULL        0                  copy 1
-a FULL / R K       -1                  copy 0
-a FULL / R V        0                  copy 1
-R K / r EMPTY      -1                  copy 0
-R V / r EMPTY       0                  copy 1
+operation                 stage offset       physical copy
+W K / release FULL        0                  copy 0
+W V / release FULL        0                  copy 1
+acquire FULL / R K       -1                  copy 0
+acquire FULL / R V        0                  copy 1
+R K / release EMPTY      -1                  copy 0
+R V / release EMPTY       0                  copy 1
 ```
 
 The `-1` means the previous copy after V advanced the shared write number. It
@@ -3904,22 +4315,22 @@ e4      R m1 {2}      EXIT {4}
 ```
 
 ```text
-                         ENTER(i) {4}
-                              | walk
-                              v
-                          W m0(i) {4}
-                              | e1
-                              v
-                          R m0(i) {2}
-                              | e2
-                              v
-                          W m1(i) {4}
-                              | e3
-                              v
-                          R m1(i) {2}
-                              | e4
-                              v
-                          EXIT(i) {4}
+                      ENTER(i) {4}
+                            | walk
+                            v
+                       W m0(i) {4}
+                            +-------------------e1 >--------------------+
+                            | walk                                      v
+                            |                                      R m0(i) {2}
+                            +-------------------< e2--------------------+
+                            v
+                       W m1(i) {4}
+                            +-------------------e3 >--------------------+
+                            | walk                                      v
+                            |                                      R m1(i) {2}
+                            +-------------------< e4--------------------+
+                            v
+                       EXIT(i) {4}
 ```
 
 No edge is removed or merged.
@@ -3937,54 +4348,57 @@ e4      ENTRY        {2}              1                released for owner {4}
 The POU semaphore DAG for iteration `i` is:
 
 ```text
-                         ENTER(i) {4}
-                              | walk
-                              v
-                     t0 = a ENTRY(i) {4}
-                               t0 |
-                                  v
-                         W m0(i) [t0] {4}
-                                  | walk
-                                  v
-                       r M0_FULL, t0 {4} e1
-                            M0_FULL |
-                                    v
-                         t1 = a M0_FULL {2}
-                                  t1 |
-                                     v
-                            R m0 [t1] {2}
-                                     | walk
-                                     v
-                       r M1_READY, t1 {2} e2
-                           M1_READY |
-                                    v
-                        t2 = a M1_READY {4}
-                                  t2 |
-                                     v
-                            W m1 [t2] {4}
-                                     | walk
-                                     v
-                        r M1_FULL, t2 {4} e3
-                            M1_FULL |
-                                    v
-                         t3 = a M1_FULL {2}
-                                  t3 |
-                                     v
-                            R m1 [t3] {2}
-                                     | walk
-                                     v
-          r ENTRY, t3(i) {2} e4 ---------------- ENTRY ---------------------+
-                                                                            |
-                               EXIT(i) {4}                                  |
-                                    | next iteration                        |
-                                    v                                       |
-                            ENTER(i+1) {4}                                  |
-                                    | walk                                  |
-                                    v                                       |
-                 next = a ENTRY(i+1) {4} <---------------------------------+
-                               next |
-                                    v
-                        W m0(i+1) [next] {4}
+                      ENTER(i) {4}
+                            | walk
+                            v
+                t0 = acquire ENTRY(i) {4}
+                         t0 |
+                            v
+                    W m0(i) [t0] {4}
+                            | walk
+                            v
+               release M0_FULL, t0 {4} e1
+                            +-----------------M0_FULL >-----------------+
+                            | walk                                      v
+                            |                               t1 = acquire M0_FULL {2}
+                            |                                        t1 |
+                            |                                           v
+                            |                                   R m0(i) [t1] {2}
+                            |                                           | walk
+                            |                                           v
+                            |                              release M1_READY, t1 {2} e2
+                            +----------------< M1_READY-----------------+
+                            v
+                t2 = acquire M1_READY {4}
+                         t2 |
+                            v
+                    W m1(i) [t2] {4}
+                            | walk
+                            v
+               release M1_FULL, t2 {4} e3
+                            +-----------------M1_FULL >-----------------+
+                            | walk                                      v
+                            |                               t3 = acquire M1_FULL {2}
+                            |                                        t3 |
+                            |                                           v
+                            |                                   R m1(i) [t3] {2}
+                            |                                           | walk
+                            |                                           v
+                            |                               release ENTRY, t3 {2} e4
+                            |                           +----< ENTRY----+
+                            v                           |
+                       EXIT(i) {4}                      |
+                            | next iteration            |
+                            v                           |
+                     ENTER(i+1) {4}                     |
+                            | walk                      |
+                            v                           |
+                            +---------< ENTRY-----------+
+                            v
+              next = acquire ENTRY(i+1) {4}
+                       next |
+                            v
+                  W m0(i+1) [next] {4}
 ```
 
 The first write/read pair uses copy `s`; the second uses `(s+1) mod 2`:
@@ -3998,54 +4412,60 @@ R m1 -> W m0(i+1)         +1                 0
 ```
 
 The generated DAG therefore places `stage-offset=1` on the `M1_READY` and
-`ENTRY` releases. The full offset overlay uses the same vertical scaffold:
+`ENTRY` releases. The full offset overlay uses the same two-lane scaffold:
 
 ```text
-                       t0 = a ENTRY {4} [offset 0]
-                                  t0 |
-                                     v
-                         W m0 [t0] {4} [copy s]
-                                     | walk
-                                     v
-                  r M0_FULL, t0 {4} e1 [offset 0]
-                              M0_FULL |
-                                      v
-                     t1 = a M0_FULL {2} [offset 0]
-                                   t1 |
-                                      v
-                          R m0 [t1] {2} [copy s]
-                                      | walk
-                                      v
-                r M1_READY, t1 {2} e2 [offset +1]
-                             M1_READY |
-                                      v
-                    t2 = a M1_READY {4} [offset 0]
-                                   t2 |
-                                      v
-                        W m1 [t2] {4} [copy s+1]
-                                      | walk
-                                      v
-                 r M1_FULL, t2 {4} e3 [offset 0]
-                              M1_FULL |
-                                      v
-                     t3 = a M1_FULL {2} [offset 0]
-                                   t3 |
-                                      v
-                        R m1 [t3] {2} [copy s+1]
-                                      | walk
-                                      v
-                 r ENTRY, t3 {2} e4 [offset +1] -------- ENTRY --------+
-                                                                         |
-                              EXIT(i) {4}                                |
-                                   | next iteration                      |
-                                   v                                     |
-                           ENTER(i+1) {4}                                |
-                                   | walk                                |
-                                   v                                     |
-                next = a ENTRY {4} [offset 0] <-------------------------+
-                              next |
-                                   v
-                    W m0(i+1) [next] {4} [copy s]
+                      ENTER(i) {4}
+                            | walk
+                            v
+            t0 = acquire ENTRY {4} [offset 0]
+                         t0 |
+                            v
+                    W m0(i) [t0] {4} [copy s]
+                            | walk
+                            v
+          release M0_FULL, t0 {4} e1 [offset 0]
+                            +-----------------M0_FULL >-----------------+
+                            | walk                                      v
+                            |                          t1 = acquire M0_FULL {2} [offset 0]
+                            |                                        t1 |
+                            |                                           v
+                            |                                   R m0(i) [t1] {2} [copy s]
+                            |                                           | walk
+                            |                                           v
+                            |                        release M1_READY, t1 {2} e2 [offset +1]
+                            +----------------< M1_READY-----------------+
+                            v
+          t2 = acquire M1_READY {4} [offset 0]
+                         t2 |
+                            v
+                    W m1(i) [t2] {4} [copy s+1]
+                            | walk
+                            v
+          release M1_FULL, t2 {4} e3 [offset 0]
+                            +-----------------M1_FULL >-----------------+
+                            | walk                                      v
+                            |                          t3 = acquire M1_FULL {2} [offset 0]
+                            |                                        t3 |
+                            |                                           v
+                            |                                   R m1(i) [t3] {2} [copy s+1]
+                            |                                           | walk
+                            |                                           v
+                            |                         release ENTRY, t3 {2} e4 [offset +1]
+                            |                           +----< ENTRY----+
+                            v                           |
+                       EXIT(i) {4}                      |
+                            | next iteration            |
+                            v                           |
+                     ENTER(i+1) {4}                     |
+                            | walk                      |
+                            v                           |
+                            +---------< ENTRY-----------+
+                            v
+           next = acquire ENTRY {4} [offset 0]
+                       next |
+                            v
+                  W m0(i+1) [next] {4} [copy s]
 ```
 
 Without the two `+1` release offsets, the following acquire would wait on a
@@ -4082,19 +4502,19 @@ EXIT(i) {3}               e2: R last(i) {1} -> EXIT(i) {3}
 ```
 
 ```text
-                         ENTER(i) {3}
-                              | walk
-                              v
-                         W buffer(i) {3}
-                              | e1
-                              v
-                         R first(i) {1}
-                              | walk
-                              v
-                         R last(i) {1}
-                              | e2
-                              v
-                         EXIT(i) {3}
+                      ENTER(i) {3}
+                            | walk
+                            v
+                     W buffer(i) {3}
+                            +-------------------e1 >--------------------+
+                            | walk                                      v
+                            |                                    R first(i) {1}
+                            |                                           | walk
+                            |                                           v
+                            |                                     R last(i) {1}
+                            +-------------------< e2--------------------+
+                            v
+                       EXIT(i) {3}
 ```
 
 No edge is removed or merged.
@@ -4114,42 +4534,46 @@ entry          EMPTY        -                1                released for owner
 e2             EMPTY        {1}              1                same semaphore
 ```
 
-The generated semaphore DAG, including the wait into iteration `i+1`, is:
+The generated semaphore DAG, including the wait into iteration `i+1`, is
+below. `[cN,sM]` means cluster `N`, stage `M`:
 
 ```text
-                         ENTER(i) {3}
-                              | walk
-                              v
-       empty = a EMPTY(i) {3} [cluster 3, stage 0]
-                         empty |
-                               v
-   W buffer(i) [empty] {3} [cluster 3, stage 0]
-                               | walk
-                               v
-r FULL, empty [none] {3} e1 [cluster 3, stage 0]
-                          FULL |
-                               v
-   full = a FULL {1} [cluster 3, stage 0]
-                          full |
-                               v
- R first(i) [full] {1} [cluster 3, stage 0]
-                               | walk
-                               v
-  R last(i) [full] {1} [cluster 2, stage 1]
-                               | walk
-                               v
-r EMPTY, full [none] {1} e2 [cluster 2, stage 1] ------ EMPTY -----+
-                                                                    |
-                         EXIT(i) {3}                                |
-                              | next iteration                      |
-                              v                                     |
-                       ENTER(i+1) {3}                               |
-                              | walk                                |
-                              v                                     |
- next = a EMPTY(i+1) {3} [cluster 3, stage 0] <--------------------+
-                          next |
-                               v
-W buffer(i+1) [next] {3} [cluster 3, stage 0]
+                      ENTER(i) {3}
+                            | walk
+                            v
+          empty = acquire EMPTY(i) {3} [c3,s0]
+                      empty |
+                            v
+                W buffer(i) [empty] {3} [c3,s0]
+                            | walk
+                            v
+        release FULL, empty [none] {3} e1 [c3,s0]
+                            +------------------FULL >-------------------+
+                            | walk                                      v
+                            |                            full = acquire FULL {1} [c3,s0]
+                            |                                      full |
+                            |                                           v
+                            |                                R first(i) [full] {1} [c3,s0]
+                            |                                           | walk
+                            |                                           v
+                            |                                 R last(i) [full] {1} [c2,s1]
+                            |                                           | walk
+                            |                                           v
+                            |                       release EMPTY, full [none] {1} e2 [c2,s1]
+                            |                           +----< EMPTY----+
+                            v                           |
+                       EXIT(i) {3}                      |
+                            | next iteration            |
+                            v                           |
+                     ENTER(i+1) {3}                     |
+                            | walk                      |
+                            v                           |
+                            +---------< EMPTY-----------+
+                            v
+          next = acquire EMPTY(i+1) {3} [c3,s0]
+                       next |
+                            v
+              W buffer(i+1) [next] {3} [c3,s0]
 ```
 
 The loop does not carry a semaphore token. Each iteration acquires `EMPTY`
