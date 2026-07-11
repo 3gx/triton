@@ -1130,6 +1130,213 @@ static LogicalResult renderChain(EmitCtx &ctx, GroupDag &g, Node *head,
   }
   return success();
 }
+
+struct IfSplitCandidate {
+  scf::IfOp ifOp;
+  bool branchIsThen = true;
+  nvws::SemaphoreReleaseOp releaseOp;
+  nvws::SemaphoreAcquireOp acquireOp;
+  unsigned tokenResultIdx = 0;
+  bool releaseOnly = false;
+};
+static nvws::SemaphoreReleaseOp findBranchReleaseForSplit(Block *block) {
+  for (Operation &op : *block) {
+    if (isa<scf::YieldOp>(op))
+      return nullptr;
+    if (auto rel = dyn_cast<nvws::SemaphoreReleaseOp>(&op))
+      return rel;
+    if (isa<nvws::SemaphoreAcquireOp>(op))
+      return nullptr;
+    if (op.hasTrait<OpTrait::ConstantLike>() || isSupportedAliasOp(&op))
+      continue;
+    return nullptr;
+  }
+  return nullptr;
+}
+static nvws::SemaphoreAcquireOp findBranchTrailingAcquire(Block *block) {
+  return dyn_cast_or_null<nvws::SemaphoreAcquireOp>(
+      block->getTerminator()->getPrevNode());
+}
+static bool branchHasAcquireAfter(nvws::SemaphoreReleaseOp rel) {
+  for (Operation *op = rel->getNextNode(); op; op = op->getNextNode()) {
+    if (isa<scf::YieldOp>(op))
+      return false;
+    if (isa<nvws::SemaphoreAcquireOp>(op))
+      return true;
+  }
+  return false;
+}
+static gpu::StageCluster inferPrecedingMmaStage(scf::IfOp ifOp) {
+  for (Operation *op = ifOp->getPrevNode(); op; op = op->getPrevNode())
+    if (isa<nvidia_gpu::MMAv5OpInterface>(op))
+      return gpu::getStageCluster(op);
+  return {};
+}
+static bool semaUsesTmem(Value sem) {
+  auto ty = dyn_cast<nvws::SemaphoreType>(sem.getType());
+  if (!ty || ty.getBaseType().empty())
+    return false;
+  auto md = dyn_cast<gpu::MemDescType>(ty.getBaseType()[0]);
+  return md && isa<nvidia_gpu::TensorMemorySpaceAttr>(md.getMemorySpace());
+}
+static unsigned semaBaseTypeCount(Value sem) {
+  auto ty = dyn_cast<nvws::SemaphoreType>(sem.getType());
+  return ty ? ty.getBaseType().size() : 0;
+}
+static void assignStageIfKnown(OpBuilder &b, Operation *op,
+                               gpu::StageCluster sc) {
+  if (sc)
+    gpu::setStageCluster(b, op, sc);
+}
+static std::optional<unsigned> yieldedTokenIndex(scf::YieldOp yield,
+                                                  Value token) {
+  for (auto [index, value] : llvm::enumerate(yield.getOperands()))
+    if (value == token)
+      return index;
+  return std::nullopt;
+}
+
+static void workaroundLoopScheduler(EmitCtx &ctx) {
+  SmallVector<IfSplitCandidate> candidates;
+  ctx.func.walk([&](scf::IfOp ifOp) {
+    if (ifOp.thenBlock()->empty())
+      return;
+    auto makeCandidate =
+        [&](bool branchIsThen,
+            bool releaseOnly) -> std::optional<IfSplitCandidate> {
+      if (!branchIsThen && ifOp.getElseRegion().empty())
+        return std::nullopt;
+      Block *block = branchIsThen ? ifOp.thenBlock() : ifOp.elseBlock();
+      auto rel = findBranchReleaseForSplit(block);
+      if (!rel)
+        return std::nullopt;
+      if (releaseOnly) {
+        if (!(semaUsesTmem(rel.getSemaphore()) &&
+              branchHasAcquireAfter(rel)))
+          return std::nullopt;
+        return IfSplitCandidate{ifOp, branchIsThen, rel, {}, 0, true};
+      }
+      auto acq = findBranchTrailingAcquire(block);
+      if (!acq)
+        return std::nullopt;
+      if (semaUsesTmem(rel.getSemaphore()) &&
+          semaBaseTypeCount(rel.getSemaphore()) > 1)
+        return std::nullopt;
+      auto yieldOp = branchIsThen ? ifOp.thenYield() : ifOp.elseYield();
+      std::optional<unsigned> pos =
+          yieldedTokenIndex(yieldOp, acq.getToken());
+      if (!pos)
+        return std::nullopt;
+      return IfSplitCandidate{ifOp, branchIsThen, rel, acq, *pos, false};
+    };
+    for (bool releaseOnly : {false, true})
+      for (bool branchIsThen : {true, false})
+        if (auto candidate = makeCandidate(branchIsThen, releaseOnly)) {
+          candidates.push_back(*candidate);
+          return;
+        }
+    if (auto acq = dyn_cast_or_null<nvws::SemaphoreAcquireOp>(
+            &ifOp.thenBlock()->front())) {
+      Operation *prev = ifOp->getPrevNode();
+      if (prev && ifOp.getCondition().getDefiningOp() == prev)
+        prev = prev->getPrevNode();
+      if (auto rel = dyn_cast_or_null<nvws::SemaphoreReleaseOp>(prev)) {
+        std::optional<unsigned> pos =
+            yieldedTokenIndex(ifOp.thenYield(), acq.getToken());
+        if (pos)
+          candidates.push_back(
+              IfSplitCandidate{ifOp, true, rel, acq, *pos, false});
+      }
+    }
+  });
+  for (IfSplitCandidate &candidate : candidates) {
+    scf::IfOp ifOp = candidate.ifOp;
+    OpBuilder b(ifOp);
+    Location loc = ifOp.getLoc();
+    auto exitIf = scf::IfOp::create(
+        b, loc, TypeRange{}, ifOp.getCondition(),
+        /*withElseRegion=*/!candidate.branchIsThen);
+    Block *exitBlock =
+        candidate.branchIsThen ? exitIf.thenBlock() : exitIf.elseBlock();
+    candidate.releaseOp->moveBefore(exitBlock, exitBlock->begin());
+    exitIf->setAttrs(ifOp->getAttrs());
+    gpu::StageCluster releaseStage =
+        gpu::getStageCluster(candidate.releaseOp);
+    if (!releaseStage)
+      releaseStage = inferPrecedingMmaStage(ifOp);
+    assignStageIfKnown(b, candidate.releaseOp, releaseStage);
+    assignStageIfKnown(b, exitIf, releaseStage);
+    SetVector<int> exitIds = partitionIdsOfFwd(candidate.releaseOp);
+    if (exitIds.empty())
+      exitIds = partitionIdsOfFwd(ifOp);
+    if (!exitIds.empty())
+      gpu::setPartition(exitIf, exitIds.getArrayRef());
+    gpu::setPartitionOutputs(exitIf, {});
+    if (candidate.releaseOnly)
+      continue;
+    b.setInsertionPointAfter(ifOp);
+    auto enterIf = scf::IfOp::create(b, loc, TypeRange{ctx.tokenType},
+                                     ifOp.getCondition(),
+                                     /*withElseRegion=*/true);
+    Block *acqBlock = candidate.branchIsThen ? enterIf.thenBlock()
+                                              : enterIf.elseBlock();
+    candidate.acquireOp->moveBefore(acqBlock, acqBlock->begin());
+    ifOp.getResult(candidate.tokenResultIdx)
+        .replaceAllUsesWith(enterIf.getResult(0));
+    b.setInsertionPointToEnd(enterIf.thenBlock());
+    scf::YieldOp::create(
+        b, loc,
+        ValueRange{candidate.branchIsThen
+                       ? Value(candidate.acquireOp.getToken())
+                       : ifOp.thenYield().getOperand(
+                             candidate.tokenResultIdx)});
+    b.setInsertionPointToEnd(enterIf.elseBlock());
+    scf::YieldOp::create(
+        b, loc,
+        ValueRange{candidate.branchIsThen
+                       ? ifOp.elseYield().getOperand(candidate.tokenResultIdx)
+                       : Value(candidate.acquireOp.getToken())});
+    b.setInsertionPoint(ifOp);
+    Value poison = ub::PoisonOp::create(b, loc, ctx.tokenType).getResult();
+    ifOp.thenYield().setOperand(candidate.tokenResultIdx, poison);
+    ifOp.elseYield().setOperand(candidate.tokenResultIdx, poison);
+    enterIf->setAttrs(ifOp->getAttrs());
+    gpu::StageCluster acquireStage =
+        gpu::getStageCluster(candidate.acquireOp);
+    assignStageIfKnown(b, enterIf, acquireStage);
+    SetVector<int> enterExitIds = partitionIdsOfFwd(candidate.releaseOp);
+    for (int partition : partitionIdsOfFwd(candidate.acquireOp))
+      enterExitIds.insert(partition);
+    if (!enterExitIds.empty()) {
+      gpu::setPartition(exitIf, enterExitIds.getArrayRef());
+      gpu::setPartition(enterIf, enterExitIds.getArrayRef());
+      gpu::setPartitionOutputs(exitIf, {});
+      SmallVector<SetVector<int>, 1> enterOutputs{enterExitIds};
+      gpu::setPartitionOutputs(enterIf, enterOutputs);
+    }
+    SetVector<int> middleIds;
+    for (Region *region : {&ifOp.getThenRegion(), &ifOp.getElseRegion()}) {
+      if (region->empty())
+        continue;
+      for (Operation &op : region->front()) {
+        if (isa<scf::YieldOp>(op))
+          continue;
+        for (int partition : partitionIdsOfFwd(&op))
+          middleIds.insert(partition);
+      }
+    }
+    auto authored = gpu::getPartitionOutputs(ifOp);
+    for (auto [index, output] : llvm::enumerate(authored)) {
+      if (index == candidate.tokenResultIdx)
+        continue;
+      for (int partition : output)
+        middleIds.insert(partition);
+    }
+    if (!middleIds.empty())
+      gpu::setPartition(ifOp, middleIds.getArrayRef());
+  }
+}
+
 static Value materializeI32Before(Operation *op, int64_t value) {
   OpBuilder b(op);
   auto cst = emitInto<arith::ConstantOp>(b, op->getLoc(), resolveOwner(op),
@@ -1385,6 +1592,9 @@ LogicalResult emitIR(triton::FuncOp funcOp, MutableArrayRef<GroupDag> groups) {
     RenderState rs;
     if (failed(renderChain(ctx, *group, group->root->children[0], rs)))
       return failure();
+  }
+  workaroundLoopScheduler(ctx);
+  while (eraseDeadTokenSlots(ctx, groups)) {
   }
   SmallVector<Operation *> aliasOps;
   ctx.func.walk<WalkOrder::PreOrder>([&](Operation *op) {

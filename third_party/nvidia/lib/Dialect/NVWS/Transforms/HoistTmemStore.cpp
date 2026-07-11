@@ -223,8 +223,8 @@ public:
             }
             if (hasPartition(store)) {
               // The alloc op can have multiple partitions at this point. But
-              // insert-tmem-semaphore requires a single owner, which should be
-              // the partiton that tmem_store belongs to.
+              // InsertSemas requires a single owner, which should be the
+              // partition that tmem_store belongs to.
               setPartition(newAlloc, getPartitionIds(store));
             }
             rewriter.eraseOp(store);
@@ -492,8 +492,8 @@ public:
         for (auto alloc : tmemAllocToHoist) {
           if (!hoistTmemAlloc(alloc)) {
             // tmem store remaining in the outer loop must belong to the MMA
-            // partition. This is required by insert-tmem-semaphore for
-            // correctly double buffering this accumulator.
+            // partition. This is required by InsertSemas to correctly double
+            // buffer this accumulator.
             setPartition(alloc, getFallbackTmemOwnerPartition(alloc));
           }
         }

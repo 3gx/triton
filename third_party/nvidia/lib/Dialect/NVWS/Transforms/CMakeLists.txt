@@ -7,7 +7,6 @@ add_triton_library(NVWSTransforms
   OrderBufferGroups.cpp
   PackEpilogueSlices.cpp
   Utilities.cpp
-  InsertTmemSemaphore.cpp
   InsertSemas.cpp
   InsertSemasAccessDag.cpp
   InsertSemasEmitIR.cpp

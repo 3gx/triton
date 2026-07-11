@@ -16,8 +16,9 @@ already fixed:
 
 The emitter allocates physical objects, rewrites structured-control-flow
 signatures, renders those nodes, and verifies the result. It does not choose
-POU versus FirstTouch, infer an owner token, move synchronization across a region,
-split an `scf.if`, repair a schedule, or retry another placement.
+POU versus FirstTouch, infer an owner token, or retry another placement. Its
+one structural scheduling exception is the post-render loop-scheduler
+workaround described below.
 
 The central invariant is:
 
@@ -102,13 +103,35 @@ next channel selected by SYNC-DAG.
 5. Aggregate every group's requested `RegionFlow` slot and rewrite each
    affected `scf.for` or `scf.if` exactly once, outermost first.
 6. Render each active group's finalized chain.
-7. Erase dead alias operations and original allocations.
-8. Erase the poison token when it is unused.
-9. Verify emitted SSA, partition, locality, and lifetime contracts.
+7. Apply the loop-scheduler workaround and remove newly dead token slots.
+8. Erase dead alias operations and original allocations.
+9. Erase the poison token when it is unused.
+10. Verify emitted SSA, partition, locality, and lifetime contracts.
 
 There is no separate “entry acquire” pass. An entry acquire is an ordinary
-`Acquire` node rendered at its exact chain position. There is no post-render
-synchronization folding or conditional rewrite.
+`Acquire` node rendered at its exact chain position.
+
+## Loop-scheduler workaround
+
+After protocol rendering, `workaroundLoopScheduler` splits qualifying
+conditionals so the downstream loop scheduler sees the release and acquire at
+separate structured boundaries:
+
+```text
+before                                 after
+%t = scf.if %cond {                    scf.if %cond { release }
+  release                              scf.if %cond { body }
+  body                                 %t = scf.if %cond {
+  %next = acquire                        %next = acquire
+  yield %next                            yield %next
+} else { yield %t0 }                   } else { yield %t0 }
+```
+
+The moved release and its exit `scf.if` preserve the release's
+`loop.stage`/`loop.cluster`; if the release lacks them, it inherits the first
+preceding MMA schedule. The moved acquire and its entry `scf.if` preserve the
+acquire schedule. The middle `scf.if` keeps its authored schedule and receives
+partition metadata derived from its remaining contents and live results.
 
 ## Physical backing and semaphore creates
 

@@ -200,8 +200,6 @@ void init_triton_nvidia_passes_nvws(py::module &&m) {
                      mlir::triton::createNVWSAssignStagePhase);
   ADD_PASS_WRAPPER_0("add_lower_semaphore",
                      mlir::triton::createNVWSLowerSemaphore);
-  ADD_PASS_WRAPPER_0("add_insert_tmem_semaphore",
-                     mlir::triton::createNVWSInsertTmemSemaphore);
   m.def("add_strip_partition_attrs_outside_ws", [](mlir::PassManager &pm) {
     pm.nest<mlir::triton::FuncOp>().addPass(
         mlir::triton::createNVWSStripPartitionAttrsOutsideWS());

@@ -1,5 +1,6 @@
 // SYNC analysis and scheduling; section links refer to sync-dag.md.
 #include "InsertSemas.h"
+#include "Utilities.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "llvm/ADT/SetVector.h"
 #include <limits>
@@ -1986,29 +1987,45 @@ static RequiredParts computeRequiredParts(Node *head) {
   }
   return chainParts;
 }
-static bool isMultiBufferedGroup(GroupDag &g, int numTmemBlocks) {
-  for (const Member &member : g.pieceTable.members)
-    for (Operation *user : member.allocOp->getResult(0).getUsers()) {
-      auto mma = dyn_cast<nvidia_gpu::MMAv5OpInterface>(user);
-      auto loop = dyn_cast<scf::ForOp>(user->getParentOp());
-      if (!mma || !loop)
-        continue;
-      scf::ForOp ws = loop;
-      for (Operation *parent = loop; parent; parent = parent->getParentOp())
-        if (auto outer = dyn_cast<scf::ForOp>(parent);
-            outer && gpu::hasWarpSpecializeTag(outer))
-          ws = outer;
-      auto shape = mma.getAccumulator().getType().getShape();
-      int64_t blockM = shape[0], blockN = shape[1];
-      if (nvidia_gpu::hasAccReadModifyWrite(mma, loop) ||
-          !nvidia_gpu::isAccMultibufferingPossible(mma, loop) ||
-          getDisallowAccMultiBuffer(ws) ||
-          numTmemBlocks + blockM * blockN * 2 > 128 * 512 ||
-          (isa<nvidia_gpu::TCGen5MMAScaledOp>(mma.getOperation()) &&
-           blockN == 256))
-        return false;
+static int computeNumStages(nvidia_gpu::TMEMAllocOp allocOp,
+                            int numTmemBlocks) {
+  auto canDoubleBufferAcc = [](nvidia_gpu::MMAv5OpInterface mmaOp,
+                               int numTmemBlocks) {
+    auto tmemDesc = mmaOp.getAccumulator().getType();
+    auto blockM = tmemDesc.getShape()[0];
+    auto blockN = tmemDesc.getShape()[1];
+    constexpr int numTMEMColumns = 512;
+    constexpr int numTMEMRows = 128;
+    if (numTmemBlocks + (blockM * blockN * 2) >
+        numTMEMRows * numTMEMColumns) {
+      return false;
     }
-  return true;
+    if (isa<nvidia_gpu::TCGen5MMAScaledOp>(mmaOp) && blockN == 256) {
+      return false;
+    }
+    return true;
+  };
+
+  auto isMultiStaged = true;
+  for (auto user : allocOp.getResult().getUsers()) {
+    if (auto mmaOp = dyn_cast<nvidia_gpu::MMAv5OpInterface>(user)) {
+      if (auto loop = dyn_cast<scf::ForOp>(user->getParentOp())) {
+        auto wsLoop = nvws::getOuterWSLoop(loop);
+        // Determine if the MMA accumulator can be multibuffered.
+        bool accIsMultiBuffered =
+            // MMAs in subsequent iterations can be overlapped.
+            !nvidia_gpu::hasAccReadModifyWrite(mmaOp, loop) &&
+            // The accumulator is reset at some point, thus allowing
+            // multibuffering.
+            nvidia_gpu::isAccMultibufferingPossible(mmaOp, loop) &&
+            // The user didn't disable it with a flag.
+            !getDisallowAccMultiBuffer(wsLoop) &&
+            canDoubleBufferAcc(mmaOp, numTmemBlocks);
+        isMultiStaged = isMultiStaged && accIsMultiBuffered;
+      }
+    }
+  }
+  return 1 + 1 * isMultiStaged;
 }
 static FailureOr<std::optional<int>>
 computeBackingCopies(GroupDag &g, ArrayRef<EdgeRec> edges,
@@ -2043,9 +2060,14 @@ computeBackingCopies(GroupDag &g, ArrayRef<EdgeRec> edges,
     return plannedCopy;
   if (plannedCopy)
     g.numCopies = *plannedCopy;
-  else if (g.isTmem() && !useMetaPartitioner &&
-           isMultiBufferedGroup(g, numTmemBlocks))
+  else if (g.isTmem() && !useMetaPartitioner) {
     g.numCopies = 2;
+    for (const Member &member : g.pieceTable.members) {
+      auto allocOp = cast<nvidia_gpu::TMEMAllocOp>(member.allocOp);
+      g.numCopies =
+          std::min(g.numCopies, computeNumStages(allocOp, numTmemBlocks));
+    }
+  }
   if (g.isTmem())
     for (const Member &m : g.pieceTable.members) {
       auto shape = m.type.getShape();

@@ -19,13 +19,6 @@ Operation *createAlloc(OpBuilder &builder, Location loc,
   }
 }
 
-int getSemaphoreDepth(MemDescType bufTy) {
-  auto shape = bufTy.getShape();
-  return isa<nvidia_gpu::TensorMemoryScalesEncodingAttr>(bufTy.getEncoding())
-             ? 1
-             : shape[0];
-}
-
 MemDescType getSemaphoreViewBufferType(MemDescType bufTy) {
   auto isScalesEnc =
       isa<nvidia_gpu::TensorMemoryScalesEncodingAttr>(bufTy.getEncoding());

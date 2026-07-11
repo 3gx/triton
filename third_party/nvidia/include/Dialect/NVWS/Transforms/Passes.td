@@ -166,22 +166,6 @@ def NVWSPackEpilogueSlices
   ];
 }
 
-def NVWSInsertTmemSemaphore: Pass<"nvws-insert-tmem-semaphore", "mlir::ModuleOp"> {
-  let summary = "Insert TMEM semaphore ops for ownership transfer.";
-
-  let description = [{
-    Inserts synchronization directly as semaphore operations for TMEM ownership
-    transfer between partitions.
-  }];
-
-  let dependentDialects = [
-    "mlir::triton::nvws::NVWSDialect",
-    "mlir::triton::TritonDialect",
-    "mlir::triton::gpu::TritonGPUDialect",
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
-  ];
-}
-
 def NVWSInsertSemas: Pass<"nvws-insert-semas", "mlir::ModuleOp"> {
   // See sema-docs/insert-semas/overview.md.
   let summary = "Insert semaphore ops for ownership transfer.";

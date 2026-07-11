@@ -32,7 +32,6 @@ std::optional<PartitionId> getPartitionId(Operation *op);
 gpu::MemDescType getSemaphoreViewBufferType(gpu::MemDescType bufType);
 gpu::MemDescType getSemaphoreMultiBufferedType(gpu::MemDescType bufType,
                                                int depth);
-int getSemaphoreDepth(gpu::MemDescType bufTy);
 
 scf::ForOp getOuterWSLoop(scf::ForOp innerFor);
 } // namespace mlir::triton::nvws
