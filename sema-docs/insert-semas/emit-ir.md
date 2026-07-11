@@ -1,131 +1,501 @@
 # EMIT-IR
 
-## Rule
+## Contract: materialize a sealed plan
 
-EMIT-IR materializes the finalized SYNC-DAG. It does not rediscover owners,
-edges, holds, token-reuse decisions, pending counts, or stage offsets. A
-`Node::reuseTokenOwner` mark is a decision to render, not a decision EMIT-IR
-may make. Its one schedule exception is the loop-scheduler
-workaround (`workaroundLoopScheduler`), which
-splits qualifying `scf.if` operations so a release leading a branch is
-hoisted before the `if` and a trailing acquire follows it — a shape the loop
-scheduler otherwise mishandles:
+EMIT-IR receives finalized `GroupDag`s. For every active group, SYNC-DAG has
+already fixed:
+
+- physical and semaphore copy counts;
+- semaphore channels, entry state, and pending counts;
+- exact acquire and release positions;
+- every access and release `tokenSource`;
+- every token producer's owner;
+- every release/acquire pairing and completion anchor;
+- every `RegionFlow` and exact path result;
+- partition requirements, schedules, recurrence distances, and copy offsets.
+
+The emitter allocates physical objects, rewrites structured-control-flow
+signatures, renders those nodes, and verifies the result. It does not choose
+POU versus FirstTouch, infer an owner token, move synchronization across a region,
+split an `scf.if`, repair a schedule, or retry another placement.
+
+The central invariant is:
+
+> Every Access, Release, and region input names an exact `tokenSource`.
+> EMIT-IR looks up that producer directly; owner and lexical order are not
+> routing inputs.
+
+## Running example: semaphore DAG to MLIR
+
+SYNC-DAG finished the running loop as:
 
 ```text
-before the workaround                    after
-%t = scf.if %c {                         scf.if %c { r S0 %t0 {1} }   ; hoisted guard
-  r  S0 %t0 {1}     ; leading release    scf.if %c { ... }            ; body: protocol ops gone
-  ...                                    %t = scf.if %c {             ; trailing guard
-  %t1 = a  S1 {1}   ; trailing acquire     %t1 = a S1 {1}; yield %t1
-  yield %t1                              } else { yield %t0 }
-} else { yield %t0 }
+|- scf.for pieces{P0:W:{0}}
+|  |- a EMPTY {0}
+|  |- W m0 {0}
+|  |- r FULL {0} [none]
+|  |- a FULL {1}
+|  |- R m0 {1}
+|  |- r EMPTY {1} [none]
+
+EMPTY: count=1, entry owner={0}
+FULL:  count=1, initially blocked
+BACKING: numCopies=1
 ```
 
-Two rarer variants hoist only the release (a
-TMEM semaphore whose branch re-acquires later), or — when the acquire leads
-the branch and the release already sits outside the `if` — perform the same
-split by moving that release into the hoisted guard and the leading acquire
-into the trailing guard. A release
-moved this way with no assigned
-pipeline stage may inherit one from the first MMA that precedes it in the
-block. Model terms are defined in the
-[InsertSemas overview](overview.md#core-objects).
+The following snippets are schematic MLIR with long type signatures omitted.
+The emitter first creates staged backing and the two semaphore objects beside
+the original allocation. Rendering later redirects managed uses, and cleanup
+removes dead originals:
 
-## Mechanical sequence
+```text
+%base = ttg.local_alloc
+  : !ttg.memdesc<1x1xi32, ...>
 
-1. For TMEM groups that received semaphores, strip the input IR's own TMEM
-   dependency tokens: TTGIR threads `!ttg.async.token` values through
-   `tmem_alloc`/`tmem_load`/`tmem_store`/MMA to order them — unrelated to
-   semaphore tokens — and the semaphore protocol now carries that ordering.
-   Remove those operands and results and delete the token entries that
-   become dead in loop and `if` signatures.
-2. Allocate the planned multi-buffered backing and create semaphores with the
-   DAG's initially-released and pending-count facts.
-3. Emit the entry acquires.
-4. Extend `scf.for`/`scf.if` signatures once for crossings that require a
-   token result.
-5. Walk the SYNC-DAG and render accesses, acquires, releases, and region
-   yields.
-6. Fold the split groups that share one planned `buffer.id` — the circular
-   SMEM and mixed-depth TMEM arrangements of
-   [ACCESS-DAG's Groups section](access-dag.md#groups) — onto their shared
-   allocation, now that each group's protocol exists.
-7. Apply the loop-scheduler workaround and remove dead aliases/allocations.
-8. Verify partition outputs, token/view locality, unmarked buffer use after
-   release, and at most one semaphore token in a loop's iter-args per group.
+%empty = nvws.semaphore.create %base true
+  {pending_count = 1}
+%full = nvws.semaphore.create %base false
+  {pending_count = 1}
+```
 
-For each group, the rendering walk's `RenderState` keeps one ordered list of
-token records — token value, semaphore, and optional owner — plus buffer views
-cached by member and owner. The last token is used by default. An acquire
-replaces any earlier record for its resolved owner and appends its result. A
-node marked with `reuseTokenOwner` may instead use its owner's record without
-changing the order. At a region boundary, only the token selected for
-threading remains. A loop hold with no token iter-arg or result passes no token
-through its boundary; a region with no crossing leaves the outer state
-unchanged.
+`true` means the entry channel begins released. The body is then rendered in
+the same order as the symbolic chain:
 
-## Node mapping
+```text
+scf.for ... {
+  %tw = nvws.semaphore.acquire %empty {ttg.partition = array<i32: 0>}
+  %bw = nvws.semaphore.buffer %empty, %tw {ttg.partition = array<i32: 0>}
+  ttg.local_store %value, %bw {ttg.partition = array<i32: 0>}
+  nvws.semaphore.release %full, %tw [#nvws.async_op<none>]
+    {arrive_count = 1, ttg.partition = array<i32: 0>}
 
-| DAG node | Emitted form |
-|---|---|
-| `Acquire` | `nvws.semaphore.acquire`; records its result for the resolved owner and makes it the last token |
-| `Release` | `nvws.semaphore.release` with the assigned completion kind and `arrive_count`; a marked node uses its owner's token when that token is not last |
-| `Access` | `nvws.semaphore.buffer`, replayed view chain, and the retargeted access; a marked node builds the view from its owner's token, otherwise from the last token |
-| sourceful alloc | explicit SMEM/TMEM store into the semaphore buffer view |
-| `For`/`If` crossing | token init/result/yield position when the hold crosses the boundary |
-| `ENTER`/`EXIT` | no operation of their own; the token iter-args, results, and yields added on the parent `for`/`if` realize the boundary |
+  %tr = nvws.semaphore.acquire %full {ttg.partition = array<i32: 1>}
+  %br = nvws.semaphore.buffer %full, %tr {ttg.partition = array<i32: 1>}
+  %v = ttg.local_load %br {ttg.partition = array<i32: 1>}
+  nvws.semaphore.release %empty, %tr [#nvws.async_op<none>]
+    {arrive_count = 1, ttg.partition = array<i32: 1>}
+}
+```
 
-POINT_OF_USE loop holds — acquires moved to the first body access — receive
-no token iter-arg: their moved acquire creates the token in the body and the
-closing release uses it there. If SYNC-DAG instead keeps a token iter-arg and
-result because an eligibility check fails — printed as bare
-`holdrule{gated}` unless the blocker is `trailing-use` or `result-consumed` —
-signature rewriting adds the ordinary loop token slot. EMIT-IR performs no
-stage comparison of its own.
+Notice that the token may cross semaphore names:
 
-## Schedule preservation
+```text
+producer a EMPTY -> token %tw -> W m0 and r FULL
+producer a FULL  -> token %tr -> R m0 and r EMPTY
+```
 
-Generated protocol operations receive the owner and `loop.stage`/
-`loop.cluster` already stored on their SYNC-DAG nodes. Access views inherit
-the retargeted access's schedule. Stage offsets are emitted in the semaphore
-operand named `stage`, to be resolved by `AssignStagePhase`; they are not
-`loop.stage` values (see the
-[NVWS-AWS terminology](../nvws-aws-overview.md#terminology)).
+The release destination is not the semaphore that produced the token. The
+token proves access to the current buffer capability; the release opens the
+next channel selected by SYNC-DAG.
 
-Circular members keep independent per-group DAGs while SYNC-DAG assigns
-their stage offsets. EMIT-IR transcribes each access's offset to its
-`nvws.semaphore.buffer` and each protocol node's offset to the
-acquire/release `stage` operands, and only then folds the equivalent backings
-and semaphore creates onto the shared multi-buffered allocation. Mixed-depth
-TMEM groups likewise keep independent depths and share only a checked
-subslice/reinterpretation of the physical allocation.
+## Emission order
 
-If the loop-scheduler workaround moves a release that has no assigned
-pipeline stage, it may copy the schedule from the first MMA preceding it in
-the block; other operations may sit between them. It does not otherwise
-reschedule the DAG.
+`emitIR` performs these steps:
+
+1. Create one function-level poison async token. It replaces uses of detached
+   legacy token results and also serves as a temporary signature placeholder.
+2. Select active groups: groups with no semaphores require no synchronization
+   emission.
+3. Clear legacy TMEM dependency operands, replace their old token-result uses
+   with poison, and repeatedly erase dead pre-existing loop/`if` token slots.
+4. Materialize all physical backing objects and semaphore creates.
+5. Aggregate every group's requested `RegionFlow` slot and rewrite each
+   affected `scf.for` or `scf.if` exactly once, outermost first.
+6. Render each active group's finalized chain.
+7. Erase dead alias operations and original allocations.
+8. Erase the poison token when it is unused.
+9. Verify emitted SSA, partition, locality, and lifetime contracts.
+
+There is no separate “entry acquire” pass. An entry acquire is an ordinary
+`Acquire` node rendered at its exact chain position. There is no post-render
+synchronization folding or conditional rewrite.
+
+## Physical backing and semaphore creates
+
+### Ordinary groups
+
+Each member's backing type reflects `numCopies`. For ordinary local or TMEM
+memory, the copy dimension is added in front of the authored shape. TMEM scale
+encodings retain their special shape convention.
+
+Consider the ACCESS-DAG overlap example:
+
+```text
+m0=[0,256), footprint={P0,P1,P2}
+m1=[64,192), footprint={P1}
+```
+
+Pieces guide synchronization, but every semaphore create carries one backing
+value/type per group member. A covering member may physically serve contained
+members when the memory kind, offsets, types, and authored planning metadata
+permit it. TMEM containment uses `ttng.tmem_subslice` and, when needed,
+`ttg.memdesc_reinterpret`.
+
+The physical plan is complete before signature rewriting and chain rendering.
+There is no later “fold the backing after emission” phase.
+
+### Mixed-depth TMEM
+
+A mixed-depth physical alias set must contain exactly two logical groups. One
+must be the unique owner by span and element width, its allocation must
+dominate the reuser, and the reuser range must fit inside it. EMIT-IR creates
+the owner's backing and derives the reuser with a subslice/reinterpret view.
+
+Failure of any containment, width, shape, or dominance condition is a malformed
+physical plan, not a request to change synchronization placement.
+
+### Circular local groups
+
+Circular groups retain separate logical SYNC-DAGs but share one physical
+backing by `buffer.id`. All members must agree on backing type and be defined
+in one block. The group with `buffer.start=0` supplies the authored backing
+identity.
+
+Compatible circular semaphore creates are shared by `(buffer.id, entry-state)`.
+Their pending counts must agree. Copy and stage offsets were already assigned
+by SYNC-DAG.
+
+### Entry state
+
+`Sema::entryOwner` controls the create's boolean entry flag:
+
+```text
+entryOwner present  -> semaphore.create ... true
+entryOwner absent   -> semaphore.create ... false
+```
+
+Creates for entry channels are emitted before non-entry channels. The create's
+`pending_count` is the uniform count already proved during channel formation.
+
+## Exact token routing
+
+`RenderState` stores records of this form:
+
+```text
+Token
+  value       emitted async-token SSA value
+  sema        emitted semaphore SSA value associated with the capability
+  ref
+    producer  exact symbolic producer node
+    sema      symbolic render channel
+    owner     effective owner
+```
+
+`recordToken` replaces only a record with the same producer. Tokens produced
+by different nodes may coexist even when they have the same owner.
+
+Before rendering an Access or Release, `renderChain` calls
+`tokenForSource(node->tokenSource)`. Missing or owner-incompatible records are
+errors; only the named producer can satisfy the consumer.
+
+### Exact fan-out and reuse
+
+The fan-out example from SYNC-DAG has three tokens live over time:
+
+```text
+a EMPTY(2) {0} -> producer token T0
+  T0 -> W m0 {0}
+  T0 -> r F1 {0}
+  T0 -> r F2 {0}
+  T0 -> later R m0 {0}
+
+a F1 {1} -> T1 -> R m0 {1} -> r EMPTY {1}
+a F2 {2} -> T2 -> R m0 {2} -> r EMPTY {2}
+```
+
+When `{0}` rereads the buffer, `T1` and `T2` may have been emitted more
+recently. The access still names producer `T0`, so the emitter selects `T0`
+exactly. Owner order cannot change that choice.
+
+## Buffer views and accesses
+
+An access needs both a token and a member view. `getView` emits:
+
+```text
+%m0_view, %m1_view, ... = nvws.semaphore.buffer %sema, %token
+```
+
+The result bundle includes a view for every group member. The current bundle
+is reused only when all exact capability facts match:
+
+- symbolic producer;
+- symbolic channel;
+- token SSA value;
+- semaphore SSA value;
+- owner;
+- `bufferStageOffset`; and
+- a `sameViewType`-compatible requested member type.
+
+`sameViewType` compares shape, element type, encoding, memory space, and
+mutability. It deliberately does not make allocation shape part of the cache
+identity.
+
+An owner-only cache would be unsound because the same owner may hold several
+different producer capabilities.
+
+### Alias replay
+
+For a `Touch`, the emitter selects its member view and replays the alias path
+recorded by ACCESS-DAG. Each cloned alias replaces the managed operand with the
+current acquired view. Result types are re-inferred where possible so staged
+allocation shapes propagate correctly.
+
+A `memdesc_index` whose result is `sameViewType`-compatible with its source can
+be elided. Other supported aliases are cloned in order:
+
+```text
+base semaphore view
+  -> memdesc_index/subview/trans/reinterpret/reshape
+  -> exact access view
+```
+
+### Access rewriting
+
+Known accesses are rewritten as follows:
+
+- general operations have the exact `Touch::accessValue` operand replaced;
+- a sourceful local allocation becomes an explicit `ttg.local_store` through
+  the acquired view;
+- a scalar local source is splatted when the destination needs a tensor;
+- managed allocation uses unrelated to semaphore creates and access nodes are
+  redirected to the new view; and
+- the rendered access returns its real completion anchor, including an
+  ACCESS-DAG-selected descriptor store.
+
+The returned anchor becomes `lastReal`, which determines the exact insertion
+point for a following release.
+
+## Synchronization-node mapping
+
+| Symbolic node | Emitted action |
+| --- | --- |
+| `Acquire` | Insert before the next real node; otherwise before the containing region terminator, or after the last root-level real operation. Apply owner, schedule, and optional `stageOffset`; record the node as producer. |
+| `Release` | Insert after the last rendered completion, or at the containing block start when no real node precedes it; use its exact source token, destination semaphore, payload array, count, schedule, and optional `stageOffset`; mark the source released for lifetime auditing. |
+| `Access` | Resolve exact source, materialize/reuse the exact buffer bundle, replay aliases, and rewrite the operation. |
+| `ENTER` / `EXIT` | Emit nothing; the parent region renderer wires path inputs/results. |
+| `For` / `If` | Render the child chain and fill the preallocated token slot only when a `RegionFlow` exists. |
+
+`chainBlock` locates the exact child block for a synchronization-only or otherwise
+empty chain. Thus a branch containing only a release still receives that
+release in its own block.
+
+## Tokens through regions
+
+### Plain POU loop
+
+The running example has no `RegionFlow`, so its `scf.for` signature is
+unchanged. Body-local acquires and releases render exactly where SYNC-DAG put
+them.
+
+`renderPlainLoop` still creates a nested render state. If the region has an
+incoming exact token used only internally, it records that token under the
+region producer while walking the body, then preserves the appropriate exact
+record outside without adding a loop result.
+
+### Carried FirstTouch loop
+
+FirstTouch's symbolic graph contains:
+
+```text
+entry acquire -> loop tokenSource
+loop RegionFlow.owner = {0}
+loop RegionFlow.exits[0] = exact tail acquire
+```
+
+Signature rewriting first adds a poison placeholder:
+
+```text
+%result = scf.for ... iter_args(%carry = %poison) -> !ttg.async.token {
+  ...
+  scf.yield %poison
+}
+```
+
+`renderCarriedLoop` then replaces the init with the exact entry token, records
+the body iter-arg as the loop's token producer, renders the body, and replaces
+the yield with the exact exit producer:
+
+```text
+%result = scf.for ... iter_args(%carry = %initial) -> !ttg.async.token {
+  ...
+  %next = nvws.semaphore.acquire %empty
+  scf.yield %next
+}
+```
+
+The loop result is recorded under:
+
+- the loop node itself;
+- the exact incoming producer alias when needed; and
+- the exact exit producer alias.
+
+Downstream `tokenSource` pointers can therefore resolve the result without an
+owner-based search. On a zero-trip loop, MLIR naturally returns `%initial`.
+
+### An `if` result
+
+Suppose SYNC-DAG recorded:
+
+```text
+if thread{{4}}
+  then ... EXIT yield{a Sback}
+  else ... EXIT yield{pass}
+```
+
+Signature rewriting adds one result and one operand to each yield. During
+rendering:
+
+- the then path resolves the exact acquire named in `flow.exits[0]`;
+- the else path sees `nullptr` and yields the exact incoming token; and
+- the `scf.if` result becomes a new producer with owner `{4}`.
+
+Schematic emitted IR:
+
+```mlir
+%out = scf.if %cond -> !ttg.async.token {
+  ...
+  %then_token = nvws.semaphore.acquire %Sback
+  scf.yield %then_token
+} else {
+  scf.yield %incoming
+}
+```
+
+Rendering normalizes a managed `if` with no authored else to an empty else. If
+`RegionFlow` needs a result, that branch supplies the exact pass-through. The
+emitter does not split the `if` or move synchronization outside it.
+
+### Several groups threading tokens through one region
+
+`rewriteSignatures` collects all groups' requested slots before touching an
+operation. The `for` or `if` is rebuilt once with all extra token types. Each
+group remembers its absolute slot index and later fills only that slot.
+
+Operations are rewritten outermost first, and every graph node pointing at an
+old region is retargeted to the replacement. This avoids repeated nested
+signature surgery.
+
+## Schedule, offsets, and partition metadata
+
+Generated synchronization nodes receive the `stageCluster` already stored in
+SYNC-DAG:
+
+- acquire schedule from its demand/boundary;
+- release schedule from its exact completion; and
+- buffer view schedule from the access operation.
+
+`stageOffset` is emitted as a signed `i32` operand on acquire/release and
+selects a semaphore copy. `bufferStageOffset` is emitted on
+`nvws.semaphore.buffer` and selects a backing copy. Neither alters `loop.stage`
+or `loop.cluster`.
+
+For the two-copy alias example:
+
+```text
+R m0 slot 0 -> release Shandoff with stageOffset=+1
+W m1 slot 1 -> acquire Shandoff at its selected slot
+```
+
+The emitter transcribes `+1`; it does not replay the slot schedule.
+
+For a structured operation that already carries partition metadata,
+`requiredParts` extends its partition set when generated synchronization needs
+additional owners inside it. Signature rewriting also extends
+`ttg.partition.outputs` for every new token result and gives terminators the
+region partition metadata when absent.
+
+## Cleanup
+
+After rendering all active groups, EMIT-IR:
+
+- erases supported alias operations whose results are dead;
+- erases original managed allocations that no longer have uses; and
+- removes the temporary poison operation when no detached legacy use remains.
+
+The initial dead-slot sweep may rebuild old `scf.for`/`scf.if` operations to
+remove obsolete async-token results before new exact slots are added. This is
+signature cleanup, not synchronization placement.
+
+## Emitted-IR verification
+
+The final verifier checks the materialized contract, not the planning policy.
+
+### Exact cached-view reuse
+
+If a cached buffer view is intentionally reused after a release, the verifier
+requires that:
+
+- the view came from `nvws.semaphore.buffer` with the recorded exact token;
+- a release of that token exists in the same block; and
+- the reused view has a witnessed use after that release.
+
+This exception is admitted only for an exact reuse chosen in SYNC-DAG.
+
+### Partition outputs
+
+For every `scf.for` or `scf.if` carrying `ttg.partition.outputs`:
+
+- the attribute arity must equal the operation's result count; and
+- each yielded nonconstant producer with partition metadata must intersect the
+  declared output partitions.
+
+### Token and view locality
+
+`verifyTokenLocality` traces every release/buffer token backward through:
+
+- direct `nvws.semaphore.acquire` results;
+- `scf.if` then/else yields; and
+- `scf.for` iter-args, yields, and init values.
+
+For partition-marked consumers and acquires, the partition sets must be equal.
+An acquire without partition metadata is outside that comparison. For a
+partition-marked semaphore buffer, every partition-marked view user must have
+the same set; unpartitioned users are outside this check.
+
+### Lifetime and loop slots
+
+Within one block, an ordinary token may not create a new buffer view after it
+has been released. A newly materialized exact-reuse buffer is recorded in
+`exactReuseBufferOps` and exempted from that generic check. Reuse of an already
+cached view records a `CachedReuseContract` and must pass the proof above.
+
+For token slots that resolve directly, or through a bounded `scf.if` result
+trace, to a semaphore acquire, a loop may not carry two slots for the create's
+first physical backing. Downstream stage/phase assignment cannot represent
+that state. The check excludes circular local backing, whose physical
+synchronization is explicitly multi-channel.
+
+Any failure here is a plan/emitter contract violation or malformed physical
+plan. EMIT-IR does not respond by choosing another acquire placement.
 
 ## Output contract
 
-Every access rewritten by EMIT-IR uses a semaphore buffer view produced from
-the token selected by the finalized DAG. Within one block, no *unmarked*
-buffer view may follow a release of its token. A view recorded in
-`reusedTokenBufferOps` may do so only because its SYNC-DAG node explicitly
-proved owner-specific token reuse; this is the sole buffer-after-release
-verifier exemption, not a general weakening. One loop carries at most one
-semaphore token per group — circular SMEM backings are excluded from that
-last verifier.
-`LowerSemaphore` can therefore assign buffer stages and phases without
-reconstructing ownership.
+After EMIT-IR succeeds:
+
+- every managed memory consumer uses a view derived from its exact planned
+  token producer;
+- every release uses that same exact token and the planned destination
+  semaphore;
+- every structured path supplies its planned region result or exact
+  pass-through;
+- schedules, counts, stage offsets, and backing offsets match SYNC-DAG;
+- partition-marked token and view consumers agree with their acquire or
+  materialization partition sets; and
+- old managed allocations and legacy token plumbing no longer define the
+  active synchronization.
 
 ## Code map
 
-[`InsertSemasEmitIR.cpp`](../../third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemasEmitIR.cpp):
-
-- `emitBackingsAndCreates` and `emitEntryAcquires`
-- `rewriteSignatures`
-- `RenderState`, `getView`, `renderAccess`, `renderRegion`, and `renderChain`
-- `foldCircularGroups`, `coalesceBackings`, and
-  `coalesceMixedDepthTmemBackings`
-- `workaroundLoopScheduler`
-- `verifyNoUseAfterRelease`, `emitIR`, and the other post-emission verifiers
+- Symbolic dump: `SyncDagDumper`, `dumpSyncDags`
+- Shared emission state: `EmitCtx`, `RenderState`
+- Legacy-token cleanup: `nukeGroupTokens`, `eraseDeadTokenSlots`
+- Backing and creates: `materializeLogicalBacking`,
+  `materializeMixedDepth`, `materializeCircular`, `emitPhysicalIR`
+- Aggregated region slots: `rewriteSignatures`
+- Views and accesses: `getView`, `renderAccess`
+- Structured control flow: `renderPlainLoop`, `renderCarriedLoop`,
+  `renderRegion`
+- Chain materialization: `renderChain`
+- Locality proof: `verifyTokenLocality`
+- Full emitted checks: `verifyEmittedIR`
+- Entry point: `emitIR`
