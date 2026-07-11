@@ -134,16 +134,6 @@ permit it. TMEM containment uses `ttng.tmem_subslice` and, when needed,
 The physical plan is complete before signature rewriting and chain rendering.
 There is no later “fold the backing after emission” phase.
 
-### Mixed-depth TMEM
-
-A mixed-depth physical alias set must contain exactly two logical groups. One
-must be the unique owner by span and element width, its allocation must
-dominate the reuser, and the reuser range must fit inside it. EMIT-IR creates
-the owner's backing and derives the reuser with a subslice/reinterpret view.
-
-Failure of any containment, width, shape, or dominance condition is a malformed
-physical plan, not a request to change synchronization placement.
-
 ### Circular local groups
 
 Circular groups retain separate logical SYNC-DAGs but share one physical

@@ -488,56 +488,6 @@ static void materializeLogicalBacking(GroupDag &g) {
       }
   }
 }
-static LogicalResult materializeMixedDepth(ArrayRef<GroupDag *> set) {
-  if (set.size() != 2)
-    return semaError(set.front()->pieceTable.members.front().allocOp)
-           << "mixed-depth TMEM reuse requires exactly two logical channels";
-  bool firstOwns = canOwnMixedDepthTmem(*set[0], *set[1]);
-  bool secondOwns = canOwnMixedDepthTmem(*set[1], *set[0]);
-  if (firstOwns == secondOwns)
-    return semaError(set.front()->pieceTable.members.front().allocOp)
-           << "mixed-depth TMEM reuse has no unique physical owner by span and "
-              "element width";
-  GroupDag &owner = *set[static_cast<unsigned>(secondOwns)];
-  GroupDag &reuser = *set[static_cast<unsigned>(firstOwns)];
-  Operation *ownerAnchor = backingAnchor(owner);
-  Operation *reuserAnchor = backingAnchor(reuser);
-  bool dominates = ownerAnchor->getBlock() == reuserAnchor->getBlock() &&
-                   ((ownerAnchor == reuserAnchor && firstOwns) ||
-                    (ownerAnchor != reuserAnchor &&
-                     ownerAnchor->isBeforeInBlock(reuserAnchor)));
-  if (!dominates)
-    return semaError(reuserAnchor)
-           << "mixed-depth TMEM physical owner does not dominate its reuser";
-  OpBuilder b(ownerAnchor);
-  Value backing = emitBacking(b, ownerAnchor->getLoc(), owner,
-                              owner.pieceTable.members.front());
-  auto ownerType = backingType(owner, owner.pieceTable.members.front());
-  auto reuserType = backingType(reuser, reuser.pieceTable.members.front());
-  auto ownerShape = ownerType.getShape(), reuserShape = reuserType.getShape();
-  if (ownerShape.empty() || reuserShape.empty())
-    return semaError(reuserAnchor)
-           << "mixed-depth TMEM backing has empty shape";
-  int64_t offset = reuser.pieceTable.members.front().offset -
-                   owner.pieceTable.members.front().offset;
-  int64_t ownerN = ownerShape.back(), reuserN = reuserShape.back();
-  if (ownerN < reuserN || ownerN % reuserN || offset < 0 ||
-      offset + reuserN > ownerN)
-    return semaError(reuserAnchor)
-           << "mixed-depth TMEM reuser is outside its physical owner";
-  unsigned ownerWidth = ownerType.getElementTypeBitWidth();
-  unsigned reuserWidth = reuserType.getElementTypeBitWidth();
-  int64_t size = reuserN / (ownerWidth / reuserWidth);
-  if (size <= 0)
-    return semaError(reuserAnchor)
-           << "invalid mixed-depth TMEM subslice width";
-  Value view = emitTmemView(b, reuserAnchor->getLoc(), backing, reuserType,
-                           offset, size, /*reinterpret=*/true);
-  owner.backing.assign(1, backing);
-  reuser.backing.assign(1, view);
-  return success();
-}
-
 static LogicalResult materializeCircular(ArrayRef<GroupDag *> set) {
   GroupDag *owner = set.front();
   for (GroupDag *g : set)
@@ -564,22 +514,17 @@ static LogicalResult materializeCircular(ArrayRef<GroupDag *> set) {
   return success();
 }
 static LogicalResult emitPhysicalIR(EmitCtx &ctx, ArrayRef<GroupDag *> groups) {
-  llvm::MapVector<int64_t, SmallVector<GroupDag *, 2>> mixed, circular;
+  llvm::MapVector<int64_t, SmallVector<GroupDag *, 2>> circular;
   for (GroupDag *group : groups) {
     GroupDag &g = *group;
-    if (g.mixedDepthPhysicalAlias)
-      mixed[g.bufferId].push_back(group);
-    else if (g.isCircular())
+    if (g.isCircular())
       circular[g.bufferId].push_back(group);
   }
   std::map<std::pair<int64_t, bool>, Sema *> circularPrimary;
   for (GroupDag *group : groups) {
     GroupDag &g = *group;
     if (g.backing.empty()) {
-      if (g.mixedDepthPhysicalAlias) {
-        if (failed(materializeMixedDepth(mixed[g.bufferId])))
-          return failure();
-      } else if (g.isCircular()) {
+      if (g.isCircular()) {
         if (failed(materializeCircular(circular[g.bufferId])))
           return failure();
       } else {

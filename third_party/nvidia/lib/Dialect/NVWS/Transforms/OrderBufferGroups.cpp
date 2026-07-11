@@ -37,7 +37,7 @@ static bool isSourceFreeAlloc(Operation *op) {
 }
 
 static bool isEligibleGroup(const GroupDag &group, Block *entry) {
-  if (!group.isTmem() || group.mixedDepthPhysicalAlias || group.isCircular() ||
+  if (!group.isTmem() || group.isCircular() ||
       group.pieceTable.members.empty() || group.bufferId < 0)
     return false;
   for (const Member &member : group.pieceTable.members) {

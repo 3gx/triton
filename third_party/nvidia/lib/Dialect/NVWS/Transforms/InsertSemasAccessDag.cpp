@@ -46,10 +46,9 @@ FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp) {
 
   SmallVector<GroupDag, 0> groups;
   auto makeGroup = [&](MemKind memory, int64_t id, ArrayRef<Operation *> allocs,
-                       bool circular = false, bool mixedDepth = false) {
+                       bool circular = false) {
     GroupDag &g = groups.emplace_back();
     g.bufferId = id;
-    g.mixedDepthPhysicalAlias = mixedDepth;
     g.memory = memory;
     g.circular = circular;
     for (Operation *op : allocs) {
@@ -67,19 +66,28 @@ FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp) {
     }
   };
   for (auto &[id, allocs] : tmemBuckets) {
-    auto firstCopy = getI64Attr(allocs.front(), kBufferCopyAttrName);
-    bool split = llvm::all_of(allocs, [&](Operation *op) {
-                   return getI64Attr(op, kBufferCopyAttrName).has_value();
-                 }) &&
-                 llvm::any_of(allocs, [&](Operation *op) {
-                   return getI64Attr(op, kBufferCopyAttrName) != firstCopy;
-                 });
-    if (!split) {
-      makeGroup(MemKind::Tmem, id, allocs);
-      continue;
+    std::optional<int64_t> expectedCopy;
+    Operation *expectedCopyOp = nullptr;
+    for (Operation *op : allocs) {
+      std::optional<int64_t> copy = getI64Attr(op, kBufferCopyAttrName);
+      if (!copy)
+        continue;
+      if (!expectedCopy) {
+        expectedCopy = copy;
+        expectedCopyOp = op;
+        continue;
+      }
+      if (copy == expectedCopy)
+        continue;
+      InFlightDiagnostic diag = semaError(op)
+                                << "TMEM allocations sharing buffer.id " << id
+                                << " have conflicting buffer.copy values "
+                                << *expectedCopy << " and " << *copy;
+      diag.attachNote(expectedCopyOp->getLoc())
+          << "first buffer.copy value is " << *expectedCopy;
+      return failure();
     }
-    for (Operation *op : allocs)
-      makeGroup(MemKind::Tmem, id, ArrayRef<Operation *>(op), false, true);
+    makeGroup(MemKind::Tmem, id, allocs);
   }
   for (auto &[id, allocs] : localBuckets)
     makeGroup(MemKind::Local, id, allocs);

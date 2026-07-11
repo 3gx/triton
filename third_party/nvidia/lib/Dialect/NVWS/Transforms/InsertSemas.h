@@ -182,7 +182,6 @@ enum class MemKind { Tmem, Local };
 
 struct GroupDag {
   int64_t bufferId = 0;
-  bool mixedDepthPhysicalAlias = false;
   MemKind memory = MemKind::Tmem;
   bool circular = false;
   PieceTable pieceTable;
@@ -219,21 +218,6 @@ private:
   // Allocation-order index. Only newNode/discardLastNode may mutate it.
   std::array<SmallVector<Node *, 0>, Node::NumKinds> nodesByKind;
 };
-inline bool canOwnMixedDepthTmem(const GroupDag &owner, const GroupDag &reuser) {
-  if (!owner.isTmem() || !reuser.isTmem() || owner.pieceTable.members.size() != 1 ||
-      reuser.pieceTable.members.size() != 1)
-    return false;
-  const Member &ownerMember = owner.pieceTable.members.front();
-  const Member &reuserMember = reuser.pieceTable.members.front();
-  unsigned ownerWidth = ownerMember.type.getElementTypeBitWidth();
-  unsigned reuserWidth = reuserMember.type.getElementTypeBitWidth();
-  if (ownerWidth != reuserWidth && ownerWidth != 2 * reuserWidth)
-    return false;
-  int64_t ownerSpan = ownerMember.extent * owner.numCopies;
-  int64_t reuserSpan = reuserMember.extent * reuser.numCopies;
-  return reuserMember.offset >= ownerMember.offset &&
-         reuserMember.offset + reuserSpan <= ownerMember.offset + ownerSpan;
-}
 inline constexpr StringLiteral kBufferIdAttrName = "buffer.id";
 inline constexpr StringLiteral kBufferOffsetAttrName = "buffer.offset";
 inline constexpr StringLiteral kBufferCopyAttrName = "buffer.copy";

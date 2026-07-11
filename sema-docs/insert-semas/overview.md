@@ -132,8 +132,8 @@ another placement policy later.
 ## Core objects
 
 - **GroupDag**: one logical synchronization group, normally keyed by memory
-  kind and group id. Circular local and mixed-depth TMEM rules may split one
-  physical `buffer.id` into several logical groups.
+  kind and group id. Circular local rules may split one physical `buffer.id`
+  into several logical groups.
 - **Member**: one allocation in the group. Members may overlap in physical
   address space.
 - **PieceId**: one disjoint interval induced by all member endpoints. A

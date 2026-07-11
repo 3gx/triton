@@ -93,15 +93,15 @@ Member
   circularStart buffer.start, or zero
 ```
 
-Grouping has three special cases:
+Grouping has three relevant rules:
 
 - A circular local allocation must have `buffer.id`, `buffer.copy`, and
   `buffer.start`, and must not have `buffer.offset`. Each circular allocation
   gets its own logical group even when another circular group has the same
   physical `buffer.id`; physical sharing is validated later.
-- TMEM allocations with one `buffer.id` stay together unless every member has
-  `buffer.copy` and the values differ. In that mixed-depth case each member is
-  a separate logical group marked for possible physical aliasing.
+- TMEM allocations with one `buffer.id` must agree on every explicit
+  `buffer.copy`; conflicting depths are rejected rather than analyzed as
+  independent protocols over aliased storage.
 - Ordinary local allocations with one `buffer.id` remain one group.
 
 Keeping logical groups separate where necessary is important: synchronization
