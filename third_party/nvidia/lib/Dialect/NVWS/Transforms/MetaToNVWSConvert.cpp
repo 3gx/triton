@@ -47,6 +47,18 @@ static bool isNestedInWarpSpecializeLoop(Operation *op) {
 static FailureOr<SmallVector<int>> getNormalizedTaskIds(Operation *op) {
   auto taskIds = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id");
   if (!taskIds)
+    taskIds = op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName);
+  // A zero-operand scf.yield may be left unassigned by Meta task propagation.
+  // It has no value-specific ownership; it terminates its parent region and
+  // therefore inherits that region operation's complete task assignment.
+  if (!taskIds && isa<scf::YieldOp>(op)) {
+    Operation *parent = op->getParentOp();
+    taskIds = parent->getAttrOfType<DenseI32ArrayAttr>("async_task_id");
+    if (!taskIds)
+      taskIds =
+          parent->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName);
+  }
+  if (!taskIds)
     return failure();
 
   SmallVector<int> ids(taskIds.asArrayRef().begin(),
@@ -63,7 +75,8 @@ static LogicalResult materializePartition(Operation *op) {
   if (failed(ids))
     return op->emitError(
         "MetaToNVWSConvert requires a non-empty, non-negative "
-        "async_task_id assignment");
+        "async_task_id or ttg.partition assignment on ")
+           << op->getName() << " with attributes " << op->getAttrDictionary();
 
   auto expected = DenseI32ArrayAttr::get(op->getContext(), *ids);
   if (Attribute existing = op->getAttr(kPartitionAttrName)) {
@@ -74,6 +87,41 @@ static LogicalResult materializePartition(Operation *op) {
   }
   op->setAttr(kPartitionAttrName, expected);
   return success();
+}
+
+// Work around the tokenized representation produced by early Meta TMA-reduce
+// lowering. A direct async token cannot remain an SSA edge between two
+// physical NVWS partitions: PartitionLoops would clone the reduce into its
+// partition and the wait into another partition, leaving the wait with a use
+// of the erased original producer. Keep the drain wait with the operation that
+// issued the reduce.
+//
+// This should eventually be replaced by an `nvws.descriptor_reduce` operation,
+// analogous to `nvws.descriptor_load`, so the NVWS pipeline can retain the
+// descriptor-level operation through partitioning and lower it afterward
+// without introducing a cross-partition async token.
+static LogicalResult coLocateDirectTmaReduceWaits(FuncOp func) {
+  LogicalResult result = success();
+  func.walk([&](TMAStoreTokenWaitOp wait) {
+    if (failed(result))
+      return;
+    auto reduce = wait.getToken().getDefiningOp<AsyncTMAReduceOp>();
+    if (!reduce)
+      return;
+    FailureOr<SmallVector<int>> ids = getNormalizedTaskIds(reduce);
+    if (failed(ids)) {
+      result = reduce.emitError(
+          "MetaToNVWSConvert cannot determine ownership of the direct "
+          "async_tma_reduce token producer");
+      return;
+    }
+    auto ownership = DenseI32ArrayAttr::get(func.getContext(), *ids);
+    // Set both forms so this is idempotent across the early ownership
+    // conversion and the post-planner conversion.
+    wait->setAttr("async_task_id", ownership);
+    wait->setAttr(kPartitionAttrName, ownership);
+  });
+  return result;
 }
 
 static void insertAll(SetVector<int> &dst, const SetVector<int> &src) {
@@ -193,6 +241,13 @@ inferResultPartition(Operation *op, unsigned resultIndex,
 static LogicalResult materializePartitionOutputs(
     Operation *op, DenseSet<Operation *> &consumedExternalTaskIds) {
   if (!isa<scf::ForOp, scf::IfOp, ReduceOp>(op) || op->getNumResults() == 0)
+    return success();
+  // A second conversion after NVWSInsertAllocas and memory planning must retain
+  // the ownership policy established by the first conversion. Allocation
+  // materialization rewrites values but does not change which partitions own
+  // region results, and re-inferring from the rewritten access graph can lose
+  // the original yielded-producer association.
+  if (op->hasAttr(kPartitionOutputsAttrName))
     return success();
 
   SmallVector<SetVector<int>> outputs;
@@ -681,6 +736,9 @@ static LogicalResult convertFunc(FuncOp func) {
       return loop.emitError(
           "MetaToNVWSConvert requires the Meta warp-specialize tag");
   }
+
+  if (failed(coLocateDirectTmaReduceWaits(func)))
+    return failure();
 
   if (failed(completePlannedLocalAllocTaskIds(func)))
     return failure();
