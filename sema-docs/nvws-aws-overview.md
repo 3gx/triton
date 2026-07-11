@@ -65,7 +65,7 @@ document uses these terms with exactly these meanings.
   together with `loop.cluster`. It determines when an operation executes; it
   never selects a backing copy or mbarrier.
 - **Semaphore group**: the `nvws.semaphore.create` operations whose first
-  buffer operand is the same allocation (`getSemaGroups` in `LowerAref.cpp`).
+  buffer operand is the same allocation (`getSemaGroups` in `LowerSempahores.cpp`).
   A semaphore group shares one current buffer stage.
 - **Channel**: a private memory-planner record connecting an allocation to its
   producer and consumers. It bounds the allocation's lifetime; it is not a
@@ -153,7 +153,7 @@ modulo schedule                       [only with TRITON_USE_MODULO_SCHEDULE]
 -> software pipeline
 ```
 
-`LowerSemaphore`'s first step (`multiBufferSemaphore` in `LowerAref.cpp`)
+`LowerSemaphore`'s first step (`multiBufferSemaphore` in `LowerSempahores.cpp`)
 widens backings the planner did not size: a semaphore group whose release is
 fed by a TMA load and whose SMEM backings carry no `buffer.copy` is rewritten
 from one copy to the effective number of copies (`tt.num_stages` on the owning

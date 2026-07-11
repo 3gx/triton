@@ -1,6 +1,6 @@
 add_triton_library(NVWSTransforms
   AssignStagePhase.cpp
-  LowerAref.cpp
+  LowerSempahores.cpp
   LowerWarpGroup.cpp
   InsertAllocas.cpp
   MetaToNVWSConvert.cpp

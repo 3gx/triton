@@ -641,6 +641,6 @@ loop is removed, including invariants this pass did not introduce.
   `validateCircularPartitionSlotOwnership` and
   `provePartitionDisjointSlotOwnership`.
 - Barrier lowering:
-  [`LowerAref.cpp`](../third_party/nvidia/lib/Dialect/NVWS/Transforms/LowerAref.cpp),
+  [`LowerSempahores.cpp`](../third_party/nvidia/lib/Dialect/NVWS/Transforms/LowerSempahores.cpp),
   `NVWSLowerSemaphore::runOnOperation`, `rewriteAcquire`, `rewriteRelease`, and
   `rewriteBuffer`.
