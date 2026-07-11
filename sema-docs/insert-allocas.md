@@ -3,10 +3,9 @@
 ## Purpose
 
 `NVWSInsertAllocas` converts cross-partition SSA communication into explicit
-mutable SMEM or TMEM accesses. It inserts no synchronization. On Meta-NVWS,
-`MemoryPlanner` uses these accesses to assign storage and reuse before
-`InsertSemas` derives synchronization from the resulting access topology.
-Terms are defined in the
+mutable SMEM or TMEM accesses on the default NVWS path. It inserts no
+synchronization. Meta-NVWS instead consumes canonical Meta buffer-allocation
+output through `MetaToNVWSConvert`. Terms are defined in the
 [NVWS-AWS terminology](nvws-aws-overview.md#terminology).
 
 ## Input contract
@@ -58,27 +57,13 @@ carries none of these annotations.
 The output contains explicit producer writes and consumer reads over mutable
 allocations. There are no `nvws.semaphore.*` operations, and the buffers keep
 their direct shape — no extra leading dimension for buffered copies is added
-(depth is decided later). On the Meta-NVWS path, `MemoryPlanner` subsequently
-adds physical reuse and depth metadata; `InsertSemas` then observes the
-resulting memory accesses.
+(depth is decided later). `InsertSemas` then observes the resulting memory
+accesses.
 
-## Differences from InsertSemaphore
+## Separation from synchronization
 
-The pass was adapted from
-[`InsertSemaphore.cpp`](../third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemaphore.cpp)
-(imported in [`PR10121`](https://github.com/triton-lang/triton/pull/10121)).
-That pass is still registered as `nvws-insert-semaphore` and covered by its
-own lit tests; it is not part of the AWS pipeline.
-
-| InsertSemaphore | Current InsertAllocas |
-|---|---|
-| Creates empty/full semaphore pairs while creating the buffer | Creates only the buffer and accesses |
-| Places producer/consumer acquire, buffer, and release operations eagerly | Places data accesses but leaves semaphore ownership and synchronization placement to `InsertSemas` |
-| Adds a leading buffered-copy dimension immediately | Keeps the direct mutable memdesc shape |
-| Rejects regular-load/cp.async-shaped values | Represents a regular load with an explicit store into SMEM |
-
-The split is structural: allocation answers *where data is communicated*;
-`InsertSemas` answers *who owns it and when ownership moves*.
+Allocation answers *where data is communicated*. `InsertSemas` independently
+derives *who owns it and when ownership moves*.
 
 ## Code map
 

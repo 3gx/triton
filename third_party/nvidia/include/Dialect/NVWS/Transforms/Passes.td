@@ -91,23 +91,6 @@ def NVWSLowerSemaphore : Pass<"nvws-lower-semaphore", "mlir::ModuleOp"> {
   ];
 }
 
-def NVWSInsertSemaphore: Pass<"nvws-insert-semaphore", "mlir::ModuleOp"> {
-  let summary = "Insert semaphore ops between producer and consumer partitions.";
-
-  let description = [{
-    Inserts synchronization directly as semaphore operations for SMEM
-    producer/consumer communication.
-  }];
-
-  let dependentDialects = [
-    "mlir::triton::nvws::NVWSDialect",
-    "mlir::triton::TritonDialect",
-    "mlir::triton::gpu::TritonGPUDialect",
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
-  ];
-
-}
-
 def NVWSInsertAllocas: Pass<"nvws-insert-allocas", "mlir::ModuleOp"> {
   // See sema-docs/insert-allocas.md.
   let summary = "Materialize NVWS communication allocations and accesses.";
@@ -283,64 +266,6 @@ def NVWSHoistTmemStore: Pass<"nvws-hoist-tmem-store", "mlir::ModuleOp"> {
   ];
 }
 
-def NVWSWSDataPartition : Pass<"nvws-ws-data-partition", "mlir::ModuleOp"> {
-  // See sema-docs/meta-ports.md#data-partition.
-  let summary = "NVWS warp specialization data partition";
-
-  let description = [{
-    Partitions operations into multiple suboperations that operate on smaller
-    data shapes before warp-specialization partition scheduling.
-  }];
-
-  let dependentDialects = [
-    "mlir::triton::TritonDialect",
-    "mlir::triton::gpu::TritonGPUDialect",
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
-  ];
-
-  let options = [
-    Option<"numWarpGroups", "num-warp-groups",
-           "int32_t", /*default*/"0",
-           "number of warp groups for warp specialization">
-  ];
-}
-
-def NVWSPartitionSchedulingMeta
-    : Pass<"nvws-partition-scheduling-meta", "mlir::triton::FuncOp"> {
-  // See sema-docs/meta-ports.md#partition-scheduling.
-  let summary = "NVWS Meta warp specialization partitioning pass";
-
-  let description = [{
-    Meta-style partition scheduler for NVWS. The pass is transactional at
-    triton::FuncOp granularity: failure leaves the function IR unchanged.
-  }];
-
-  let dependentDialects = [
-    "mlir::triton::TritonDialect",
-    "mlir::triton::gpu::TritonGPUDialect",
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
-  ];
-
-  let options = [
-    Option<"mergeEpilogue", "merge-epilogue",
-           "bool", /*default*/"false",
-           "If true, merge epilogue ops into the correction/reduction partition "
-           "(or computation partition if neither exists)">,
-    Option<"mergeEpilogueToComputation", "merge-epilogue-to-computation",
-           "bool", /*default*/"false",
-           "If true, merge epilogue ops directly into computation partitions">,
-    Option<"mergeCorrection", "merge-correction",
-           "bool", /*default*/"false",
-           "If true, merge correction ops into computation partitions">,
-    Option<"mergeReduction", "merge-reduction",
-           "bool", /*default*/"false",
-           "If true, merge reduction ops into computation partitions">,
-    Option<"separateEpilogueStore", "separate-epilogue-store",
-           "bool", /*default*/"false",
-           "If true, place epilogue store ops in a dedicated 1-warp partition">
-  ];
-}
-
 def NVWSStripPartitionAttrsOutsideWS
     : Pass<"nvws-strip-partition-attrs-outside-ws", "mlir::triton::FuncOp"> {
   let summary = "Strip partition attrs outside tt.warp_specialize loops.";
@@ -354,36 +279,6 @@ def NVWSStripPartitionAttrsOutsideWS
   let dependentDialects = [
     "mlir::triton::TritonDialect",
     "mlir::triton::gpu::TritonGPUDialect"
-  ];
-}
-
-def NVWSMemoryPlanner : Pass<"nvws-memory-planner", "mlir::ModuleOp"> {
-  // See sema-docs/meta-ports.md#memory-planning.
-  let summary = "NVWS SMEM/TMEM memory planner";
-
-  let description = [{
-    Computes SMEM and TMEM memory planning metadata for NVWS.
-  }];
-
-  let dependentDialects = [
-    "mlir::triton::TritonDialect",
-    "mlir::triton::gpu::TritonGPUDialect",
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
-  ];
-
-  let options = [
-    Option<"numBuffers", "num-buffers",
-           "int32_t", /*default*/"0",
-           "number of warp-specialization buffers">,
-    Option<"smemAllocAlgo", "smem-alloc-algo",
-           "int32_t", /*default*/"0",
-           "SMEM allocation algorithm">,
-    Option<"smemBudget", "smem-budget",
-           "int32_t", /*default*/"0",
-           "SMEM allocation budget in bytes">,
-    Option<"smemCircularReuse", "smem-circular-reuse",
-           "bool", /*default*/"false",
-           "enable SMEM circular reuse in the WSBuffer planner">
   ];
 }
 

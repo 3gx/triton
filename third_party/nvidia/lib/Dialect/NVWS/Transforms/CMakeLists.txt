@@ -6,7 +6,6 @@ add_triton_library(NVWSTransforms
   MetaToNVWSConvert.cpp
   OrderBufferGroups.cpp
   PackEpilogueSlices.cpp
-  InsertSemaphore.cpp
   Utilities.cpp
   InsertTmemSemaphore.cpp
   InsertSemas.cpp
@@ -14,12 +13,7 @@ add_triton_library(NVWSTransforms
   InsertSemasEmitIR.cpp
   InsertSemasSyncDag.cpp
   HoistTmemStore.cpp
-  WSUtility.cpp
-  WSDataPartition.cpp
-  PartitionSchedulingMeta.cpp
   StripPartitionAttrsOutsideWS.cpp
-  MemoryPlanner.cpp
-  MemoryPlannerNVWSAdapter.cpp
 
   DEPENDS
   NVWSTransformsIncGen

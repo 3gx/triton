@@ -194,16 +194,12 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
 }
 
 void init_triton_nvidia_passes_nvws(py::module &&m) {
-  ADD_PASS_OPTION_WRAPPER_1("add_data_partitioning",
-                            mlir::triton::createNVWSWSDataPartition, int32_t);
   ADD_PASS_WRAPPER_0("add_lower_warp_group",
                      mlir::triton::createNVWSLowerWarpGroup);
   ADD_PASS_WRAPPER_0("add_assign_stage_phase",
                      mlir::triton::createNVWSAssignStagePhase);
   ADD_PASS_WRAPPER_0("add_lower_semaphore",
                      mlir::triton::createNVWSLowerSemaphore);
-  ADD_PASS_WRAPPER_0("add_insert_semaphore",
-                     mlir::triton::createNVWSInsertSemaphore);
   ADD_PASS_WRAPPER_0("add_insert_tmem_semaphore",
                      mlir::triton::createNVWSInsertTmemSemaphore);
   m.def("add_strip_partition_attrs_outside_ws", [](mlir::PassManager &pm) {

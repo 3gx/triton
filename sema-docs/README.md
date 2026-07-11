@@ -9,10 +9,9 @@ The documents describe algorithms and contracts. Source is authoritative.
 ## Reading order
 
 1. [NVWS-AWS pipeline and terminology](nvws-aws-overview.md)
-2. [Meta ports](meta-ports.md)
-3. [InsertAllocas](insert-allocas.md)
-4. [InsertSemas overview](insert-semas/overview.md)
-5. [ACCESS-DAG](insert-semas/access-dag.md)
-6. [SYNC-DAG](insert-semas/sync-dag.md)
-7. [EMIT-IR](insert-semas/emit-ir.md)
-8. [AssignStagePhase and LowerSemaphore](assign-stage-phase-and-lower-semaphores.md)
+2. [InsertAllocas](insert-allocas.md)
+3. [InsertSemas overview](insert-semas/overview.md)
+4. [ACCESS-DAG](insert-semas/access-dag.md)
+5. [SYNC-DAG](insert-semas/sync-dag.md)
+6. [EMIT-IR](insert-semas/emit-ir.md)
+7. [AssignStagePhase and LowerSemaphore](assign-stage-phase-and-lower-semaphores.md)

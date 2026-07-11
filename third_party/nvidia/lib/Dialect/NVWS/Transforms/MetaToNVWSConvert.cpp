@@ -611,6 +611,62 @@ static LogicalResult translateBufferPlan(FuncOp func) {
   return realizeReuseTargets(func);
 }
 
+// Meta buffer allocation rewrites a sourceful local_alloc into a source-free
+// local_alloc plus local_store.  The store keeps the task assignment, while
+// the newly materialized allocation does not.  Restore that mechanical
+// association for that exact one-store representation.
+static LogicalResult completePlannedLocalAllocTaskIds(FuncOp func) {
+  LogicalResult result = success();
+  func.walk([&](LocalAllocOp alloc) {
+    if (failed(result) || !isNestedInWarpSpecializeLoop(alloc) ||
+        alloc.getSrc() || succeeded(getNormalizedTaskIds(alloc)))
+      return;
+
+    std::optional<SmallVector<int>> producerIds;
+    for (Operation *user : alloc->getUsers()) {
+      auto store = dyn_cast<LocalStoreOp>(user);
+      if (!store || store.getDst() != alloc.getResult())
+        continue;
+      FailureOr<SmallVector<int>> storeIds = getNormalizedTaskIds(store);
+      if (failed(storeIds))
+        continue;
+      if (producerIds) {
+        result = alloc.emitError(
+            "MetaToNVWSConvert requires exactly one assigned producer store "
+            "for a planned local_alloc");
+        return;
+      }
+      producerIds = *storeIds;
+    }
+
+    if (producerIds)
+      alloc->setAttr("async_task_id",
+                     DenseI32ArrayAttr::get(func.getContext(), *producerIds));
+  });
+  return result;
+}
+
+// A source-free TMEM allocation is likewise only a storage handle.  If Meta
+// leaves it unassigned inside a WS loop, use the first assigned direct store
+// as the deterministic bookkeeping partition.
+static void completePlannedTmemAllocTaskIds(FuncOp func) {
+  DenseMap<Operation *, SmallVector<int>> storeTaskIds;
+  func.walk<WalkOrder::PreOrder>([&](TMEMStoreOp store) {
+    auto alloc = store.getDst().getDefiningOp<TMEMAllocOp>();
+    if (!alloc || alloc.getSrc() || !isNestedInWarpSpecializeLoop(alloc) ||
+        succeeded(getNormalizedTaskIds(alloc)) ||
+        storeTaskIds.contains(alloc))
+      return;
+    FailureOr<SmallVector<int>> ids = getNormalizedTaskIds(store);
+    if (succeeded(ids))
+      storeTaskIds.try_emplace(alloc, *ids);
+  });
+
+  for (auto &[op, ids] : storeTaskIds)
+    op->setAttr("async_task_id",
+                DenseI32ArrayAttr::get(func.getContext(), ids));
+}
+
 static LogicalResult convertFunc(FuncOp func) {
   SmallVector<scf::ForOp> wsLoops;
   func.walk([&](scf::ForOp loop) {
@@ -625,6 +681,10 @@ static LogicalResult convertFunc(FuncOp func) {
       return loop.emitError(
           "MetaToNVWSConvert requires the Meta warp-specialize tag");
   }
+
+  if (failed(completePlannedLocalAllocTaskIds(func)))
+    return failure();
+  completePlannedTmemAllocTaskIds(func);
 
   WalkResult partitionResult = func.walk([&](Operation *op) {
     if (!isWarpSpecializeLoop(op) && !isNestedInWarpSpecializeLoop(op)) {

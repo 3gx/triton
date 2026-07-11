@@ -8,11 +8,10 @@ are selected.
 
 | Step | Default NVWS | Meta-NVWS (`TRITON_NVWS_USE_META=1`) |
 |---|---|---|
-| Data partition | Hopper `WSDataPartition` pass | NVWS port of Meta `WSDataPartition` |
+| Data partition | Canonical `WSDataPartition` | Canonical `WSDataPartition` |
 | Loop pre-schedule | Standard latency schedule (`scheduleKeyOpsUpstream`) | Meta-aware latency schedule (`scheduleKeyOpsMetaWS`) |
-| Partition schedule inside AWS | `TritonGPUPartitionScheduling` | NVWS port of `PartitionSchedulingMeta` |
-| NVWS memory planner | Not run | NVWS port of Meta `WSMemoryPlanner` |
-| Buffer materialization | `NVWSInsertAllocas` | `NVWSInsertAllocas` |
+| Planning inside AWS | `TritonGPUPartitionScheduling`, then `NVWSInsertAllocas` | Canonical Meta partition scheduling, task propagation, buffer allocation, and memory planning |
+| Representation conversion | None | `MetaToNVWSConvert` maps completed Meta IR to NVWS ownership and access representation |
 | Synchronization | `NVWSInsertSemas` | `NVWSInsertSemas` |
 | Barrier lowering | `NVWSLowerSemaphore` | `NVWSLowerSemaphore` |
 
@@ -92,8 +91,7 @@ stage; `loop.stage` means the pipeline stage.
 
 Consider a two-copy circular backing shared by two allocations A and B — a
 planner-selected reuse group, where `buffer.circular` marks the group and
-`buffer.start` is each allocation's starting copy (see
-[meta-ports](meta-ports.md#output-representation)) — with `buffer.start = 0`
+`buffer.start` is each allocation's starting copy — with `buffer.start = 0`
 for A and 1 for B. The current buffer stage starts one less than the number of
 backing copies, which is 1 here. Every partition uses this same shared value:
 
@@ -113,7 +111,7 @@ and for exact-alias handoffs across multiple copies in both SMEM and TMEM.
 
 | Meta AutoWS | NVWS |
 |---|---|
-| `Channel` (producer-to-consumer dependency record) | channel inside the ported memory planner (Meta-NVWS only) |
+| `Channel` (producer-to-consumer dependency record) | channel inside the canonical Meta memory planner (Meta-NVWS only) |
 | token with `producer_acquire` / `producer_commit` / `consumer_wait` / `consumer_release` | one `nvws.semaphore` per ownership transfer; `acquire` returns a token, `release` consumes it |
 | `bufferFull` / `bufferEmpty` mbarrier arrays | one mbarrier per buffer stage of each semaphore, allocated by `LowerSemaphore` |
 | `accumCnt`, `bufferIdx = accumCnt % numBuffers` | buffer stage, tracked by `AssignStagePhase` |
@@ -130,12 +128,18 @@ The relevant Blackwell pipeline is:
 modulo schedule                       [only with TRITON_USE_MODULO_SCHEDULE]
 -> data partition
 -> assign latencies and schedule loops [skipped with TRITON_USE_MODULO_SCHEDULE]
+-> TMA-store lowering and SinkBroadcast [Meta-NVWS only]
 -> automatic warp specialization
-     -> partition scheduling             [default / Meta-NVWS variants]
-     -> strip partition metadata outside WS loops [Meta-NVWS only]
-     -> hoist loop-invariant TMEM stores
-     -> InsertAllocas
-     -> MemoryPlanner                    [Meta-NVWS only]
+     default NVWS:
+       -> TritonGPU partition scheduling
+       -> hoist loop-invariant TMEM stores
+       -> InsertAllocas
+     Meta-NVWS:
+       -> canonical PartitionSchedulingMeta and TaskIdPropagation
+       -> canonical BufferAllocation, TMEM-store hoisting, and MemoryPlanner
+       -> annotate and validate TMA-store waits
+       -> MetaToNVWSConvert
+       -> OrderBufferGroups
      -> InsertSemas
      -> LowerSemaphore
           -> give TMA-load-fed SMEM backings num-stages copies
@@ -175,10 +179,17 @@ concrete partitions, barriers, multi-buffered descriptors, and the finalized
 partition schedule
   ttg.partition, ttg.partition.outputs, WS tags, loop schedule
 
-InsertAllocas
+InsertAllocas (default NVWS)
   explicit producer writes and consumer reads over mutable SMEM/TMEM buffers
 
-MemoryPlanner (Meta-NVWS)
+canonical Meta planning (Meta-NVWS)
+  async_task_id ownership and the final buffer.id/copy/offset plan
+
+MetaToNVWSConvert (Meta-NVWS)
+  ttg.partition, ttg.partition.outputs, WS tags, explicit mutable accesses,
+  and the translated physical buffer plan
+
+MemoryPlanner output (Meta-NVWS)
   buffer.id/copy/offset and optional circular metadata; allocations sharing
   a buffer.id always connect through shared members into one component
   (reusers are stacked within their owner's columns) — InsertSemas asserts
@@ -207,7 +218,7 @@ LowerSemaphore
 
 ## Code map
 
-- Backend selection: [`compiler.py`](../third_party/nvidia/backend/compiler.py),
+- Backend selection: [`compiler.py`](../python/triton/backends/nvidia/compiler.py),
   `make_ttgir`, Blackwell branch.
 - AWS orchestration:
   [`AutomaticWarpSpecialization.cpp`](../lib/Dialect/TritonGPU/Transforms/WarpSpecialization/AutomaticWarpSpecialization.cpp),
