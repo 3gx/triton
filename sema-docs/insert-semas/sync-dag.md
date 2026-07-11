@@ -1141,6 +1141,7 @@ piece. The exact edge inventory is:
 
 ```text
 DAG node             synchronization edge ending here
+ENTER(i) {0}         none
 A: W async m0 {0}    none
 B: W sync m1 {0}     none
 C: R m1 {1}          q1: B {0} -> C {1}       [none,tma_load]
@@ -1153,73 +1154,71 @@ completion list also includes A's TMA load. `D` replaces C as owner `{1}`'s
 latest access, so `q2` starts at D. The synchronization-edge DAG is:
 
 ```text
-                         A: W async m0 {0}
-                                  | walk
-                                  v
-                  B: W sync m1 {0} [none,tma_load]
-                                  | q1
-                                  v
-                         C: R m1 {1}
-                                  | walk
-                                  v
-                         D: R m0 {1}
-                                  | q2
-                                  v
-                             EXIT(i) {0}
+                                                              ENTER(i) {0}
+                                                                    | walk
+                                                                    v
+                                                          A: W async m0(i) {0}
+                                                                    | walk
+                                                                    v
+                                                           B: W sync m1(i) {0}
+                        +-------------------------------------------+
+                     q1 |                                           | walk
+                        v                                           v
+                 C: R m1(i) {1}                                     |
+                        | walk                                      |
+                        v                                           |
+                 D: R m0(i) {1}                                     |
+                     q2 |                                           |
+                        +-------------------------------------------+
+                                                                    v
+                                                               EXIT(i) {0}
 ```
 
 The semaphore assignment is:
 
 ```text
 edge / role    semaphore    release owner    pending_count    initial state
-entry,q2       EMPTY        {1}              1                released
+entry          EMPTY        -                1                released for owner {0}
+q2             EMPTY        {1}              1                same semaphore
 q1             FULL         {0}              2                blocked
 ```
 
-One release waits for two completions, so `FULL` has `pending_count=2`:
+One release waits for two completions, so `FULL` has `pending_count=2`.
+Owner `{0}` continues directly toward `EXIT` while owner `{1}` executes the
+reader chain:
 
 ```text
-                      producer = a EMPTY(i) {0}
-                                      producer |
-                                               v
-                           A: W async m0 {0}
-                                      producer |
-                                               v
-                           B: W sync  m1 {0}
-                                      producer |
-                                               v
-       r FULL, producer [none,tma_load] {0} q1
-                                      FULL(2) |
-                                              v
-                              consumer = a FULL(2) {1}
-                                           consumer |
-                                                    v
-                                      C: R m1 {1}
-                                           consumer |
-                                                    v
-                                      D: R m0 {1}
-                                           consumer |
-                                                    v
-                         r EMPTY, consumer [none] {1} q2
-```
-
-That `EMPTY` release supplies the first write of the next iteration. The
-semaphore path bypasses the loop boundary; `EXIT` and `ENTER` show control
-flow only:
-
-```text
-r EMPTY, consumer(i) {1} q2 ---------------- EMPTY ----------------+
-                                                                    |
-EXIT(i) {0}                                                         |
-     | next iteration                                               |
-     v                                                              |
-ENTER(i+1) {0}                                                      |
-     | walk                                                         |
-     v                                                              |
-next = a EMPTY(i+1) {0} <-------------------------------------------+
-     next |
-          v
-A: W async m0(i+1) [next] {0}
+                                                              ENTER(i) {0}
+                                                                    | walk
+                                                                    v
+                                                     producer = acquire EMPTY(i) {0}
+                                                           producer |
+                                                                    v
+                                                   A: W async m0(i) [producer] {0}
+                                                                    | walk
+                                                                    v
+                                                    B: W sync m1(i) [producer] {0}
+                                                                    | walk
+                                                                    v
+                                              release FULL, producer [none,tma_load] {0} q1
+                        +-------------------------------------------+
+                FULL(2) |                                           | walk
+                        v                                           v
+         consumer = acquire FULL(2) {1}                        EXIT(i) {0}
+               consumer |                                           | next iteration
+                        v                                           v
+             C: R m1(i) [consumer] {1}                       ENTER(i+1) {0}
+                        | walk                                      | walk
+                        v                                           v
+             D: R m0(i) [consumer] {1}                              |
+                        | walk                                      |
+                        v                                           |
+      release EMPTY, consumer [none] {1} q2                         |
+                  EMPTY |                                           |
+                        +---------------------------> next = acquire EMPTY(i+1) {0}
+                                                               next |
+                                                                    v
+                                                 A: W async m0(i+1) [next] {0}
 ```
 
 The `FULL` semaphore therefore has `pending_count=2`. It waits once for the
