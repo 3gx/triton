@@ -61,68 +61,21 @@
 The document uses the following terms throughout:
 
 ```text
-IR              compiler operations read and changed by the pass
-DAG             nodes joined by one-way arrows
-ACCESS-DAG      input description of buffer reads, writes, loops, and branches
-SYNC-DAG        acquire, release, semaphore, and token plan built here
-EMIT-IR         step that creates IR from the completed SYNC-DAG plan
-
-WS loop         short for warp-specialized loop
-partition       one independently scheduled part of a WS loop
-WS tag          identifies which WS loop owns a partition
-owner           (partition, WS tag)
-root            code outside a partition; root has no owner
-
-SMEM / TMEM     shared memory / tensor memory
-buffer          storage in SMEM or TMEM that operations read or write
-TMA             Tensor Memory Accelerator operation
-MMA             matrix-multiply operation
-WGMMA           warp-group matrix-multiply operation
-accumulator     TMEM buffer updated by an MMA
-async           work that finishes after the operation that starts it
-
-group           buffers with the same buffer.id that are analyzed together
-buffer.id       input number that says which buffer names share storage
-member          one allocation or view in a group
-piece           one non-overlapping part of a group
-buffer copy     one physical SMEM or TMEM storage copy
-semaphore copy  one physical copy of a semaphore
-alias           another name or view for the same physical buffer
-circular        copies selected by a loop index that wraps around
-buffer.start    input copy number for the first write of a circular member
-meta partitioning
-                alternate partitioning mode; it disables automatic TMEM copies
-
-region          one loop body or one branch of an if
-ENTER / EXIT    start and end nodes used to describe one region path
-boundary owner  owner used for a piece at ENTER and EXIT
-region summary  one parent-level node describing a nested region's buffer use
-
-edge A -> B     B must wait for A
-semaphore       records releases and wakes matching acquires
-acquire         waits on a semaphore
-token           value returned by an acquire and used by buffers and releases
-release         uses a token to signal a semaphore
-arrival         one unit added to a semaphore when release work finishes
-pending_count   number of arrivals an acquire waits for
-arrive_count    arrivals contributed by each completion on one release
-completion      work a release waits for, such as a TMA load or MMA
-
-initially released
-                the first acquire may finish before any release runs
-blocked         the first acquire waits for a release
-iter_arg        value carried from one loop iteration to the next
-zero-trip loop  loop that runs no iterations
-iteration distance
-                number of loop iterations from a release to its acquire
-num-stages      pass setting used for in-flight semaphore copies
-pipelined loop  loop where work from different iterations overlaps
+group          allocations and views analyzed together, ordinarily one buffer.id
+backing        physical SMEM or TMEM storage used by the group
+m0, m1         members: allocation names or views in the group
+P0, P1         non-overlapping pieces of the group storage
+{0}, {1}       owners: partitions 0 and 1 with the enclosing loop's WS tag
+root           code with no partition owner
+source         latest write to the piece
+uses           latest access to the piece by each owner since that write
+token          value returned by an acquire and used by releases and semaphore.buffer
 ```
 
-An owner contains both a partition number and a WS tag. Two
-operations have the same owner only when both values match. Most diagrams show
-one loop at a time, so `{0}` abbreviates `(partition 0, the WS tag of that loop)`.
-Nested examples name the outer and inner loops when their tags differ.
+An owner contains both a partition number and a WS tag. Two operations have
+the same owner only when both values match. Most diagrams show one loop at a
+time, so `{0}` abbreviates `(partition 0, the WS tag of that loop)`. Nested
+examples name the outer and inner loops when their tags differ.
 
 The examples use this short form:
 
@@ -141,9 +94,6 @@ R m0 [t] {1}           the read uses the buffer selected by token t
 `a` and `r` are short for acquire and release. `[none]` means the release
 signals when it runs. `[tma_load]` means it waits for a TMA load. `[tc5mma]`
 means it waits for an MMA.
-
-`scf.for` is a loop. `iter_args` are values carried to the next iteration,
-and `yield` returns those values from the current iteration.
 
 The diagrams use three views:
 
@@ -164,27 +114,6 @@ POU          point of use: acquire immediately before the access that needs it
 FirstTouch   make the loop token available before entry and carry it through the loop
 Auto         try POU; if one loop cannot use it, rebuild that loop with FirstTouch
 ```
-
-Pipeline terms used later:
-
-```text
-stage         logical pipeline step of an operation
-cluster       order of operations within and across stages
-stage offset  which buffer or semaphore copy an operation uses
-```
-
-Every worked example names its test under `test/NVWS` except `@same_owner_nested`,
-`@doc_preserved_async_edge`, and `@doc_repeated_same_owner_sources`. Those
-three inputs were run through the pass but are not test cases. The DAG dump can
-be printed with:
-
-```text
-NVWS_INSERT_SEMA_DUMP_DAG=1 triton-opt input.mlir \
-  -allow-unregistered-dialect --nvws-insert-semas
-```
-
-The dump names semaphores `S0`, `S1`, and so on. Examples use names such as
-`EMPTY` and `FULL` to make their purpose easier to follow.
 
 ## Purpose
 
@@ -212,6 +141,19 @@ find where one partition must wait for another
 
 SYNC-DAG decides all waits, semaphores, and tokens before EMIT-IR starts.
 
+Every worked example names its test under `test/NVWS` except
+`@same_owner_nested`, `@doc_preserved_async_edge`, and
+`@doc_repeated_same_owner_sources`. Those three inputs were run through the
+pass but are not test cases. The DAG dump can be printed with:
+
+```text
+NVWS_INSERT_SEMA_DUMP_DAG=1 triton-opt input.mlir \
+  -allow-unregistered-dialect --nvws-insert-semas
+```
+
+The dump names semaphores `S0`, `S1`, and so on. Examples use names such as
+`EMPTY` and `FULL` to make their purpose easier to follow.
+
 ## From buffer accesses to synchronization edges
 
 The pass visits buffer accesses in program order. For each buffer piece it
@@ -221,17 +163,16 @@ access by each owner. It adds an edge whenever one owner must wait for another.
 ### What the pass remembers for each piece
 
 ```text
-source    node from which a new owner receives the current contents
-uses      latest read or write of those contents by each owner
+source    latest write to the piece
+uses      latest access to the piece by each owner since that write
 ```
 
 A read updates only that owner's entry in `uses`. It does not replace the
-source, so readers that can run separately still start from the same source. A write
-becomes the new source and removes the earlier entries from `uses`.
+source, so readers that can run separately still start from the same source.
+A write becomes the new source and removes the earlier entries from `uses`.
 
-Inside a nested loop or branch, `ENTER` stands for contents received from the
-parent. The child uses `ENTER` as its local source while the parent still
-remembers where the contents came from.
+Inside a nested loop or branch, the child DAG uses `ENTER` to represent the
+latest write from the parent. A write inside the child becomes the new source.
 
 ### Read and write rules
 
@@ -2564,14 +2505,21 @@ if no wait edges remain
 otherwise, if buffer.copy is specified
   use that many buffer copies
 
-otherwise, if this is a TMEM buffer, meta partitioning is off,
+otherwise, if this is a TMEM buffer in the normal NVWS pipeline
 and the two-copy checks pass
   use two buffer copies
 ```
 
-A TMEM buffer does not need an MMA user to receive two copies. Automatic
-two-copy selection is disabled when meta partitioning is used. When the
-buffer has an MMA user, it also stays single-copy if any of these are true:
+The NVWS Meta pipeline is selected by `TRITON_NVWS_USE_META=1`. Its memory
+planner runs before InsertSemas and writes `buffer.copy`. Automatic warp
+specialization then calls InsertSemas with `use-meta-partitioner=true`.
+InsertSemas still uses any `buffer.copy` value, but it does not guess two TMEM
+copies when that value is absent. A missing value therefore means one copy in
+this pipeline.
+
+In the normal NVWS pipeline, a synchronized TMEM buffer without `buffer.copy`
+can be given two copies automatically. It does not need an MMA user. When it
+does have an MMA user, it stays single-copy if any of these are true:
 
 - the MMA reads the old accumulator while writing the new value;
 - that MMA and loop do not support two accumulator copies;
