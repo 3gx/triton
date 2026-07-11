@@ -2648,7 +2648,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
           firstInBodyLoad = &op;
       } else if (isa<ttng::TMEMStoreOp>(&op) ||
                  (isa<ttng::MMAv5OpInterface>(&op) &&
-                  &op == mmaOp.getOperation())) {
+                  cast<ttng::MMAv5OpInterface>(&op).getAccumulator() ==
+                      tmemAllocOp.getResult())) {
         if (!firstInBodyStoreOrMma)
           firstInBodyStoreOrMma = &op;
       }
@@ -2698,7 +2699,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
       continue;
     handledUsers.insert(&op);
     if (auto mmaOpT = dyn_cast<ttng::MMAv5OpInterface>(&op)) {
-      if (&op == mmaOp.getOperation()) {
+      if (mmaOpT.getAccumulator() == tmemAllocOp.getResult()) {
         // This uses and defines D. Will be both producer and consumer.
         // If useAcc is false, the MMA doesn't read the accumulator - it
         // overwrites it completely. In this case, the MMA is the first
@@ -2737,7 +2738,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
           }
         }
         if (currentProds.empty()) {
-          mmaOp->emitError(
+          mmaOpT->emitError(
               "handleOperandD: no producer found for MMA operand D. "
               "Expected a tmem_store before the loop or use_acc=false.");
           return failure();
@@ -2746,7 +2747,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
         auto producerTaskIds = getAsyncTaskIds(currentProds.front());
         auto consumerIds = getAsyncTaskIds(&op);
         if (producerTaskIds.size() != 1) {
-          mmaOp->emitError(
+          mmaOpT->emitError(
               "handleOperandD: expected exactly one producer task ID, got ")
               << producerTaskIds.size();
           return failure();
@@ -2766,11 +2767,6 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
           currentProds.push_back(&op);
         }
       } else {
-        if (mmaOpT.getAccumulator() == tmemAllocOp.getResult()) {
-          mmaOp->emitError(
-              "handleOperandD: unexpected MMA using same TMEM as operand D");
-          return failure();
-        }
         // This uses tmem. mark as tmem.end = channel_id
         if (currentProds.empty()) {
           mmaOpT->emitError(
@@ -2894,7 +2890,11 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
         createChannelsForProducers(currentProds, producerTaskId, consumerIds,
                                    tmemAllocOp.getOperation(), user, channels);
       } else {
-        assert(false && "Unexpected Producer Found");
+        // Producer and consumer are in the same task (partition) -- no
+        // cross-partition channel is needed for this post-loop TMEM load.
+        // (Previously asserted; a same-partition post-loop accumulator load is
+        // legitimate under data partitioning where the epilogue is merged into
+        // the computation partition.)
       }
     }
   }

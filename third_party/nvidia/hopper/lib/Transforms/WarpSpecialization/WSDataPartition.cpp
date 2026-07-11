@@ -264,7 +264,7 @@ static bool needToSlice(Value v, unsigned dim, int size) {
   if (isa<AsyncTokenType>(v.getType()))
     return true;
   auto shape = getShape(v);
-  return shape.size() > dim && shape[dim] > size;
+  return shape.size() > dim && shape[dim] >= size;
 }
 
 static bool isDotOrMMAv5Op(Operation *op) {
@@ -301,6 +301,78 @@ static Value getDotPartitionRoot(Operation *op) {
   if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op))
     return mmaOp.getAccumulator();
   llvm_unreachable("expected dot or MMAv5 op");
+}
+
+// SSA value carrying the dot's output, for the "output is only consumed by an
+// atomic/reduce store" check that authorizes replicate-and-reduce partitioning
+// along the contraction (K) dim. A Hopper wgmma yields the result directly; an
+// MMAv5 accumulator lives in TMEM and is read back by a tmem_load, so return
+// that load's result (the value that flows to the reduce store). Returns null
+// if there is not exactly one such load (ambiguous -> don't replicate).
+static Value getDotOutputValue(Operation *op) {
+  if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op))
+    return dotOp.getD();
+  if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(op)) {
+    Value acc = mmaOp.getAccumulator();
+    ttng::TMEMLoadOp load;
+    for (Operation *user : acc.getUsers()) {
+      if (auto l = dyn_cast<ttng::TMEMLoadOp>(user)) {
+        if (load)
+          return {}; // more than one load of the accumulator -> ambiguous
+        load = l;
+      }
+    }
+    return load ? load.getResult() : Value{};
+  }
+  return {};
+}
+
+// Remap the TMEM buffer ids in a `tt.autows` channel-spec string so that a
+// reuse group formed by annotation (channels sharing a buffer id, e.g. HSTU
+// dpT/dq both "opndD,tmem,1,11") never spans two concurrently-live
+// data-partition warp groups -- which would make WSMemoryPlanner's
+// verifyReuseGroup reject the reuse (co-live members) and fall back to one
+// distinct TMEM column per buffer. A channel spec is
+// "opnd<A|B|D>,<smem|tmem>,<numBuffers>,<bufferId>"; only the tmem buffer id
+// (the field after the second comma following "tmem,") is remapped as `id *
+// numPartitions + offset`. This keeps ids equal within a group (reuse
+// preserved) and disjoint across groups. smem channels are left unchanged (SMEM
+// has its own planner/budget).
+static std::string remapAutowsTmemIds(StringRef s, unsigned numPartitions,
+                                      unsigned offset) {
+  std::string out;
+  out.reserve(s.size() + 16);
+  const StringRef tag = "tmem,";
+  size_t i = 0;
+  while (i < s.size()) {
+    if (s.substr(i, tag.size()) == tag) {
+      out += tag;
+      i += tag.size();
+      // Copy the numBuffers field and its trailing comma verbatim.
+      while (i < s.size() && s[i] != ',') {
+        out += s[i];
+        i++;
+      }
+      if (i < s.size()) {
+        out += s[i]; // the comma
+        i++;
+      }
+      // Parse and remap the bufferId digits.
+      size_t j = i;
+      while (j < s.size() && llvm::isDigit(s[j]))
+        j++;
+      if (j > i) {
+        unsigned id = 0;
+        s.substr(i, j - i).getAsInteger(10, id);
+        out += std::to_string(id * numPartitions + offset);
+        i = j;
+      }
+    } else {
+      out += s[i];
+      i++;
+    }
+  }
+  return out;
 }
 
 static Value getMMAv5ScaleOperand(Operation *op, unsigned operandIdx) {
@@ -477,6 +549,29 @@ static bool getBackwardSliceToPartition(Value v,
                   DataPartitionScheme::noOpPartitionDim))
             return false;
         }
+      }
+      // Capture a whole-accumulator initializing store (e.g. a pre-loop
+      // `tmem_store %cst, %acc` that zero-inits a use_acc MMA accumulator). Its
+      // result token seeds the loop-carried accumulator token; if the store is
+      // not partitioned along with the accumulator, the sliced accumulators
+      // reuse the original's loop token (blocking dead-arg elimination of the
+      // unsliced original) and are never initialized. The store writes the full
+      // accumulator, so its source is partitioned along the same dim.
+      for (Operation *user : tmemAllocOp.getResult().getUsers()) {
+        auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user);
+        if (!storeOp || storeOp.getDst() != tmemAllocOp.getResult())
+          continue;
+        if (!partitionScheme.ops.insert(storeOp)) {
+          if (!isControlFlowOp(storeOp) &&
+              partitionScheme.opPartitionDims[storeOp] != currentDim) {
+            return false;
+          }
+          continue;
+        }
+        partitionScheme.opPartitionDims[storeOp] = currentDim;
+        if (!getBackwardSliceToPartition(storeOp.getSrc(), partitionScheme,
+                                         currentDim))
+          return false;
       }
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
                isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
@@ -687,9 +782,14 @@ static bool getForwardSliceToPartition(Value v,
       Value opndB = getDotOperandB(depOp);
       if ((currentDim == 0 && v == opndB) || (currentDim == 1 && v == opndA)) {
         // It is fine to continue the partition if the dot output is immediately
-        // stored out via an atomic add, as the dot computes a partial result.
-        if (auto dotOp = dyn_cast<nvidia_gpu::WarpGroupDotOp>(depOp);
-            dotOp && onlyUsedByAtomicStore(dotOp.getD())) {
+        // stored out via an atomic/reduce add, as each partition then computes
+        // a partial result that the atomic add reduces in global memory.
+        // Handles both Hopper wgmma (SSA result) and Blackwell MMAv5 (TMEM
+        // accumulator read back by a tmem_load, e.g. HSTU reduce_dq: dqT = Kt @
+        // dST is a KV-contraction whose tmem_load -> trans ->
+        // descriptor_reduce(add)).
+        if (Value dotOut = getDotOutputValue(depOp);
+            dotOut && onlyUsedByAtomicStore(dotOut)) {
           partitionScheme.dotPartitionOperand[depOp] = v == opndA ? 0 : 1;
           // Duplicate the users of the dot output since the shape of the output
           // will not be changed
@@ -1070,6 +1170,18 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       newOp->setLoc(appendToNameLoc(
           newOp->getLoc(), "_" + std::to_string(offset), op->getContext()));
     }
+    // Give each partition group its own TMEM reuse-group buffer ids so an
+    // annotation-formed reuse group (shared buffer id) stays within one warp
+    // group instead of spanning both (co-live) groups after partitioning.
+    if (numOfPartitions > 1) {
+      if (auto autows = newOp->getAttrOfType<StringAttr>("tt.autows")) {
+        newOp->setAttr(
+            "tt.autows",
+            StringAttr::get(newOp->getContext(),
+                            remapAutowsTmemIds(autows.getValue(),
+                                               numOfPartitions, offset)));
+      }
+    }
     mappings.map(op, newOp);
     reverseMappings.map(newOp, op);
     // set result shape for all results
@@ -1135,6 +1247,36 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       }
       mappings.map(v, newV);
       reverseMappings.map(newV, v);
+    }
+    // An elementwise op requires every value-carrying tensor operand to share
+    // the (sliced) result type. A value shared with a differently-partitioned
+    // consumer keeps a single op-level partition dim, so for this consumer an
+    // operand may end up with a layout that differs from the result that
+    // cloneAndSetResultType produced (same shape/element type, different
+    // encoding) -- a `same type` verifier failure (e.g. a `tl.where` mask
+    // default whose zero splat is also a dot accumulator init, resliced with a
+    // renormalized linear layout). Coerce such operands to the result type with
+    // a local ConvertLayout, leaving the shared value intact for other
+    // consumers. Gated on matching shape+element type so operands not meant to
+    // equal the result (e.g. the i1 condition) are left alone.
+    if (dim != DataPartitionScheme::noOpPartitionDim &&
+        (newOp->hasTrait<OpTrait::Elementwise>() ||
+         isa<arith::SelectOp>(newOp))) {
+      if (auto resTy =
+              dyn_cast<RankedTensorType>(newOp->getResult(0).getType())) {
+        for (OpOperand &use : newOp->getOpOperands()) {
+          auto opndTy = dyn_cast<RankedTensorType>(use.get().getType());
+          if (!opndTy || opndTy == resTy ||
+              opndTy.getShape() != resTy.getShape() ||
+              opndTy.getElementType() != resTy.getElementType())
+            continue;
+          OpBuilder b(newOp);
+          auto cvt =
+              ConvertLayoutOp::create(b, newOp->getLoc(), resTy, use.get());
+          setAsyncTaskIds(cvt, sliceTaskIds);
+          use.set(cvt.getResult());
+        }
+      }
     }
     return newOp;
   };

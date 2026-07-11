@@ -1627,8 +1627,9 @@ void createTokenPost(
   });
 }
 
-static Value hoistLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
-                             Operation *oldAlloc) {
+static Value hoistLocalAlloc(
+    OpBuilderWithAsyncTaskIds &builder, Operation *oldAlloc,
+    std::function<void(Operation *, Operation *)> rewriteCallback = nullptr) {
 
   Type oldAllocType;
 
@@ -1678,7 +1679,8 @@ static Value hoistLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
           oldAlloc->getLoc(), localAlloc.getSrc(), newBuf);
       storeOp->moveBefore(oldAlloc);
     }
-    mlir::triton::replaceUsesAndPropagateType(builder, oldAlloc, newBuf);
+    mlir::triton::replaceUsesAndPropagateType(builder, oldAlloc, newBuf,
+                                              rewriteCallback);
   } else if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(oldAlloc)) {
     builder.setLoopScheduleInfoFromOp(tmemAlloc);
     if (tmemAlloc.getSrc() != nullptr) {
@@ -1956,6 +1958,28 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
     }
   }
 
+  // Map every channel by its current consumer op so that, when hoisting a
+  // producer alloc rewrites/erases a memdesc-view consumer (for example an
+  // outer-block memdesc_trans sharing a hoisted local_alloc with an inner-loop
+  // MMA), the affected channels can be repointed at the freshly created view
+  // instead of retaining a dangling operation pointer.
+  DenseMap<Operation *, SmallVector<Channel *>> consumerToChannels;
+  for (auto *c : channels)
+    consumerToChannels[c->getDstOp()].push_back(c);
+  auto remapConsumerChannels = [&](Operation *oldUser, Operation *newUser) {
+    auto it = consumerToChannels.find(oldUser);
+    if (it == consumerToChannels.end())
+      return;
+    // Copy before mutating the map because insertion may rehash it.
+    SmallVector<Channel *> affected = it->second;
+    consumerToChannels.erase(oldUser);
+    for (auto *c : affected) {
+      if (c->op == oldUser)
+        c->op = newUser;
+    }
+    consumerToChannels[newUser].append(affected.begin(), affected.end());
+  };
+
   mlir::DominanceInfo dom(funcOp);
   LDBG("channels in group");
   for (auto &[repChannel, channels] : channelsGroupedByProducers) {
@@ -2057,11 +2081,14 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
       } else
         llvm_unreachable("Unexpected srcOp type");
     } else if (channel->channelKind == DataChannelKind::SMEM) {
-      // Move LocalAlloc to the beginning of the function.
+      // Move LocalAlloc to the beginning of the function. Hoisting rewrites
+      // memdesc-view users onto the new buffer; repoint channels referencing
+      // those views so sibling channel groups do not retain dangling pointers.
       if (auto oldAlloc = dyn_cast<ttg::LocalAllocOp>(srcOp)) {
-        buffer = hoistLocalAlloc(builder, oldAlloc);
-      } else
+        buffer = hoistLocalAlloc(builder, oldAlloc, remapConsumerChannels);
+      } else {
         llvm_unreachable("Unexpected srcOp type");
+      }
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
       int cc = getNVIDIAComputeCapability(funcOp->getParentOfType<ModuleOp>());
