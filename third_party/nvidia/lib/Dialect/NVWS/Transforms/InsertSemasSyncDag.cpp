@@ -702,8 +702,11 @@ public:
     placeChain(g.root->children[0], placed);
     if (hadError)
       return failure();
-    if (remainingEdges.empty() && placed.supplies.empty())
+    if (remainingEdges.empty() && placed.supplies.empty()) {
+      if (failed(verifyRegionDrains()))
+        return failure();
       return formSemaphores();
+    }
     dumpSyncDagTree(g);
     if (!remainingEdges.empty()) {
       EdgeRec *missing = remainingEdges.front();
@@ -755,6 +758,13 @@ private:
     PendingSupplies supplies;
     Node *guard = nullptr;
     Watch watch;
+  };
+  struct ScopedRegionDrain {
+    Node *anchor = nullptr;
+    Node *channel = nullptr;
+    Owner owner;
+    Node *drain = nullptr;
+    SmallVector<Node *, 2> handoffs;
   };
   struct LoopSupply {
     EdgeRefs entry, closes;
@@ -911,6 +921,51 @@ private:
     channelParent[acquire] = acquire;
     return acquire;
   }
+  ScopedRegionDrain &getOrCreateRegionDrain(Node *region, const Owner &owner,
+                                             Node *channel, Node *guard) {
+    Node *anchor = guard && region->parent != guard->parent ? guard : region;
+    Node *channelClass = findChannel(channel);
+    for (ScopedRegionDrain &entry : regionDrains) {
+      if (entry.anchor != anchor || findChannel(entry.channel) != channelClass)
+        continue;
+      assert(sameOwner(entry.owner, owner) &&
+             "one region-drain channel must have one acquire owner");
+      entry.drain->count = std::max(entry.drain->count, channel->count);
+      return entry;
+    }
+
+    Node *drain = makeAcquire(anchor, owner, true);
+    drain->count = channel->count;
+    uniteChannels(drain, channel);
+    regionDrains.push_back({anchor, channel, owner, drain, {}});
+    return regionDrains.back();
+  }
+  LogicalResult verifyRegionDrains() {
+    for (auto [index, entry] : llvm::enumerate(regionDrains)) {
+      if (!entry.anchor || !entry.channel || !entry.drain ||
+          entry.drain->kind != Node::Acquire ||
+          entry.drain->scheduleAnchor != entry.anchor ||
+          entry.drain->parent != entry.anchor->parent ||
+          !sameOwner(entry.drain->owner, entry.owner) ||
+          findChannel(entry.drain) != findChannel(entry.channel))
+        return semaError(g.root->op)
+               << "scoped region drain has invalid completion provenance";
+      for (Node *handoff : entry.handoffs)
+        if (!handoff || handoff->kind != Node::Release ||
+            handoff->tokenSource != entry.drain ||
+            handoff->scheduleAnchor != entry.drain ||
+            handoff->parent != entry.anchor->parent)
+          return semaError(g.root->op)
+                 << "region handoff does not use its exact drain token";
+      for (const ScopedRegionDrain &other :
+           ArrayRef(regionDrains).drop_front(index + 1))
+        if (entry.anchor == other.anchor &&
+            findChannel(entry.channel) == findChannel(other.channel))
+          return semaError(g.root->op)
+                 << "one region completion has two drain acquire sites";
+    }
+    return success();
+  }
   Tokens::Token sourceToken(const EdgeRec &edge, const Tokens &tokens) const {
     switch (edge.src->kind) {
     case Node::Access:
@@ -1025,14 +1080,17 @@ private:
             uniteChannels(acquire, channel);
             acquire->count = std::max(acquire->count, channel->count);
           } else {
-            Node *drain = makeAcquire(edge.src, edge.srcOwner, true);
-            drain->count = channel->count;
-            uniteChannels(drain, channel);
-            tokens.record(edge.srcOwner, drain, drain, {AsyncOp::NONE});
+            ScopedRegionDrain &entry = getOrCreateRegionDrain(
+                edge.src, edge.srcOwner, channel, guard);
+            Node *drain = entry.drain;
+            if (!tokens.findProducer(drain))
+              tokens.record(edge.srcOwner, drain, drain, {AsyncOp::NONE});
             EdgeRec handoff{drain,         acquire,         edge.srcOwner,
                             edge.dstOwner, {AsyncOp::NONE}, {}};
-            supply.appendExecuted(
-                insertRelease(handoff, acquire, tokens, guard));
+            Node *release = insertRelease(handoff, acquire, tokens, drain);
+            if (release)
+              entry.handoffs.push_back(release);
+            supply.appendExecuted(release);
           }
           continue;
         }
@@ -1638,6 +1696,7 @@ private:
   DenseMap<Node *, EdgeRefs> atDst;
   DenseMap<Node *, Node *> channelParent;
   std::map<BoundaryKey, Node *> regionChannels;
+  SmallVector<ScopedRegionDrain, 4> regionDrains;
   DenseSet<Node *> seeded;
   DenseSet<Node *> exitSources;
   llvm::SmallSetVector<EdgeRec *, 8> remainingEdges;
