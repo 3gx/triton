@@ -1183,7 +1183,18 @@ private:
         uniteChannels(acquire, channel);
       }
     Tokens::Token *owned = tokens.find(node->owner);
-    if (!node->tokenSource && noIncoming && owned && reusable.contains(node)) {
+    bool hasEntryToken =
+        owned && owned->last->kind == Node::Enter &&
+        owned->last->parent == node->parent;
+    // A scoped drain is one exact completed phase. A later same-owner access
+    // with no remaining memory edge may consume another disjoint piece from
+    // that phase without acquiring the source channel again.
+    bool hasRegionDrainToken =
+        owned && llvm::any_of(regionDrains, [&](const ScopedRegionDrain &entry) {
+          return entry.drain == owned->producer;
+        });
+    if (!node->tokenSource && noIncoming && owned &&
+        (reusable.contains(node) || hasEntryToken || hasRegionDrainToken)) {
       node->tokenSource = owned->producer;
       owned->last = node;
       owned->payloads = {asyncPayloadOf(node->op)};
@@ -1210,6 +1221,31 @@ private:
   void placeIf(Node *region, Chain &chain, Node *next) {
     std::optional<Owner> boundaryOwner = uniformPieceOwner(region);
     Tokens incoming = chain.tokens;
+    // A continuation after the conditional may coexecute with a guarded
+    // handoff. Materialize their common region-completion token once at the
+    // conditional boundary so every path fans out from one exact drain.
+    if (boundaryOwner && next) {
+      Chain adopted = enterChain(Chain{}, incoming, region->children.front());
+      if (!adopted.tokens.findOpen(*boundaryOwner)) {
+        EdgeRefs boundary;
+        auto appendBoundaryEdges = [&](ArrayRef<EdgeRec *> refs) {
+          for (EdgeRec *edge : refs)
+            if (!edge->handled &&
+                sameOwner(edge->dstOwner, *boundaryOwner))
+              boundary.push_back(edge);
+        };
+        appendBoundaryEdges(atDst.lookup(region));
+        appendBoundaryEdges(chain.pending);
+        if (!boundary.empty()) {
+          Node *acquire = makeAcquire(region, *boundaryOwner);
+          Supply supply = collectSupply(acquire, boundary, incoming, chain);
+          applySupply(acquire, supply);
+          if (!hadError)
+            incoming.record(*boundaryOwner, acquire, acquire,
+                            {AsyncOp::NONE});
+        }
+      }
+    }
     Chain adopted = enterChain(Chain{}, incoming, region->children.front());
     const Tokens::Token *input =
         boundaryOwner ? adopted.tokens.findOpen(*boundaryOwner) : nullptr;
@@ -1217,6 +1253,11 @@ private:
       region->tokenSource = input->producer;
       region->producedTokenOwner.emplace(*boundaryOwner);
     }
+    // Both alternatives see the same incoming edges. Snapshot them before the
+    // first branch marks its alternative copy handled.
+    EdgeRefs branchPending = unhandledAt(region);
+    EdgeRefs inherited = unhandled(chain.pending);
+    branchPending.append(inherited.begin(), inherited.end());
     SmallVector<Chain, 2> branches;
     for (Node *child : region->children) {
       Chain branch = enterChain(chain, incoming, child);
@@ -1224,8 +1265,7 @@ private:
         branch.tokens.record(*boundaryOwner, region, child, input->payloads);
         setEntryToken(child, {*boundaryOwner, region, child, input->payloads});
       }
-      branch.pending = atDst.lookup(region);
-      branch.pending.append(chain.pending.begin(), chain.pending.end());
+      branch.pending = branchPending;
       branch.guard = child;
       placeChain(child, branch);
       branches.push_back(std::move(branch));
@@ -1245,6 +1285,8 @@ private:
     }
     if (allPass) {
       assert(input && "pass-through region must have an input token");
+      for (BranchExit &branch : exits)
+        replaceTokenSource(branch.chain.guard, region, input->producer);
       chain.tokens = adopted.tokens;
       chain.tokens.eraseProducer(input->producer);
       chain.tokens.record(owner, input->producer, region, input->payloads);
@@ -1264,6 +1306,16 @@ private:
         publish = exitSources.contains(region);
         discard = !publish;
       }
+    }
+    if (next && !publish) {
+      bool hasContinuation = llvm::any_of(exits, [&](const BranchExit &branch) {
+        return !branch.exitEdges.empty() ||
+               branch.chain.supplies.count(
+                   boundaryKey(branch.exit, owner));
+      });
+      // A branch that touches only dead/disjoint pieces owes no arrival to the
+      // following access; its owner-local completion may end in the branch.
+      discard = !hasContinuation;
     }
     if (allowCompletion && !complete) {
       complete = true;
@@ -1298,6 +1350,9 @@ private:
       return;
     }
     if (allowCompletion || discard) {
+      if (input)
+        for (BranchExit &branch : exits)
+          replaceTokenSource(branch.chain.guard, region, input->producer);
       region->tokenSource = nullptr;
       dropOwner(chain.tokens, std::move(incoming), owner);
       return;
