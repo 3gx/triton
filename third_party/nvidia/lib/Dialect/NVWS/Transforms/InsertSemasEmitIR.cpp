@@ -577,13 +577,7 @@ static LogicalResult emitPhysicalIR(EmitCtx &ctx, ArrayRef<GroupDag *> groups) {
     GroupDag &g = *group;
     if (g.backing.empty()) {
       if (g.mixedDepthPhysicalAlias) {
-        ArrayRef<GroupDag *> set = mixed[g.bufferId];
-        // A semaphore-owned backing cannot also have raw users from an
-        // inactive logical peer. Materialize the active peer independently
-        // when its mixed-depth partner needs no synchronization.
-        if (set.size() == 1)
-          materializeLogicalBacking(g);
-        else if (failed(materializeMixedDepth(set)))
+        if (failed(materializeMixedDepth(mixed[g.bufferId])))
           return failure();
       } else if (g.isCircular()) {
         if (failed(materializeCircular(circular[g.bufferId])))
