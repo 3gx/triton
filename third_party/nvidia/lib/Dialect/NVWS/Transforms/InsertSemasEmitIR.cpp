@@ -40,8 +40,9 @@ private:
   }
 
   StringRef semaName(const Node *node) const {
-    return node->sema < g.semas.size() ? g.semas[node->sema].name
-                                       : "<unformed>";
+    if (node->sema < g.semas.size())
+      return g.semas[node->sema].name;
+    return "<unformed>";
   }
 
   void printPieces(const Node *node, Operation *anchor) {
@@ -536,6 +537,7 @@ static LogicalResult materializeMixedDepth(ArrayRef<GroupDag *> set) {
   reuser.backing.assign(1, view);
   return success();
 }
+
 static LogicalResult materializeCircular(ArrayRef<GroupDag *> set) {
   GroupDag *owner = set.front();
   for (GroupDag *g : set)
@@ -575,7 +577,13 @@ static LogicalResult emitPhysicalIR(EmitCtx &ctx, ArrayRef<GroupDag *> groups) {
     GroupDag &g = *group;
     if (g.backing.empty()) {
       if (g.mixedDepthPhysicalAlias) {
-        if (failed(materializeMixedDepth(mixed[g.bufferId])))
+        ArrayRef<GroupDag *> set = mixed[g.bufferId];
+        // A semaphore-owned backing cannot also have raw users from an
+        // inactive logical peer. Materialize the active peer independently
+        // when its mixed-depth partner needs no synchronization.
+        if (set.size() == 1)
+          materializeLogicalBacking(g);
+        else if (failed(materializeMixedDepth(set)))
           return failure();
       } else if (g.isCircular()) {
         if (failed(materializeCircular(circular[g.bufferId])))
@@ -615,6 +623,7 @@ static LogicalResult emitPhysicalIR(EmitCtx &ctx, ArrayRef<GroupDag *> groups) {
   }
   return success();
 }
+
 static void fixupAnchors(MutableArrayRef<GroupDag> groups, Operation *oldOp, Operation *newOp) {
   for (GroupDag &g : groups) {
     forEachNode(g, [&](Node *n) {
@@ -870,9 +879,11 @@ static Value getView(EmitCtx &ctx, GroupDag &g, RenderState &rs, Node *node,
   RenderState::ViewBundle *bundle = rs.findViewBundle(
       source, owner, node->bufferStageOffset, touch.member,
       types[touch.member]);
-  if (bundle && rs.releasedSources.contains(source.ref.producer))
-    ctx.cachedReuseContracts.push_back(
-        {bundle->buffers[touch.member], source.value});
+  if (bundle && rs.releasedSources.contains(source.ref.producer)) {
+    Value buffer = bundle->buffers[touch.member];
+    if (!ctx.exactReuseBufferOps.contains(buffer.getDefiningOp()))
+      ctx.cachedReuseContracts.push_back({buffer, source.value});
+  }
   if (!bundle) {
     OpBuilder b(accessOp);
     auto buf = emitInto<nvws::SemaphoreBufferOp>(

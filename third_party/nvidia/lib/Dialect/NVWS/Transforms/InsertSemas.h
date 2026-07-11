@@ -296,7 +296,9 @@ inline AsyncOp asyncPayloadOf(Operation *op) {
 inline bool isSupportedAliasOp(Operation *op) {
   StringRef name = op->getName().getStringRef();
   return name == "ttg.memdesc_index" || name == "ttg.memdesc_subview" ||
-         name == "ttg.memdesc_trans" || name == "ttg.memdesc_reinterpret" || name == "ttg.memdesc_reshape";
+         name == "ttg.memdesc_subslice" || name == "ttg.memdesc_trans" ||
+         name == "ttg.memdesc_reinterpret" ||
+         name == "ttg.memdesc_reshape";
 }
 template <typename Fn>
 inline void forEachNode(Node *head, Fn &&fn) {

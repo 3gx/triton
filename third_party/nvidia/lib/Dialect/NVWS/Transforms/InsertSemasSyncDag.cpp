@@ -318,9 +318,16 @@ private:
     Payloads none{AsyncOp::NONE};
     bool wsAdopt =
         node->kind == Node::For && gpu::hasWarpSpecializeTag(node->op);
+    std::optional<Owner> uniformOwner = uniformPieceOwner(node);
+    bool canReuse = uniformOwner && chainTokens.find(*uniformOwner);
+    for (auto [id, info] : infos)
+      canReuse &= state[id].canReuseToken(info.owner, info.effect);
+    size_t edgeStart = edges.size();
     for (auto [id, info] : infos)
       applyTouch(state[id], id, info.owner, info.effect, node, none, edges,
                  wsAdopt);
+    if (canReuse && edges.size() == edgeStart)
+      reusable.insert(node);
     ExitFacts returned;
     for (auto [childIndex, childHead] : llvm::enumerate(node->children)) {
       ChainState child;
@@ -359,8 +366,8 @@ private:
     }
     assert(!infos.empty() && "retained region must touch the group");
     chainTokens.clear();
-    if (auto owner = uniformPieceOwner(node); owner && owner->has_value())
-      chainTokens.record(*owner, node, node, {AsyncOp::NONE});
+    if (uniformOwner && uniformOwner->has_value())
+      chainTokens.record(*uniformOwner, node, node, {AsyncOp::NONE});
   }
   void visitExit(Node *node) {
     for (auto [id, info] : sortedPieceInfo(node)) {
@@ -724,23 +731,48 @@ public:
 
 private:
   using EdgeRefs = SmallVector<EdgeRec *, 2>;
-  // Alternatives agree on arrivals; coexecuting supplies add arrivals.
+  using BoundaryKey = std::pair<Node *, Owner>;
+  // Keep mutually exclusive paths separate until their counts are normalized;
+  // coexecuting supplies form the Cartesian product of their paths.
   struct Supply {
-    SmallVector<Node *, 2> releases;
-    unsigned arrivals = 0;
-    bool empty() const { return releases.empty(); }
+    struct Path {
+      SmallVector<Node *, 2> releases;
+      unsigned arrivals = 0;
+    };
+    SmallVector<Path, 2> paths;
+    SmallVector<BoundaryKey, 1> completions;
+    bool empty() const { return paths.empty(); }
     void appendExecuted(Supply other) {
-      arrivals += other.arrivals;
-      releases.append(other.releases.begin(), other.releases.end());
+      for (const BoundaryKey &key : other.completions)
+        if (!llvm::is_contained(completions, key))
+          completions.push_back(key);
+      if (other.empty())
+        return;
+      if (empty()) {
+        paths = std::move(other.paths);
+        return;
+      }
+      SmallVector<Path, 2> product;
+      for (const Path &lhs : paths)
+        for (const Path &rhs : other.paths) {
+          product.push_back(lhs);
+          Path &path = product.back();
+          path.arrivals += rhs.arrivals;
+          path.releases.append(rhs.releases.begin(), rhs.releases.end());
+        }
+      paths = std::move(product);
     }
     void appendExecuted(Node *release) {
       if (!release)
         return;
-      arrivals += release->count * release->payloads.size();
-      releases.push_back(release);
+      if (empty())
+        paths.emplace_back();
+      for (Path &path : paths) {
+        path.arrivals += release->count * release->payloads.size();
+        path.releases.push_back(release);
+      }
     }
   };
-  using BoundaryKey = std::pair<Node *, Owner>;
   using PendingSupplies = std::map<BoundaryKey, Supply>;
   struct Watch {
     std::optional<Owner> owner;
@@ -775,6 +807,7 @@ private:
     Node *exit = nullptr;
     EdgeRefs exitEdges;
     std::optional<Tokens::Token> token;
+    bool completionReady = false;
     bool passesInput = false;
   };
   static BoundaryKey boundaryKey(Node *region, const Owner &owner) {
@@ -818,17 +851,39 @@ private:
   void recordPOU(Node *loop, Node *acquire, bool mustPreserveBoundary = false) {
     pouPlanSites.push_back({loop, acquire, mustPreserveBoundary});
   }
+  bool normalizePath(Supply::Path &path, unsigned required,
+                     Node *anchor) {
+    if (path.arrivals == required)
+      return true;
+    if (path.arrivals > required || path.releases.size() != 1) {
+      fail(anchor, "one execution path does not supply the acquire pending count");
+      return false;
+    }
+    Node *release = path.releases.front();
+    if (!scalableRelease(release) || release->payloads.empty() ||
+        required % release->payloads.size()) {
+      fail(anchor, "one execution path does not supply the acquire pending count");
+      return false;
+    }
+    release->count = required / release->payloads.size();
+    path.arrivals = required;
+    return true;
+  }
   void appendAlternative(Supply &paths, Supply branch, Node *region) {
     if (branch.empty()) {
       fail(region, "conditional path provides no semaphore arrival");
       return;
     }
-    if (!paths.empty() && paths.arrivals != branch.arrivals) {
-      fail(region, "conditional paths provide incompatible semaphore counts");
-      return;
-    }
-    paths.arrivals = branch.arrivals;
-    paths.releases.append(branch.releases.begin(), branch.releases.end());
+    paths.paths.append(branch.paths.begin(), branch.paths.end());
+    for (const BoundaryKey &key : branch.completions)
+      if (!llvm::is_contained(paths.completions, key))
+        paths.completions.push_back(key);
+    unsigned required = 0;
+    for (const Supply::Path &path : paths.paths)
+      required = std::max(required, path.arrivals);
+    for (Supply::Path &path : paths.paths)
+      if (!normalizePath(path, required, region))
+        return;
   }
   Node *concreteAcquire(Node *producer) const {
     if (!producer)
@@ -866,14 +921,23 @@ private:
   }
   void observeRegionDemand(Node *region, Chain &chain) const {
     Watch &watch = chain.watch;
-    std::optional<Owner> owner = uniformPieceOwner(region);
-    if (!owner)
+    auto observe = [&](const Owner &owner) {
+      Node *channel = regionChannelFor(region, owner);
+      bool deferred = chain.supplies.count(boundaryKey(region, owner));
+      if (!region->flow && !region->tokenSource && !channel && !deferred)
+        return;
+      watch.demands.try_emplace(owner, region);
+    };
+    if (std::optional<Owner> owner = uniformPieceOwner(region)) {
+      observe(*owner);
       return;
-    Node *channel = regionChannelFor(region, *owner);
-    bool deferred = chain.supplies.count(boundaryKey(region, *owner));
-    if (!region->flow && !region->tokenSource && !channel && !deferred)
-      return;
-    watch.demands.try_emplace(*owner, region);
+    }
+    SmallVector<Owner, 2> owners;
+    for (auto [_, info] : sortedPieceInfo(region))
+      if (!llvm::is_contained(owners, info.owner)) {
+        owners.push_back(info.owner);
+        observe(info.owner);
+      }
   }
   Node *precedingChannel(Node *node, const Owner &owner) const {
     for (Node *cursor = node; cursor && cursor->parent; cursor = cursor->parent)
@@ -972,7 +1036,13 @@ private:
       return {edge.srcOwner, edge.src->tokenSource, edge.src, edge.payloads};
     case Node::For:
     case Node::If: {
-      Node *producer = edge.src->flow ? edge.src : edge.src->tokenSource;
+      Node *producer = nullptr;
+      if (auto completion = regionCompletions.find(
+              boundaryKey(edge.src, edge.srcOwner));
+          completion != regionCompletions.end())
+        producer = completion->second;
+      else
+        producer = edge.src->flow ? edge.src : edge.src->tokenSource;
       if (!producer)
         return {};
       if (const Tokens::Token *token = tokens.findProducer(producer))
@@ -1023,30 +1093,25 @@ private:
       tokens.close(source.producer);
     return release;
   }
-  void applySupply(Node *acquire, const Supply &supply,
+  void applySupply(Node *acquire, Supply &supply,
                    unsigned requiredCount = 0) {
-    unsigned expected = supply.arrivals;
-    if (expected && requiredCount && expected != requiredCount) {
-      if (supply.releases.size() != 1 ||
-          !scalableRelease(supply.releases.front()) ||
-          supply.releases.front()->payloads.empty() ||
-          requiredCount % supply.releases.front()->payloads.size())
-        return fail(
-            acquire,
-            "one execution path does not supply the acquire pending count");
-      Node *release = supply.releases.front();
-      unsigned payloads = release->payloads.size();
-      release->count = requiredCount / payloads;
-      expected = requiredCount;
-    }
-    for (Node *release : supply.releases) {
-      if (release->sat && release->sat != acquire) {
-        this->fail(release, "one release cannot satisfy two acquire sites");
+    unsigned expected = std::max(acquire->count, requiredCount);
+    for (const Supply::Path &path : supply.paths)
+      expected = std::max(expected, path.arrivals);
+    for (Supply::Path &path : supply.paths) {
+      if (!normalizePath(path, expected, acquire))
         return;
+      for (Node *release : path.releases) {
+        if (release->sat && release->sat != acquire) {
+          this->fail(release, "one release cannot satisfy two acquire sites");
+          return;
+        }
+        release->sat = acquire;
       }
-      release->sat = acquire;
     }
-    acquire->count = std::max(acquire->count, expected);
+    for (const BoundaryKey &key : supply.completions)
+      regionCompletions[key] = acquire;
+    acquire->count = expected;
   }
   Supply collectSupply(Node *acquire, ArrayRef<EdgeRec *> refs, Tokens &tokens,
                        Chain &chain, Node *guard = nullptr) {
@@ -1150,7 +1215,12 @@ private:
     result.exitEdges = unhandledAt(result.exit);
     if (const Tokens::Token *open = branch.tokens.findOpen(owner))
       result.token = *open;
-    result.passesInput = result.token && result.token->producer == region;
+    bool hasPending =
+        branch.supplies.count(boundaryKey(result.exit, owner));
+    result.completionReady = result.token && result.exitEdges.empty() &&
+                             !hasPending;
+    result.passesInput = result.completionReady &&
+                         result.token->producer == region;
     result.chain = std::move(branch);
     return result;
   }
@@ -1272,6 +1342,65 @@ private:
     }
     chain.pending.clear();
     if (!boundaryOwner) {
+      if (next) {
+        SmallVector<Owner, 2> sourceOwners;
+        for (EdgeRec *edge : unhandledAt(next))
+          if (edge->src == region &&
+              !llvm::is_contained(sourceOwners, edge->srcOwner))
+            sourceOwners.push_back(edge->srcOwner);
+        if (!sourceOwners.empty()) {
+          for (const Owner &owner : sourceOwners) {
+            Node *channel = nullptr;
+            for (Chain &branch : branches) {
+              const Tokens::Token *token = branch.tokens.find(owner);
+              Node *candidate =
+                  token ? concreteAcquire(token->producer) : nullptr;
+              if (!candidate) {
+                fail(region,
+                     "mixed-owner conditional has no exact owner channel");
+                return;
+              }
+              if (channel)
+                uniteChannels(channel, candidate);
+              else
+                channel = candidate;
+            }
+            regionChannels[boundaryKey(region, owner)] = channel;
+          }
+          Supply paths;
+          for (Chain &branch : branches) {
+            Node *exit = chainExit(branch.guard);
+            Node *guard = exit->prev ? exit->prev : branch.guard;
+            Supply branchPath;
+            for (const Owner &owner : sourceOwners) {
+              const Tokens::Token *token = branch.tokens.find(owner);
+              if (!token) {
+                fail(region,
+                     "mixed-owner conditional path has no exact completion");
+                break;
+              }
+              Tokens::Token exact = *token;
+              branchPath.appendExecuted(
+                  materializeRelease(exact, owner, nullptr, guard));
+            }
+            if (hadError)
+              return;
+            appendAlternative(paths, std::move(branchPath), region);
+          }
+          Owner targetOwner = next->kind == Node::Access
+                                  ? next->owner
+                                  : Owner{};
+          chain.supplies[boundaryKey(next, targetOwner)].appendExecuted(
+              std::move(paths));
+          chain.tokens = std::move(incoming);
+          for (const Owner &owner : sourceOwners)
+            chain.tokens.eraseOwner(owner);
+          for (EdgeRec *edge : unhandledAt(next))
+            if (edge->src == region)
+              markHandled(edge);
+          return;
+        }
+      }
       chain.tokens = std::move(incoming);
       return;
     }
@@ -1281,7 +1410,7 @@ private:
     for (Chain &branch : branches) {
       exits.push_back(normalizeBranch(std::move(branch), region, owner));
       allPass &= exits.back().passesInput;
-      complete &= exits.back().token.has_value();
+      complete &= exits.back().completionReady;
     }
     if (allPass) {
       assert(input && "pass-through region must have an input token");
@@ -1320,19 +1449,29 @@ private:
     if (allowCompletion && !complete) {
       complete = true;
       for (BranchExit &branch : exits) {
-        if (branch.token)
+        if (branch.completionReady)
           continue;
         bool hasPending =
             branch.chain.supplies.count(boundaryKey(branch.exit, owner));
-        if (branch.exitEdges.empty() && !hasPending) {
+        if (branch.exitEdges.empty() && !hasPending && !branch.token) {
           complete = false;
           break;
         }
         Node *acquire = makeAcquire(branch.exit, owner);
         Supply supply = materializeExitSupply(branch, acquire, owner);
+        if (branch.token) {
+          Tokens::Token exact = *branch.token;
+          if (input && exact.producer == region)
+            exact.producer = input->producer;
+          Node *guard =
+              branch.exit->prev ? branch.exit->prev : branch.chain.guard;
+          supply.appendExecuted(
+              materializeRelease(exact, exact.owner, acquire, guard));
+        }
         applySupply(acquire, supply);
         branch.chain.tokens.record(owner, acquire, acquire, {AsyncOp::NONE});
         branch.token = *branch.chain.tokens.findOpen(owner);
+        branch.completionReady = true;
         branch.passesInput = false;
       }
     }
@@ -1372,6 +1511,7 @@ private:
       }
       appendAlternative(paths, std::move(branchPaths), region);
     }
+    paths.completions.push_back(boundaryKey(region, owner));
     Node *target = next;
     if (!target && (chain.guard || chain.watch.owner))
       target = chainExit(chain.guard ? chain.guard : region);
@@ -1489,6 +1629,8 @@ private:
                              const Tokens &loopInputs, const Owner &owner,
                              LoopSupply &supply) {
     const Tokens::Token *initial = loopInputs.findOpen(owner);
+    if (!initial && reusable.contains(region))
+      initial = loopInputs.find(owner);
     if (supply.entry.empty() && initial) {
       incoming.record(initial->owner, initial->producer, initial->last,
                       initial->payloads);
@@ -1751,6 +1893,7 @@ private:
   DenseMap<Node *, EdgeRefs> atDst;
   DenseMap<Node *, Node *> channelParent;
   std::map<BoundaryKey, Node *> regionChannels;
+  std::map<BoundaryKey, Node *> regionCompletions;
   SmallVector<ScopedRegionDrain, 4> regionDrains;
   DenseSet<Node *> seeded;
   DenseSet<Node *> exitSources;
