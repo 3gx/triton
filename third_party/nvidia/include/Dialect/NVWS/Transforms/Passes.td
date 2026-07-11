@@ -126,6 +126,43 @@ def NVWSInsertAllocas: Pass<"nvws-insert-allocas", "mlir::ModuleOp"> {
 
 }
 
+def NVWSMetaToNVWSConvert
+    : Pass<"nvws-meta-to-nvws-convert", "mlir::ModuleOp"> {
+  let summary = "Convert Meta warp-specialization planning metadata to NVWS IR";
+
+  let description = [{
+    Mechanically converts the output of the Meta warp-specialization planning
+    prefix into the representation consumed by the NVWS mechanism passes. The
+    pass does not choose partitions, schedules, buffers, or synchronization.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def NVWSPackEpilogueSlices
+    : Pass<"nvws-pack-epilogue-slices", "mlir::ModuleOp"> {
+  let summary = "Pack data-partitioned epilogue producer/store slices";
+
+  let description = [{
+    Shortens register live ranges in data-partitioned merged epilogues by
+    placing each explicit local_store immediately after its producer slice.
+    This is a scheduling-only optimization over buffers already materialized
+    by Meta buffer allocation and must run before memory planning.
+  }];
+
+  let dependentDialects = [
+    "mlir::scf::SCFDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def NVWSInsertTmemSemaphore: Pass<"nvws-insert-tmem-semaphore", "mlir::ModuleOp"> {
   let summary = "Insert TMEM semaphore ops for ownership transfer.";
 

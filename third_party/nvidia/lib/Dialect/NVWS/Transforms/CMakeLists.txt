@@ -3,6 +3,8 @@ add_triton_library(NVWSTransforms
   LowerAref.cpp
   LowerWarpGroup.cpp
   InsertAllocas.cpp
+  MetaToNVWSConvert.cpp
+  PackEpilogueSlices.cpp
   InsertSemaphore.cpp
   Utilities.cpp
   InsertTmemSemaphore.cpp
@@ -25,6 +27,7 @@ add_triton_library(NVWSTransforms
   TritonIR
   TritonGPUIR
   TritonNvidiaGPUIR
+  NVHopperTransforms
   NVWSIR
   MLIRTransformUtils
 )

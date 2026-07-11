@@ -754,10 +754,7 @@ class CUDABackend(BaseBackend):
                 # TRITON_USE_MODULO_SCHEDULE=1 (default algo: rau)
                 # TRITON_USE_MODULO_SCHEDULE=sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
-            if use_nvws_meta:
-                nvidia.passes.nvws.add_data_partitioning(pm, 1)
-            else:
-                nvidia.passes.hopper.add_data_partitioning(pm, 1)
+            nvidia.passes.hopper.add_data_partitioning(pm, 1)
             # The modulo / LLM scheduler above already produced the full loop
             # schedule (loop.stage / loop.cluster). Re-running assign_latencies +
             # schedule_loops here would recompute and OVERRIDE it, so only run
@@ -771,7 +768,20 @@ class CUDABackend(BaseBackend):
                 # 2-CTA + upstream WS is not supported
                 if opt.cluster_dims is None or max(opt.cluster_dims) < 2:
                     if use_nvws_meta:
-                        passes.ttgpuir.add_warp_specialize(pm, opt.num_stages, 1, True, smem_budget)
+                        # TMA-store lowering and broadcast sinking have valid
+                        # standalone boundaries. The remaining canonical Meta
+                        # planning prefix runs with verification deferred inside
+                        # core AWS; NVWS conversion is its first verified suffix
+                        # pass, so no verifier observes Meta's intentionally
+                        # incomplete intermediate partition form.
+                        nvidia.passes.hopper.add_tma_store_lowering(pm)
+                        nvidia.passes.hopper.add_sink_broadcast(pm)
+                        passes.ttgpuir.add_warp_specialize(
+                            pm,
+                            num_stages=opt.num_stages,
+                            use_meta_partitioner=True,
+                            smem_budget=smem_budget,
+                        )
                     else:
                         passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             else:
