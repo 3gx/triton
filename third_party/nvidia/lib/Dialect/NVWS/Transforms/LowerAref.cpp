@@ -472,6 +472,38 @@ DenseSet<MMAv5OpInterface> getAsyncMMAv5Consumers(Value semaphore) {
   }
   return mmav5Ops;
 }
+
+// PartitionLoops moves partitioned siblings carrying a warp-specialization tag
+// into the matching loop's warp group. Semaphore cleanup remains unpartitioned,
+// so a tagged user before the loop is semantically live through that loop even
+// though its current lexical position precedes it.
+void addWarpSpecializationCleanupAnchors(
+    SemaphoreCreateOp op, SetVector<Operation *> &users) {
+  Block *block = op->getBlock();
+  DenseSet<int> movedUserTags;
+  for (Operation *user : users) {
+    Operation *anchor = block->findAncestorOpInBlock(*user);
+    if (!anchor || !hasPartition(anchor))
+      continue;
+    if (auto tag = getWarpSpecializeTag(anchor))
+      movedUserTags.insert(*tag);
+  }
+  if (movedUserTags.empty())
+    return;
+
+  for (Operation &candidate : *block) {
+    auto loop = dyn_cast<scf::ForOp>(&candidate);
+    if (!loop)
+      continue;
+    auto stages = loop->getAttrOfType<ArrayAttr>(kPartitionStagesAttrName);
+    if (!stages || stages.size() <= 1)
+      continue;
+    if (auto tag = getWarpSpecializeTag(loop);
+        tag && movedUserTags.contains(*tag))
+      users.insert(loop);
+  }
+}
+
 class LowerSemaphoreCreate : public OpRewritePattern<SemaphoreCreateOp> {
 public:
   LowerSemaphoreCreate(
@@ -516,6 +548,7 @@ public:
     SetVector<Operation *> allUsers;
     for (Operation *user : op->getUsers())
       allUsers.insert(user);
+    addWarpSpecializationCleanupAnchors(op, allUsers);
 
     Operation *cleanupAnchor = op.getOperation();
     if (!allUsers.empty()) {
