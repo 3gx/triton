@@ -17,6 +17,7 @@
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
+namespace ttnvws = ::mlir::triton::nvws;
 namespace mlir {
 
 #define DEBUG_TYPE "nvgpu-ws-tma-store-lowering"
@@ -38,8 +39,10 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
       return;
     storeOps.push_back(op);
   });
+  SmallVector<tt::DescriptorReduceOp> reduceOps;
+  funcOp.walk([&](tt::DescriptorReduceOp op) { reduceOps.push_back(op); });
 
-  if (storeOps.empty())
+  if (storeOps.empty() && reduceOps.empty())
     return;
 
   LDBG("Lowering " << storeOps.size() << " DescriptorStoreOp(s)");
@@ -108,9 +111,6 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
 
   // Also lower DescriptorReduceOp → local_alloc + AsyncTMAReduceOp (with token)
   // + TMAStoreTokenWaitOp, matching the early TMA store pattern.
-  SmallVector<tt::DescriptorReduceOp> reduceOps;
-  funcOp.walk([&](tt::DescriptorReduceOp op) { reduceOps.push_back(op); });
-
   if (!reduceOps.empty())
     LDBG("Lowering " << reduceOps.size() << " DescriptorReduceOp(s)");
 
@@ -178,6 +178,20 @@ struct NVGPUWSTMAStoreLoweringPass
     : public impl::NVGPUWSTMAStoreLoweringBase<NVGPUWSTMAStoreLoweringPass> {
   void runOnOperation() override {
     auto mod = getOperation();
+    // Focused conversion tests need a boundary after task propagation but
+    // before buffer planning.  Production invokes the same routine from the
+    // native-Meta pipeline; this module attribute only selects that boundary
+    // for the standalone test pass.
+    if (mod->hasAttr("ttg.test_nvws_tma_store_conversion")) {
+      WalkResult result = mod->walk([&](triton::FuncOp funcOp) {
+        if (failed(doConvertDescriptorStoresToNVWS(funcOp)))
+          return WalkResult::interrupt();
+        return WalkResult::advance();
+      });
+      if (result.wasInterrupted())
+        signalPassFailure();
+      return;
+    }
     if (!mod->hasAttr("ttg.early_tma_store_lowering"))
       return;
     mod->walk([&](triton::FuncOp funcOp) { doTMAStoreLowering(funcOp); });
@@ -195,15 +209,23 @@ static constexpr const char *kCanRotateByBufferCount =
     "can_rotate_by_buffer_count";
 
 static bool isTMAStoreLikeOp(Operation *op) {
-  return isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(op);
+  // Keep the established wait-counting domain narrow: descriptor scatter is
+  // also store-like at the dialect interface level, but it has no specific
+  // completion token/wait support in this pipeline.
+  return isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
+             ttnvws::DescriptorStoreOp, ttnvws::DescriptorReduceOp>(op);
 }
 
 static Value getTMAStoreSource(Operation *op) {
-  if (auto copyOp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op))
-    return copyOp.getSrc();
-  if (auto reduceOp = dyn_cast<ttng::AsyncTMAReduceOp>(op))
-    return reduceOp.getSrc();
+  if (!isTMAStoreLikeOp(op))
+    return {};
+  if (auto store = dyn_cast<ttng::TMAStoreLikeOpInterface>(op))
+    return store.getSrc();
   return {};
+}
+
+static bool isAbstractDescriptorStoreLike(Operation *op) {
+  return isa<ttnvws::DescriptorStoreOp, ttnvws::DescriptorReduceOp>(op);
 }
 
 // Trace the token back to the defining TMA store-like op
@@ -312,43 +334,80 @@ findLocalStoreWritingBuffer(scf::ForOp forOp, Value buffer,
   return nullptr;
 }
 
-void doAnnotateTMAStoreWaits(triton::FuncOp funcOp) {
+static ttg::LocalAllocOp findUnderlyingLocalAlloc(Value buffer) {
+  DenseSet<Value> visited;
+  while (buffer && visited.insert(buffer).second) {
+    Operation *def = buffer.getDefiningOp();
+    if (!def)
+      return nullptr;
+    if (auto alloc = dyn_cast<ttg::LocalAllocOp>(def))
+      return alloc;
+    if (!def->hasTrait<OpTrait::MemDescViewTrait>() || def->getNumOperands() == 0)
+      return nullptr;
+    Value source = def->getOperand(0);
+    if (!isa<ttg::MemDescType>(source.getType()))
+      return nullptr;
+    buffer = source;
+  }
+  return nullptr;
+}
+
+static void annotateTMAStoreRotationTargets(triton::FuncOp funcOp,
+                                            bool abstractStores) {
   MLIRContext *ctx = funcOp.getContext();
-  // Use walk to find TMAStoreTokenWaitOp ops inside ForOp bodies, including
-  // those nested inside SubtiledRegionOp regions.
+  auto annotate = [&](Operation *target, Value buffer) {
+    auto allocOp = findUnderlyingLocalAlloc(buffer);
+    if (!allocOp)
+      return;
+
+    // Only annotate buffers that have buffer.copy from the memory planner.
+    // Buffers without buffer.copy were not planned and cannot be rotated.
+    auto bufferCopy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy");
+    if (!bufferCopy || bufferCopy.getInt() <= 0)
+      return;
+
+    target->setAttr(kCanRotateByBufferCount,
+                    IntegerAttr::get(IntegerType::get(ctx, 32),
+                                     bufferCopy.getInt()));
+  };
+
+  // Abstract stores and legacy waits are invoked at the same pipeline boundary
+  // so a source hidden behind a subtiled-region argument has identical
+  // conservative behavior in both representations.
   funcOp.walk([&](scf::ForOp forOp) {
-    forOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
-      Value buffer;
-      auto *tmaOp = getDefiningTMAStoreOp(waitOp, buffer);
-      if (!tmaOp)
+    forOp.walk([&](Operation *op) {
+      if (!abstractStores) {
+        auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(op);
+        if (!waitOp)
+          return;
+        Value buffer;
+        if (!getDefiningTMAStoreOp(waitOp, buffer))
+          return;
+        annotate(waitOp, buffer);
         return;
-
-      auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
-      if (!allocOp)
-        return;
-
-      // Only annotate buffers that have buffer.copy from the memory planner.
-      // Buffers without buffer.copy were not planned and cannot be rotated.
-      auto bufferCopy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy");
-      if (!bufferCopy)
-        return;
-
-      int k = bufferCopy.getInt();
-      if (k <= 0)
-        return;
-
-      waitOp->setAttr(kCanRotateByBufferCount,
-                      IntegerAttr::get(IntegerType::get(ctx, 32), k));
+      }
+      if (isAbstractDescriptorStoreLike(op))
+        annotate(op, getTMAStoreSource(op));
     });
   });
+}
+
+void doAnnotateTMAStoreWaits(triton::FuncOp funcOp) {
+  annotateTMAStoreRotationTargets(funcOp, /*abstractStores=*/false);
+}
+
+void doAnnotateAbstractTMAStores(triton::FuncOp funcOp) {
+  annotateTMAStoreRotationTargets(funcOp, /*abstractStores=*/true);
 }
 
 struct NVGPUTestAnnotateTMAStoreWaitsPass
     : public impl::NVGPUTestAnnotateTMAStoreWaitsBase<
           NVGPUTestAnnotateTMAStoreWaitsPass> {
   void runOnOperation() override {
-    getOperation()->walk(
-        [&](triton::FuncOp funcOp) { doAnnotateTMAStoreWaits(funcOp); });
+    getOperation()->walk([&](triton::FuncOp funcOp) {
+      doAnnotateAbstractTMAStores(funcOp);
+      doAnnotateTMAStoreWaits(funcOp);
+    });
   }
 };
 
@@ -356,26 +415,137 @@ struct NVGPUTestAnnotateTMAStoreWaitsPass
 // Validate TMA store annotations (safety checks)
 // ---------------------------------------------------------------------------
 
-void doValidateTMAStoreAnnotations(triton::FuncOp funcOp) {
+static void validateTMAStoreRotationTargets(triton::FuncOp funcOp,
+                                            bool abstractStores) {
   funcOp.walk([&](scf::ForOp forOp) {
-    forOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
-      if (!waitOp->hasAttr(kCanRotateByBufferCount))
+    forOp.walk([&](Operation *op) {
+      if (!op->hasAttr(kCanRotateByBufferCount))
         return;
 
       Value buffer;
-      auto *tmaOp = getDefiningTMAStoreOp(waitOp, buffer);
-      if (!tmaOp) {
-        waitOp->removeAttr(kCanRotateByBufferCount);
+      if (!abstractStores) {
+        auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(op);
+        if (!waitOp)
+          return;
+        if (!getDefiningTMAStoreOp(waitOp, buffer)) {
+          op->removeAttr(kCanRotateByBufferCount);
+          return;
+        }
+      } else if (isAbstractDescriptorStoreLike(op)) {
+        buffer = getTMAStoreSource(op);
+      } else {
         return;
       }
 
-      auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
-      if (!allocOp) {
-        waitOp->removeAttr(kCanRotateByBufferCount);
-        return;
-      }
+      auto allocOp = findUnderlyingLocalAlloc(buffer);
+      if (!allocOp)
+        op->removeAttr(kCanRotateByBufferCount);
     });
   });
+}
+
+void doValidateTMAStoreAnnotations(triton::FuncOp funcOp) {
+  validateTMAStoreRotationTargets(funcOp, /*abstractStores=*/false);
+}
+
+void doValidateAbstractTMAStoreAnnotations(triton::FuncOp funcOp) {
+  validateTMAStoreRotationTargets(funcOp, /*abstractStores=*/true);
+}
+
+// Copy only representation-independent metadata.  The destination builders
+// own their inherent attributes and operand segment sizes; completion operands
+// are transferred explicitly to the generated token wait below.
+static void copyAbstractStoreMetadata(Operation *from, Operation *to) {
+  for (NamedAttribute attr : from->getAttrs()) {
+    StringRef name = attr.getName().strref();
+    if (name == "operandSegmentSizes" || name == "operand_segment_sizes" ||
+        name == "kind" || name == "reduce_kind" ||
+        name == kCanRotateByBufferCount)
+      continue;
+    to->setAttr(attr.getName(), attr.getValue());
+  }
+}
+
+// Turn the tokenless native-Meta representation back into the exact TTNG
+// issue/token/wait boundary consumed by the generic pipeliner and final TMA
+// wait lowering.  This runs after loop scheduling, so the temporary token does
+// not participate in Meta partitioning or planning.
+static LogicalResult materializeAbstractTMAStores(triton::FuncOp funcOp) {
+  SmallVector<Operation *> stores;
+  funcOp.walk([&](Operation *op) {
+    if (isAbstractDescriptorStoreLike(op))
+      stores.push_back(op);
+  });
+
+  // Native-Meta channel tokens must have been resolved by doTokenLowering.
+  // Failing before mutating the function makes a missed completion transfer
+  // explicit instead of silently dropping a source-buffer release.
+  for (Operation *op : stores) {
+    if (auto store = dyn_cast<ttnvws::DescriptorStoreOp>(op)) {
+      if (!store.getNvwsTokens().empty() ||
+          !store.getNvwsTokenIndices().empty())
+        return store.emitError(
+            "unresolved NVWS completion token before TMA store "
+            "materialization");
+    } else {
+      auto reduce = cast<ttnvws::DescriptorReduceOp>(op);
+      if (!reduce.getNvwsTokens().empty() ||
+          !reduce.getNvwsTokenIndices().empty())
+        return reduce.emitError(
+            "unresolved NVWS completion token before TMA reduce "
+            "materialization");
+    }
+  }
+
+  MLIRContext *ctx = funcOp.getContext();
+  Type tokenType = ttg::AsyncTokenType::get(ctx);
+  for (Operation *op : stores) {
+    OpBuilderWithAsyncTaskIds builder(op);
+    builder.setInsertionPoint(op);
+
+    Operation *issue = nullptr;
+    Value token;
+    ValueRange barriers;
+    ValueRange barrierPreds;
+    if (auto store = dyn_cast<ttnvws::DescriptorStoreOp>(op)) {
+      auto tmaStore =
+          builder.createWithAsyncTaskIds<ttng::AsyncTMACopyLocalToGlobalOp>(
+              store.getLoc(), tokenType, store.getDesc(), store.getIndices(),
+              store.getSrc(), tt::EvictionPolicy::NORMAL);
+      issue = tmaStore;
+      token = tmaStore.getToken();
+      barriers = store.getBarriers();
+      barrierPreds = store.getBarrierPreds();
+    } else {
+      auto reduce = cast<ttnvws::DescriptorReduceOp>(op);
+      auto tmaReduce = builder.createWithAsyncTaskIds<ttng::AsyncTMAReduceOp>(
+          reduce.getLoc(), tokenType, reduce.getKind(), reduce.getDesc(),
+          reduce.getIndices(), reduce.getSrc(), tt::EvictionPolicy::NORMAL);
+      issue = tmaReduce;
+      token = tmaReduce.getToken();
+      barriers = reduce.getBarriers();
+      barrierPreds = reduce.getBarrierPreds();
+    }
+    copyAbstractStoreMetadata(op, issue);
+
+    auto wait = builder.createWithAsyncTaskIds<ttng::TMAStoreTokenWaitOp>(
+        op->getLoc(), token, barriers, barrierPreds,
+        /*nvwsTokens=*/ValueRange{}, /*nvwsTokenIndices=*/ValueRange{});
+    copyAbstractStoreMetadata(op, wait);
+    if (Attribute rotate = op->getAttr(kCanRotateByBufferCount))
+      wait->setAttr(kCanRotateByBufferCount, rotate);
+    op->erase();
+  }
+
+  bool hasSurvivor = false;
+  funcOp.walk([&](Operation *op) {
+    if (!isAbstractDescriptorStoreLike(op))
+      return;
+    op->emitError("abstract NVWS descriptor store survived late "
+                  "materialization");
+    hasSurvivor = true;
+  });
+  return failure(hasSurvivor);
 }
 
 // ---------------------------------------------------------------------------
@@ -574,12 +744,31 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
   });
 }
 
+LogicalResult doMaterializeAndPlaceTMAStoreWaits(triton::FuncOp funcOp,
+                                                 bool enableRotation) {
+  if (failed(materializeAbstractTMAStores(funcOp)))
+    return failure();
+  if (enableRotation)
+    doTMAStoreWaitReorder(funcOp);
+  return success();
+}
+
 struct NVGPUTestTMAStoreTokenWaitReorderPass
     : public impl::NVGPUTestTMAStoreTokenWaitReorderBase<
           NVGPUTestTMAStoreTokenWaitReorderPass> {
+  using impl::NVGPUTestTMAStoreTokenWaitReorderBase<
+      NVGPUTestTMAStoreTokenWaitReorderPass>::
+      NVGPUTestTMAStoreTokenWaitReorderBase;
+
   void runOnOperation() override {
-    getOperation()->walk(
-        [&](triton::FuncOp funcOp) { doTMAStoreWaitReorder(funcOp); });
+    WalkResult result = getOperation()->walk([&](triton::FuncOp funcOp) {
+      if (failed(doMaterializeAndPlaceTMAStoreWaits(
+              funcOp, /*enableRotation=*/enableRotation)))
+        return WalkResult::interrupt();
+      return WalkResult::advance();
+    });
+    if (result.wasInterrupted())
+      signalPassFailure();
   }
 };
 

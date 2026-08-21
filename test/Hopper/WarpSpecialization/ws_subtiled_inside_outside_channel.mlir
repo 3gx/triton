@@ -49,16 +49,15 @@
 // CHECK:      ttg.local_store {{.*}} {async_task_id = array<i32: 0>}
 // CHECK:      ttng.arrive_barrier {{.*}}async_task_id = array<i32: 0>{{.*}}dstTask = 2
 //
-// Epilogue-store partition (task 2): each flat consumer waits, loads, stores,
-// then RELEASES its barrier (balanced 2 waits + 2 releases).
+// Epilogue-store partition (task 2): each flat consumer waits, issues its TMA
+// store, then returns the staging slot with a barrier attached to the specific
+// TMA completion wait (balanced 2 waits + 2 completion releases).
 // CHECK:      ttng.wait_barrier {{.*}}async_task_id = array<i32: 2>
-// CHECK:      ttg.local_load {{.*}} {async_task_id = array<i32: 2>}
-// CHECK:      tt.descriptor_store {{.*}} {async_task_id = array<i32: 2>}
-// CHECK:      ttng.arrive_barrier {{.*}}async_task_id = array<i32: 2>
+// CHECK:      ttng.async_tma_copy_local_to_global {{.*}} {async_task_id = array<i32: 2>
+// CHECK:      ttng.async_tma_store_token_wait %{{.*}} , %{{.*}}[%{{.*}}] {{.*}}async_task_id = array<i32: 2>
 // CHECK:      ttng.wait_barrier {{.*}}async_task_id = array<i32: 2>
-// CHECK:      ttg.local_load {{.*}} {async_task_id = array<i32: 2>}
-// CHECK:      tt.descriptor_store {{.*}} {async_task_id = array<i32: 2>}
-// CHECK:      ttng.arrive_barrier {{.*}}async_task_id = array<i32: 2>
+// CHECK:      ttng.async_tma_copy_local_to_global {{.*}} {async_task_id = array<i32: 2>
+// CHECK:      ttng.async_tma_store_token_wait %{{.*}} , %{{.*}}[%{{.*}}] {{.*}}async_task_id = array<i32: 2>
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>

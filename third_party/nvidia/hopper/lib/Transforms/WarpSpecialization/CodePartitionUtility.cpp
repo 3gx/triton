@@ -21,6 +21,11 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+static bool isTiledTMAStoreLike(Operation *op) {
+  return isa<ttng::TMAStoreLikeOpInterface>(op) &&
+         !isa<ttng::AsyncTMAScatterOp>(op);
+}
+
 void removeWarpSpecMetadata(triton::FuncOp funcOp) {
   // The canonical set of attributes AutoWS stamps on ops/loops. `removeAttr` is
   // a no-op when the attribute is absent, so a single walk over every op
@@ -1773,7 +1778,8 @@ static bool isKeyOp(Operation *op) {
     return true;
 
   // Store operations
-  if (isa<tt::DescriptorStoreOp, tt::StoreOp, ttng::TMEMStoreOp,
+  if (isTiledTMAStoreLike(op) ||
+      isa<tt::DescriptorStoreOp, tt::StoreOp, ttng::TMEMStoreOp,
           ttg::LocalStoreOp, tt::DescriptorReduceOp>(op))
     return true;
 
@@ -1925,6 +1931,12 @@ static std::string getKeyOpDescription(Operation *op) {
        << formatInput(reduceOp.getDesc());
     return result;
   }
+  if (isTiledTMAStoreLike(op)) {
+    auto storeOp = cast<ttng::TMAStoreLikeOpInterface>(op);
+    ss << opName << " " << formatInput(storeOp.getSrc()) << " -> "
+       << formatInput(storeOp.getDesc());
+    return result;
+  }
 
   // For arithmetic/math ops, show inputs and output
   if (op->getNumResults() > 0) {
@@ -2058,6 +2070,10 @@ static std::string getKeyOpLabel(Operation *op) {
     if (auto reduceOp = dyn_cast<tt::DescriptorReduceOp>(op)) {
       return getValueDisplayName(reduceOp.getSrc());
     }
+    if (isTiledTMAStoreLike(op)) {
+      auto storeOp = cast<ttng::TMAStoreLikeOpInterface>(op);
+      return getValueDisplayName(storeOp.getSrc());
+    }
     return "?";
   };
 
@@ -2084,6 +2100,10 @@ static std::string getKeyOpLabel(Operation *op) {
     if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(op)) {
       return getShapeStr(storeOp.getSrc().getType());
     }
+    if (isTiledTMAStoreLike(op)) {
+      auto storeOp = cast<ttng::TMAStoreLikeOpInterface>(op);
+      return getShapeStr(storeOp.getSrc().getType());
+    }
     return "";
   };
 
@@ -2107,7 +2127,8 @@ static std::string getKeyOpLabel(Operation *op) {
     // Load: out = load(src)
     std::string inputs = getTensorInputs(op);
     label += outputName + " = " + opName + "(" + inputs + ")";
-  } else if (isa<tt::DescriptorStoreOp, tt::StoreOp, ttng::TMEMStoreOp,
+  } else if (isTiledTMAStoreLike(op) ||
+             isa<tt::DescriptorStoreOp, tt::StoreOp, ttng::TMEMStoreOp,
                  ttg::LocalStoreOp, tt::DescriptorReduceOp>(op)) {
     // Store: store(src) - only show the source tensor, not the destination
     std::string srcName = getStoreSrcName(op);
@@ -3409,8 +3430,9 @@ static void getSubtiledChannelEndpoints(Operation *allocOp,
       if (auto st = dyn_cast<ttg::LocalStoreOp>(&op)) {
         if (bound(st.getDst()))
           prodRegion = sub;
-      } else if (auto cp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(&op)) {
-        if (bound(cp.getSrc()))
+      } else if (isTiledTMAStoreLike(&op)) {
+        auto tmaStore = cast<ttng::TMAStoreLikeOpInterface>(&op);
+        if (bound(tmaStore.getSrc()))
           consRegion = sub;
       } else if (auto ld = dyn_cast<ttg::LocalLoadOp>(&op)) {
         if (bound(ld.getSrc()))
@@ -3548,6 +3570,12 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
       } else
         consumers.push_back(user);
     }
+    // Subtile formation can fold one sibling's abstract TMA consumer into the
+    // representative region, leaving its former staging allocation with only
+    // a dead producer store. Such an allocation has no communication edge and
+    // must not become a same-task AllocChannel.
+    if (consumers.empty())
+      return;
     // If no LocalStoreOp user but the alloc has a tensor source,
     // the local_alloc itself is the producer (direct alloc+store).
     if (!producerOp && localAlloc.getSrc())

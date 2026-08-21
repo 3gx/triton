@@ -39,4 +39,26 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threa
     } {tt.warp_specialize}
     tt.return %result : tensor<16x16xf32, #blocked>
   }
+
+  // Native Meta skips the standalone early TMA-store pass. A function with no
+  // WS metadata must therefore take the common bailout path and recover the
+  // legacy issue/token/wait representation before the AutoWS pass returns.
+  // CHECK-LABEL: @no_ws_metadata_store_reduce
+  // CHECK-NOT: tt.descriptor_store
+  // CHECK: %[[STORE_TOKEN:.*]] = ttng.async_tma_copy_local_to_global
+  // CHECK: ttng.async_tma_store_token_wait %[[STORE_TOKEN]]
+  // CHECK-NOT: tt.descriptor_reduce
+  // CHECK: %[[REDUCE_TOKEN:.*]] = ttng.async_tma_reduce add
+  // CHECK: ttng.async_tma_store_token_wait %[[REDUCE_TOKEN]]
+  // CHECK-NOT: nvws.descriptor_
+  tt.func public @no_ws_metadata_store_reduce(
+      %store_desc: !tt.tensordesc<16x16xf32, #shared>,
+      %reduce_desc: !tt.tensordesc<16x16xf32, #shared>,
+      %src: tensor<16x16xf32, #blocked>, %i: i32) {
+    tt.descriptor_store %store_desc[%i, %i], %src
+        : !tt.tensordesc<16x16xf32, #shared>, tensor<16x16xf32, #blocked>
+    tt.descriptor_reduce add, %reduce_desc[%i, %i], %src
+        : !tt.tensordesc<16x16xf32, #shared>, tensor<16x16xf32, #blocked>
+    tt.return
+  }
 }

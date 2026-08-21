@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-test-tma-store-token-wait-reorder="enable-rotation=false" --nvgpu-tma-store-token-wait-lowering | FileCheck %s --check-prefix=LATE
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
@@ -12,6 +13,28 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %tok = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
     // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32}
     ttng.async_tma_store_token_wait %tok : !ttg.async.token
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// Late-created store/reduce tokens must feed the unchanged pending-count
+// lowering. With rotation disabled each generated wait is adjacent, so both
+// lower to pendings=0.
+// LATE-LABEL: late_abstract_store_reduce
+// LATE-NOT: nvws.descriptor_
+// LATE-COUNT-2: ttng.async_tma_store_wait {pendings = 0 : i32}
+  tt.func public @late_abstract_store_reduce(
+      %storeDesc: !tt.tensordesc<128x64xf16, #shared>,
+      %reduceDesc: !tt.tensordesc<128x64xf16, #shared>,
+      %storeSrc: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+      %reduceSrc: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>, %i: i32) {
+    nvws.descriptor_store %storeDesc[%i, %i] %storeSrc : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    nvws.descriptor_reduce add, %reduceDesc[%i, %i] %reduceSrc : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     tt.return
   }
 }

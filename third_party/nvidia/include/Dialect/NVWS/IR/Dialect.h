@@ -33,6 +33,7 @@
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include <cstdint>
 
 #include "nvidia/include/Dialect/NVWS/IR/NVWSAttrEnums.h.inc"

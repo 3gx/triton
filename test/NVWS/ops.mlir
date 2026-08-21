@@ -153,3 +153,43 @@ tt.func @token_with_ws_constraints() {
   nvws.consumer_release %0, %c0_i32 {async_task_id = dense<1> : vector<1xi32>, constraints = {WSBarrier = {dstTask = 0 : i32}}} : tensor<3x!nvws.token>, i32
   tt.return
 }
+
+// -----
+
+#store_shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+#barrier_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @descriptor_store_reduce
+  // CHECK-NOT: = nvws.descriptor_
+  // CHECK: nvws.descriptor_store
+  // CHECK: nvws.descriptor_reduce add
+  // CHECK: nvws.descriptor_store {{.*}} nvws_token {{.*}} barrier_types = {{.*}} token_types = tensor<2x!nvws.token>
+  // CHECK: nvws.descriptor_reduce max, {{.*}} nvws_token {{.*}} barrier_types = {{.*}} token_types = tensor<2x!nvws.token>
+  // CHECK-NOT: = nvws.descriptor_
+  tt.func @descriptor_store_reduce(
+      %desc: !tt.tensordesc<16x16xf16, #store_shared>,
+      %src: !ttg.memdesc<16x16xf16, #store_shared, #smem, mutable>,
+      %barrier: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+      %token: tensor<2x!nvws.token>, %i: i32, %j: i32, %pred: i1) {
+    nvws.descriptor_store %desc[%i, %j] %src
+        : !tt.tensordesc<16x16xf16, #store_shared>,
+          !ttg.memdesc<16x16xf16, #store_shared, #smem, mutable>
+    nvws.descriptor_reduce add, %desc[%i, %j] %src
+        : !tt.tensordesc<16x16xf16, #store_shared>,
+          !ttg.memdesc<16x16xf16, #store_shared, #smem, mutable>
+    nvws.descriptor_store %desc[%i, %j] %src, %barrier[%pred]
+        nvws_token %token[%i]
+        : !tt.tensordesc<16x16xf16, #store_shared>,
+          !ttg.memdesc<16x16xf16, #store_shared, #smem, mutable>
+          barrier_types = !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+          token_types = tensor<2x!nvws.token>
+    nvws.descriptor_reduce max, %desc[%i, %j] %src, %barrier[%pred]
+        nvws_token %token[%j]
+        : !tt.tensordesc<16x16xf16, #store_shared>,
+          !ttg.memdesc<16x16xf16, #store_shared, #smem, mutable>
+          barrier_types = !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+          token_types = tensor<2x!nvws.token>
+    tt.return
+  }
+}

@@ -16,7 +16,7 @@
 - [Effects](#effects)
 - [When an access finishes](#when-an-access-finishes)
   - [Why `tt.descriptor_store` needs special handling](#why-ttdescriptor_store-needs-special-handling)
-  - [Required `nvws.descriptor_store` counterpart](#required-nvwsdescriptor_store-counterpart)
+  - [NVWS descriptor store/reduce and deferred InsertSemas support](#nvws-descriptor-storereduce-and-deferred-insertsemas-support)
 - [Regions and boundaries](#regions-and-boundaries)
   - [Choosing a boundary owner](#choosing-a-boundary-owner)
   - [A loop can have a different owner per piece](#a-loop-can-have-a-different-owner-per-piece)
@@ -424,32 +424,29 @@ indirect path is outside the supported input.
 
 [↑ Back to contents](#contents)
 
-### Required `nvws.descriptor_store` counterpart
+### NVWS descriptor store/reduce and deferred InsertSemas support
 
-NVWS does not currently have a descriptor-store counterpart to
-`nvws.descriptor_load` and `nvws.descriptor_gather`. A buffer-taking operation
-would make the SMEM dependency explicit. Allocation materialization could
-first produce:
+NVWS now defines resultless, buffer-taking `nvws.descriptor_store` and
+`nvws.descriptor_reduce`. Native Meta creates an empty staging allocation plus
+an explicit `ttg.local_store`, then uses the NVWS operation as the SMEM reader:
 
 ```mlir
-%loaded = ttg.local_load %buf
-%value = ttg.convert_layout %loaded
+%buf = ttg.local_alloc
 ttg.local_store %value, %buf
-nvws.descriptor_store %desc, ..., %buf
+nvws.descriptor_store %desc[%coords] %buf
 ```
 
-ACCESS-DAG could record the local store as a write to `%buf` and
-`nvws.descriptor_store` as the following read. When the load-convert-store
-round trip preserves the SMEM representation and its intermediate values have
-no other users, it could be folded to:
+The operations have no public TMA completion-token result. In native Meta they
+temporarily carry deferred channel token/index operands, which token lowering
+resolves to barrier/predicate operands. Late TMA materialization transfers
+those barriers to the generated `ttng.async_tma_store_token_wait`, so the
+buffer-release arrival cannot run before the TMA engine finishes reading SMEM.
 
-```mlir
-nvws.descriptor_store %desc, ..., %buf
-```
-
-The operation must also expose when the asynchronous TMA store finishes reading
-the SMEM buffer, so the semaphore arrival returning that buffer is not posted
-early.
+General `InsertSemasAccessDag.cpp` consumption is still deferred. ACCESS-DAG
+does not yet classify these NVWS operations as managed reads or use their
+internal completion contract; the Meta-to-NVWS bridge therefore retains its
+existing early-TTNG completion-anchor path. Adding the NVWS access and
+completion rules belongs to the follow-up InsertSemas series.
 
 [↑ Back to contents](#contents)
 

@@ -21,7 +21,8 @@
 // Group 1: Epilogue operations
 // CHECK: partition1
 // CHECK: ttng.tmem_load
-// CHECK: tt.descriptor_store
+// CHECK: ttng.async_tma_copy_local_to_global
+// CHECK: ttng.async_tma_store_token_wait
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
@@ -101,7 +102,8 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // partition scheduler?
 // Partition 1 (partition 2): Epilogue store operations
 // CHECK: partition1
-// CHECK: tt.descriptor_store
+// CHECK: ttng.async_tma_copy_local_to_global
+// CHECK: ttng.async_tma_store_token_wait
 // Partition 2 (partition 1): Epilogue load from tensor memory
 // CHECK: partition2
 // CHECK: ttng.tmem_load
@@ -202,7 +204,8 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // Group 1: Epilogue operations
 // CHECK: partition1
 // CHECK: ttng.tmem_load
-// CHECK: tt.descriptor_store
+// CHECK: ttng.async_tma_copy_local_to_global
+// CHECK: ttng.async_tma_store_token_wait
 
 #blocked3 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked4 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
@@ -281,7 +284,8 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // The tmem_store should inherit the partition from its source value
 // CHECK: ttng.tmem_store
 // CHECK: ttng.tmem_load
-// CHECK: tt.descriptor_store
+// CHECK: ttng.async_tma_copy_local_to_global
+// CHECK: ttng.async_tma_store_token_wait
 
 #blocked6 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked7 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
@@ -345,16 +349,15 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 // -----
 
-// Test case: Persistent Blackwell GEMM kernel with early-lowered TMA store.
-// Same as the persistent test above, but tt.descriptor_store has been lowered
-// (by WSTMAStoreLowering) into:
-//   convert_layout -> local_alloc -> fence_async_shared ->
-//   async_tma_copy_local_to_global -> async_tma_store_token_wait
+// Test case: Persistent Blackwell GEMM kernel using the tokenless native-Meta
+// descriptor-store abstraction. The store starts as tt.descriptor_store,
+// converts to nvws.descriptor_store after task propagation, and materializes
+// the TTNG issue/token/wait only after scheduling.
 // Partitions: 1 = MMA, 2 = loads, 3 = TMA store, 4 = tmem_load + truncf + convert + alloc
 // The WS pass should fuse the consumer release barrier into the
 // TMAStoreTokenWaitOp instead of emitting a separate arrive_barrier.
 
-// CHECK-LABEL: @matmul_kernel_tma_persistent_early_store
+// CHECK-LABEL: @matmul_kernel_tma_persistent_abstract_store
 // CHECK: ttg.warp_specialize
 // Default group: MMA operations
 // CHECK: default
@@ -363,7 +366,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // CHECK: partition0
 // CHECK: ttng.async_tma_copy_global_to_local
 // CHECK: ttng.async_tma_copy_global_to_local
-// Partition 1: Early-lowered TMA store
+// Partition 1: Late-materialized TMA store
 // CHECK: partition1
 // CHECK: ttng.async_tma_copy_local_to_global
 // Barrier should be fused into the wait op, not a separate arrive_barrier
@@ -379,7 +382,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 #smem5 = #ttg.shared_memory
 #tmem5 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @matmul_kernel_tma_persistent_early_store(%a_desc: !tt.tensordesc<128x128xf16, #shared8>, %a_desc_0: i32, %a_desc_1: i32, %a_desc_2: i64, %a_desc_3: i64, %b_desc: !tt.tensordesc<128x128xf16, #shared8>, %b_desc_4: i32, %b_desc_5: i32, %b_desc_6: i64, %b_desc_7: i64, %c_desc: !tt.tensordesc<128x128xf16, #shared8>, %c_desc_8: i32, %c_desc_9: i32, %c_desc_10: i64, %c_desc_11: i64, %M: i32 {tt.divisibility = 16 : i32}, %N: i32 {tt.divisibility = 16 : i32}, %K: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+  tt.func public @matmul_kernel_tma_persistent_abstract_store(%a_desc: !tt.tensordesc<128x128xf16, #shared8>, %a_desc_0: i32, %a_desc_1: i32, %a_desc_2: i64, %a_desc_3: i64, %b_desc: !tt.tensordesc<128x128xf16, #shared8>, %b_desc_4: i32, %b_desc_5: i32, %b_desc_6: i64, %b_desc_7: i64, %c_desc: !tt.tensordesc<128x128xf16, #shared8>, %c_desc_8: i32, %c_desc_9: i32, %c_desc_10: i64, %c_desc_11: i64, %M: i32 {tt.divisibility = 16 : i32}, %N: i32 {tt.divisibility = 16 : i32}, %K: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %false = arith.constant false
     %true = arith.constant true
     %c148_i32 = arith.constant 148 : i32
@@ -442,11 +445,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %tmem_result, %tmem_token = ttng.tmem_load %accumulator[%accumulator_22#1] {ttg.partition = array<i32: 4>} : !ttg.memdesc<128x128xf32, #tmem5, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked11>
       %truncated = arith.truncf %tmem_result {ttg.partition = array<i32: 4>} : tensor<128x128xf32, #blocked11> to tensor<128x128xf16, #blocked11>
       %converted = ttg.convert_layout %truncated {ttg.partition = array<i32: 4>} : tensor<128x128xf16, #blocked11> -> tensor<128x128xf16, #blocked12>
-      %store_alloc = ttg.local_alloc %converted {ttg.partition = array<i32: 4>} : (tensor<128x128xf16, #blocked12>) -> !ttg.memdesc<128x128xf16, #shared8, #smem5, mutable>
-      ttng.fence_async_shared {bCluster = false}
-      // Partition 3: Async TMA store
-      %store_token = ttng.async_tma_copy_local_to_global %c_desc[%offs_am_c, %offs_bn_c] %store_alloc {ttg.partition = array<i32: 3>} : !tt.tensordesc<128x128xf16, #shared8>, !ttg.memdesc<128x128xf16, #shared8, #smem5, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %store_token {ttg.partition = array<i32: 3>} : !ttg.async.token
+      // Partition 3: abstract descriptor store. Conversion creates the staging
+      // allocation with producer task 4 while retaining store task 3.
+      tt.descriptor_store %c_desc[%offs_am_c, %offs_bn_c], %converted {ttg.partition = array<i32: 3>} : !tt.tensordesc<128x128xf16, #shared8>, tensor<128x128xf16, #blocked12>
       scf.yield %tile_id_c_23 : i32
     } {tt.data_partition_factor = 1 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
     tt.return

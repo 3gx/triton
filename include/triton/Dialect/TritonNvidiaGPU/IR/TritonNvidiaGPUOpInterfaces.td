@@ -5,7 +5,8 @@ include "mlir/IR/OpBase.td"
 
 def TMAOpInterface : OpInterface<"TMAOpInterface"> {
   let description = [{
-    Common interface for asynchronous TMA operations.
+    Common interface for TMA operations. Implementations may be abstractly
+    synchronous and lower to asynchronous hardware operations later.
   }];
 
   let cppNamespace = "::mlir::triton::nvidia_gpu";
@@ -52,7 +53,9 @@ def TMALoadLikeOpInterface : OpInterface<"TMALoadLikeOpInterface", [TMAOpInterfa
 
 def TMAStoreLikeOpInterface : OpInterface<"TMAStoreLikeOpInterface", [TMAOpInterface]> {
   let description = [{
-    Common interface for asynchronous TMA operations that read shared memory.
+    Common interface for TMA operations that read shared memory. The interface
+    describes the source-buffer relationship and does not require a completion
+    token result.
   }];
 
   let cppNamespace = "::mlir::triton::nvidia_gpu";

@@ -894,7 +894,11 @@ class CUDABackend(BaseBackend):
             if knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-            nvidia.passes.hopper.add_tma_store_lowering(pm)
+            # Native Meta keeps descriptor stores/reduces abstract through
+            # partition scheduling and converts them to NVWS afterwards.
+            # Compatibility and non-Meta paths retain the early TTNG form.
+            if not knobs.nvidia.use_meta_ws or opt.early_tma_store_lowering is True:
+                nvidia.passes.hopper.add_tma_store_lowering(pm)
             if knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_sink_broadcast(pm)
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
@@ -1009,7 +1013,11 @@ class CUDABackend(BaseBackend):
                         passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
-                nvidia.passes.hopper.add_tma_store_lowering(pm)
+                # Keep an explicit compatibility/debug route to the legacy
+                # early TTNG representation. The default (None) uses the
+                # tokenless NVWS abstraction.
+                if opt.early_tma_store_lowering is True:
+                    nvidia.passes.hopper.add_tma_store_lowering(pm)
                 nvidia.passes.hopper.add_sink_broadcast(pm)
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 smem_budget = _max_shared_mem_for_capability(capability)

@@ -102,6 +102,38 @@ static ttng::SubtiledRegionOp getEnclosingSubtiledRegionTile(Operation *op) {
 
 namespace {
 
+// Meta's TMA-store staging path handles tiled descriptor stores/reductions.
+// Row scatter also implements TMAStoreLikeOpInterface, but was never part of
+// this path and remains excluded.
+static bool isTiledTMAStoreLike(Operation *op) {
+  return isa<ttng::TMAStoreLikeOpInterface>(op) &&
+         !isa<ttng::AsyncTMAScatterOp>(op);
+}
+
+static bool isAbstractTMAStoreCompletion(Operation *op) {
+  return isa<ttnvws::DescriptorStoreOp, ttnvws::DescriptorReduceOp>(op);
+}
+
+// Both the legacy early-lowered wait and the new tokenless NVWS operation can
+// carry a deferred consumer-release token.  For the abstract form the token is
+// resolved before late NVWS->TTNG materialization, then the realized barrier is
+// transferred to the generated TMAStoreTokenWaitOp.
+static bool addDeferredTMAStoreRelease(Operation *op, Value token, Value idx) {
+  if (auto wait = dyn_cast<ttng::TMAStoreTokenWaitOp>(op)) {
+    wait.addToken(token, idx);
+    return true;
+  }
+  if (auto store = dyn_cast<ttnvws::DescriptorStoreOp>(op)) {
+    store.addToken(token, idx);
+    return true;
+  }
+  if (auto reduce = dyn_cast<ttnvws::DescriptorReduceOp>(op)) {
+    reduce.addToken(token, idx);
+    return true;
+  }
+  return false;
+}
+
 unsigned getNumBuffersOrDefault(scf::ForOp forOp, unsigned numBuffers) {
   // Use the attribute attached to the loop if it exists otherwise use the
   // global control.
@@ -414,7 +446,8 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
 
   llvm::SetVector<Block *> epliogBlocks;
   funcOp->walk([&](Operation *op) {
-    if (isa<tt::DescriptorStoreOp, tt::StoreOp>(op)) {
+    if (isa<tt::DescriptorStoreOp, ttnvws::DescriptorStoreOp, tt::StoreOp>(
+            op)) {
       epliogBlocks.insert(op->getBlock());
     }
   });
@@ -496,17 +529,23 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
       for (Operation &op : *block)
         opOrder[&op] = order++;
 
-      auto getDescriptorStore = [](Operation *op) -> tt::DescriptorStoreOp {
-        if (auto store = dyn_cast<tt::DescriptorStoreOp>(op))
-          return store;
+      auto getDescriptorStore = [](Operation *op) -> Operation * {
+        if (isa<tt::DescriptorStoreOp, ttnvws::DescriptorStoreOp>(op))
+          return op;
         for (Operation *user : op->getUsers()) {
-          if (auto store = dyn_cast<tt::DescriptorStoreOp>(user))
-            return store;
+          if (isa<tt::DescriptorStoreOp, ttnvws::DescriptorStoreOp>(user))
+            return user;
         }
         return nullptr;
       };
 
-      using StoreChannel = std::pair<tt::DescriptorStoreOp, Channel *>;
+      auto getDescriptor = [](Operation *op) -> Value {
+        if (auto store = dyn_cast<tt::DescriptorStoreOp>(op))
+          return store.getDesc();
+        return cast<ttnvws::DescriptorStoreOp>(op).getDesc();
+      };
+
+      using StoreChannel = std::pair<Operation *, Channel *>;
       llvm::MapVector<Value, SmallVector<StoreChannel>> channelsByDesc;
       for (auto *channel : channels) {
         Operation *dstOp = channel->getDstOp();
@@ -518,7 +557,7 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
         Operation *srcOp = channel->getSrcOp();
         if (!srcOp || srcOp->getBlock() != block)
           continue;
-        channelsByDesc[store.getDesc()].push_back({store, channel});
+        channelsByDesc[getDescriptor(store)].push_back({store, channel});
       }
 
       auto canMoveAfter = [](Operation *op, Operation *insertAfter) {
@@ -619,7 +658,7 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
     // Group store ops based on types.
     SmallVector<SmallVector<Operation *, 2>, 2> storeBuckets(2);
     for (auto op : reverse(epilogOps)) {
-      if (isa<tt::DescriptorStoreOp>(op))
+      if (isa<tt::DescriptorStoreOp, ttnvws::DescriptorStoreOp>(op))
         storeBuckets[0].push_back(op);
       if (isa<tt::StoreOp>(op))
         storeBuckets[1].push_back(op);
@@ -1471,7 +1510,27 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     auto originTaskIds = builder.getAsyncTaskIds();
     auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
     builder.setAsyncTaskIdsFromOp(srcOp);
-    tt::DescriptorStoreOp tmaStore;
+    Operation *tmaStore = nullptr;
+    Value tmaStoreDesc;
+    auto recordTMAStore = [&](Operation *candidate) {
+      if (auto store = dyn_cast<tt::DescriptorStoreOp>(candidate)) {
+        tmaStore = candidate;
+        tmaStoreDesc = store.getDesc();
+        return true;
+      }
+      if (auto reduce = dyn_cast<tt::DescriptorReduceOp>(candidate)) {
+        tmaStore = candidate;
+        tmaStoreDesc = reduce.getDesc();
+        return true;
+      }
+      if (isTiledTMAStoreLike(candidate)) {
+        tmaStore = candidate;
+        tmaStoreDesc =
+            cast<ttng::TMAStoreLikeOpInterface>(candidate).getDesc();
+        return true;
+      }
+      return false;
+    };
     bool requireMMASharedEncoding =
         llvm::any_of(actualConsumers, [&](Operation *op) {
           // convert_layout
@@ -1479,14 +1538,14 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
             for (auto *user : op->getUsers()) {
               // Do not reuse the current order for TMA store desc. Subsequent
               // codegen for TMA store does not handle mismatching order well.
-              if ((tmaStore = dyn_cast<tt::DescriptorStoreOp>(user))) {
+              if (recordTMAStore(user)) {
                 return false;
               }
             }
           }
           // Do not reuse the current order for TMA store desc. Subsequent
           // codegen for TMA store does not handle mismatching order well.
-          if ((tmaStore = dyn_cast<tt::DescriptorStoreOp>(op))) {
+          if (recordTMAStore(op)) {
             return false;
           }
           return isa<mlir::triton::DotOpInterface>(op);
@@ -1501,7 +1560,7 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
           /*fp4Padded*/ false);
     } else if (tmaStore) {
       sharedLayout = ttng::getEncodingFromDescriptor(tmaStore, tensorType,
-                                                     tmaStore.getDesc());
+                                                     tmaStoreDesc);
     } else if (auto nvwsLoad = getConvertedDescriptorLoad(srcOp)) {
       // TMA descriptor load (converted to nvws.descriptor_load before buffer
       // allocation): use the descriptor's shared encoding.
@@ -2675,11 +2734,11 @@ void insertAsyncComm(
               // directly from memory anyway.
               while (llvm::isa<ttg::ConvertLayoutOp>(user) && user->hasOneUse())
                 user = *user->getUsers().begin();
-              // Handle descriptor store/reduce or early lowered TMA
-              // store/reduce
-              if (llvm::isa<tt::DescriptorStoreOp,
-                            ttng::AsyncTMACopyLocalToGlobalOp,
-                            ttng::AsyncTMAReduceOp>(user)) {
+              // Handle raw descriptor store/reduce, the tokenless NVWS form,
+              // or the legacy early-lowered TTNG form.
+              if (llvm::isa<tt::DescriptorStoreOp, tt::DescriptorReduceOp>(
+                      user) ||
+                  isTiledTMAStoreLike(user)) {
                 consumerOps.insert(user);
                 actualConsumerOps.insert(user);
               }
@@ -2693,10 +2752,9 @@ void insertAsyncComm(
       }
     }
 
-    // If any actual consumer is a TMA store-like op, follow its token
-    // result to find TMAStoreTokenWaitOp and add it to actualConsumerOps.
-    // This enables barrier fusion for the early-lowered TMA store/reduce
-    // pattern (local_alloc → async_tma_copy/reduce → token_wait).
+    // For the legacy early-lowered TTNG form, follow the issue token to its
+    // completion wait.  The tokenless NVWS form is itself the abstract
+    // completion endpoint and remains in actualConsumerOps directly.
     DenseSet<Operation *> additionalConsumerOps;
     for (auto *op : actualConsumerOps) {
       if (llvm::isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
@@ -3521,8 +3579,9 @@ void insertAsyncComm(
         for (Operation &op : tileBlock.without_terminator()) {
           if (auto st = dyn_cast<ttg::LocalStoreOp>(&op))
             rewireBufferArg(st.getDst());
-          else if (auto cp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(&op))
-            rewireBufferArg(cp.getSrc());
+          else if (isTiledTMAStoreLike(&op))
+            rewireBufferArg(
+                cast<ttng::TMAStoreLikeOpInterface>(&op).getSrc());
         }
         slot.valid = true;
         subtiledRegionsTouched.push_back(sub);
@@ -4380,6 +4439,18 @@ void insertAsyncComm(
         }
         auto consumerReleasePoint = consumerReleaseHeuristic(
             tailProducer, tokenTailConsumer, token.first);
+        auto isExactAbstractCompletion = [&](Operation *candidate) {
+          if (!candidate || !isAbstractTMAStoreCompletion(candidate) ||
+              !actualConsumerOps.count(candidate))
+            return false;
+          auto taskIds = getAsyncTaskIds(candidate);
+          return taskIds.empty() || llvm::is_contained(taskIds, token.first);
+        };
+        bool hasAbstractCompletion = llvm::any_of(
+            actualConsumerOps, isExactAbstractCompletion);
+        hasAbstractCompletion |=
+            isAbstractTMAStoreCompletion(consumerReleasePoint) ||
+            isAbstractTMAStoreCompletion(tokenTailConsumer);
         auto subtiled = getEnclosingSubtiledRegionTile(consumerReleasePoint);
         if (!subtiled)
           subtiled = getEnclosingSubtiledRegionTile(tokenTailConsumer);
@@ -4388,6 +4459,22 @@ void insertAsyncComm(
             subtiled = sr;
         }
         if (subtiled) {
+          bool subtiledIsExactConsumer =
+              actualConsumerOps.count(subtiled.getOperation()) ||
+              consumerOps.count(subtiled.getOperation()) ||
+              tokenTailConsumer == subtiled.getOperation() ||
+              getEnclosingSubtiledRegionTile(tokenTailConsumer) == subtiled;
+          auto isExactSubtiledAbstractCompletion = [&](Operation *candidate) {
+            if (!candidate || !isAbstractTMAStoreCompletion(candidate))
+              return false;
+            auto taskIds = getAsyncTaskIds(candidate);
+            if (!taskIds.empty() &&
+                !llvm::is_contained(taskIds, token.first))
+              return false;
+            return isExactAbstractCompletion(candidate) ||
+                   (subtiledIsExactConsumer &&
+                    getEnclosingSubtiledRegionTile(candidate) == subtiled);
+          };
           Operation *insertTarget = tokenTailConsumer;
           if (isa<ttng::SubtiledRegionOp>(tokenTailConsumer)) {
             auto &tileBlock = subtiled.getTileRegion().front();
@@ -4408,21 +4495,69 @@ void insertAsyncComm(
           } else {
             tileBufIdx = subtiled.addSharedArg(bufferIdx);
           }
-          ttnvws::ConsumerReleaseOp::create(tileBuilder, insertTarget->getLoc(),
-                                            tileToken, tileBufIdx);
-          LDBG("create inline ConsumerRelease in SubtiledRegionOp "
-               << masterChannel->uniqID << " ");
+          Operation *completionCarrier =
+              isExactSubtiledAbstractCompletion(insertTarget) ? insertTarget
+                                                               : nullptr;
+          if (!completionCarrier) {
+            Block &tileBlock = subtiled.getTileRegion().front();
+            for (Operation &candidate :
+                 llvm::reverse(tileBlock.without_terminator())) {
+              if (isExactSubtiledAbstractCompletion(&candidate)) {
+                completionCarrier = &candidate;
+                break;
+              }
+            }
+          }
+          hasAbstractCompletion |= completionCarrier != nullptr;
+          if (completionCarrier && addDeferredTMAStoreRelease(
+                                       completionCarrier, tileToken,
+                                       tileBufIdx)) {
+            LDBG("attached inline ConsumerRelease token to abstract TMA store "
+                 "completion in SubtiledRegionOp "
+                 << masterChannel->uniqID << " ");
+          } else if (!hasAbstractCompletion) {
+            ttnvws::ConsumerReleaseOp::create(
+                tileBuilder, insertTarget->getLoc(), tileToken, tileBufIdx);
+            LDBG("create inline ConsumerRelease in SubtiledRegionOp "
+                 << masterChannel->uniqID << " ");
+          } else {
+            consumerReleasePoint->emitError(
+                "failed to find exact abstract TMA store completion carrier "
+                "for subtiled consumer release");
+            llvm::report_fatal_error(
+                "missing abstract TMA store completion carrier");
+          }
         } else {
           builder.setLoopScheduleInfoFromOp(consumerReleasePoint);
-          if (auto tokenWaitOp =
-                  dyn_cast<ttng::TMAStoreTokenWaitOp>(consumerReleasePoint)) {
-            tokenWaitOp.addToken(token.second, bufferIdx);
+          Operation *completionCarrier =
+              isa<ttng::TMAStoreTokenWaitOp>(consumerReleasePoint) ||
+                      isExactAbstractCompletion(consumerReleasePoint)
+                  ? consumerReleasePoint
+                  : nullptr;
+          if (!completionCarrier &&
+              (isa<ttng::TMAStoreTokenWaitOp>(tokenTailConsumer) ||
+               isExactAbstractCompletion(tokenTailConsumer)))
+            completionCarrier = tokenTailConsumer;
+          if (hasAbstractCompletion &&
+              !isExactAbstractCompletion(completionCarrier)) {
+            completionCarrier = nullptr;
+            for (Operation &candidate : llvm::reverse(
+                     tokenTailConsumer->getBlock()->getOperations())) {
+              if (isExactAbstractCompletion(&candidate)) {
+                completionCarrier = &candidate;
+                break;
+              }
+            }
+          }
+          if (completionCarrier && addDeferredTMAStoreRelease(
+                                       completionCarrier, token.second,
+                                       bufferIdx)) {
             LLVM_DEBUG({
-              LDBG("attached ConsumerRelease token to TMAStoreTokenWaitOp "
+              LDBG("attached ConsumerRelease token to TMA store completion "
                    << masterChannel->uniqID << " ");
               token.second.dump();
             });
-          } else {
+          } else if (!hasAbstractCompletion) {
             builder.setInsertionPointAfter(consumerReleasePoint);
             auto releaseOp =
                 builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
@@ -4434,6 +4569,12 @@ void insertAsyncComm(
               LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
               token.second.dump();
             });
+          } else {
+            consumerReleasePoint->emitError(
+                "failed to find exact abstract TMA store completion carrier "
+                "for consumer release");
+            llvm::report_fatal_error(
+                "missing abstract TMA store completion carrier");
           }
         }
       }

@@ -27,6 +27,46 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// The tokenless representation records the same planner-selected K directly
+// on the abstract operation.
+// CHECK-LABEL: abstract_store_double_buffer
+// CHECK: nvws.descriptor_store
+// CHECK-SAME: can_rotate_by_buffer_count = 2
+  tt.func public @abstract_store_double_buffer(
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
+      %lb: index, %ub: index, %step: index, %i: i32) {
+    %buf = ttg.local_alloc {buffer.copy = 2 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    scf.for %iv = %lb to %ub step %step {
+      nvws.descriptor_store %desc[%i, %i] %buf : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// CHECK-LABEL: abstract_reduce_unplanned
+// CHECK: nvws.descriptor_reduce
+// CHECK-NOT: can_rotate_by_buffer_count
+  tt.func public @abstract_reduce_unplanned(
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
+      %lb: index, %ub: index, %step: index, %i: i32) {
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    scf.for %iv = %lb to %ub step %step {
+      nvws.descriptor_reduce add, %desc[%i, %i] %buf : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
 // Single-buffered (buffer.copy = 1). K = 1 → annotated.
 // CHECK-LABEL: single_buffer
 // CHECK: ttng.async_tma_store_token_wait

@@ -57,6 +57,14 @@ namespace mlir {
 
 using OperationListT = std::vector<Operation *>;
 
+// The Meta staging planner handles tiled descriptor stores/reductions. TMA
+// row-scatter also implements the common interface, but was not staging input
+// to this planner before the NVWS abstraction and remains excluded.
+static bool isTiledTMAStoreLike(Operation *op) {
+  return isa<ttng::TMAStoreLikeOpInterface>(op) &&
+         !isa<ttng::AsyncTMAScatterOp>(op);
+}
+
 //===----------------------------------------------------------------------===//
 // MemoryPlannerBase - Abstract base class for memory planners
 //===----------------------------------------------------------------------===//
@@ -1447,12 +1455,8 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
     if (buf.tmaStaging > 0) {
       Value desc;
       for (auto user : buf.allocOp->getUsers()) {
-        if (auto storeOp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
-          desc = storeOp.getDesc();
-          break;
-        }
-        if (auto reduceOp = dyn_cast<ttng::AsyncTMAReduceOp>(user)) {
-          desc = reduceOp.getDesc();
+        if (isTiledTMAStoreLike(user)) {
+          desc = cast<ttng::TMAStoreLikeOpInterface>(user).getDesc();
           break;
         }
       }
@@ -2129,8 +2133,7 @@ public:
       // Kind classification.
       bool staging = false;
       for (Operation *user : r.allocOp->getUsers()) {
-        if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
-                user)) {
+        if (isTiledTMAStoreLike(user)) {
           staging = true;
           break;
         }
@@ -2353,8 +2356,7 @@ static unsigned allocateSmemBuffersViaSearch(
         needsFallback = true;
       unsigned storeUsers = 0;
       for (Operation *user : alloc->getUsers())
-        if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
-                user))
+        if (isTiledTMAStoreLike(user))
           ++storeUsers;
       if (storeUsers > 1)
         needsFallback = true; // subtiled staging (K|S) unmodeled
@@ -2497,19 +2499,19 @@ static unsigned allocateSmemBuffers(
            << buf.numCopies);
     }
 
-    // Detect TMA staging buffers: allocs whose users include
-    // AsyncTMACopyLocalToGlobalOp (store staging, type 1) or
-    // AsyncTMAReduceOp (reduce staging, type 2).
+    // Detect TMA staging buffers through the common store-like interface.
+    // Keep the concrete reduce distinction because tmaStaging=2 selects the
+    // reduce-specific lifetime policy; every other store-like op uses type 1.
+    bool hasTMAStoreLikeUser = false;
     for (auto user : alloc->getUsers()) {
-      if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
-        buf.tmaStaging = 1;
-        break;
-      }
-      if (isa<ttng::AsyncTMAReduceOp>(user)) {
+      if (isa<ttng::AsyncTMAReduceOp, ttnvws::DescriptorReduceOp>(user)) {
         buf.tmaStaging = 2;
         break;
       }
+      hasTMAStoreLikeUser |= isTiledTMAStoreLike(user);
     }
+    if (buf.tmaStaging == 0 && hasTMAStoreLikeUser)
+      buf.tmaStaging = 1;
 
     wsBuffers.push_back(buf);
 
@@ -2963,7 +2965,20 @@ static unsigned allocateSmemBuffers(
   // pipelining can rotate them. Their operands must be loop invariant.
   for (auto &buf : wsBuffers) {
     auto allocOp = buf.allocOp;
-    if (auto forOp = allocOp->getParentOfType<scf::ForOp>()) {
+    Operation *outermostLoop = nullptr;
+    for (Operation *parent = allocOp->getParentOp(); parent;
+         parent = parent->getParentOp()) {
+      // Preserve the legacy load/channel behavior: direct scf.while hoisting
+      // is needed only for the newly materialized store/reduce staging. An
+      // enclosing scf.for remains a valid target for every TMA-fed allocation,
+      // exactly as before.
+      if (isa<scf::ForOp>(parent) ||
+          (buf.tmaStaging > 0 && isa<scf::WhileOp>(parent)))
+        outermostLoop = parent;
+      if (isa<triton::FuncOp>(parent))
+        break;
+    }
+    if (outermostLoop) {
       bool feedsTMA = false;
       SmallVector<Value> worklist = {allocOp->getResult(0)};
       DenseSet<Value> visited;
@@ -2982,8 +2997,7 @@ static unsigned allocateSmemBuffers(
             feedsTMA = true;
             break;
           }
-          if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
-                  user)) {
+          if (isTiledTMAStoreLike(user)) {
             feedsTMA = true;
             break;
           }
@@ -2994,13 +3008,12 @@ static unsigned allocateSmemBuffers(
         }
       }
       if (feedsTMA) {
-        auto outermost = forOp;
-        while (auto parent = outermost->getParentOfType<scf::ForOp>())
-          outermost = parent;
         // Hoist only when every operand is loop invariant.
         bool operandsAreLoopInvariant = true;
         for (Value operand : allocOp->getOperands()) {
-          if (outermost.getBodyRegion().isAncestor(operand.getParentRegion())) {
+          Operation *operandParent = operand.getParentRegion()->getParentOp();
+          if (operandParent == outermostLoop ||
+              outermostLoop->isAncestor(operandParent)) {
             operandsAreLoopInvariant = false;
             break;
           }
@@ -3010,7 +3023,7 @@ static unsigned allocateSmemBuffers(
                << buf.bufferId << "] — operand defined inside the target loop");
           continue;
         }
-        allocOp->moveBefore(outermost);
+        allocOp->moveBefore(outermostLoop);
         LDBG("Phase 6: hoisted WSBuffer[" << buf.bufferId
                                           << "] before outermost loop");
       }

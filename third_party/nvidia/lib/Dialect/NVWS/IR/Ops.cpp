@@ -14,11 +14,54 @@
 #define GET_ATTRDEF_CLASSES
 #include "Dialect/NVWS/IR/NVWSAttrEnums.cpp.inc"
 
-#define GET_OP_CLASSES
 #include "Dialect/NVWS/IR/NVWSOpInterfaces.cpp.inc"
-#include "Dialect/NVWS/IR/Ops.cpp.inc"
 
 namespace mlir::triton::nvws {
+
+// barrier-and-pred := `,` ssa-value `[` ssa-value `]`
+// barriers-and-preds := (barrier-and-pred)*
+static ParseResult
+parseBarriersAndPreds(OpAsmParser &parser,
+                      SmallVectorImpl<OpAsmParser::UnresolvedOperand> &barriers,
+                      SmallVectorImpl<OpAsmParser::UnresolvedOperand> &preds) {
+  while (succeeded(parser.parseOptionalComma())) {
+    if (parser.parseOperand(barriers.emplace_back()) ||
+        parser.parseLSquare() || parser.parseOperand(preds.emplace_back()) ||
+        parser.parseRSquare())
+      return failure();
+  }
+  return success();
+}
+
+static void printBarriersAndPreds(OpAsmPrinter &printer, Operation *,
+                                  OperandRange barriers, OperandRange preds) {
+  assert(barriers.size() == preds.size());
+  for (auto [barrier, pred] : llvm::zip(barriers, preds))
+    printer << ", " << barrier << '[' << pred << ']';
+}
+
+// nvws-tokens-and-indices := (`nvws_token` ssa-value `[` ssa-value `]`)*
+static ParseResult parseNvwsTokensAndIndices(
+    OpAsmParser &parser,
+    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &nvwsTokens,
+    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &nvwsTokenIndices) {
+  while (succeeded(parser.parseOptionalKeyword("nvws_token"))) {
+    if (parser.parseOperand(nvwsTokens.emplace_back()) ||
+        parser.parseLSquare() ||
+        parser.parseOperand(nvwsTokenIndices.emplace_back()) ||
+        parser.parseRSquare())
+      return failure();
+  }
+  return success();
+}
+
+static void printNvwsTokensAndIndices(OpAsmPrinter &printer, Operation *,
+                                      OperandRange nvwsTokens,
+                                      OperandRange nvwsTokenIndices) {
+  assert(nvwsTokens.size() == nvwsTokenIndices.size());
+  for (auto [token, index] : llvm::zip(nvwsTokens, nvwsTokenIndices))
+    printer << " nvws_token " << token << '[' << index << ']';
+}
 
 static LogicalResult verifyNoDuplicateAsyncOps(Operation *op,
                                                ArrayAttr asyncOps) {
@@ -361,4 +404,68 @@ void SemaphoreBufferOp::setStage(Value stage) {
   getStageMutable().assign(stage);
 }
 
+static LogicalResult verifyDescriptorStoreLikeOp(
+    Operation *op, TensorDescType descType, ValueRange indices,
+    gpu::MemDescType srcType, ValueRange barriers, ValueRange barrierPreds,
+    ValueRange nvwsTokens, ValueRange nvwsTokenIndices) {
+  if (failed(verifyDescriptorLoadStoreOp(op, descType, srcType)))
+    return failure();
+
+  unsigned blockRank = descType.getBlockType().getRank();
+  if (indices.size() != blockRank)
+    return op->emitOpError("expected ")
+           << blockRank << " coordinates, but got " << indices.size();
+  if (indices.empty() || indices.size() > 5)
+    return op->emitOpError("must have between 1 and 5 coordinates");
+
+  if (!isa<gpu::SharedMemorySpaceAttr>(srcType.getMemorySpace()))
+    return op->emitOpError("source must use shared memory, but got ")
+           << srcType.getMemorySpace();
+
+  if (barriers.size() != barrierPreds.size())
+    return op->emitOpError(
+        "expected one predicate for every completion barrier");
+  if (nvwsTokens.size() != nvwsTokenIndices.size())
+    return op->emitOpError(
+        "expected one index for every deferred NVWS token");
+  return success();
+}
+
+LogicalResult DescriptorStoreOp::verify() {
+  return verifyDescriptorStoreLikeOp(
+      *this, getDesc().getType(), getIndices(), getSrc().getType(),
+      getBarriers(), getBarrierPreds(), getNvwsTokens(), getNvwsTokenIndices());
+}
+
+LogicalResult DescriptorReduceOp::verify() {
+  if (getKind() == DescriptorReduceKind::NONE)
+    return emitOpError("reduction kind must not be none");
+  return verifyDescriptorStoreLikeOp(
+      *this, getDesc().getType(), getIndices(), getSrc().getType(),
+      getBarriers(), getBarrierPreds(), getNvwsTokens(), getNvwsTokenIndices());
+}
+
+void DescriptorStoreOp::addBarrier(Value barrier, Value pred) {
+  getBarriersMutable().append(barrier);
+  getBarrierPredsMutable().append(pred);
+}
+
+void DescriptorStoreOp::addToken(Value token, Value idx) {
+  getNvwsTokensMutable().append(token);
+  getNvwsTokenIndicesMutable().append(idx);
+}
+
+void DescriptorReduceOp::addBarrier(Value barrier, Value pred) {
+  getBarriersMutable().append(barrier);
+  getBarrierPredsMutable().append(pred);
+}
+
+void DescriptorReduceOp::addToken(Value token, Value idx) {
+  getNvwsTokensMutable().append(token);
+  getNvwsTokenIndicesMutable().append(idx);
+}
+
 } // namespace mlir::triton::nvws
+
+#define GET_OP_CLASSES
+#include "Dialect/NVWS/IR/Ops.cpp.inc"

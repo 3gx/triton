@@ -54,6 +54,8 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
 
 LogicalResult doBufferAllocation(triton::FuncOp funcOp);
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp);
+LogicalResult doConvertDescriptorStoresToNVWS(triton::FuncOp funcOp);
+void doTMAStoreLowering(triton::FuncOp &funcOp);
 void doHoistLoopInvariantTMEMStore(triton::FuncOp funcOp);
 void removeRedundantTmemZeroStores(triton::FuncOp funcOp);
 void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers);
@@ -62,11 +64,18 @@ void doPingPongPrep(triton::FuncOp funcOp, unsigned numWarpGroups,
                     int capability, int defaultNumStages);
 void doPingPongSync(triton::FuncOp funcOp, unsigned numWarpGroups,
                     int capability);
+void doAnnotateAbstractTMAStores(triton::FuncOp funcOp);
+void doValidateAbstractTMAStoreAnnotations(triton::FuncOp funcOp);
 void doAnnotateTMAStoreWaits(triton::FuncOp funcOp);
 void doValidateTMAStoreAnnotations(triton::FuncOp funcOp);
 // Best-effort reordering of annotated TMA store waits; never fails (see the
 // definition in WSTMAStoreLowering.cpp).
 void doTMAStoreWaitReorder(triton::FuncOp funcOp);
+// Unconditionally materialize tokenless NVWS descriptor stores/reduces into
+// TTNG issue/token/wait operations, then optionally rotate the generated (and
+// legacy) waits to the next source-buffer overwrite.
+LogicalResult doMaterializeAndPlaceTMAStoreWaits(triton::FuncOp funcOp,
+                                                 bool enableRotation);
 
 } // namespace mlir
 

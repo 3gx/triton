@@ -39,17 +39,15 @@
 // CHECK:      ttg.local_store
 // CHECK:      ttng.arrive_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
 //
-// Epilogue-store consumer (async_task_id 2). The first column's consumer reads
-// slot accumCnt+0 (= tile 0 = outLHS); the second column's consumer reads the
-// DISTINCT slot accumCnt+1 (= tile 1 = outRHS). Same +0/+1 pairing as the
-// producer -> no swap.
+// Epilogue-store consumer (async_task_id 2). Each consumer waits for its
+// producer slot, issues the corresponding TMA store, and returns that slot on
+// the specific completion wait.
 // CHECK:      ttng.wait_barrier
-// CHECK:      ttg.local_load
-// CHECK:      tt.descriptor_store
-// CHECK:      arith.addi %{{.*}}, %c1_i64{{.*}} {async_task_id = array<i32: 2>}
+// CHECK:      ttng.async_tma_copy_local_to_global
+// CHECK:      ttng.async_tma_store_token_wait %{{.*}} , %{{.*}}[%{{.*}}]
 // CHECK:      ttng.wait_barrier
-// CHECK:      ttg.local_load
-// CHECK:      tt.descriptor_store
+// CHECK:      ttng.async_tma_copy_local_to_global
+// CHECK:      ttng.async_tma_store_token_wait %{{.*}} , %{{.*}}[%{{.*}}]
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>

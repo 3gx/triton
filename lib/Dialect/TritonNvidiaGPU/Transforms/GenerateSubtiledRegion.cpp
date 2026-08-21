@@ -27,15 +27,16 @@ static SmallVector<int32_t> getOpAsyncTaskIds(Operation *op) {
   return {};
 }
 
-static bool isTMAStoreLike(Operation *op) {
-  return isa<AsyncTMACopyLocalToGlobalOp, AsyncTMAReduceOp>(op);
+// This transform handles tiled descriptor stores/reductions. Row scatter also
+// implements TMAStoreLikeOpInterface, but has never participated in this
+// subtile formation and must retain that behavior.
+static bool isTiledTMAStoreLike(Operation *op) {
+  return isa<TMAStoreLikeOpInterface>(op) && !isa<AsyncTMAScatterOp>(op);
 }
 
 static Value getTMAStoreSrc(Operation *op) {
-  if (auto copy = dyn_cast<AsyncTMACopyLocalToGlobalOp>(op))
-    return copy.getSrc();
-  if (auto reduce = dyn_cast<AsyncTMAReduceOp>(op))
-    return reduce.getSrc();
+  if (isTiledTMAStoreLike(op))
+    return cast<TMAStoreLikeOpInterface>(op).getSrc();
   return {};
 }
 
@@ -513,7 +514,7 @@ collectPerTileChain(Value splitResult, Operation *splitOp, Block *block,
         for (Operation *bufUser : store.getDst().getUsers()) {
           if (bufUser->getBlock() != block || bufUser == store)
             continue;
-          if (!isTMAStoreLike(bufUser) ||
+          if (!isTiledTMAStoreLike(bufUser) ||
               getOpAsyncTaskIds(bufUser) != getOpAsyncTaskIds(store))
             continue;
           if (bufUser->isBeforeInBlock(splitOp) || bufUser == splitOp)
@@ -546,6 +547,17 @@ collectPerTileChain(Value splitResult, Operation *splitOp, Block *block,
         continue;
       if (excludeOps.contains(defOp))
         continue;
+      // A planned TMA staging allocation is the cross-task communication
+      // object. Keep it outside the producer tile region and pass it as a
+      // per-tile operand; cloning it into the producer body would make the
+      // local_store write a private allocation while the consumer TMA region
+      // still reads the original outer allocation.
+      if (auto localStore = dyn_cast<gpu::LocalStoreOp>(op)) {
+        if (operand == localStore.getDst() &&
+            isa<gpu::LocalAllocOp>(defOp) &&
+            defOp->hasAttr("buffer.tmaStaging"))
+          continue;
+      }
       if (!chainSet.contains(defOp) && visited.insert(defOp).second) {
         chainSet.insert(defOp);
         auxWorklist.push_back(defOp);
@@ -1105,7 +1117,7 @@ bool tryGenerateForSplit(triton::SplitOp splitOp) {
   bool tmaInterleaved = false;
   for (auto &chain : chains) {
     for (Operation *op : chain)
-      if (isTMAStoreLike(op)) {
+      if (isTiledTMAStoreLike(op)) {
         tmaInterleaved = true;
         break;
       }
@@ -1313,7 +1325,7 @@ bool tryGenerateForSplit(triton::SplitOp splitOp) {
           break;
         }
       Operation *tmaStore0 = tmaChains[0].front();
-      SmallVector<int32_t> tmaTaskIds = isTMAStoreLike(tmaStore0)
+      SmallVector<int32_t> tmaTaskIds = isTiledTMAStoreLike(tmaStore0)
                                             ? getOpAsyncTaskIds(tmaStore0)
                                             : SmallVector<int32_t>{};
       int64_t copies = 0;

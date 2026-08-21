@@ -180,6 +180,187 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
   return failure(hasUnconvertedLoad);
 }
 
+namespace {
+
+// Keep the staging-buffer names identical to the standalone early TMA-store
+// lowering.  Besides making diagnostics useful, the names are used to make
+// allocation grouping deterministic.
+static Location getDescriptorStoreStagingLoc(Operation *op, Value desc,
+                                              StringRef suffix) {
+  Location opLoc = op->getLoc();
+  Location descLoc = desc.getLoc();
+  if (Operation *defOp = desc.getDefiningOp())
+    descLoc = defOp->getLoc();
+
+  auto findName = [](Location loc, auto &self) -> StringRef {
+    if (auto nameLoc = dyn_cast<NameLoc>(loc))
+      return nameLoc.getName().strref();
+    if (auto callSiteLoc = dyn_cast<CallSiteLoc>(loc))
+      return self(callSiteLoc.getCallee(), self);
+    if (auto fusedLoc = dyn_cast<FusedLoc>(loc)) {
+      for (Location child : fusedLoc.getLocations()) {
+        StringRef name = self(child, self);
+        if (!name.empty())
+          return name;
+      }
+    }
+    return {};
+  };
+
+  StringRef descName = findName(descLoc, findName);
+  if (descName.empty())
+    return opLoc;
+  return NameLoc::get(
+      StringAttr::get(op->getContext(), (descName + suffix).str()), opLoc);
+}
+
+// Copy WS/scheduling metadata without replacing structural attributes created
+// by the destination op's builder (notably operandSegmentSizes).
+static void copyDescriptorStoreMetadata(Operation *from, Operation *to,
+                                        bool copyReduceKind) {
+  for (NamedAttribute attr : from->getAttrs()) {
+    if (!copyReduceKind && attr.getName() == "reduce_kind")
+      continue;
+    to->setAttr(attr.getName(), attr.getValue());
+  }
+}
+
+template <typename DescriptorOp>
+static ttg::LocalAllocOp createDescriptorStoreStagingAlloc(
+    DescriptorOp op, Value src, OpBuilderWithAsyncTaskIds &builder,
+    StringRef suffix) {
+  Value desc = op.getDesc();
+  auto tensorType = cast<RankedTensorType>(src.getType());
+  Attribute encoding =
+      ttng::getEncodingFromDescriptor(op, tensorType, desc);
+  auto memorySpace = ttg::SharedMemorySpaceAttr::get(op.getContext());
+  auto memDescType = ttg::MemDescType::get(
+      tensorType.getShape(), tensorType.getElementType(), encoding, memorySpace,
+      /*mutableMemory=*/true);
+
+  // The sourceful allocation executes with its tensor producer.  A block
+  // argument has no defining op, so retain the descriptor op's ownership as
+  // the conservative fallback.  Its loop stage/cluster deliberately remain
+  // those of the descriptor operation in both cases.
+  SmallVector<AsyncTaskId> allocTaskIds = getAsyncTaskIds(op);
+  if (Operation *srcDef = src.getDefiningOp()) {
+    SmallVector<AsyncTaskId> producerTaskIds = getAsyncTaskIds(srcDef);
+    if (!producerTaskIds.empty()) {
+      // Task propagation may put the descriptor-store task on the tensor
+      // producer as a transitive user. The staging write belongs to the actual
+      // producer side of the channel, not to that consumer task. Remove the
+      // store tasks when doing so leaves a producer; if producer and store are
+      // genuinely the same task, retain their common ownership.
+      SmallVector<AsyncTaskId> storeTaskIds = getAsyncTaskIds(op);
+      SmallVector<AsyncTaskId> exclusiveProducerTaskIds;
+      llvm::copy_if(producerTaskIds,
+                    std::back_inserter(exclusiveProducerTaskIds),
+                    [&](AsyncTaskId task) {
+                      return !llvm::is_contained(storeTaskIds, task);
+                    });
+      allocTaskIds = exclusiveProducerTaskIds.empty()
+                         ? std::move(producerTaskIds)
+                         : std::move(exclusiveProducerTaskIds);
+    }
+  }
+  builder.setAsynTaskIdsFromArray(allocTaskIds);
+  builder.setLoopScheduleInfoFromOp(op);
+  Location allocLoc = getDescriptorStoreStagingLoc(op, desc, suffix);
+  // Conversion runs after task propagation. Leaving this sourceful until
+  // doBufferAllocation would make channel discovery see the allocation before
+  // its later sourceful-alloc canonicalization, producing a separate channel
+  // buffer and then a second TMA staging buffer. Materialize the canonical form
+  // now so this one allocation is both the producer->store channel and the TMA
+  // source, matching the legacy early-lowered memory plan.
+  auto alloc = builder.createWithAsyncTaskIds<ttg::LocalAllocOp>(allocLoc,
+                                                                 memDescType);
+  builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(op.getLoc(), src,
+                                                     alloc.getResult());
+  return alloc;
+}
+
+static Value
+stripSingleUseStoreLayoutConversions(Value src,
+                                     SmallVectorImpl<Operation *> &forwarders) {
+  while (auto convert = src.getDefiningOp<ttg::ConvertLayoutOp>()) {
+    if (!convert->hasOneUse())
+      break;
+    forwarders.push_back(convert);
+    src = convert.getSrc();
+  }
+  return src;
+}
+
+} // namespace
+
+LogicalResult doConvertDescriptorStoresToNVWS(triton::FuncOp funcOp) {
+  SmallVector<tt::DescriptorStoreOp> stores;
+  SmallVector<tt::DescriptorReduceOp> reduces;
+  funcOp.walk([&](tt::DescriptorStoreOp op) { stores.push_back(op); });
+  funcOp.walk([&](tt::DescriptorReduceOp op) { reduces.push_back(op); });
+
+  // The legacy reduce_kind field on descriptor_store is not equivalent to a
+  // plain store.  Refuse it explicitly instead of silently discarding the
+  // reduction semantics in the new representation.
+  for (tt::DescriptorStoreOp op : stores) {
+    if (op.getReduceKind() != tt::DescriptorReduceKind::NONE)
+      return op.emitError("descriptor_store with reduce_kind must be "
+                          "canonicalized to tt.descriptor_reduce before "
+                          "native Meta warp specialization");
+  }
+
+  for (tt::DescriptorStoreOp op : stores) {
+    OpBuilderWithAsyncTaskIds builder(op);
+    builder.setInsertionPoint(op);
+    SmallVector<Operation *> deadForwarders;
+    Value stagingSrc =
+        stripSingleUseStoreLayoutConversions(op.getSrc(), deadForwarders);
+    auto alloc = createDescriptorStoreStagingAlloc(
+        op, stagingSrc, builder, "_staging");
+
+    builder.setAsyncTaskIdsFromOp(op);
+    builder.setLoopScheduleInfoFromOp(op);
+    auto nvwsOp = builder.createWithAsyncTaskIds<ttnvws::DescriptorStoreOp>(
+        op.getLoc(), op.getDesc(), op.getIndices(), alloc.getResult());
+    copyDescriptorStoreMetadata(op, nvwsOp, /*copyReduceKind=*/false);
+    op.erase();
+    for (Operation *forwarder : deadForwarders)
+      if (forwarder->use_empty())
+        forwarder->erase();
+  }
+
+  for (tt::DescriptorReduceOp op : reduces) {
+    OpBuilderWithAsyncTaskIds builder(op);
+    builder.setInsertionPoint(op);
+    SmallVector<Operation *> deadForwarders;
+    Value stagingSrc =
+        stripSingleUseStoreLayoutConversions(op.getSrc(), deadForwarders);
+    auto alloc = createDescriptorStoreStagingAlloc(
+        op, stagingSrc, builder, "_reduce_staging");
+
+    builder.setAsyncTaskIdsFromOp(op);
+    builder.setLoopScheduleInfoFromOp(op);
+    auto nvwsOp = builder.createWithAsyncTaskIds<ttnvws::DescriptorReduceOp>(
+        op.getLoc(), op.getKind(), op.getDesc(), op.getIndices(),
+        alloc.getResult());
+    copyDescriptorStoreMetadata(op, nvwsOp, /*copyReduceKind=*/true);
+    op.erase();
+    for (Operation *forwarder : deadForwarders)
+      if (forwarder->use_empty())
+        forwarder->erase();
+  }
+
+  bool hasUnconvertedStore = false;
+  funcOp.walk([&](Operation *op) {
+    if (!isa<tt::DescriptorStoreOp, tt::DescriptorReduceOp>(op))
+      return;
+    op->emitError("descriptor store/reduce operation was not converted for "
+                  "AutoWS");
+    hasUnconvertedStore = true;
+  });
+  return failure(hasUnconvertedStore);
+}
+
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx) {
   assert(isa<triton::gpu::MemDescType>(alloc.getType()) &&

@@ -10,4 +10,5 @@ add_triton_library(NVWSIR
   LINK_LIBS PUBLIC
   TritonIR
   TritonGPUIR
+  TritonNvidiaGPUIR
 )

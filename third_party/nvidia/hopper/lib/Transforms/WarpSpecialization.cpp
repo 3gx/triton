@@ -68,6 +68,18 @@ void doLowerSubtiledRegionsWithNVWSOps(triton::FuncOp funcOp) {
         toInline.push_back(op);
         break;
       }
+      if (auto store = dyn_cast<nvws::DescriptorStoreOp>(&tileOp)) {
+        if (!store.getNvwsTokens().empty()) {
+          toInline.push_back(op);
+          break;
+        }
+      }
+      if (auto reduce = dyn_cast<nvws::DescriptorReduceOp>(&tileOp)) {
+        if (!reduce.getNvwsTokens().empty()) {
+          toInline.push_back(op);
+          break;
+        }
+      }
     }
   });
   for (auto op : toInline)
@@ -107,7 +119,15 @@ public:
   // single reject epilogue shared by the early-exit paths in runOnFuncOp; use
   // it as `return bailOut(funcOp);`. The canonical WS-metadata set lives in the
   // shared `removeWarpSpecMetadata` (CodePartitionUtility.h).
-  void bailOut(triton::FuncOp funcOp) { removeWarpSpecMetadata(funcOp); }
+  void bailOut(triton::FuncOp funcOp) {
+    // Native Meta deliberately skips the standalone early TMA-store pass. If
+    // specialization is rejected before the abstract NVWS conversion point,
+    // restore the legacy issue/token/wait representation so bailout codegen is
+    // identical to the previous pipeline. This is a no-op when an earlier
+    // compatibility path already lowered the operations.
+    doTMAStoreLowering(funcOp);
+    removeWarpSpecMetadata(funcOp);
+  }
 
   // Dump the whole module to llvm::dbgs() after a pipeline step, gated on the
   // `dump-intermediate-steps` pass option. Collapses the identical dump blocks
@@ -138,8 +158,13 @@ public:
       }
       return WalkResult::advance();
     });
-    if (!enabled)
-      return;
+    if (!enabled) {
+      // Native Meta omits the standalone early TMA-store lowering pass.  A
+      // function without WS metadata never reaches the abstract conversion
+      // below, so restore the legacy representation before returning.  This is
+      // a no-op for compatibility pipelines that already lowered the stores.
+      return bailOut(funcOp);
+    }
 
     int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
     if (numWarps < 4) {
@@ -253,6 +278,12 @@ public:
     }
     dumpAfter(moduleOp, "doConvertDescriptorLoadsToNVWS");
 
+    if (failed(doConvertDescriptorStoresToNVWS(funcOp))) {
+      signalPassFailure();
+      return;
+    }
+    dumpAfter(moduleOp, "doConvertDescriptorStoresToNVWS");
+
     // Canonicalize the SMEM/TEM buffers.
     // Create buffers for register channels.
     if (failed(doBufferAllocation(funcOp))) {
@@ -276,6 +307,16 @@ public:
     }
 
     if (tmaStorePipelining) {
+      // Keep the abstract and legacy forms at the same annotation boundary.
+      // In particular, a subtiled source is already a region argument here;
+      // both representations therefore conservatively keep an adjacent wait
+      // instead of changing codegen by enabling a new rotation.
+      doAnnotateAbstractTMAStores(funcOp);
+      dumpAfter(moduleOp, "doAnnotateAbstractTMAStores");
+
+      doValidateAbstractTMAStoreAnnotations(funcOp);
+      dumpAfter(moduleOp, "doValidateAbstractTMAStoreAnnotations");
+
       doAnnotateTMAStoreWaits(funcOp);
       dumpAfter(moduleOp, "doAnnotateTMAStoreWaits");
 
@@ -311,10 +352,12 @@ public:
     }
     dumpAfter(moduleOp, "cleanupWarpSpecializedLoops");
 
-    if (tmaStorePipelining) {
-      doTMAStoreWaitReorder(funcOp);
-      dumpAfter(moduleOp, "doTMAStoreWaitReorder");
+    if (failed(doMaterializeAndPlaceTMAStoreWaits(
+            funcOp, /*enableRotation=*/tmaStorePipelining))) {
+      signalPassFailure();
+      return;
     }
+    dumpAfter(moduleOp, "doMaterializeAndPlaceTMAStoreWaits");
   }
 
   void runOnOperation() override {

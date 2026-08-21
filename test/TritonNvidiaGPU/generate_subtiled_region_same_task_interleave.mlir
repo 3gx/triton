@@ -91,6 +91,63 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 
+  // CHECK-LABEL: @same_task_nvws_store_interleave
+  // Tokenless NVWS stores still belong to the producer's per-tile chain.
+  // CHECK: ttng.subtiled_region
+  // CHECK:        ttg.local_store
+  // CHECK-NEXT:   nvws.descriptor_store
+  // CHECK-NEXT:   ttng.subtiled_region_yield
+  // CHECK-NOT: ttng.subtiled_region
+  tt.func @same_task_nvws_store_interleave(
+      %tmem_buf: !ttg.memdesc<128x128xf32, #tmem2, #ttng.tensor_memory, mutable>,
+      %acc_tok: !ttg.async.token,
+      %desc: !tt.tensordesc<128x64xf16, #shared2>,
+      %off0: i32, %off1: i32, %off2: i32) {
+    %smem0 = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
+    %smem1 = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
+
+    %loaded:2 = ttng.tmem_load %tmem_buf[%acc_tok] : !ttg.memdesc<128x128xf32, #tmem2, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked_full2>
+    %reshaped = tt.reshape %loaded#0 : tensor<128x128xf32, #blocked_full2> -> tensor<128x2x64xf32, #blocked3d2>
+    %transposed = tt.trans %reshaped {order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #blocked3d2> -> tensor<128x64x2xf32, #blocked3d_perm2>
+    %lhs, %rhs = tt.split %transposed : tensor<128x64x2xf32, #blocked3d_perm2> -> tensor<128x64xf32, #blocked2d2>
+
+    %trunc0 = arith.truncf %lhs {async_task_id = array<i32: 3>} : tensor<128x64xf32, #blocked2d2> to tensor<128x64xf16, #blocked2d2>
+    ttg.local_store %trunc0, %smem0 {async_task_id = array<i32: 3>} : tensor<128x64xf16, #blocked2d2> -> !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
+    nvws.descriptor_store %desc[%off0, %off1] %smem0 {async_task_id = array<i32: 3>} : !tt.tensordesc<128x64xf16, #shared2>, !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
+
+    %trunc1 = arith.truncf %rhs {async_task_id = array<i32: 3>} : tensor<128x64xf32, #blocked2d2> to tensor<128x64xf16, #blocked2d2>
+    ttg.local_store %trunc1, %smem1 {async_task_id = array<i32: 3>} : tensor<128x64xf16, #blocked2d2> -> !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
+    nvws.descriptor_store %desc[%off0, %off2] %smem1 {async_task_id = array<i32: 3>} : !tt.tensordesc<128x64xf16, #shared2>, !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
+    tt.return
+  }
+
+  // CHECK-LABEL: @same_task_nvws_reduce_interleave
+  // CHECK: ttng.subtiled_region
+  // CHECK:        ttg.local_store
+  // CHECK-NEXT:   nvws.descriptor_reduce add
+  // CHECK-NEXT:   ttng.subtiled_region_yield
+  // CHECK-NOT: ttng.subtiled_region
+  tt.func @same_task_nvws_reduce_interleave(
+      %tmem_buf: !ttg.memdesc<128x128xf32, #tmem2, #ttng.tensor_memory, mutable>,
+      %acc_tok: !ttg.async.token,
+      %desc: !tt.tensordesc<128x64xf32, #shared32>,
+      %off0: i32, %off1: i32, %off2: i32) {
+    %smem0 = ttg.local_alloc : () -> !ttg.memdesc<128x64xf32, #shared32, #smem2, mutable>
+    %smem1 = ttg.local_alloc : () -> !ttg.memdesc<128x64xf32, #shared32, #smem2, mutable>
+
+    %loaded:2 = ttng.tmem_load %tmem_buf[%acc_tok] : !ttg.memdesc<128x128xf32, #tmem2, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked_full2>
+    %reshaped = tt.reshape %loaded#0 : tensor<128x128xf32, #blocked_full2> -> tensor<128x2x64xf32, #blocked3d2>
+    %transposed = tt.trans %reshaped {order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #blocked3d2> -> tensor<128x64x2xf32, #blocked3d_perm2>
+    %lhs, %rhs = tt.split %transposed : tensor<128x64x2xf32, #blocked3d_perm2> -> tensor<128x64xf32, #blocked2d2>
+
+    ttg.local_store %lhs, %smem0 {async_task_id = array<i32: 1>} : tensor<128x64xf32, #blocked2d2> -> !ttg.memdesc<128x64xf32, #shared32, #smem2, mutable>
+    nvws.descriptor_reduce add, %desc[%off0, %off1] %smem0 {async_task_id = array<i32: 1>} : !tt.tensordesc<128x64xf32, #shared32>, !ttg.memdesc<128x64xf32, #shared32, #smem2, mutable>
+
+    ttg.local_store %rhs, %smem1 {async_task_id = array<i32: 1>} : tensor<128x64xf32, #blocked2d2> -> !ttg.memdesc<128x64xf32, #shared32, #smem2, mutable>
+    nvws.descriptor_reduce add, %desc[%off0, %off2] %smem1 {async_task_id = array<i32: 1>} : !tt.tensordesc<128x64xf32, #shared32>, !ttg.memdesc<128x64xf32, #shared32, #smem2, mutable>
+    tt.return
+  }
+
   // CHECK-LABEL: @adjacent_tmem_loads_keep_both_epilogues
   // Hoisting the two loads together must not make the second split absorb and
   // erase the first region as part of its setup interval.

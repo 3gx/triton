@@ -30,6 +30,16 @@
 // CHECK: %[[STAGE1:.*]] = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 1 : i32, buffer.tmaStaging = 1 : i32}
 // CHECK: ttg.local_store %{{.*}}, %[[STAGE1]] {async_task_id = array<i32: 1>}
 
+// The abstract NVWS forms must receive exactly the same staging kind, copy
+// count, and fused buffer ID as their legacy TTNG equivalents.
+// CHECK-LABEL: tt.func public @nvws_staging_interface
+// CHECK: %[[TT_STORE:.*]] = ttg.local_alloc {{.*}}buffer.copy = [[STORE_COPIES:[0-9]+]] : i32, buffer.id = [[STORE_ID:[0-9]+]] : i32, buffer.tmaStaging = 1 : i32
+// CHECK: %[[NVWS_STORE:.*]] = ttg.local_alloc {{.*}}buffer.copy = [[STORE_COPIES]] : i32, buffer.id = [[STORE_ID]] : i32, buffer.tmaStaging = 1 : i32
+// CHECK: nvws.descriptor_store {{.*}} %[[NVWS_STORE]]
+// CHECK: %[[TT_REDUCE:.*]] = ttg.local_alloc {{.*}}buffer.copy = [[REDUCE_COPIES:[0-9]+]] : i32, buffer.id = [[REDUCE_ID:[0-9]+]] : i32, buffer.tmaStaging = 2 : i32
+// CHECK: %[[NVWS_REDUCE:.*]] = ttg.local_alloc {{.*}}buffer.copy = [[REDUCE_COPIES]] : i32, buffer.id = [[REDUCE_ID]] : i32, buffer.tmaStaging = 2 : i32
+// CHECK: nvws.descriptor_reduce add, {{.*}} %[[NVWS_REDUCE]]
+
 // -----// WarpSpec internal IR Dump After: doBufferAllocation
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -234,6 +244,31 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     ttg.local_store %src1, %stage1 {async_task_id = array<i32: 1>} : tensor<64x128xf16, #blocked4> -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
     %token1 = ttng.async_tma_copy_local_to_global %desc[%c64, %c0] %stage1 {async_task_id = array<i32: 1>} : !tt.tensordesc<64x128xf16, #shared>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> !ttg.async.token
     ttng.async_tma_store_token_wait %token1 {async_task_id = array<i32: 1>} : !ttg.async.token
+    tt.return
+  }
+
+  tt.func public @nvws_staging_interface(
+      %store_desc: !tt.tensordesc<64x128xf16, #shared>,
+      %reduce_desc: !tt.tensordesc<64x128xf32, #shared1>,
+      %store_src: tensor<64x128xf16, #blocked4>,
+      %reduce_src: tensor<64x128xf32, #blocked4>) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+
+    %tt_store = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
+    ttg.local_store %store_src, %tt_store {async_task_id = array<i32: 0>} : tensor<64x128xf16, #blocked4> -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
+    %tt_store_token = ttng.async_tma_copy_local_to_global %store_desc[%c0, %c0] %tt_store {async_task_id = array<i32: 1>} : !tt.tensordesc<64x128xf16, #shared>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> !ttg.async.token
+
+    %nvws_store = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
+    ttg.local_store %store_src, %nvws_store {async_task_id = array<i32: 0>} : tensor<64x128xf16, #blocked4> -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
+    nvws.descriptor_store %store_desc[%c0, %c0] %nvws_store {async_task_id = array<i32: 1>} : !tt.tensordesc<64x128xf16, #shared>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
+
+    %tt_reduce = ttg.local_alloc : () -> !ttg.memdesc<64x128xf32, #shared1, #smem, mutable>
+    ttg.local_store %reduce_src, %tt_reduce {async_task_id = array<i32: 0>} : tensor<64x128xf32, #blocked4> -> !ttg.memdesc<64x128xf32, #shared1, #smem, mutable>
+    %tt_reduce_token = ttng.async_tma_reduce add, %reduce_desc[%c0, %c0] %tt_reduce {async_task_id = array<i32: 1>} : !tt.tensordesc<64x128xf32, #shared1>, !ttg.memdesc<64x128xf32, #shared1, #smem, mutable> -> !ttg.async.token
+
+    %nvws_reduce = ttg.local_alloc : () -> !ttg.memdesc<64x128xf32, #shared1, #smem, mutable>
+    ttg.local_store %reduce_src, %nvws_reduce {async_task_id = array<i32: 0>} : tensor<64x128xf32, #blocked4> -> !ttg.memdesc<64x128xf32, #shared1, #smem, mutable>
+    nvws.descriptor_reduce add, %reduce_desc[%c0, %c0] %nvws_reduce {async_task_id = array<i32: 1>} : !tt.tensordesc<64x128xf32, #shared1>, !ttg.memdesc<64x128xf32, #shared1, #smem, mutable>
     tt.return
   }
 } loc(#loc)

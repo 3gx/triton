@@ -19,12 +19,18 @@ doTaskPartition          (Hopper only; skipped on Blackwell)
   → doDataPartition      (via nvgpu-ws-data-partition when requested)
   → doPingPongPrep       (optional, if pingpongAutoWS is set)
   → doConvertDescriptorLoadsToNVWS
+  → doConvertDescriptorStoresToNVWS
   → doBufferAllocation
   → doMemoryPlanner
+  → doGenerateSubtiledRegion  (optional)
+  → doAnnotateAbstractTMAStores + validation  (optional rotation policy)
   → doCodePartition
   → doPingPongSync       (optional)
+  → doLowerSubtiledRegionsWithNVWSOps
   → doTokenLowering
   → doLoopSchedulePreprocessing + scheduleLoops  (external, not in this directory)
+  → doLowerRemainingSubtiledRegions + cleanupWarpSpecializedLoops
+  → doMaterializeAndPlaceTMAStoreWaits
   → SoftwarePipeliner::lowerLoops
   → peelPartitionLoops   (first masked tile vs. unmasked remainder)
   → SoftwarePipeliner::expandLoops
@@ -51,8 +57,11 @@ other operands, such as TMEM loads, have been prepared.
 
 The TMA store wait pipeline is enabled by default and can be disabled with the
 `nvgpu-warp-specialization` pass option `tma-store-pipelining=false`. Disabling
-it skips wait annotation, annotation validation, and wait reordering; it does
-not disable early TMA store lowering.
+it skips wait annotation, annotation validation, and wait reordering. Native
+Meta still materializes every `nvws.descriptor_store/reduce` into a TTNG
+issue/token/wait and leaves the wait adjacent to the issue. The independent
+`early_tma_store_lowering=true` compatibility option selects the legacy
+pre-AutoWS TTNG representation.
 
 ## Register Budgets
 
@@ -91,16 +100,16 @@ recognizes the `scf.while` outer loop (same doc).
 | `PingPong.cpp` | `doPingPongPrep` / `doPingPongSync` | Named barrier insertion for ping-pong scheduling |
 | `WSCodePartition.cpp` | `doBufferAllocation` | Channel discovery and SMEM/TMEM allocation hoisting (pre-pass) |
 | `WSBuffer.cpp` | `appendAccumCntsForOps` | Accumulation counter infrastructure for multi-buffer indexing |
-| `WSMemoryPlanner.cpp` | `doMemoryPlanner` | Plans SMEM and TMEM allocation (multi-buffering, liveness) |
+| `WSMemoryPlanner.cpp` | `doMemoryPlanner` | Plans SMEM and TMEM allocation (multi-buffering, liveness), including TMA staging hoists through `scf.for` and `scf.while` |
 | `WSCodePartition.cpp` | `doCodePartition` | Creates channels, inserts async copies and barriers |
 | `Pipeliner/PartitionLoopPeeling.cpp` | `peelPartitionLoops` | After scheduled-load lowering, peels a partition-local first iteration when `iv < lb + step`, folding the masked prologue and unmasked remainder predicates |
-| `WSLowerMem.cpp` | `doConvertDescriptorLoadsToNVWS` / `optimizeTMALoads` | Converts `tt.descriptor_load` to buffered `nvws.descriptor_load` before buffer hoisting, then lowers it to async TMA copies after planning |
+| `WSLowerMem.cpp` | `doConvertDescriptorLoadsToNVWS` / `doConvertDescriptorStoresToNVWS` / `optimizeTMALoads` | Converts TT descriptor loads and stores/reduces to explicit-buffer NVWS forms before planning; lowers loads during channel insertion while stores/reduces remain abstract through scheduling |
 | `WSSpecialize.cpp` | `specializeRegion` | Clones ops into `ttg.WarpSpecializeOp` regions |
-| `WSLowerToken.cpp` | `doTokenLowering` | Lowers `ProducerAcquireOp`/`ConsumerWaitOp` to hardware barriers |
-| `WSTMAStoreLowering.cpp` | `doTMAStoreLowering` | Pre-pass lowering of `tt.descriptor_store` for WS visibility |
-| `WSTMAStoreLowering.cpp` | `doAnnotateTMAStoreWaits` | Annotate TMA store waits with multi-buffer rotation count |
-| `WSTMAStoreLowering.cpp` | `doValidateTMAStoreAnnotations` | Safety check: strip invalid annotations |
-| `WSTMAStoreLowering.cpp` | `doTMAStoreWaitReorder` | Reschedule TMA store waits using SWP CoarseSchedule |
+| `WSLowerToken.cpp` | `doTokenLowering` | Lowers channel tokens to hardware barriers, including deferred completion operands carried by abstract descriptor stores/reduces |
+| `WSTMAStoreLowering.cpp` | `doTMAStoreLowering` | Legacy pre-pass lowering retained for compatibility and native-Meta bailout |
+| `WSTMAStoreLowering.cpp` | `doAnnotateAbstractTMAStores` / `doAnnotateTMAStoreWaits` | After subtile generation, annotate abstract stores and legacy waits with the same multi-buffer rotation policy |
+| `WSTMAStoreLowering.cpp` | `doValidateAbstractTMAStoreAnnotations` / `doValidateTMAStoreAnnotations` | Safety check: strip rotation metadata whose staging allocation cannot be recovered |
+| `WSTMAStoreLowering.cpp` | `doMaterializeAndPlaceTMAStoreWaits` | Unconditionally lower abstract stores/reduces to TTNG issue/token/wait, transfer release barriers, and optionally reorder waits using the SWP schedule |
 | `TMEMAlloc1D.cpp` | `TMEM1DAllocator` | 1D tensor memory allocation for cross-partition values |
 | `CodePartitionUtility.cpp` | — | Channel data structures, operand D handling, barrier fusion, buffer management |
 | `Utility.cpp` | — | `AsyncTaskId` helpers, `OpBuilderWithAsyncTaskIds` |

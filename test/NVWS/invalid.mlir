@@ -17,6 +17,133 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
 
 // -----
 
+#shared16 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+#shared32 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 32}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @descriptor_store_element_type_mismatch(
+      %desc: !tt.tensordesc<16x16xf16, #shared16>,
+      %src: !ttg.memdesc<16x16xf32, #shared32, #smem, mutable>,
+      %i: i32, %j: i32) {
+    // expected-error @below {{descriptor block and tensor element types must match, but got descriptor element type 'f16' and tensor element type 'f32'}}
+    nvws.descriptor_store %desc[%i, %j] %src
+        : !tt.tensordesc<16x16xf16, #shared16>,
+          !ttg.memdesc<16x16xf32, #shared32, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @descriptor_store_element_count_mismatch(
+      %desc: !tt.tensordesc<16x16xf16, #shared>,
+      %src: !ttg.memdesc<8x16xf16, #shared, #smem, mutable>,
+      %i: i32, %j: i32) {
+    // expected-error @below {{descriptor block and tensor must have the same number of elements, but got descriptor block with 256 elements tensor with 128 elements}}
+    nvws.descriptor_store %desc[%i, %j] %src
+        : !tt.tensordesc<16x16xf16, #shared>,
+          !ttg.memdesc<8x16xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @descriptor_store_coordinate_count(
+      %desc: !tt.tensordesc<16x16xf16, #shared>,
+      %src: !ttg.memdesc<16x16xf16, #shared, #smem, mutable>, %i: i32) {
+    // expected-error @below {{expected 2 coordinates, but got 1}}
+    nvws.descriptor_store %desc[%i] %src
+        : !tt.tensordesc<16x16xf16, #shared>,
+          !ttg.memdesc<16x16xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @descriptor_store_requires_shared_source(
+      %desc: !tt.tensordesc<16x16xf16, #shared>,
+      %src: !ttg.memdesc<16x16xf16, #shared, #ttng.shared_cluster_memory, mutable>,
+      %i: i32, %j: i32) {
+    // expected-error @below {{source must use shared memory, but got #ttng.shared_cluster_memory}}
+    nvws.descriptor_store %desc[%i, %j] %src
+        : !tt.tensordesc<16x16xf16, #shared>,
+          !ttg.memdesc<16x16xf16, #shared, #ttng.shared_cluster_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @descriptor_reduce_rejects_none(
+      %desc: !tt.tensordesc<16x16xf16, #shared>,
+      %src: !ttg.memdesc<16x16xf16, #shared, #smem, mutable>,
+      %i: i32, %j: i32) {
+    // expected-error @below {{reduction kind must not be none}}
+    "nvws.descriptor_reduce"(%desc, %i, %j, %src)
+        <{kind = 0 : i32,
+          operandSegmentSizes = array<i32: 1, 2, 1, 0, 0, 0, 0>}>
+        : (!tt.tensordesc<16x16xf16, #shared>, i32, i32,
+           !ttg.memdesc<16x16xf16, #shared, #smem, mutable>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+#barrier_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @descriptor_store_requires_barrier_predicate_pairs(
+      %desc: !tt.tensordesc<16x16xf16, #shared>,
+      %src: !ttg.memdesc<16x16xf16, #shared, #smem, mutable>,
+      %barrier: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+      %i: i32, %j: i32) {
+    // expected-error @below {{expected one predicate for every completion barrier}}
+    "nvws.descriptor_store"(%desc, %i, %j, %src, %barrier)
+        <{operandSegmentSizes = array<i32: 1, 2, 1, 1, 0, 0, 0>}>
+        : (!tt.tensordesc<16x16xf16, #shared>, i32, i32,
+           !ttg.memdesc<16x16xf16, #shared, #smem, mutable>,
+           !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @descriptor_reduce_requires_token_index_pairs(
+      %desc: !tt.tensordesc<16x16xf16, #shared>,
+      %src: !ttg.memdesc<16x16xf16, #shared, #smem, mutable>,
+      %token: tensor<2x!nvws.token>, %i: i32, %j: i32) {
+    // expected-error @below {{expected one index for every deferred NVWS token}}
+    "nvws.descriptor_reduce"(%desc, %i, %j, %src, %token)
+        <{kind = 1 : i32,
+          operandSegmentSizes = array<i32: 1, 2, 1, 0, 0, 1, 0>}>
+        : (!tt.tensordesc<16x16xf16, #shared>, i32, i32,
+           !ttg.memdesc<16x16xf16, #shared, #smem, mutable>,
+           tensor<2x!nvws.token>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {

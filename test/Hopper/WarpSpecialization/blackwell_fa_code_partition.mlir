@@ -19,12 +19,12 @@
 // CHECK: ttng.async_tma_copy_global_to_local
 // CHECK: ttng.async_tma_copy_global_to_local
 // CHECK: ttng.async_tma_copy_global_to_local
-// partition2: Output TMA store (convert_layout, descriptor_store for output)
+// partition2: Output TMA stores and their completion waits
 // CHECK: partition2
-// CHECK: ttg.convert_layout
-// CHECK: tt.descriptor_store
-// CHECK: ttg.convert_layout
-// CHECK: tt.descriptor_store
+// CHECK: ttng.async_tma_copy_local_to_global
+// CHECK: ttng.async_tma_store_token_wait
+// CHECK: ttng.async_tma_copy_local_to_global
+// CHECK: ttng.async_tma_store_token_wait
 // partition3: Softmax 1 (tmem_load qk, reduce max/sum, exp2, truncf, tmem_alloc p)
 // CHECK: partition3
 // CHECK: ttng.tmem_load

@@ -2,35 +2,37 @@
 
 **File**: `WSTMAStoreLowering.cpp`, `WSMemoryPlanner.cpp`
 
-After `doTMAStoreLowering` converts `tt::DescriptorStoreOp` into
-`LocalAllocOp` + `AsyncTMACopyLocalToGlobalOp` + `TMAStoreTokenWaitOp`
-(see [Memory Lowering](MemoryLowering.md#tma-store-lowering)), the
-memory planner and a sequence of sub-passes handle these staging buffers.
+Native Meta keeps `tt.descriptor_store/reduce` through partition scheduling,
+then `doConvertDescriptorStoresToNVWS` converts each operation to an empty
+staging `LocalAllocOp`, a producer-owned `LocalStoreOp`, and a resultless
+`nvws.descriptor_store/reduce`. The NVWS operation remains tokenless through
+memory planning, code partitioning, subtile handling, channel-token lowering,
+and loop scheduling. Only the post-schedule wait-placement phase creates the
+TTNG issue, TMA completion token, and `TMAStoreTokenWaitOp` (see
+[Memory Lowering](MemoryLowering.md#tma-storereduce-lowering)).
 
-Before this lowering, `doBufferAllocation` uses each `DescriptorStoreOp` as
-the ordering anchor for channels feeding TMA stores. The producer-side
-`local_store` order must match the descriptor-store order for the same TMA
-descriptor; later wait annotation and rotation reason about the sequence of
-stores to a shared staging buffer.
+The legacy `doTMAStoreLowering` route remains for non-Meta, Meta-to-NVWS,
+explicit compatibility mode, and native-Meta bailout. Both representations use
+the same planner metadata and post-subtile rotation-policy boundary.
 
 ## Memory Planner: `buffer.tmaStaging` Handling
 
 **File**: `WSMemoryPlanner.cpp` (within `allocateSmemBuffers`)
 
-When `early_tma_store_lowering` is enabled, the `local_alloc` ops created
-for TMA store staging are visible to the memory planner. Each WSBuffer is
-classified by which TMA op it feeds (Phase 1):
+The explicit `local_alloc` staging is visible to the memory planner in both
+native-Meta and legacy forms. Each WSBuffer is classified through the common
+store-like interface, with the concrete reduce forms retaining their distinct
+tag (Phase 1):
 
 ```cpp
 for (auto user : alloc->getUsers()) {
-    if (isa<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
-        buf.tmaStaging = 1;   // regular TMA store staging (dk, dv, c, o, ...)
-        break;
-    }
-    if (isa<ttng::AsyncTMAReduceOp>(user)) {
+    if (isa<ttng::AsyncTMAReduceOp,
+            nvws::DescriptorReduceOp>(user)) {
         buf.tmaStaging = 2;   // TMA atomic-add reduce staging (dq, ...)
         break;
     }
+    if (isTiledTMAStoreLike(user))
+        buf.tmaStaging = 1;   // regular TMA store staging (dk, dv, c, o, ...)
 }
 ```
 
@@ -155,55 +157,68 @@ tmaStoreSmem = numEntries * size * copies
 ### Phase 6: Hoist Before Outermost Loop
 
 All TMA staging allocs are moved before the outermost enclosing
-`scf.for` loop. This is required for the rotation mechanism
-(`doAnnotateTMAStoreWaits`) which reads `buffer.copy` and only annotates
-allocs that are outside all loops.
+`scf.for` or `scf.while` loop when every allocation operand is invariant with
+respect to that loop. This keeps persistent-loop iterations on one planned
+staging allocation and makes it available to the rotation mechanism. A
+non-invariant allocation is left in place rather than hoisted illegally.
 
 ## Wait Annotation and Reordering Pipeline
 
-Within the AutoWS monolithic pass (`WarpSpecialization.cpp`), three
-functions handle the wait ops after the memory planner:
+Within the AutoWS monolithic pass (`WarpSpecialization.cpp`), abstract and
+legacy forms converge at the post-subtile annotation and post-schedule
+materialization boundaries:
 
 ```
 doMemoryPlanner
-  → doAnnotateTMAStoreWaits      ← annotate waits with buffer count
-  → doValidateTMAStoreAnnotations ← safety check
+  → doGenerateSubtiledRegion
+  → doAnnotateAbstractTMAStores + validation
+  → doAnnotateTMAStoreWaits + validation  ← legacy compatibility form
   → doCodePartition
-  → ...
+  → doLowerSubtiledRegionsWithNVWSOps
+  → doTokenLowering             ← resolve completion tokens to barriers
   → scheduleLoops                 ← SWP assigns pipeline stages
   → cleanupWarpSpecializedLoops   ← prune dead loop-carried values
-  → doTMAStoreWaitReorder         ← move waits using the SWP schedule
+  → doMaterializeAndPlaceTMAStoreWaits
+      ├─ materialize NVWS → TTNG issue/token/wait unconditionally
+      └─ optionally move waits using the SWP schedule
 ```
 
 This sequence is controlled by the `nvgpu-warp-specialization` pass option
 `tma-store-pipelining`, which defaults to `true`. When set to `false`, AutoWS
-skips all three steps: annotation, validation, and post-schedule reordering.
-This option is independent of `early_tma_store_lowering`, which controls
-whether descriptor stores are lowered into async TMA store operations before
+skips annotation, validation, and post-schedule reordering. It does not skip
+late materialization: each abstract operation still becomes its TTNG
+issue/token/wait, with the wait left adjacent to the issue. The independent
+`early_tma_store_lowering=true` option selects the legacy representation before
 warp specialization.
 
 Each function is also available as a standalone MLIR pass for use outside
 the monolithic pipeline.
 
-## Step 1: `doAnnotateTMAStoreWaits`
+## Step 1: Annotate Rotation Policy
 
 **Test pass**: `nvgpu-test-annotate-tma-store-waits` (`NVGPUTestAnnotateTMAStoreWaitsPass`)
 
-This pass walks `scf.for` loops and inspects every `TMAStoreTokenWaitOp`.
-For each wait, it traces the token back to the defining
-TMA store-like op (`AsyncTMACopyLocalToGlobalOp` or `AsyncTMAReduceOp`),
-then looks at the SMEM buffer used by that store:
+At the post-subtile boundary, `doAnnotateAbstractTMAStores` inspects
+`nvws.descriptor_store/reduce`; `doAnnotateTMAStoreWaits` handles legacy
+`TMAStoreTokenWaitOp`. For a legacy wait, it first traces the token back to the
+defining TTNG store/reduce. Both paths then inspect the SMEM source:
 
 1. Get the `LocalAllocOp` that produces the buffer.
 2. Read the `buffer.copy` attribute (set earlier by the memory planner),
    which records how many physical copies of this buffer exist.
-3. If `buffer.copy = K`, set `can_rotate_by_buffer_count = K`
-   on the wait op.
+3. If `buffer.copy = K`, set `can_rotate_by_buffer_count = K` on the abstract
+   operation or legacy wait.
 
-The attribute means: "K buffer copies exist, so this wait can be delayed
+The attribute means: "K buffer copies exist, so the eventual wait can be delayed
 until the K-th subsequent TMA store to the same buffer — at that point
 the buffer slot is about to be overwritten and the earlier store must
 have finished reading."
+
+Annotation intentionally runs after subtile generation. A subtiled source may
+already be a region argument at this boundary; if the underlying planned alloc
+cannot be recovered, no rotation attribute is attached. Applying the same rule
+to abstract and legacy forms prevents the representation change from enabling
+a rotation that the legacy pipeline did not perform.
 
 ### Token Tracing
 
@@ -214,21 +229,50 @@ have finished reading."
 | **Direct** | Token is the direct SSA result of `AsyncTMACopyLocalToGlobalOp` or `AsyncTMAReduceOp` |
 | **Loop-carried** | Token is a block argument of the `scf.for` body; the function follows the corresponding yield operand back to its `AsyncTMACopyLocalToGlobalOp` or `AsyncTMAReduceOp` |
 
-## Step 2: `doValidateTMAStoreAnnotations`
+## Step 2: Validate Rotation Policy
 
 This is a safety pass that runs immediately after annotation. It
-re-checks every annotated wait and strips the `can_rotate_by_buffer_count`
-attribute if the defining TMA store or its `LocalAllocOp` can no longer
-be resolved. This guards against IR transformations between annotation
-and reordering that might invalidate assumptions.
+re-checks every annotated abstract operation and legacy wait. The abstract form
+uses `doValidateAbstractTMAStoreAnnotations`; the legacy form uses
+`doValidateTMAStoreAnnotations`. Either strips
+`can_rotate_by_buffer_count` when the underlying `LocalAllocOp` can no longer
+be resolved.
 
-## Step 3: `doTMAStoreWaitReorder`
+## Completion/Release Metadata
+
+The public NVWS form has no TMA completion-token result, but the operation can
+temporarily carry paired internal operands:
+
+- deferred `nvws_tokens` and indices attached by `doCodePartition`; or
+- resolved completion barriers and predicates produced by `doTokenLowering`.
+
+The abstract store/reduce itself is the final staging-buffer consumer during
+code partitioning. For a subtiled operation, the inner operation receives the
+captured token/index and the containing region is inlined before token lowering
+examines token users. Token lowering replaces the deferred pairs with the same
+barrier/predicate pairs that the legacy path attaches to
+`TMAStoreTokenWaitOp`.
+
+## Step 3: Materialize and Reorder
 
 **Test pass**: `nvgpu-test-tma-store-token-wait-reorder` (`NVGPUTestTMAStoreTokenWaitReorderPass`)
 
-This pass runs **after** `scheduleLoops` has assigned pipeline stages and
-clusters to every op. It uses the SWP `CoarseSchedule` to move waits
-forward in the linearized pipeline order.
+`doMaterializeAndPlaceTMAStoreWaits` runs **after** `scheduleLoops` has assigned
+pipeline stages and clusters. It first replaces every abstract operation:
+
+```text
+nvws.descriptor_store  -> ttng.async_tma_copy_local_to_global + token_wait
+nvws.descriptor_reduce -> ttng.async_tma_reduce + token_wait
+```
+
+The generated wait receives any resolved completion barriers/predicates and
+the rotation attribute. The conversion fails if deferred NVWS tokens remain,
+and verifies that no abstract operation survives. Materialization is
+unconditional; only the following call to `doTMAStoreWaitReorder` depends on
+`tma-store-pipelining`.
+
+When enabled, reordering uses the SWP `CoarseSchedule` to move waits forward in
+the linearized pipeline order.
 
 ### Algorithm
 
@@ -246,12 +290,13 @@ For each annotated `TMAStoreTokenWaitOp` with `can_rotate_by_buffer_count = K`:
 
 3. **Count K stores**: walk the linearized schedule, counting
    `AsyncTMACopyLocalToGlobalOp` and `AsyncTMAReduceOp` ops. Stop at the K-th
-   store-like op — this is the point where the buffer slot would be reused.
+   store-like op — its source slot is the one about to be reused.
 
-4. **Adjust for barriers**: scan backwards from the insertion target to
-   find a preceding `WaitBarrierOp`. If one exists, insert before it
-   instead — this avoids placing the TMA store wait between a barrier
-   wait and the ops it guards.
+4. **Find the overwrite boundary**: locate the scheduled `ttg.local_store`
+   that writes the target issue's source memdesc and insert before it. If that
+   writer belongs to another partition and is not directly visible, insert
+   before the scheduled `WaitBarrierOp` guarding the target issue. If neither
+   target can be proven, leave the wait in its adjacent fallback position.
 
 5. **Update the schedule**: split the cluster at the insertion target and
    create a new cluster for the wait op, assigned to the target's pipeline
@@ -267,18 +312,20 @@ With `buffer.copy = 2` (double-buffered) and a 3-stage pipeline:
 ```
 Stage 0: AsyncTMACopyLocalToGlobal (store to buffer[0])
          TMAStoreTokenWait          ← originally placed here
-Stage 1: ...compute...
-Stage 2: AsyncTMACopyLocalToGlobal (store to buffer[1])
+Stage 1: AsyncTMACopyLocalToGlobal (store to buffer[1])
+Stage 2: LocalStore (next value to buffer[0])
+         AsyncTMACopyLocalToGlobal (next store from buffer[0])
 ```
 
-After reordering with K=2, the wait moves forward to just before the 2nd
-copy (which would overwrite buffer[0]):
+After reordering with K=2, the wait moves forward to just before the writer for
+the second subsequent issue, which would overwrite buffer[0]:
 
 ```
 Stage 0: AsyncTMACopyLocalToGlobal (store to buffer[0])
-Stage 1: ...compute...
+Stage 1: AsyncTMACopyLocalToGlobal (store to buffer[1])
 Stage 2: TMAStoreTokenWait          ← moved here
-         AsyncTMACopyLocalToGlobal (store to buffer[1])
+         LocalStore (next value to buffer[0])
+         AsyncTMACopyLocalToGlobal (next store from buffer[0])
 ```
 
 This allows the compute in stage 1 to overlap with the asynchronous TMA

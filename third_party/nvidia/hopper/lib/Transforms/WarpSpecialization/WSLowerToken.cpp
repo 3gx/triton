@@ -1,6 +1,7 @@
 #include "CodePartitionUtility.h"
 #include "WarpSpecializationPipeline.h"
 #include "mlir/Transforms/Passes.h"
+#include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 
 #include <set>
@@ -149,6 +150,13 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
     // multiple producers or consumers? Check if num_warps agree.
     unsigned producerWarps = 0, consumerWarps = 0;
     SmallVector<Operation *> usersForToken;
+    DenseMap<Operation *, SmallVector<Value>> tokenAliasesForUser;
+    DenseSet<Operation *> seenUsersForToken;
+    auto recordTokenUser = [&](Operation *user, Value alias) {
+      if (seenUsersForToken.insert(user).second)
+        usersForToken.push_back(user);
+      tokenAliasesForUser[user].push_back(alias);
+    };
     for (OpOperand &use : createTokenOp.getResult().getUses()) {
       Operation *user = use.getOwner();
       if (auto wsOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
@@ -160,11 +168,11 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
           auto tArg = region.getArgument(opndNum);
           for (Operation *tUser : tArg.getUsers()) {
             // Use of TokenOp via capture of warp_specialize.
-            usersForToken.push_back(tUser);
+            recordTokenUser(tUser, tArg);
           }
         }
       } else {
-        usersForToken.push_back(user);
+        recordTokenUser(user, createTokenOp.getResult());
       }
     }
     // Detect and skip same-partition ProducerCommit/ConsumerWait pairs.
@@ -204,7 +212,9 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         producerWarps = nWarps;
       } else if (dyn_cast<ttnvws::ConsumerReleaseOp>(user) ||
                  dyn_cast<ttnvws::ConsumerWaitOp>(user) ||
-                 dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
+                 dyn_cast<ttng::TMAStoreTokenWaitOp>(user) ||
+                 dyn_cast<ttnvws::DescriptorStoreOp>(user) ||
+                 dyn_cast<ttnvws::DescriptorReduceOp>(user)) {
         auto nWarps = mlir::triton::gpu::lookupNumWarps(user);
         assert(consumerWarps == 0 || consumerWarps == nWarps);
         consumerWarps = nWarps;
@@ -245,6 +255,38 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
     auto extractBufferEmpty = [&](Location loc, Value idx) -> Value {
       return ttg::MemDescIndexOp::create(builder, loc, singleBarrierMemDescType,
                                          bufferEmptyArray, idx);
+    };
+    auto resolveTMAStoreCompletion = [&](auto op) {
+      auto aliasesIt = tokenAliasesForUser.find(op.getOperation());
+      if (aliasesIt == tokenAliasesForUser.end())
+        return false;
+      ArrayRef<Value> aliases = aliasesIt->second;
+      SmallVector<unsigned> resolved;
+      Value truePred;
+      unsigned pairIdx = 0;
+      for (auto [nvwsTok, nvwsIdx] :
+           llvm::zip(op.getNvwsTokens(), op.getNvwsTokenIndices())) {
+        unsigned i = pairIdx++;
+        if (!llvm::is_contained(aliases, nvwsTok))
+          continue;
+        if (!truePred)
+          truePred =
+              arith::ConstantIntOp::create(builder, op.getLoc(), 1, 1);
+        Value bufferEmpty = extractBufferEmpty(op.getLoc(), nvwsIdx);
+        setAsyncTaskIds(bufferEmpty.getDefiningOp(),
+                        getAsyncTaskIds(op.getOperation()));
+        op.addBarrier(bufferEmpty, truePred);
+        resolved.push_back(i);
+      }
+      // A completion carrier may hold releases for several independent
+      // channels. Resolve only operands belonging to this CreateTokenOp; later
+      // iterations resolve the remaining pairs against their own barrier
+      // arrays. Erase in reverse, and erase the later segment first.
+      for (unsigned i : llvm::reverse(resolved)) {
+        op.getNvwsTokenIndicesMutable().erase(i, 1);
+        op.getNvwsTokensMutable().erase(i, 1);
+      }
+      return !resolved.empty();
     };
     auto handleOneUser = [&](Operation *user) -> bool {
       // Skip same-partition ProducerCommit/ConsumerWait pairs — the
@@ -287,17 +329,18 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
-        Value truePred = arith::ConstantIntOp::create(builder, loc, 1, 1);
-        for (auto [nvwsTok, nvwsIdx] :
-             llvm::zip(op.getNvwsTokens(), op.getNvwsTokenIndices())) {
-          Value bufferEmpty = extractBufferEmpty(loc, nvwsIdx);
-          setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
-          op.addBarrier(bufferEmpty, truePred);
-        }
-        op.getNvwsTokensMutable().clear();
-        op.getNvwsTokenIndicesMutable().clear();
+        if (!resolveTMAStoreCompletion(op))
+          return false;
         // Do NOT erase — the op stays with its newly-added real barriers.
         return true;
+      } else if (auto op = dyn_cast<ttnvws::DescriptorStoreOp>(user)) {
+        if (!resolveTMAStoreCompletion(op))
+          return false;
+        // Keep the abstract op; late lowering transfers the real barriers to
+        // the generated TMAStoreTokenWaitOp.
+        return true;
+      } else if (auto op = dyn_cast<ttnvws::DescriptorReduceOp>(user)) {
+        return resolveTMAStoreCompletion(op);
       }
       return false;
     };
@@ -383,5 +426,20 @@ void doTokenLowering(triton::FuncOp funcOp, unsigned numConsumerGroups) {
   // lowerGetAsyncTaskIdOp(mod, numConsumerGroups);
   lowerTokenOperations(mod, numCTAs, numConsumerGroups);
 }
+
+#define GEN_PASS_DEF_NVGPUTESTWSLOWERTOKEN
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+struct NVGPUTestWSLowerTokenPass
+    : public impl::NVGPUTestWSLowerTokenBase<NVGPUTestWSLowerTokenPass> {
+  using impl::NVGPUTestWSLowerTokenBase<
+      NVGPUTestWSLowerTokenPass>::NVGPUTestWSLowerTokenBase;
+
+  void runOnOperation() override {
+    getOperation()->walk([&](triton::FuncOp funcOp) {
+      doTokenLowering(funcOp, numConsumerGroups);
+    });
+  }
+};
 
 } // namespace mlir

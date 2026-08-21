@@ -42,6 +42,11 @@ namespace mlir {
 
 namespace {
 
+static bool isTiledTMAStoreLike(Operation *op) {
+  return isa<ttng::TMAStoreLikeOpInterface>(op) &&
+         !isa<ttng::AsyncTMAScatterOp>(op);
+}
+
 bool enclosingAChannel(Operation *ctrlOp,
                        const DenseSet<Operation *> &regionsWithChannels) {
   for (auto *op : regionsWithChannels) {
@@ -291,7 +296,7 @@ static int64_t getReuseGroupStride(ReuseGroup *group) {
   for (Operation &op : sub.getTileRegion().front().without_terminator()) {
     if (isa<ttg::LocalStoreOp>(&op))
       ++writes;
-    else if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttg::LocalLoadOp>(&op))
+    else if (isTiledTMAStoreLike(&op) || isa<ttg::LocalLoadOp>(&op))
       ++reads;
   }
   int64_t perTile = writes > 0 ? writes : reads;

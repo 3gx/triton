@@ -30,6 +30,61 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // -----
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#barrier_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// Late store materialization preserves ownership/schedule metadata and moves
+// resolved completion barriers onto the newly created token wait.
+// CHECK-LABEL: abstract_store_materializes_completion
+// CHECK-NOT: nvws.descriptor_store
+// CHECK: %[[STORE_TOKEN:.*]] = ttng.async_tma_copy_local_to_global
+// CHECK-SAME: {async_task_id = array<i32: 2>, loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 2>}
+// CHECK-SAME: -> !ttg.async.token
+// CHECK: ttng.async_tma_store_token_wait %[[STORE_TOKEN]] , %{{.*}}[%{{.*}}]
+// CHECK-SAME: {async_task_id = array<i32: 2>, loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 2>}
+// CHECK-NOT: nvws.descriptor_store
+  tt.func public @abstract_store_materializes_completion(
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
+      %src: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+      %barrier: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+      %i: i32, %pred: i1) {
+    nvws.descriptor_store %desc[%i, %i] %src, %barrier[%pred] {async_task_id = array<i32: 2>, loop.cluster = 3 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> barrier_types = !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// Abstract reduces materialize before the existing K=1 overwrite-placement
+// algorithm, which moves the generated wait to the next iteration's writer.
+// CHECK-LABEL: abstract_reduce_k1
+// CHECK: scf.for
+// CHECK: ttg.local_store {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: %[[REDUCE_TOKEN:.*]] = ttng.async_tma_reduce add
+// CHECK-SAME: {async_task_id = array<i32: 3>, loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>}
+// CHECK: ttng.async_tma_store_token_wait %[[REDUCE_TOKEN]]
+// CHECK-NOT: can_rotate_by_buffer_count
+// CHECK-SAME: {async_task_id = array<i32: 3>, loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 3>}
+// CHECK-NOT: nvws.descriptor_reduce
+  tt.func public @abstract_reduce_k1(
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
+      %srcTensor: tensor<128x64xf16>,
+      %src: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+      %lb: index, %ub: index, %step: index, %i: i32) {
+    scf.for %iv = %lb to %ub step %step {
+      ttg.local_store %srcTensor, %src {loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      nvws.descriptor_reduce add, %desc[%i, %i] %src {async_task_id = array<i32: 3>, can_rotate_by_buffer_count = 1 : i32, loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    } {tt.scheduled_max_stage = 1 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
 // Double-buffered (K=2). One TMA copy at stage 1. Counting 2 copies forward

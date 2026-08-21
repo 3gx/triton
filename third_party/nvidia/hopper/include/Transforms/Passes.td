@@ -168,6 +168,18 @@ def NVGPUTestWSCodePartition: Pass<"nvgpu-test-ws-code-partition", "mlir::Module
   ];
 }
 
+def NVGPUTestWSLowerToken: Pass<"nvgpu-test-ws-lower-token", "mlir::ModuleOp"> {
+  let summary = "test native-Meta WS token lowering";
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
+  let options = [
+    Option<"numConsumerGroups", "num-consumer-groups",
+           "int32_t", /*default*/"1",
+           "number of consumer warp groups">
+  ];
+}
+
 def NVGPUTestPingPongSync : Pass<"nvgpu-test-ping-pong-sync", "mlir::ModuleOp"> {
   let summary = "test ping pong sync";
 
@@ -240,7 +252,8 @@ def NVGPUWSTMAStoreLowering : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleO
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
-                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
 }
 
 def NVGPUSinkBroadcast : Pass<"nvgpu-sink-broadcast", "mlir::ModuleOp"> {
@@ -260,14 +273,16 @@ def NVGPUTestAnnotateTMAStoreWaits : Pass<"nvgpu-test-annotate-tma-store-waits",
   let summary = "Annotate TMA store waits with can_rotate_by_buffer_count";
 
   let description = [{
-    This pass walks `scf.for` loops to find `ttng.async_tma_store_token_wait`
-    ops whose SMEM buffer has a `buffer.copy` attribute (set by the memory
-    planner).  For each such wait, it sets `can_rotate_by_buffer_count = K`
-    where K = buffer.copy - 1, indicating that the wait can be delayed by
-    up to K iterations because K+1 buffer slots are available.
+    This pass walks `scf.for` loops to find legacy
+    `ttng.async_tma_store_token_wait` and abstract
+    `nvws.descriptor_store/reduce` operations whose SMEM buffer has a
+    `buffer.copy` attribute (set by the memory planner). For each operation, it
+    sets `can_rotate_by_buffer_count = K` where K = buffer.copy, so the wait can
+    move to the K-th subsequent store that is about to reuse the same slot.
   }];
 
-  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
 }
 
 def NVGPUTestTMAStoreTokenWaitReorder : Pass<"nvgpu-test-tma-store-token-wait-reorder", "mlir::ModuleOp"> {
@@ -292,7 +307,13 @@ def NVGPUTestTMAStoreTokenWaitReorder : Pass<"nvgpu-test-tma-store-token-wait-re
     attempting the reorder.
   }];
 
-  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
+  let options = [
+    Option<"enableRotation", "enable-rotation",
+           "bool", /*default*/"true",
+           "move generated waits to the next source-buffer overwrite">
+  ];
 }
 
 def NVGPUTMAStoreTokenWaitLowering : Pass<"nvgpu-tma-store-token-wait-lowering", "mlir::ModuleOp"> {

@@ -33,6 +33,7 @@ include "mlir/Interfaces/ViewLikeInterface.td"
 include "triton/Dialect/Triton/IR/TritonTypes.td"
 include "triton/Dialect/Triton/IR/TritonAttrDefs.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypes.td"
+include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOpInterfaces.td"
 include "NVWSDialect.td"
 include "NVWSTypes.td"
 include "NVWSAttrDefs.td"
@@ -332,6 +333,115 @@ def NVWS_DescriptorGatherOp : NVWS_Op<"descriptor_gather", [NVWS_DescriptorLoadO
     $desc `[` $x_offsets `,` $y_offset `]` $txCount $result
     attr-dict `:` type(operands)
   }];
+}
+
+def NVWS_DescriptorStoreOp
+    : NVWS_Op<"descriptor_store", [
+        AttrSizedOperandSegments,
+        TMAStoreLikeOpInterface
+      ]> {
+  let summary = "Store from shared memory through a tensor descriptor";
+  let description = [{
+    Abstractly synchronous descriptor store whose source is an explicit shared
+    memory buffer. The operation is lowered to an asynchronous TTNG TMA issue
+    and a completion wait after Meta loop scheduling.
+
+    The barrier/predicate and NVWS token/index operand pairs are internal
+    completion metadata. They return ownership of the source buffer and are
+    transferred to the completion wait during late lowering; they are not TMA
+    completion-token results.
+  }];
+
+  let arguments = (ins
+    Arg<TT_TensorDescType, "",
+        [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$desc,
+    Variadic<I32>:$indices,
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+    Variadic<TTG_MemDescType>:$barriers,
+    Variadic<I1>:$barrier_preds,
+    Variadic<AnyType>:$nvws_tokens,
+    Variadic<I32>:$nvws_token_indices
+  );
+
+  let builders = [
+    OpBuilder<(ins "Value":$desc, "ValueRange":$indices, "Value":$src), [{
+      build($_builder, $_state, desc, indices, src,
+            /*barriers=*/ValueRange(), /*barrier_preds=*/ValueRange(),
+            /*nvws_tokens=*/ValueRange(),
+            /*nvws_token_indices=*/ValueRange());
+    }]>
+  ];
+
+  let assemblyFormat = [{
+    $desc `[` $indices `]` $src
+    custom<BarriersAndPreds>($barriers, $barrier_preds)
+    custom<NvwsTokensAndIndices>($nvws_tokens, $nvws_token_indices)
+    attr-dict `:` qualified(type($desc)) `,` qualified(type($src))
+    (`barrier_types` `=` qualified(type($barriers))^)?
+    (`token_types` `=` type($nvws_tokens)^)?
+  }];
+
+  let extraClassDeclaration = [{
+    void addBarrier(Value barrier, Value pred);
+    void addToken(Value token, Value idx);
+  }];
+  let hasVerifier = 1;
+}
+
+def NVWS_DescriptorReduceOp
+    : NVWS_Op<"descriptor_reduce", [
+        AttrSizedOperandSegments,
+        TMAStoreLikeOpInterface
+      ]> {
+  let summary =
+      "Reducing store from shared memory through a tensor descriptor";
+  let description = [{
+    Abstractly synchronous descriptor reduction whose source is an explicit
+    shared memory buffer. Atomicity and supported reduction kinds match the
+    TTNG asynchronous TMA reduction produced during late lowering.
+
+    The barrier/predicate and NVWS token/index operand pairs are internal
+    completion metadata. They return ownership of the source buffer and are
+    transferred to the completion wait during late lowering; they are not TMA
+    completion-token results.
+  }];
+
+  let arguments = (ins
+    TT_DescriptorReduceKindAttr:$kind,
+    Arg<TT_TensorDescType, "",
+        [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$desc,
+    Variadic<I32>:$indices,
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+    Variadic<TTG_MemDescType>:$barriers,
+    Variadic<I1>:$barrier_preds,
+    Variadic<AnyType>:$nvws_tokens,
+    Variadic<I32>:$nvws_token_indices
+  );
+
+  let builders = [
+    OpBuilder<(ins "triton::DescriptorReduceKind":$kind, "Value":$desc,
+                   "ValueRange":$indices, "Value":$src), [{
+      build($_builder, $_state, kind, desc, indices, src,
+            /*barriers=*/ValueRange(), /*barrier_preds=*/ValueRange(),
+            /*nvws_tokens=*/ValueRange(),
+            /*nvws_token_indices=*/ValueRange());
+    }]>
+  ];
+
+  let assemblyFormat = [{
+    $kind `,` $desc `[` $indices `]` $src
+    custom<BarriersAndPreds>($barriers, $barrier_preds)
+    custom<NvwsTokensAndIndices>($nvws_tokens, $nvws_token_indices)
+    attr-dict `:` qualified(type($desc)) `,` qualified(type($src))
+    (`barrier_types` `=` qualified(type($barriers))^)?
+    (`token_types` `=` type($nvws_tokens)^)?
+  }];
+
+  let extraClassDeclaration = [{
+    void addBarrier(Value barrier, Value pred);
+    void addToken(Value token, Value idx);
+  }];
+  let hasVerifier = 1;
 }
 
 #endif
