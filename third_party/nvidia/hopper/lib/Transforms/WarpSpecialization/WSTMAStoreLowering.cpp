@@ -753,6 +753,24 @@ LogicalResult doMaterializeAndPlaceTMAStoreWaits(triton::FuncOp funcOp,
   return success();
 }
 
+#define GEN_PASS_DEF_NVGPUMATERIALIZENVWSDESCRIPTORSTORES
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+struct NVGPUMaterializeNVWSDescriptorStoresPass
+    : public impl::NVGPUMaterializeNVWSDescriptorStoresBase<
+          NVGPUMaterializeNVWSDescriptorStoresPass> {
+  void runOnOperation() override {
+    WalkResult result = getOperation()->walk([&](triton::FuncOp funcOp) {
+      if (failed(doMaterializeAndPlaceTMAStoreWaits(
+              funcOp, /*enableRotation=*/false)))
+        return WalkResult::interrupt();
+      return WalkResult::advance();
+    });
+    if (result.wasInterrupted())
+      signalPassFailure();
+  }
+};
+
 struct NVGPUTestTMAStoreTokenWaitReorderPass
     : public impl::NVGPUTestTMAStoreTokenWaitReorderBase<
           NVGPUTestTMAStoreTokenWaitReorderPass> {

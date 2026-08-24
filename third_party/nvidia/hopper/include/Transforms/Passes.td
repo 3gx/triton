@@ -241,6 +241,51 @@ def NVGPUTestPingPongPrep : Pass<"nvgpu-test-ping-pong-prep", "mlir::ModuleOp"> 
   ];
 }
 
+def NVGPUConvertDescriptorLoadsToNVWS
+    : Pass<"nvgpu-convert-descriptor-loads-to-nvws", "mlir::ModuleOp"> {
+  let summary = "Convert TT descriptor loads and gathers to NVWS";
+  let description = [{
+    Converts `tt.descriptor_load` and `tt.descriptor_gather` to explicit-buffer
+    `nvws.descriptor_load` and `nvws.descriptor_gather`. This pass performs only
+    descriptor conversion.
+  }];
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
+}
+
+def NVGPUConvertDescriptorStoresToNVWS
+    : Pass<"nvgpu-convert-descriptor-stores-to-nvws", "mlir::ModuleOp"> {
+  let summary = "Convert TT descriptor stores and reductions to NVWS";
+  let description = [{
+    Converts `tt.descriptor_store` and `tt.descriptor_reduce` to explicit-buffer
+    `nvws.descriptor_store` and `nvws.descriptor_reduce`. This pass performs only
+    descriptor conversion.
+  }];
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
+}
+
+def NVGPUMaterializeNVWSDescriptorStores
+    : Pass<"nvgpu-materialize-nvws-descriptor-stores", "mlir::ModuleOp"> {
+  let summary = "Materialize NVWS descriptor stores and reductions";
+  let description = [{
+    Uses native Meta's existing materialization with wait rotation disabled to
+    replace `nvws.descriptor_store` and `nvws.descriptor_reduce` with TTNG TMA
+    issues and `ttng.async_tma_store_token_wait` operations. Final wait
+    `pendings` are lowered by the later token-wait-lowering pass.
+  }];
+  let dependentDialects = ["mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
+}
+
 def NVGPUWSTMAStoreLowering : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleOp"> {
   let summary = "Lower descriptor stores to async TMA copies via shared memory";
 
