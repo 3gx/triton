@@ -2,8 +2,9 @@
 
 ## Goal
 
-Make `TRITON_NVWS_USE_META=1` use all four NVWS descriptor operations through
-`NVWSInsertSemas` and lower them in `NVWSLowerSemaphore`:
+Make `TRITON_NVWS_USE_META=1`, with
+`TRITON_NVWS_USE_META_NVWS_ALLOCAS=0`, use all four NVWS descriptor operations
+through `NVWSInsertSemas`:
 
 ```text
 nvws.descriptor_load
@@ -14,7 +15,8 @@ nvws.descriptor_reduce
 
 The work has three independently authorized stages:
 
-0. create dedicated TT-to-NVWS descriptor conversion passes;
+0. create dedicated conversion/materialization passes that wrap existing Meta
+   helpers;
 1. wire and verify load/gather;
 2. add store/reduce.
 
@@ -40,6 +42,22 @@ scope is authorized. Existing untracked artifacts are never staged.
 The active stage defines the complete mutation scope. The agent must not fix,
 refactor, optimize, or clean up anything outside that scope merely because it
 was discovered while implementing or testing the stage.
+
+Unless the active stage explicitly names a removal or replacement, all work is
+additive:
+
+- do not delete, move, rename, merge, or rewrite existing tests;
+- do not remove existing `RUN` lines, checks, negative cases, or coverage;
+- do not weaken checks, add an XFAIL, or change expected behavior to make a new
+  test pass;
+- do not remove or repurpose existing test-only dispatches, pass wrappers,
+  compatibility paths, flags, or production call sites;
+- adding a new pass or API does not authorize migrating existing callers or
+  cleaning up the older path in the same stage.
+
+New pass coverage must be added alongside existing coverage. If testing the
+new feature appears to require restructuring or deleting existing coverage,
+report the conflict and stop for explicit authorization instead.
 
 If a suspected out-of-scope issue appears to block the active stage:
 
@@ -74,25 +92,46 @@ and do not make speculative changes for it.
 - Commit `1ce1b72ec0` already defines and verifies NVWS store/reduce and provides
   `doConvertDescriptorStoresToNVWS`.
 
+The optional `TRITON_NVWS_USE_META_NVWS_ALLOCAS=1` route is out of scope for
+this plan and remains unchanged.
+
 ---
 
-## Stage 0: Dedicated conversion passes
+## Stage 0: Dedicated Meta helper passes
 
 ### Deliverable
 
-Create two standalone production passes:
+Create three standalone production passes:
 
 ```text
 nvgpu-convert-descriptor-loads-to-nvws
 nvgpu-convert-descriptor-stores-to-nvws
+nvgpu-materialize-nvws-descriptor-stores
 ```
 
-Each pass does one thing only:
+The two conversion passes each:
 
 - walk each `tt.func`;
 - call its existing conversion helper;
 - propagate failure through the pass manager;
 - rely on the helper's survivor check to reject unconverted supported TT ops.
+
+The materialization pass walks each `tt.func` and calls the existing Meta
+helper:
+
+```cpp
+doMaterializeAndPlaceTMAStoreWaits(func, /*enableRotation=*/false)
+```
+
+It converts:
+
+```text
+nvws.descriptor_store/reduce
+-> TTNG issue/token
+-> TMAStoreTokenWait
+```
+
+It does not compute the final TMA wait `pendings` value.
 
 The passes do not perform buffer allocation, memory planning, partitioning,
 InsertSemas, or LowerSemaphore work.
@@ -100,11 +139,15 @@ InsertSemas, or LowerSemaphore work.
 ### Implementation
 
 - Add pass definitions and dependent dialects in Hopper `Passes.td`.
-- Add thin wrappers beside the helpers in `WSLowerMem.cpp`.
+- Add thin conversion wrappers beside the helpers in `WSLowerMem.cpp`.
+- Add a thin materialization wrapper beside the existing Meta store-wait
+  materialization code in `WSTMAStoreLowering.cpp`.
 - Expose normal pass factories so `AutomaticWarpSpecialization` can add them to
   its nested Meta pass manager.
-- Replace the `ttg.test_nvws_tma_store_conversion` test-only dispatch with the
-  dedicated store/reduce pass in its conversion tests.
+- Keep `ttg.test_nvws_tma_store_conversion`, its existing wrapper behavior,
+  and every existing conversion test unchanged.
+- Add separate focused tests for the three new pass entry points; do not move or
+  delete existing test cases.
 - Do not change any production pipeline in Stage 0.
 
 ### Tests
@@ -122,9 +165,15 @@ Direct pass tests must cover:
 - no raw store/reduce surviving the store pass;
 - no allocation/planner side effects beyond those intentionally created by
   the conversion helper.
+- direct NVWS store and reduce materialization to TTNG issue plus
+  `TMAStoreTokenWait`;
+- rotation remaining disabled in the materialization pass;
+- no final `ttng.async_tma_store_wait` yet, proving final `pendings` lowering is
+  still owned by the existing later pass.
 
-Use existing conversion test files where possible, especially Hopper
-`ws_tma_store_lowering.mlir` and existing descriptor-load conversion coverage.
+Add separate focused pass tests. Existing conversion test files, including
+`ws_tma_store_lowering.mlir`, remain unchanged; input patterns may be copied
+into the new focused tests, but existing cases are not moved.
 
 Agent gate:
 
@@ -138,7 +187,7 @@ production pipeline yet. The mandatory runtime gate begins in Stage 1.
 
 ### Stage 0 stop
 
-Report the two pass names, direct input/output IR, tests, and uncommitted diff.
+Report the three pass names, direct input/output IR, tests, and uncommitted diff.
 Wait for user testing and a separate Stage 0 commit request. After committing,
 stop. Stage 1 requires a new explicit request.
 
@@ -152,38 +201,33 @@ Stage 0 is explicitly committed and the user separately requests Stage 1.
 
 ### Deliverable
 
-Meta+NVWS has an explicit, non-duplicated load/gather conversion boundary:
+Meta+NVWS explicitly invokes the Stage 0 load/gather conversion pass on the
+default Meta allocation route. Each arrow below names exactly one pass:
 
 ```text
-default Meta allocation:
-  dedicated load/gather conversion pass
-  -> WSBufferAllocation
-
-TRITON_NVWS_USE_META_NVWS_ALLOCAS=1:
-  existing MetaToNVWSConvert
-  -> existing NVWSInsertAllocas load/gather conversion
-```
-
-Both routes then use the already-implemented path:
-
-```text
-NVWS load/gather
--> InsertSemas release [tma_load]
--> LowerSemaphore createTMALoad/createTMAGather
--> TTNG TMA load/gather
+tt.descriptor_load/gather
+  -- nvgpu-convert-descriptor-loads-to-nvws -->
+nvws.descriptor_load/gather
+  -- nvgpu-test-ws-buffer-allocation -->
+planned nvws.descriptor_load/gather
+  -- nvws-insert-semas -->
+nvws.descriptor_load/gather + semaphore.release [tma_load]
+  -- nvws-lower-semaphore -->
+TTNG async TMA load/gather
 ```
 
 ### Implementation
 
 - In the default Meta allocation branch of
-  `AutomaticWarpSpecialization.cpp`, add the Stage 0 load/gather pass
-  immediately before `NVGPUTestWSBufferAllocation`.
-- Make `NVGPUTestWSBufferAllocationPass` perform buffer allocation only.
-- Make `NVGPUTestWSMemoryPlannerPass` perform memory planning only; remove its
-  repeated conversion call.
-- Update standalone buffer-allocation/planner test pipelines that contain raw
-  TT load/gather to run the dedicated conversion pass explicitly.
-- Leave the optional `NVWSInsertAllocas` conversion implementation unchanged.
+  `AutomaticWarpSpecialization.cpp`, add
+  `nvgpu-convert-descriptor-loads-to-nvws` immediately before
+  `NVGPUTestWSBufferAllocation`.
+- Keep the existing conversion calls inside `NVGPUTestWSBufferAllocationPass`
+  and `NVGPUTestWSMemoryPlannerPass` unchanged. They are idempotent after the
+  dedicated pass; removing or refactoring them is outside Stage 1.
+- Keep all standalone buffer-allocation/planner test pipelines unchanged.
+- Do not modify or test the optional `NVWSInsertAllocas` allocation route in
+  this stage.
 - Do not change ACCESS-DAG, `AsyncOp::TMALoad`, AssignStagePhase, or
   LowerSemaphore in Stage 1. If integration exposes a failure there, follow
   the verified-blocker protocol and stop pending explicit authorization.
@@ -195,8 +239,7 @@ Required matrix:
 
 | Allocation route | Load | Gather |
 |---|---:|---:|
-| Dedicated pass + Meta buffer allocation | pass | pass |
-| Existing NVWSInsertAllocas route | pass | pass |
+| Dedicated pass + default Meta buffer allocation | pass | pass |
 
 Tests must show:
 
@@ -214,7 +257,7 @@ defined below: the six-file command and all three fused-attention commands.
 
 ### Stage 1 stop
 
-Report the four matrix results, the three IR boundaries, tests, and uncommitted
+Report the two matrix results, the three IR boundaries, tests, and uncommitted
 diff. Wait for user testing and a separate Stage 1 commit request. After
 committing, stop. Stage 2 requires a new explicit request.
 
@@ -228,16 +271,24 @@ Stage 1 is explicitly committed and the user separately requests Stage 2.
 
 ### Deliverable
 
-Both Meta+NVWS allocation routes implement:
+The default Meta+NVWS allocation route implements the following pipeline. Each
+arrow names exactly one pass, and every Stage 0 pass is referenced by its exact
+name:
 
 ```text
 tt.descriptor_store/reduce
--> dedicated Stage 0 store/reduce conversion pass
--> nvws.descriptor_store/reduce
--> InsertSemas release [tma_store]
--> LowerSemaphore TTNG store/reduce issue
--> TMAStoreTokenWait
--> exactly one EMPTY-barrier arrival after completion
+  -- nvgpu-convert-descriptor-stores-to-nvws -->
+nvws.descriptor_store/reduce
+  -- nvgpu-test-ws-buffer-allocation -->
+planned nvws.descriptor_store/reduce
+  -- nvws-insert-semas -->
+nvws.descriptor_store/reduce + semaphore.release [none]
+  -- nvgpu-materialize-nvws-descriptor-stores -->
+TTNG store/reduce issue + TMAStoreTokenWait + semaphore.release [none]
+  -- nvws-lower-semaphore -->
+TTNG store/reduce issue + TMAStoreTokenWait + EMPTY ArriveBarrier
+  -- nvgpu-tma-store-token-wait-lowering -->
+TTNG store/reduce issue + TMAStoreWait {pendings=N} + EMPTY ArriveBarrier
 ```
 
 All four descriptor operation kinds are NVWS operations at the InsertSemas
@@ -246,40 +297,54 @@ route.
 
 ### Implementation
 
-1. Add the Stage 0 store/reduce pass after Meta task propagation and before the
-   allocation branch.
+1. Add `nvgpu-convert-descriptor-stores-to-nvws` immediately after
+   `nvgpu-convert-descriptor-loads-to-nvws`, before the default Meta buffer
+   allocation pass.
 2. During development, use explicit `early_tma_store_lowering=False`; before
    handoff, make the default Meta+NVWS route use NVWS store/reduce and retain
    explicit `True` for legacy behavior.
 3. Verify that default `doBufferAllocation` preserves the already-supported
-   canonical source-free staging shape unchanged. In the optional InsertAllocas
-   route, add only the handling required to prevent a second staging buffer.
+   canonical source-free staging shape unchanged. Do not modify the optional
+   InsertAllocas route.
 4. Extend MetaToNVWS root/external preconverted-descriptor recognition from
    load/gather to store/reduce so their partition and WS metadata is preserved.
    Reuse the abstract annotation already invoked by the Meta+NVWS prefix, add
    `doValidateAbstractTMAStoreAnnotations` to its validation wrapper, and teach
    ordinary-store epilogue packing about the abstract form. Keep legacy
    workarounds for explicit compatibility.
-5. Add `AsyncOp::TMAStore`; classify store/reduce source as an ACCESS-DAG read;
-   emit `release [tma_store]`; count one pending arrival; classify both as reads
-   in AssignStagePhase.
-6. Add `createTMAStore` and `createTMAReduce` in LowerSemaphore.
-7. Make LowerSemaphore associate each `tma_store` release with every descriptor
-   operation whose SMEM-read completion it represents. Derive the association
-   and token strategy from the actual emitted semaphore IR; do not assume one
-   token or one CFG shape without a focused test.
-8. Emit the TTNG issues and ensure EMPTY is released exactly once, only after
-   every relevant SMEM read is complete. Suppress any duplicate ordinary
-   arrival.
-9. Audit whether real integration IR combines several store/reduce operations
-   under one release. If it does, support and test that exact shape before the
-   default cutover; otherwise diagnose it explicitly rather than inventing an
-   unverified combined-token algorithm.
-10. Assert no NVWS store/reduce survives LowerSemaphore and update the relevant
-    `sema-docs` documents.
+5. Classify store/reduce source as an ACCESS-DAG read and classify both as reads
+   in AssignStagePhase. Keep the existing generic `AsyncOp::NONE` release
+   protocol; do not add `AsyncOp::TMAStore`.
+6. Invoke `nvgpu-materialize-nvws-descriptor-stores` immediately after
+   `nvws-insert-semas` and before `nvws-lower-semaphore`; its wrapper calls the
+   Meta helper with rotation disabled.
+7. Reuse LowerSemaphore's existing generic `[none]` release lowering unchanged.
+   Do not add store-token association, barrier attachment, wait movement, or
+   store-specific lowering to LowerSemaphore.
+8. Reuse the existing global `nvgpu-tma-store-token-wait-lowering` pass
+   unchanged. It computes TMA wait `pendings=N` from issue/token/wait ordering
+   and replaces the token wait with
+   `ttng.async_tma_store_wait {pendings=N}`.
+9. Keep semaphore `pending_count`/`arrive_count` independent from TMA wait
+   `pendings`. Do not copy or derive a value between those count domains.
+10. Assert no NVWS store/reduce survives the materialization pass and update the
+    relevant `sema-docs` documents.
 
-Do not add a LowerSemaphore proxy fence unless codegen comparison proves one is
-missing; the later NVIDIA fence pass already handles TTNG store/reduce issues.
+All downstream edits in Stage 2 are limited to recognizing
+`nvws.descriptor_store` and `nvws.descriptor_reduce` as reads and inserting the
+existing materialization pass. Existing load/gather, generic semaphore,
+LowerSemaphore, final token-wait lowering, MMA, TMEM, compatibility, and
+unrelated planner behavior must remain unchanged.
+
+Do not improvise a custom store-token protocol, `AsyncOp::TMAStore`, custom
+LowerSemaphore store lowering, or a new pending-count algorithm. If the fixed
+flow above fails an acceptance test, follow the verified-blocker protocol:
+independently verify the failure and root cause, report minimal options, and
+stop for explicit authorization.
+
+Running the existing Meta materialization and token-wait-lowering logic
+verbatim is the Stage 2 contract. Stage 2 does not add a new scheduler-ordering
+analysis, verifier, wait-placement algorithm, or compensating synchronization.
 
 ### Tests and acceptance
 
@@ -288,55 +353,69 @@ Required matrix:
 | Allocation route | Store | Reduce |
 |---|---:|---:|
 | Default Meta allocation | pass | pass |
-| `TRITON_NVWS_USE_META_NVWS_ALLOCAS=1` | pass | pass |
 
 Required cases:
 
 - single store and single reduce;
 - alias/subview staging and packed epilogue;
 - root/external ownership;
-- pending-count and `arrive_count` behavior;
-- any combined-release shape observed in the integrated test IR;
-- no duplicate staging allocation;
-- no extra LowerSemaphore-specific proxy fence, and final fence placement/count
-  matching the explicit legacy route;
+- semaphore `pending_count`/`arrive_count` unchanged from the generic `[none]`
+  protocol;
+- no extra LowerSemaphore-specific logic or proxy fence;
 - explicit legacy compatibility.
 
 Required boundaries:
 
 ```text
 after conversion:          nvws.descriptor_store/reduce
-after InsertSemas:         release [tma_store]
-after LowerSemaphore:      TTNG issue + barrier-carrying token wait
-after token-wait lowering: single-op case has one store wait + one arrival
+after InsertSemas:         nvws store/reduce followed by release [none]
+after materialization:     TTNG issue + TMAStoreTokenWait; no NVWS survivor
+after token-wait lowering: TMAStoreWait {pendings=N}; no token-wait survivor
 final AWS output:          no TT/NVWS store/reduce survivor
 ```
 
-If integration emits a combined release, its test must instead prove that all
-associated SMEM reads complete before exactly one EMPTY release; it must not
-assume the single-op wait/token shape.
+Semaphore counts and TMA wait `pendings` remain separate existing mechanisms;
+Stage 2 does not copy or derive either value from the other.
 
 Agent gate:
 
 - build first;
-- run focused conversion, allocation, MetaToNVWS, InsertSemas, pending-count,
-  AssignStagePhase, LowerSemaphore, packing, observed association-shape, and
-  diagnostic lit tests;
+- run focused conversion, allocation, MetaToNVWS, InsertSemas,
+  materialization, AssignStagePhase, LowerSemaphore, final token-wait lowering,
+  packing, and diagnostic lit tests;
 - run complete `test/NVWS` and `test/Hopper/WarpSpecialization`;
 - run relevant TritonNvidiaGPU subtile tests;
-- compare new default with explicit legacy at MemoryPlanner, LowerSemaphore,
-  final TTGIR, waits, arrivals, and normalized PTX;
+- run existing explicit-legacy compatibility coverage without adding a new
+  wait-scheduling analysis or replacement algorithm;
 - run the complete authorized runtime gate defined below: the six-file command
   and all three fused-attention commands;
 - run `git diff --check`.
 
 ### Stage 2 stop
 
-Report the four matrix results, all IR boundaries, equivalence evidence, tests,
-and the complete uncommitted diff. The user tests both allocation modes and
-runtime kernels. Commit only after a separate Stage 2 commit request. After
+Report the two matrix results, required IR boundaries, tests, and the complete
+uncommitted diff. The user tests the default allocation route and runtime
+kernels. Commit only after a separate Stage 2 commit request. After
 committing, stop. Removing legacy compatibility requires another explicit
 request and is outside this plan.
+
+---
+
+## Post-plan TODO: LowerSemaphore-owned materialization
+
+This is recorded for posterity only. It is not part of Stage 0, 1, or 2 and is
+not authorized by this plan.
+
+Consider removing the future production dependency on
+`nvgpu-materialize-nvws-descriptor-stores` by moving NVWS descriptor
+store/reduce issue and `TMAStoreTokenWait` creation into LowerSemaphore. That
+alternative would still reuse the existing Meta
+`NVGPUTMAStoreTokenWaitLowering` pass unchanged for final `pendings=N`
+calculation and token-wait lowering.
+
+This alternative requires a separate investigation, plan, user authorization,
+implementation, tests, and commit. No Stage 2 failure authorizes switching to
+it automatically; the verified-blocker protocol applies.
 
 ---
 
