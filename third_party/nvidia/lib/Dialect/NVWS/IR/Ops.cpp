@@ -108,6 +108,14 @@ LogicalResult SemaphoreReleaseOp::verify() {
 LogicalResult SemaphoreCreateOp::verify() {
   SmallVector<int64_t> dims;
 
+  if (auto maskAttr = getReleasedMaskAttr()) {
+    uint32_t mask = static_cast<uint32_t>(maskAttr.getInt());
+    unsigned depth = getType().getNumStages();
+    if (depth < 32 && (mask >> depth) != 0)
+      return emitError("released_mask has bits outside semaphore depth ")
+             << depth;
+  }
+
   for (auto operand : getOperands()) {
     llvm::DenseSet<Operation *> seen;
     if (!allLegalSemaphoreBackingUses(operand, seen)) {

@@ -927,8 +927,8 @@ analyzeCombinedSemaphoreGroup(ArrayRef<SemaphoreAcquireOp> acquireGroup) {
     if (combinedDepth && *combinedDepth != depth)
       return {};
     combinedDepth = depth;
-    uint32_t emptyMask = getEffectiveReleasedMask(info.emptySema);
-    uint32_t fullMask = getEffectiveReleasedMask(info.fullSema);
+    uint32_t emptyMask = getReleasedMask(info.emptySema);
+    uint32_t fullMask = getReleasedMask(info.fullSema);
     if ((emptyReleasedMask && *emptyReleasedMask != emptyMask) ||
         (fullReleasedMask && *fullReleasedMask != fullMask))
       return {};
@@ -1039,7 +1039,7 @@ void combineSemaphores(scf::ForOp loop) {
   for (auto acquireOp : loop.getOps<SemaphoreAcquireOp>()) {
     auto semaCreate =
         acquireOp.getSemaphore().getDefiningOp<SemaphoreCreateOp>();
-    if (getEffectiveReleasedMask(semaCreate))
+    if (getReleasedMask(semaCreate))
       continue;
     bool isTMEM = llvm::any_of(semaCreate.getBuffers(), [&](Value buf) {
       return cast<MemDescType>(buf.getType()).getMemorySpace() == tmem;

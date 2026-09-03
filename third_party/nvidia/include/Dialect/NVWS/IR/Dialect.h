@@ -69,11 +69,6 @@ inline uint32_t getReleasedMask(SemaphoreCreateOp op) {
   return mask ? static_cast<uint32_t>(mask.getInt()) : 0;
 }
 
-inline uint32_t getEffectiveReleasedMask(SemaphoreCreateOp op) {
-  return getReleasedMask(op) &
-         getPhysicalStageMask(op.getType().getNumStages());
-}
-
 } // namespace mlir::triton::nvws
 
 #endif // DIALECT_NVWS_IR_DIALECT_H_
