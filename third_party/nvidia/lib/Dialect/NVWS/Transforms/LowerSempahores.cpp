@@ -36,7 +36,6 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
-#include "nvidia/include/Dialect/NVWS/IR/SemaphorePendingCount.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -729,11 +728,47 @@ void multiBufferSemaphore(
 // dominant consumer in a warp-specialize for-loop.
 // ---------------------------------------------------------------------------
 
+struct CombinedReleasePlan {
+  SmallVector<Attribute> asyncOps;
+  int pendingCount;
+};
+
+FailureOr<CombinedReleasePlan>
+planCombinedRelease(ArrayRef<SemaphoreReleaseOp> releaseOps) {
+  assert(!releaseOps.empty());
+  llvm::SmallSetVector<Attribute, 5> asyncOpsSet;
+  for (SemaphoreReleaseOp releaseOp : releaseOps) {
+    for (Attribute attr : releaseOp.getAsyncOps()) {
+      auto kind = cast<AsyncOpAttr>(attr).getValue();
+      if (kind == AsyncOp::CpAsync) {
+        releaseOp.emitError(
+            "cannot combine semaphore release with unsupported cp_async kind");
+        return failure();
+      }
+      asyncOpsSet.insert(attr);
+    }
+  }
+  if (asyncOpsSet.empty()) {
+    SemaphoreReleaseOp releaseOp = releaseOps.front();
+    releaseOp.emitError("cannot combine semaphore releases with empty "
+                        "async_ops");
+    return failure();
+  }
+
+  // Combining collapses all releases on one side to one release site. Each
+  // distinct completion kind contributes one arrival at that site, so both
+  // arrive_count and the barrier threshold are normalized to that topology.
+  SmallVector<Attribute> asyncOps(asyncOpsSet.begin(), asyncOpsSet.end());
+  return CombinedReleasePlan{std::move(asyncOps),
+                             static_cast<int>(asyncOpsSet.size())};
+}
+
 void createCombinedSemaphoreOps(ArrayRef<SemaphoreAcquireOp> acquireOps,
                                 ArrayRef<SemaphoreBufferOp> bufferOps,
                                 ArrayRef<SemaphoreReleaseOp> releaseOps,
                                 SemaphoreCreateOp acquireSema,
                                 SemaphoreCreateOp releaseSema,
+                                const CombinedReleasePlan &releasePlan,
                                 OpBuilder &builder) {
   assert(!acquireOps.empty() && !bufferOps.empty() && !releaseOps.empty());
 
@@ -787,16 +822,13 @@ void createCombinedSemaphoreOps(ArrayRef<SemaphoreAcquireOp> acquireOps,
     bufOffset += bufferOp.getBuffers().size();
   }
 
-  llvm::SmallSetVector<Attribute, 5> asyncOpsSet;
-  for (auto relOp : releaseOps)
-    asyncOpsSet.insert(relOp.getAsyncOps().begin(), relOp.getAsyncOps().end());
-
   builder.setInsertionPoint(lastRelease);
   auto combinedRelease = SemaphoreReleaseOp::create(
       builder, lastRelease.getLoc(), releaseSema, combinedAcquire.getToken(),
-      builder.getArrayAttr(
-          SmallVector<Attribute>(asyncOpsSet.begin(), asyncOpsSet.end())));
+      builder.getArrayAttr(releasePlan.asyncOps));
   combinedRelease.setArriveCountAttr(builder.getI32IntegerAttr(1));
+  releaseSema.setPendingCountAttr(
+      builder.getI32IntegerAttr(releasePlan.pendingCount));
   assignStageCluster(combinedRelease, getPartitionWsTagIds(lastRelease),
                      getStageCluster(lastRelease), builder);
 }
@@ -984,7 +1016,9 @@ CombinedSemaPair createCombinedSemaphores(ArrayRef<SemaToCombineInfo> infos,
 
 void combineConsumerSide(ArrayRef<SemaphoreAcquireOp> acquireGroup,
                          ArrayRef<SemaToCombineInfo> infos,
-                         CombinedSemaPair combinedPair, OpBuilder &builder) {
+                         CombinedSemaPair combinedPair,
+                         const CombinedReleasePlan &releasePlan,
+                         OpBuilder &builder) {
   // Consumer acquires FULL, buffers from it, then cross-releases EMPTY.
   SmallVector<SemaphoreBufferOp> consBufferOps;
   SmallVector<SemaphoreReleaseOp> consReleaseOps;
@@ -993,11 +1027,14 @@ void combineConsumerSide(ArrayRef<SemaphoreAcquireOp> acquireGroup,
     consReleaseOps.push_back(info.consReleaseOp);
   }
   createCombinedSemaphoreOps(acquireGroup, consBufferOps, consReleaseOps,
-                             combinedPair.full, combinedPair.empty, builder);
+                             combinedPair.full, combinedPair.empty, releasePlan,
+                             builder);
 }
 
 void combineProducerSide(ArrayRef<SemaToCombineInfo> infos,
-                         CombinedSemaPair combinedPair, OpBuilder &builder) {
+                         CombinedSemaPair combinedPair,
+                         const CombinedReleasePlan &releasePlan,
+                         OpBuilder &builder) {
   // Producer acquires EMPTY, buffers from it, then cross-releases FULL.
   SmallVector<SemaphoreAcquireOp> prodAcquireOps;
   SmallVector<SemaphoreBufferOp> prodBufferOps;
@@ -1008,7 +1045,8 @@ void combineProducerSide(ArrayRef<SemaToCombineInfo> infos,
     prodReleaseOps.push_back(info.prodReleaseOp);
   }
   createCombinedSemaphoreOps(prodAcquireOps, prodBufferOps, prodReleaseOps,
-                             combinedPair.empty, combinedPair.full, builder);
+                             combinedPair.empty, combinedPair.full, releasePlan,
+                             builder);
 }
 
 void eraseSemaToCombineGroup(ArrayRef<SemaphoreAcquireOp> acquireGroup,
@@ -1031,7 +1069,7 @@ void eraseSemaToCombineGroup(ArrayRef<SemaphoreAcquireOp> acquireGroup,
     info.emptySema->erase();
 }
 
-void combineSemaphores(scf::ForOp loop) {
+LogicalResult combineSemaphores(scf::ForOp loop) {
   // 1. Find consumer acquire ops (consumer = acquires a semaphore with no
   //    initially released stages). Skip TMEM.
   SmallVector<SemaphoreAcquireOp> consumerAcquires;
@@ -1072,19 +1110,28 @@ void combineSemaphores(scf::ForOp loop) {
     auto groupInfo = analyzeCombinedSemaphoreGroup(acquireGroup);
     if (groupInfo.empty())
       continue;
+
+    SmallVector<SemaphoreReleaseOp> consumerReleases;
+    SmallVector<SemaphoreReleaseOp> producerReleases;
+    for (SemaToCombineInfo info : groupInfo) {
+      consumerReleases.push_back(info.consReleaseOp);
+      producerReleases.push_back(info.prodReleaseOp);
+    }
+    auto consumerPlan = planCombinedRelease(consumerReleases);
+    if (failed(consumerPlan))
+      return failure();
+    auto producerPlan = planCombinedRelease(producerReleases);
+    if (failed(producerPlan))
+      return failure();
+
     auto combinedPair = createCombinedSemaphores(groupInfo, loop);
     OpBuilder builder(loop.getContext());
-    combineConsumerSide(acquireGroup, groupInfo, combinedPair, builder);
-    combineProducerSide(groupInfo, combinedPair, builder);
+    combineConsumerSide(acquireGroup, groupInfo, combinedPair, *consumerPlan,
+                        builder);
+    combineProducerSide(groupInfo, combinedPair, *producerPlan, builder);
     eraseSemaToCombineGroup(acquireGroup, groupInfo);
-    // The combiner is the author of the combined semaphores: stamp their
-    // pending counts from the now-complete combined protocol.
-    for (auto sema : {combinedPair.empty, combinedPair.full}) {
-      auto a = analyzeSemaphorePendingCount(sema);
-      sema.setPendingCountAttr(
-          builder.getI32IntegerAttr(a.pendingCount));
-    }
   }
+  return success();
 }
 
 // Precompute cross-semaphore async relationships before any rewrite:
@@ -1360,9 +1407,9 @@ public:
       }
     });
 
-    for (scf::ForOp loop : loops) {
-      combineSemaphores(loop);
-    }
+    for (scf::ForOp loop : loops)
+      if (failed(combineSemaphores(loop)))
+        return signalPassFailure();
 
     auto getSemaGroups = [&]() {
       llvm::DenseMap<Value, SmallVector<SemaphoreCreateOp>> semaGroups;
