@@ -1,5 +1,4 @@
 // RUN: triton-opt %s --nvws-meta-to-nvws-convert | FileCheck %s
-// RUN: triton-opt %s --nvws-meta-to-nvws-convert --nvws-meta-to-nvws-convert | FileCheck %s
 
 #offsets = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>

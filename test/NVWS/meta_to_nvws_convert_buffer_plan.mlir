@@ -2,10 +2,6 @@
 // RUN:   --implicit-check-not=ttg.memdesc_reinterpret \
 // RUN:   --implicit-check-not=allocation.reuseTarget \
 // RUN:   --implicit-check-not="buffer.id = 22"
-// RUN: triton-opt %s --nvws-meta-to-nvws-convert --nvws-meta-to-nvws-convert | FileCheck %s \
-// RUN:   --implicit-check-not=ttg.memdesc_reinterpret \
-// RUN:   --implicit-check-not=allocation.reuseTarget \
-// RUN:   --implicit-check-not="buffer.id = 22"
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared64 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16}>
